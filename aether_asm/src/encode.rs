@@ -9,6 +9,15 @@
 //! addresses are known.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XmmReg {
+    Xmm0 = 0, Xmm1 = 1, Xmm2 = 2, Xmm3 = 3,
+    Xmm4 = 4, Xmm5 = 5, Xmm6 = 6, Xmm7 = 7,
+}
+impl XmmReg {
+    pub fn lo3(self) -> u8 { (self as u8) & 0b111 }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CondCode {
     /// equal (ZF=1)
     E  = 0x4,
@@ -22,6 +31,14 @@ pub enum CondCode {
     G  = 0xF,
     /// signed greater-or-equal (SF=OF)
     Ge = 0xD,
+    /// unsigned/ucomiss above (CF=0, ZF=0)
+    A  = 0x7,
+    /// unsigned/ucomiss below (CF=1)
+    B  = 0x2,
+    /// unsigned above-or-equal (CF=0)
+    Ae = 0x3,
+    /// unsigned below-or-equal (CF=1 or ZF=1)
+    Be = 0x6,
 }
 
 impl CondCode {
@@ -72,6 +89,27 @@ pub enum Instr {
     /// `idiv r/m64` — RDX:RAX / src; quotient → RAX, remainder → RDX.
     /// REX.W + F7 /7
     IdivRegQ { src: Reg },
+
+    // -------- SSE2 single-precision float (f32) -----------------------------
+    /// `movss disp32(%rbp), %xmm` — load f32 from stack slot.
+    MovssRbpDispToXmm { dst: XmmReg, disp: i32 },
+    /// `movss %xmm, disp32(%rbp)` — store f32 to stack slot.
+    MovssXmmToRbpDisp { src: XmmReg, disp: i32 },
+    /// `movss sym(%rip), %xmm` — load f32 constant from .rdata.
+    MovssRipSymToXmm { dst: XmmReg, sym: String },
+    /// `movss %src, %dst` — register-register move.
+    MovssXmmXmm { dst: XmmReg, src: XmmReg },
+    /// `addss %src, %dst` — dst += src (AT&T order).
+    AddssXmmXmm { dst: XmmReg, src: XmmReg },
+    SubssXmmXmm { dst: XmmReg, src: XmmReg },
+    MulssXmmXmm { dst: XmmReg, src: XmmReg },
+    DivssXmmXmm { dst: XmmReg, src: XmmReg },
+    /// `ucomiss %src, %dst` — sets flags based on `dst <=> src`.
+    UcomissXmmXmm { dst: XmmReg, src: XmmReg },
+    /// `movss (%rsp), %xmm` — load from top of stack.
+    MovssRspToXmm { dst: XmmReg },
+    /// `movss %xmm, (%rsp)` — store to top of stack.
+    MovssXmmToRsp { src: XmmReg },
     /// `cmpq %src, %dst` (AT&T): flags = dst - src.   REX.W + 39 /r
     CmpRegRegQ { dst: Reg, src: Reg },
     /// `testq %a, %b` — flags = a & b. REX.W + 85 /r.
@@ -259,6 +297,72 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
             let modrm = 0b11_111_000 | src.lo3();
             Encoded { bytes: vec![rex, 0xF7, modrm], reloc: None }
         }
+
+        // ------------------ SSE2 f32 -------------------------------------
+        MovssRbpDispToXmm { dst, disp } => {
+            // F3 0F 10 /r ; ModR/M = 10 reg 101 (rbp + disp32)
+            let modrm = 0b10_000_101 | (dst.lo3() << 3);
+            let mut b = vec![0xF3, 0x0F, 0x10, modrm];
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        MovssXmmToRbpDisp { src, disp } => {
+            // F3 0F 11 /r ; ModR/M = 10 reg 101
+            let modrm = 0b10_000_101 | (src.lo3() << 3);
+            let mut b = vec![0xF3, 0x0F, 0x11, modrm];
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        MovssRipSymToXmm { dst, sym } => {
+            // F3 0F 10 /r ; ModR/M = 00 reg 101 (rip + disp32). Reloc at offset 4.
+            let modrm = 0b00_000_101 | (dst.lo3() << 3);
+            let bytes = vec![0xF3, 0x0F, 0x10, modrm, 0, 0, 0, 0];
+            Encoded {
+                bytes,
+                reloc: Some(PendingReloc {
+                    sym: sym.clone(),
+                    offset_in_instr: 4,
+                    kind: PendingRelocKind::Rel32Pc,
+                }),
+            }
+        }
+        MovssXmmXmm { dst, src } => {
+            // F3 0F 10 /r ; ModR/M = 11 reg(dst) rm(src)
+            let modrm = 0b11_000_000 | (dst.lo3() << 3) | src.lo3();
+            Encoded { bytes: vec![0xF3, 0x0F, 0x10, modrm], reloc: None }
+        }
+        AddssXmmXmm { dst, src } => {
+            // F3 0F 58 /r
+            let modrm = 0b11_000_000 | (dst.lo3() << 3) | src.lo3();
+            Encoded { bytes: vec![0xF3, 0x0F, 0x58, modrm], reloc: None }
+        }
+        SubssXmmXmm { dst, src } => {
+            let modrm = 0b11_000_000 | (dst.lo3() << 3) | src.lo3();
+            Encoded { bytes: vec![0xF3, 0x0F, 0x5C, modrm], reloc: None }
+        }
+        MulssXmmXmm { dst, src } => {
+            let modrm = 0b11_000_000 | (dst.lo3() << 3) | src.lo3();
+            Encoded { bytes: vec![0xF3, 0x0F, 0x59, modrm], reloc: None }
+        }
+        DivssXmmXmm { dst, src } => {
+            let modrm = 0b11_000_000 | (dst.lo3() << 3) | src.lo3();
+            Encoded { bytes: vec![0xF3, 0x0F, 0x5E, modrm], reloc: None }
+        }
+        UcomissXmmXmm { dst, src } => {
+            // 0F 2E /r ; ModR/M = 11 reg(dst) rm(src) — flags = dst <=> src
+            let modrm = 0b11_000_000 | (dst.lo3() << 3) | src.lo3();
+            Encoded { bytes: vec![0x0F, 0x2E, modrm], reloc: None }
+        }
+        MovssRspToXmm { dst } => {
+            // F3 0F 10 ModRM SIB ; ModRM = 00 reg(dst) 100 (SIB follows)
+            // SIB = 00 100 100 (scale=0, index=none, base=rsp)
+            let modrm = 0b00_000_100 | (dst.lo3() << 3);
+            Encoded { bytes: vec![0xF3, 0x0F, 0x10, modrm, 0x24], reloc: None }
+        }
+        MovssXmmToRsp { src } => {
+            let modrm = 0b00_000_100 | (src.lo3() << 3);
+            Encoded { bytes: vec![0xF3, 0x0F, 0x11, modrm, 0x24], reloc: None }
+        }
         CmpRegRegQ { dst, src } => {
             // REX.W + 39 /r — `cmp r/m64, r64`. AT&T syntax `cmpq %src, %dst`
             // sets flags as if dst - src. ModRM.reg = src, ModRM.rm = dst.
@@ -416,6 +520,38 @@ mod tests {
         let e = encode_instruction(&Instr::JmpRel32 { sym: "L".into() });
         assert_eq!(e.bytes, vec![0xE9, 0, 0, 0, 0]);
         assert_eq!(e.reloc.as_ref().unwrap().offset_in_instr, 1);
+    }
+
+    #[test]
+    fn sse_arithmetic_encodings() {
+        // `addss %xmm1, %xmm0` -> F3 0F 58 C1
+        assert_eq!(enc(Instr::AddssXmmXmm { dst: XmmReg::Xmm0, src: XmmReg::Xmm1 }),
+            vec![0xF3, 0x0F, 0x58, 0xC1]);
+        // `subss %xmm1, %xmm0` -> F3 0F 5C C1
+        assert_eq!(enc(Instr::SubssXmmXmm { dst: XmmReg::Xmm0, src: XmmReg::Xmm1 }),
+            vec![0xF3, 0x0F, 0x5C, 0xC1]);
+        // `mulss %xmm1, %xmm0` -> F3 0F 59 C1
+        assert_eq!(enc(Instr::MulssXmmXmm { dst: XmmReg::Xmm0, src: XmmReg::Xmm1 }),
+            vec![0xF3, 0x0F, 0x59, 0xC1]);
+        // `divss %xmm1, %xmm0` -> F3 0F 5E C1
+        assert_eq!(enc(Instr::DivssXmmXmm { dst: XmmReg::Xmm0, src: XmmReg::Xmm1 }),
+            vec![0xF3, 0x0F, 0x5E, 0xC1]);
+        // `ucomiss %xmm1, %xmm0` -> 0F 2E C1
+        assert_eq!(enc(Instr::UcomissXmmXmm { dst: XmmReg::Xmm0, src: XmmReg::Xmm1 }),
+            vec![0x0F, 0x2E, 0xC1]);
+        // `movss disp(%rbp), %xmm0` -> F3 0F 10 85 disp32
+        assert_eq!(enc(Instr::MovssRbpDispToXmm { dst: XmmReg::Xmm0, disp: -8 }),
+            vec![0xF3, 0x0F, 0x10, 0x85, 0xF8, 0xFF, 0xFF, 0xFF]);
+        // `movss %xmm0, disp(%rbp)` -> F3 0F 11 85 disp32
+        assert_eq!(enc(Instr::MovssXmmToRbpDisp { src: XmmReg::Xmm0, disp: -8 }),
+            vec![0xF3, 0x0F, 0x11, 0x85, 0xF8, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn movss_rip_has_relocation() {
+        let e = encode_instruction(&Instr::MovssRipSymToXmm { dst: XmmReg::Xmm0, sym: "C".into() });
+        assert_eq!(e.bytes, vec![0xF3, 0x0F, 0x10, 0x05, 0, 0, 0, 0]);
+        assert_eq!(e.reloc.as_ref().unwrap().offset_in_instr, 4);
     }
 
     #[test]

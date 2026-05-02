@@ -20,7 +20,7 @@
 //! drift gets caught immediately.
 
 use crate::coff::{ObjectBuilder, Symbol, SymbolStorage};
-use crate::encode::{CondCode, Instr, Reg};
+use crate::encode::{CondCode, Instr, Reg, XmmReg};
 
 #[derive(Debug)]
 pub enum AsmError {
@@ -58,9 +58,21 @@ pub fn parse_gas(src: &str) -> Result<ObjectBuilder, AsmError> {
             if !matches!(current, SectionId::Rdata) {
                 return Err(syn(lineno, ".asciz outside .rdata".into()));
             }
-            // Append at the end of rdata; label was already recorded.
             ob.rdata.data.extend_from_slice(s.as_bytes());
             ob.rdata.data.push(0);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(".byte") {
+            if !matches!(current, SectionId::Rdata) {
+                return Err(syn(lineno, ".byte outside .rdata".into()));
+            }
+            let v = rest.trim();
+            let n: u64 = if let Some(hex) = v.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).map_err(|e| syn(lineno, format!("bad .byte: {e}")))?
+            } else {
+                v.parse().map_err(|e| syn(lineno, format!("bad .byte: {e}")))?
+            };
+            ob.rdata.data.push(n as u8);
             continue;
         }
         // Label: `name:`
@@ -189,6 +201,13 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
         Instr::NegRegQ { .. } => 3,
         Instr::CqoSignExt => 2,
         Instr::IdivRegQ { .. } => 3,
+        Instr::MovssRbpDispToXmm { .. } | Instr::MovssXmmToRbpDisp { .. } => 8,
+        Instr::MovssRipSymToXmm { .. } => 8,
+        Instr::MovssXmmXmm { .. } => 4,
+        Instr::AddssXmmXmm { .. } | Instr::SubssXmmXmm { .. }
+            | Instr::MulssXmmXmm { .. } | Instr::DivssXmmXmm { .. } => 4,
+        Instr::UcomissXmmXmm { .. } => 3,
+        Instr::MovssRspToXmm { .. } | Instr::MovssXmmToRsp { .. } => 5,
     }).sum()
 }
 
@@ -218,6 +237,27 @@ fn parse_reg(s: &str, line: u32) -> Result<Reg, AsmError> {
 fn parse_imm(s: &str, line: u32) -> Result<i64, AsmError> {
     let s = s.trim().trim_start_matches('$');
     s.parse::<i64>().map_err(|e| syn(line, format!("bad immediate {s}: {e}")))
+}
+
+fn parse_xmm(s: &str, line: u32) -> Result<XmmReg, AsmError> {
+    let s = s.trim().trim_start_matches('%');
+    Ok(match s {
+        "xmm0" => XmmReg::Xmm0, "xmm1" => XmmReg::Xmm1,
+        "xmm2" => XmmReg::Xmm2, "xmm3" => XmmReg::Xmm3,
+        "xmm4" => XmmReg::Xmm4, "xmm5" => XmmReg::Xmm5,
+        "xmm6" => XmmReg::Xmm6, "xmm7" => XmmReg::Xmm7,
+        _ => return Err(syn(line, format!("unknown xmm register: %{s}"))),
+    })
+}
+
+/// Parse `SYM(%rip)` form. Returns the symbol name on a match.
+fn parse_rip_mem(s: &str) -> Option<String> {
+    let s = s.trim();
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close <= open { return None; }
+    if s[open + 1..close].trim() != "%rip" { return None; }
+    Some(s[..open].trim().to_string())
 }
 
 /// Parse a memory operand of the form `disp(%rbp)` or `-disp(%rbp)` or
@@ -294,6 +334,53 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "cqo"   => Instr::CqoSignExt,
         "cqto"  => Instr::CqoSignExt,
         "idivq" => Instr::IdivRegQ { src: parse_reg(rest, lineno)? },
+
+        // SSE2 single-precision float instructions.
+        "movss" => {
+            let (a, b) = split_comma(rest);
+            // Forms:
+            //   movss disp(%rbp), %xmm
+            //   movss %xmm, disp(%rbp)
+            //   movss sym(%rip), %xmm
+            //   movss %xmm, %xmm
+            if let Some(disp) = parse_rbp_mem(a) {
+                Instr::MovssRbpDispToXmm { dst: parse_xmm(b, lineno)?, disp }
+            } else if let Some(disp) = parse_rbp_mem(b) {
+                Instr::MovssXmmToRbpDisp { src: parse_xmm(a, lineno)?, disp }
+            } else if let Some(sym) = parse_rip_mem(a) {
+                Instr::MovssRipSymToXmm { dst: parse_xmm(b, lineno)?, sym }
+            } else if a.trim() == "(%rsp)" {
+                Instr::MovssRspToXmm { dst: parse_xmm(b, lineno)? }
+            } else if b.trim() == "(%rsp)" {
+                Instr::MovssXmmToRsp { src: parse_xmm(a, lineno)? }
+            } else {
+                Instr::MovssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+            }
+        }
+        "addss" => {
+            let (a, b) = split_comma(rest);
+            Instr::AddssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "subss" => {
+            let (a, b) = split_comma(rest);
+            Instr::SubssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "mulss" => {
+            let (a, b) = split_comma(rest);
+            Instr::MulssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "divss" => {
+            let (a, b) = split_comma(rest);
+            Instr::DivssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "ucomiss" => {
+            let (a, b) = split_comma(rest);
+            Instr::UcomissXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "seta"  => Instr::SetccAl { cc: CondCode::A  },
+        "setb"  => Instr::SetccAl { cc: CondCode::B  },
+        "setae" => Instr::SetccAl { cc: CondCode::Ae },
+        "setbe" => Instr::SetccAl { cc: CondCode::Be },
         "xorl"  => {
             let (a, b) = split_comma(rest);
             Instr::XorRegReg32 { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }

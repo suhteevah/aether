@@ -17,7 +17,7 @@ Exit code non-zero if any dimension errors. **Run this before claiming any work 
 
 `--json` for machine-readable output; `--only sloc|scan|tests|golden|conformance` to focus a single dimension.
 
-Current snapshot: **7,782 total lines • 6,352 code • 0 todo/unimplemented/unreachable/ignored • 0 stub_return** • 4 explicit `panic!()` (all guard rails: unreachable AST shape in tests, file-type validation in `aether-prepare`) • 44 `Phase N` markers (all explicitly roadmap, not surprise debt) • **38/38 tests pass • 9/9 golden artifacts match • 8/8 conformance cases pass • 15/15 runtime end-to-end cases pass** (the runtime dimension actually compiles `.aether` → exe through the Aether-only chain and asserts the .exe's exit code and stdout).
+Current snapshot: **8,135 total lines • 6,647 code • 0 todo/unimplemented/unreachable/ignored • 0 stub_return** • 4 explicit `panic!()` (all guard rails) • 44 `Phase N` markers (all explicitly roadmap) • **40/40 tests pass • 9/9 golden artifacts match • 8/8 conformance cases pass • 17/17 runtime end-to-end cases pass.** Runtime suite covers: hello + arith + idivq/cqo + unary + ifelse + nested for + while/break/continue + FFI to libaether_rt + pointer-to-local + **f32 SSE2 (literals, arithmetic, ucomiss compares)**.
 
 The runtime suite proves the asm backend correctness on real programs:
 
@@ -169,7 +169,7 @@ Flags: `--emit=mir`, `--emit=llvm-ir`, `--strip-comments` (default on), `--targe
 19. ~~Integer `/` and `%` (`cqo` + `idivq`)~~ **DONE**
 20. ~~`&local` → `lea reg, disp(%rbp)` for passing pointers to FFI~~ **DONE**
 21. ~~Link `libaether_rt.a` from `--emit=aether-bin` so `extern fn aether_*` resolves~~ **DONE** — proven by `ffi_self_check`, `ffi_tape_push`, `ffi_buffer`, `for_ffi_tape`, `nested_loops` runtime tests.
-22. **f32/f64 in the asm backend**: SSE2 (xmm0–xmm7), `movss/addss/mulss/divss/ucomiss`, float arg passing via xmm0–xmm3, `cvtsi2ss` for int↔float, `f32`-aware `Bin` lowering. Without this, training math has to live in the runtime; with it, an Aether program can compute floats directly.
+22. ~~f32 in the asm backend~~ **DONE** — SSE2 (xmm0–xmm7), `movss/addss/subss/mulss/divss/ucomiss`, f32 literal interning to `.rdata` via `.byte` directive, type-aware `Bin` lowering with stack spill for nested expressions, ucomiss + setcc for compares. Verified by `f32_compare` (1.5 + 2.5 == 4.0 → exit 7) and `f32_arith` ((10.0 * 4.5 - 3.0) / 1.0 == 42 → exit 42). **Next f32 work**: `cvtsi2ss` / `cvtss2si` for int↔float casts, `f32` arg passing via xmm0–xmm3 for FFI, f32 fn return values, f64 (xmm + 0xF2 prefix instead of 0xF3).
 23. **Struct field access** (`x.field`) → load from offset within the local that holds the struct. Needed to express the `Model` struct from `examples/aether_lm.aether` directly in compiled Aether code.
 24. **Self-hosted linker**: replace the system `ld` step in `--emit=aether-bin` with a PE32+ writer in `aether_asm/`. After this, the toolchain has zero external deps for static binaries (still uses msvcrt's `puts`, but resolves it through our own import-table writer).
 25. **Real cuBLAS/cuDNN backend in `runtime/`**: replace each `aether_op_*` no-op with a CUDA implementation.
@@ -225,4 +225,4 @@ Flags: `--emit=mir`, `--emit=llvm-ir`, `--strip-comments` (default on), `--targe
 
 ## Source of Truth
 
-`J:\aether\handoff.md` — the full spec, war doc, examples, and roadmap. Read it before changing direction on anything in this file.
+`J:\aether\SPEC.md` — the full spec, war doc, examples, and roadmap (was `handoff.md` until renamed to free the name for session handoffs). Read it before changing direction on anything in this file. `HANDOFF.md` is the session-handoff state file.

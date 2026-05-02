@@ -2,7 +2,7 @@
 
 AI-native systems language. Close to the metal, LLM-readable, comments stripped at lex time.
 
-See `handoff.md` for the full spec, war doc, and roadmap. See `CLAUDE.md` for coder/agent instructions.
+See `SPEC.md` for the full spec, war doc, and roadmap. See `CLAUDE.md` for coder/agent instructions, and `HANDOFF.md` for the latest session state.
 
 ## Build
 
@@ -62,7 +62,7 @@ target\release\aetherc.exe examples\aether_lm.aether --emit=llvm-ir
 * `trainer/` — Rust binaries (`aether-train`, `aether-infer`, `aether-prepare`) that call **only** runtime symbols. What aetherc Phase 1 will emit from the Aether source.
 * `stdlib/` — `.aether` source for the language stdlib (`ops`, `optim`, `nn`, `tensor`). Every primitive op is an `extern fn` resolving to a runtime symbol.
 * `examples/` — `.aether` programs: hello, matmul, distributed training, LLM serving, and `aether_lm.aether` (AetherLM-Tiny in pure Aether).
-* `docs/`, `handoff.md`, `CLAUDE.md` — design.
+* `docs/`, `SPEC.md`, `CLAUDE.md`, `HANDOFF.md` — design + session state.
 
 ## Philosophy
 

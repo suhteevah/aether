@@ -1,0 +1,9 @@
+// expect: exit=7
+// f32 arithmetic + ucomiss compare. Demonstrates SSE2 in the asm backend:
+//   1.5 + 2.5 = 4.0,  4.0 == 4.0 → true → tail returns 7.
+fn main() -> i32 {
+    let x: f32 = 1.5;
+    let y: f32 = 2.5;
+    let z: f32 = x + y;
+    if z == 4.0 { 7 } else { 0 }
+}
