@@ -1,0 +1,13 @@
+// expect: exit=12
+// while-loop with break: count up to 100 by 3, but stop at the first
+// multiple of 3 that exceeds 10. We expect to break at i = 12.
+fn main() -> i32 {
+    let mut i = 0;
+    while i < 100 {
+        if i > 10 {
+            break;
+        }
+        i = i + 3;
+    }
+    i
+}

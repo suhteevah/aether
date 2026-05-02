@@ -1,0 +1,10 @@
+// Local bindings, arithmetic, and a tail-expression return value.
+// Compiles through the Aether-only chain (aetherc -> aether-asm -> link).
+
+fn main() -> i32 {
+    let x = 7;
+    let y = 35;
+    let z = x + y;
+    println("computing 7 + 35:");
+    z
+}

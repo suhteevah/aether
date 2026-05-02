@@ -1,0 +1,13 @@
+// Struct, const, extern fn declarations all coexist.
+const D_MODEL: i64 = 320;
+
+pub struct Tensor<T, S> {
+    data: T,
+    shape: S,
+}
+
+extern fn matmul_f32(a: &Tensor<f32, [M, K]>, b: &Tensor<f32, [K, N]>, out: &mut Tensor<f32, [M, N]>) -> i32;
+
+fn use_matmul(a: &Tensor<f32, [M, K]>, b: &Tensor<f32, [K, N]>, c: &mut Tensor<f32, [M, N]>) {
+    matmul_f32(a, b, c);
+}

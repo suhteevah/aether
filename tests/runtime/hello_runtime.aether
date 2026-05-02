@@ -1,0 +1,6 @@
+// expect: exit=0
+// expect: stdout contains Hello from Aether
+fn main() -> i32 {
+    println("Hello from Aether - close to the metal");
+    0
+}

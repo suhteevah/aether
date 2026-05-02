@@ -1,0 +1,9 @@
+// expect: exit=15
+// Mixed Add + Mul with deeper expression nesting.
+fn main() -> i32 {
+    let a = 3;
+    let b = 4;
+    let c = a * b;
+    let d = c + b - 1;
+    d
+}

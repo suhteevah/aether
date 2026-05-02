@@ -1,0 +1,17 @@
+// Local bindings, arithmetic, multi-arg calls — all targets of the asm backend.
+fn compute() -> i32 {
+    let a = 3;
+    let b = 14;
+    let c = a + b;
+    let d = c - 1;
+    let e = d * 2;
+    e
+}
+
+fn main() -> i32 {
+    let x = 7;
+    let y = 35;
+    let z = x + y;
+    println("done");
+    z
+}

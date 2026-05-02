@@ -1,0 +1,72 @@
+// Aether primitive ops. Every `extern fn` here resolves to a C-ABI symbol
+// in libaether_rt. Phase 0 stubs return without computing; Phase 1 routes
+// to cuBLAS / cuDNN / NCCL on the kokonoe 3070 Ti.
+//
+// Naming matches the symbol that aetherc emits in LLVM IR:
+//   `aether::ops::matmul_f32` -> @aether_op_matmul_f32
+
+module aether::ops;
+
+use core::tensor::Tensor;
+
+// --- linear algebra -----------------------------------------------------
+
+extern fn matmul_f32(
+    a: &Tensor<f32, [M, K]>,
+    b: &Tensor<f32, [K, N]>,
+    out: &mut Tensor<f32, [M, N]>,
+) -> i32;
+
+extern fn matmul_bf16(
+    a: &Tensor<bf16, [M, K]>,
+    b: &Tensor<bf16, [K, N]>,
+    out: &mut Tensor<bf16, [M, N]>,
+) -> i32;
+
+extern fn add_f32(a: &Tensor<f32, [N]>, b: &Tensor<f32, [N]>, out: &mut Tensor<f32, [N]>) -> i32;
+extern fn scale_f32(x: &mut Tensor<f32, [N]>, s: f32) -> i32;
+extern fn axpy_f32(alpha: f32, x: &Tensor<f32, [N]>, y: &mut Tensor<f32, [N]>) -> i32;
+
+// --- nonlinearities -----------------------------------------------------
+
+extern fn gelu_f32(x: &mut Tensor<f32, [N]>) -> i32;
+extern fn silu_f32(x: &mut Tensor<f32, [N]>) -> i32;
+extern fn relu_f32(x: &mut Tensor<f32, [N]>) -> i32;
+extern fn softmax_f32(x: &mut Tensor<f32, [B, N]>, axis: i32) -> i32;
+
+// --- normalisation ------------------------------------------------------
+
+extern fn layer_norm_f32(
+    x: &Tensor<f32, [B, S, D]>,
+    gamma: &Tensor<f32, [D]>,
+    beta: &Tensor<f32, [D]>,
+    eps: f32,
+    out: &mut Tensor<f32, [B, S, D]>,
+) -> i32;
+
+// --- attention ----------------------------------------------------------
+
+extern fn scaled_dot_product_attention_f32(
+    q: &Tensor<f32, [B, H, S, D]>,
+    k: &Tensor<f32, [B, H, S, D]>,
+    v: &Tensor<f32, [B, H, S, D]>,
+    causal: i32,
+    out: &mut Tensor<f32, [B, H, S, D]>,
+) -> i32;
+
+// --- losses -------------------------------------------------------------
+
+extern fn cross_entropy_f32(
+    logits: &Tensor<f32, [B, V]>,
+    labels: &Tensor<i32, [B]>,
+    loss: &mut Tensor<f32, [1]>,
+) -> i32;
+
+// --- gradient utilities -------------------------------------------------
+
+extern fn zero_grad_f32(g: &mut Tensor<f32, [N]>) -> i32;
+extern fn clip_grad_norm_f32(g: &mut Tensor<f32, [N]>, max_norm: f32) -> f32;
+
+// --- distributed --------------------------------------------------------
+
+extern fn all_reduce_sum_f32(buf: &mut Tensor<f32, [N]>, world_size: i32) -> i32;

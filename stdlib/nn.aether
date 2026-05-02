@@ -1,0 +1,49 @@
+// Building blocks expressed in pure Aether. Every op resolves to an
+// extern symbol declared in aether::ops or aether::optim.
+
+module aether::nn;
+
+use core::tensor::Tensor;
+use aether::ops::matmul_f32;
+use aether::ops::add_f32;
+use aether::ops::layer_norm_f32;
+use aether::ops::gelu_f32;
+use aether::ops::softmax_f32;
+use aether::ops::scaled_dot_product_attention_f32;
+
+pub struct Linear<I, O> {
+    w: Tensor<f32, [I, O]>,
+    b: Tensor<f32, [O]>,
+}
+
+#[autodiff]
+fn linear_forward(self: &Linear<I, O>, x: &Tensor<f32, [B, S, I]>)
+    -> Tensor<f32, [B, S, O]>
+{
+    let y = x.matmul(self.w);
+    y.add_bias(self.b)
+}
+
+pub struct Embedding<V, D> {
+    w: Tensor<f32, [V, D]>,
+}
+
+#[autodiff]
+fn embedding_forward(self: &Embedding<V, D>, ids: &Tensor<i32, [B, S]>)
+    -> Tensor<f32, [B, S, D]>
+{
+    self.w.gather(ids)
+}
+
+pub struct LayerNorm<D> {
+    gamma: Tensor<f32, [D]>,
+    beta: Tensor<f32, [D]>,
+    eps: f32,
+}
+
+#[autodiff]
+fn layer_norm_forward(self: &LayerNorm<D>, x: &Tensor<f32, [B, S, D]>)
+    -> Tensor<f32, [B, S, D]>
+{
+    x.layer_norm(self.gamma, self.beta, self.eps)
+}

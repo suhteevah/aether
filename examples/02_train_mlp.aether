@@ -1,0 +1,10 @@
+// Distributed MLP training. Tape + all_reduce inserted by the MIR pass.
+
+#[autodiff]
+#[distributed(world_size=8, backend="nccl", algorithm="ring")]
+fn train_step(model: &mut Mlp, batch: &Batch) {
+    let logits = model.forward(&batch.input);
+    let loss = logits.cross_entropy(&batch.labels);
+    loss.backward();
+    optimizer.step(grads);
+}

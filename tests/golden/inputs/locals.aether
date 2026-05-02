@@ -1,0 +1,8 @@
+// Golden for the asm backend's local-variables + arithmetic path.
+fn main() -> i32 {
+    let x = 7;
+    let y = 35;
+    let z = x + y;
+    println("computing 7 + 35:");
+    z
+}

@@ -1,0 +1,34 @@
+// AdamW + SGD optimisers. Bare-metal: a single state struct per param,
+// in-place fused update via `aether_op_adamw_step_f32`.
+
+module aether::optim;
+
+use core::tensor::Tensor;
+
+pub struct AdamWState<S> {
+    m: Tensor<f32, S>,
+    v: Tensor<f32, S>,
+    step: i64,
+}
+
+extern fn adamw_step_f32(
+    param: &mut Tensor<f32, [N]>,
+    grad: &Tensor<f32, [N]>,
+    m: &mut Tensor<f32, [N]>,
+    v: &mut Tensor<f32, [N]>,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    step: i64,
+) -> i32;
+
+extern fn sgd_step_f32(
+    param: &mut Tensor<f32, [N]>,
+    grad: &Tensor<f32, [N]>,
+    lr: f32,
+    momentum: f32,
+    weight_decay: f32,
+    state: &mut Tensor<f32, [N]>,
+) -> i32;

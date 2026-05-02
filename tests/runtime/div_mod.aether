@@ -1,0 +1,9 @@
+// expect: exit=42
+// Integer division and modulo. (97 / 3) - (97 % 3) - 31 = 32 - 1 - 31 = 0.
+// We then add the result to 42 + 0 to keep the test's expected exit=42.
+fn main() -> i32 {
+    let q = 97 / 3;
+    let r = 97 % 3;
+    let check = q - r - 31;
+    42 + check
+}

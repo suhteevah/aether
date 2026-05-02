@@ -1,0 +1,18 @@
+// expect: exit=18
+// for-loop with continue: sum 0..10 but skip values < 2 and == 5.
+// 2+3+4+6+7+8+9 = 39. Hmm wrong arithmetic. Recompute:
+//   skip i < 2 (skip 0, 1) + skip i == 5
+//   keeps: 2+3+4+6+7+8+9 = 39. Use that.
+// Actually exit is encoded as an u8 so let's pick something smaller.
+// Sum 0..7, skip i == 3:  0+1+2+4+5+6 = 18.  Use 18.
+// expect-fixed below.
+fn main() -> i32 {
+    let mut acc = 0;
+    for i in 0..7 {
+        if i == 3 {
+            continue;
+        }
+        acc = acc + i;
+    }
+    acc
+}

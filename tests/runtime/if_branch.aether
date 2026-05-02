@@ -1,0 +1,8 @@
+// expect: exit=99
+// If/else with comparison. Picks the larger of two and adds an offset.
+fn main() -> i32 {
+    let a = 30;
+    let b = 41;
+    let bigger = if a > b { a } else { b };
+    bigger + 58
+}

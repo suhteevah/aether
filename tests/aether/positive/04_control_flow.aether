@@ -1,0 +1,17 @@
+// if/else, parallel for over ranges, warp/block regions.
+fn loop_kernel() {
+    parallel for i in 0..64 {
+        warp {
+            let acc = 0;
+        }
+        block {
+            let stride = 16;
+        }
+    }
+
+    if 1 == 1 {
+        let x = 42;
+    } else {
+        let y = 0;
+    }
+}

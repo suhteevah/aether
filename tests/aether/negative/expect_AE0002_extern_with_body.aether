@@ -1,0 +1,4 @@
+// extern fn must not have a body — the parser should reject this.
+extern fn matmul(a: i32, b: i32) -> i32 {
+    return 0;
+}

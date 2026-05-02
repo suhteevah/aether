@@ -1,0 +1,15 @@
+// AVX-512 tiled matmul. Comments here vanish at lex time.
+
+#[target(arch = "x86_64", features = "avx512")]
+#[perf(critical, unroll = 8, vectorize = true)]
+pub fn matmul_f32(a: &Tensor<f32, [M, K]>, b: &Tensor<f32, [K, N]>, c: &mut Tensor<f32, [M, N]>) {
+    let TILE_M = 64;
+    let TILE_K = 256;
+    let TILE_N = 64;
+
+    parallel for ii in 0..TILE_M {
+        warp {
+            let acc = simd_zero();
+        }
+    }
+}

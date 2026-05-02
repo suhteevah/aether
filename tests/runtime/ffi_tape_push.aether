@@ -1,0 +1,13 @@
+// expect: exit=3
+// Push 3 entries onto the runtime tape, then read the count back.
+extern fn aether_autodiff_init(tape: i64) -> i32;
+extern fn aether_autodiff_push(tape: i64, value: i64) -> i32;
+extern fn aether_rt_self_check() -> i32;
+
+fn main() -> i32 {
+    aether_autodiff_init(0);
+    aether_autodiff_push(0, 0);
+    aether_autodiff_push(0, 0);
+    aether_autodiff_push(0, 0);
+    aether_rt_self_check()
+}

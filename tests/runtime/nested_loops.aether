@@ -1,0 +1,29 @@
+// expect: exit=25
+// Nested for loops + accumulator + if/else + FFI in the conditional branch.
+// 5 x 5 = 25 (i, j) pairs. We push to the tape only when i + j >= 4, counting
+// 15 such pairs by hand. Then we return `visited`, which should be 25 since
+// the outer accumulator increments on every iteration regardless.
+extern fn aether_autodiff_init(tape: i64) -> i32;
+extern fn aether_autodiff_push(tape: i64, value: i64) -> i32;
+extern fn aether_rt_self_check() -> i32;
+
+fn main() -> i32 {
+    aether_autodiff_init(0);
+    let mut visited = 0;
+    for i in 0..5 {
+        for j in 0..5 {
+            visited = visited + 1;
+            if i + j >= 4 {
+                aether_autodiff_push(0, 0);
+            } else {
+                visited = visited + 0;
+            }
+        }
+    }
+    let pushed = aether_rt_self_check();
+    if pushed == 15 {
+        visited
+    } else {
+        0
+    }
+}

@@ -1,0 +1,8 @@
+// Attributes with mixed key=value forms.
+#[autodiff]
+#[distributed(world_size=8, backend="nccl", algorithm="ring")]
+fn step() {
+    let x = forward();
+    let loss = x.cross_entropy(labels);
+    loss.backward();
+}

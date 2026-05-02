@@ -1,0 +1,17 @@
+// Aether stdlib — tensor primitives. Stubs only at Phase 0; the parser
+// recognises the surface, the runtime/codegen will fill in real ops.
+
+module core::tensor;
+
+pub struct Tensor<T, S> {
+    data: T,
+    shape: S,
+}
+
+pub struct Simd<T, N> {
+    lanes: T,
+}
+
+pub fn zeros<T, S>(shape: S) -> Tensor<T, S> {
+    Tensor { data: 0, shape: shape }
+}

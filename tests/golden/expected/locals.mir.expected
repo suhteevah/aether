@@ -1,0 +1,9 @@
+// AETHER MIR — comments above this line do not exist in any binary
+
+fn main {
+    let x = 7
+    let y = 35
+    let z = x + y
+    println("computing 7 + 35:")
+    z
+}

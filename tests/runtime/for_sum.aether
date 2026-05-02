@@ -1,0 +1,9 @@
+// expect: exit=45
+// 0 + 1 + ... + 9 = 45 — for loop + accumulator + assignment.
+fn main() -> i32 {
+    let mut acc = 0;
+    for i in 0..10 {
+        acc = acc + i;
+    }
+    acc
+}

@@ -1,0 +1,9 @@
+// expect: exit=10
+// Unary negation roundtrip: -(-x) == x.  And boolean !.
+fn main() -> i32 {
+    let a = 5;
+    let b = -a;
+    let c = -b;          // should equal a
+    let zero_or_one = if !c { 1 } else { 0 };  // c != 0, so !c = 0 → else branch → 0
+    c + c + zero_or_one  // = 5 + 5 + 0 = 10
+}

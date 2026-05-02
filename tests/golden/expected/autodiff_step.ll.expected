@@ -1,0 +1,34 @@
+; ModuleID = 'aether'
+target triple = "x86_64-pc-windows-gnu"
+
+; --- aether autodiff + distributed runtime intrinsics ---
+declare void @aether_autodiff_init(i8*)
+declare void @aether_autodiff_push(i8*, i8*)
+declare void @aether_autodiff_reverse(i8*)
+declare void @aether_autodiff_accumulate(i8*, i8*)
+declare void @aether_autodiff_partial(i8*, i32, i32, i32)
+declare void @aether_dist_all_reduce(i8*, i32, i32)
+declare i32 @puts(i8*)
+
+define i32 @train_step() {
+entry:
+  %tape = alloca [1024 x { i32, i32, i8* }]
+  %tape_p = bitcast [1024 x { i32, i32, i8* }]* %tape to i8*
+  call void @aether_autodiff_init(i8* %tape_p)
+  ; aether: let logits = forward()
+  %v0 = bitcast i8* null to i8*  ; placeholder for `logits`
+  call void @aether_autodiff_push(i8* %tape_p, i8* %v0)
+  ; aether: let loss = logits.cross_entropy(labels)
+  %v1 = bitcast i8* null to i8*  ; placeholder for `loss`
+  call void @aether_autodiff_push(i8* %tape_p, i8* %v1)
+  ; ∂/∂(loss)
+  call void @aether_autodiff_accumulate(i8* %tape_p, i8* null)
+  ; --- AdGraph reverse (symbolic partials) ---
+  call void @aether_autodiff_partial(i8* %tape_p, i32 0, i32 8, i32 1)
+  call void @aether_autodiff_partial(i8* %tape_p, i32 1, i32 10, i32 1)
+  call void @aether_autodiff_reverse(i8* %tape_p)
+  ; all_reduce grads across 8 ranks via nccl
+  call void @aether_dist_all_reduce(i8* null, i32 8, i32 0)
+  ret i32 0
+}
+

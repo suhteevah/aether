@@ -1,0 +1,13 @@
+// expect: exit=7
+// Eq comparison + nested if/else.
+fn main() -> i32 {
+    let x = 5;
+    let r = if x == 5 {
+        let a = 3;
+        let b = 4;
+        a + b
+    } else {
+        0
+    };
+    r
+}

@@ -1,0 +1,20 @@
+[package]
+name = "trainer"
+version = "0.1.0"
+edition = "2021"
+description = "AetherLM trainer — calls only the libaether_rt C ABI. No framework deps."
+
+[[bin]]
+name = "aether-train"
+path = "src/main.rs"
+
+[[bin]]
+name = "aether-infer"
+path = "src/bin/infer.rs"
+
+[[bin]]
+name = "aether-prepare"
+path = "src/bin/prepare.rs"
+
+[dependencies]
+aether_rt = { path = "../runtime" }

@@ -1,0 +1,10 @@
+// expect: exit=0
+// FFI smoke: call into libaether_rt directly. After init, no entries pushed,
+// so the runtime self-check returns 0.
+extern fn aether_autodiff_init(tape: i64) -> i32;
+extern fn aether_rt_self_check() -> i32;
+
+fn main() -> i32 {
+    aether_autodiff_init(0);
+    aether_rt_self_check()
+}

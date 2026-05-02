@@ -1,0 +1,9 @@
+// Tape + AllReduce shape — golden checks both MIR (with symbolic partials)
+// and LLVM IR (with @aether_autodiff_partial calls).
+#[autodiff]
+#[distributed(world_size=8, backend="nccl", algorithm="ring")]
+fn train_step() {
+    let logits = forward();
+    let loss = logits.cross_entropy(labels);
+    loss.backward();
+}

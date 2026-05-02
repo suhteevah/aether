@@ -1,0 +1,12 @@
+[package]
+name = "aether_asm"
+version = "0.1.0"
+edition = "2021"
+description = "x86-64 instruction encoder + Windows PE32+ COFF object writer. Bootstrap; Phase 5 self-hosts in Aether."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "aether-asm"
+path = "src/bin/aether-asm.rs"

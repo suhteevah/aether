@@ -1,0 +1,5 @@
+// This comment will be stripped
+fn main() -> i32 {
+    println("Hello from Aether - close to the metal");
+    0
+}

@@ -1,0 +1,9 @@
+[package]
+name = "aether-audit"
+version = "0.1.0"
+edition = "2021"
+description = "Codebase audit harness — honesty scanner, SLOC, test census, golden artifacts, language conformance."
+
+[[bin]]
+name = "aether-audit"
+path = "src/main.rs"

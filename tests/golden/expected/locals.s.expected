@@ -1,0 +1,33 @@
+# AETHER x86-64 assembly (Microsoft x64 ABI)
+# Emitted by aetherc; comments here are debug-only and do not
+# come from any .aether source — those were stripped at lex time.
+
+.section .rdata,"dr"
+.LC0:
+    .asciz "computing 7 + 35:"
+
+.section .text
+.globl main
+
+main:
+    pushq %rbp
+    movq %rsp, %rbp
+    subq $64, %rsp
+    movq $7, %rax
+    movq %rax, -8(%rbp)
+    movq $35, %rax
+    movq %rax, -16(%rbp)
+    movq -8(%rbp), %rax
+    pushq %rax
+    movq -16(%rbp), %rax
+    popq %r10
+    xchgq %rax, %r10
+    addq %r10, %rax
+    movq %rax, -24(%rbp)
+    leaq .LC0(%rip), %rcx
+    callq puts
+    movq -24(%rbp), %rax
+    addq $64, %rsp
+    popq %rbp
+    ret
+

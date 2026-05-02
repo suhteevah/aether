@@ -1,0 +1,8 @@
+// LLM serving — single static binary, paged KV cache, continuous batching.
+
+#[server(port=8080, continuous_batching=true, paged_attention=true)]
+fn serve_llama() {
+    let engine = InferenceEngine::load_gguf("model.gguf");
+    let cache = PagedKVCache::new(2048, 128);
+    engine.run(cache);
+}

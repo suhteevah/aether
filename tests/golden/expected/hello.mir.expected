@@ -1,0 +1,6 @@
+// AETHER MIR — comments above this line do not exist in any binary
+
+fn main {
+    println("Hello from Aether - close to the metal")
+    0
+}

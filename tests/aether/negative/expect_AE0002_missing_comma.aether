@@ -1,0 +1,4 @@
+// Missing comma between args.
+fn step() {
+    foo(1 2);
+}

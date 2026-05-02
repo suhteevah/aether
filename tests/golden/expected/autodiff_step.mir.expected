@@ -1,0 +1,21 @@
+// AETHER MIR — comments above this line do not exist in any binary
+
+fn train_step [autodiff] [distributed world_size=8 backend=nccl algo=ring] {
+    tape_init
+    let logits = forward()
+    tape_push logits
+    let loss = logits.cross_entropy(labels)
+    tape_push loss
+    accumulate_grad loss
+    tape_reverse
+    all_reduce grads world_size=8 backend=nccl
+}
+# AdGraph forward
+  v0 = Forward { callee: "forward", inputs: [] }
+  v1 = Param("labels")
+  v2 = CrossEntropy { logits: 0, labels: 1 }
+# loss = v2
+# AdGraph reverse
+  seed grad[2] = 1
+  grad[0] += softmax(v[0]) - onehot(v[1])
+  ∂L/∂labels = grad[1]
