@@ -1,0 +1,60 @@
+// expect: exit=0
+// requires: cuda
+//
+// Const-generic fn template: ONE definition, monomorphized at every call
+// site from the caller's tensor shapes. Two distinct (M, K, N) call sites
+// emit two distinct specialisations under mangled names.
+use runtime;
+
+const B1: i32 = 8;
+const K1: i32 = 16;
+const N1: i32 = 4;
+
+const B2: i32 = 4;
+const K2: i32 = 32;
+const N2: i32 = 2;
+
+// Template: M, K, N inferred from x's [M, K] and y's [M, N] at each call.
+fn forward<M, K, N>(
+    x: Tensor<f32, [M, K]>,
+    w: Tensor<f32, [K, N]>,
+    y: Tensor<f32, [M, N]>,
+) -> i32 {
+    x.matmul(&w, &mut y);
+    0
+}
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    // Site 1: M=8, K=16, N=4.
+    let h_x1: i64 = aether_alloc_f32(128);
+    let h_w1: i64 = aether_alloc_f32(64);
+    aether_init_normal_f32(h_x1, 128, 1.0, 1);
+    aether_init_normal_f32(h_w1, 64, 0.1, 7);
+    let x1: Tensor<f32, [B1, K1]>;
+    let w1: Tensor<f32, [K1, N1]>;
+    let y1: Tensor<f32, [B1, N1]>;
+    aether_dev_h2d_f32(h_x1, x1, 128);
+    aether_dev_h2d_f32(h_w1, w1, 64);
+    forward(x1, w1, y1);
+
+    // Site 2: M=4, K=32, N=2 — distinct specialisation.
+    let h_x2: i64 = aether_alloc_f32(128);
+    let h_w2: i64 = aether_alloc_f32(64);
+    aether_init_normal_f32(h_x2, 128, 1.0, 3);
+    aether_init_normal_f32(h_w2, 64, 0.1, 11);
+    let x2: Tensor<f32, [B2, K2]>;
+    let w2: Tensor<f32, [K2, N2]>;
+    let y2: Tensor<f32, [B2, N2]>;
+    aether_dev_h2d_f32(h_x2, x2, 128);
+    aether_dev_h2d_f32(h_w2, w2, 64);
+    forward(x2, w2, y2);
+
+    aether_dev_sync();
+    aether_free_f32(h_x1, 128);
+    aether_free_f32(h_w1, 64);
+    aether_free_f32(h_x2, 128);
+    aether_free_f32(h_w2, 64);
+    0
+}

@@ -1,0 +1,21 @@
+// expect: exit=42
+//
+// Struct literal initialiser. Foo { a: 1.0, b: 2.0 } parses as a
+// StructLit expression in expression contexts where the surrounding
+// construct didn't disable it (i.e. anywhere except `if`/`while`/`for`
+// cond positions, mirroring Rust's `no_struct_literal` flag). Lowers
+// to one slot per field, each storing the corresponding initialiser —
+// equivalent to `let p: Point; p.x = 5; p.y = 6; p.scale = 2.0;` but
+// in one line.
+struct Point {
+    x: i32,
+    y: i32,
+    scale: f32,
+}
+
+fn main() -> i32 {
+    let p: Point = Point { x: 5, y: 6, scale: 2.0 };
+    let scaled: f32 = p.scale * 2.0;
+    let acc: i64 = p.x + p.y;
+    acc * i64(scaled) - 2
+}

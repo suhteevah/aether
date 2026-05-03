@@ -1,0 +1,13 @@
+// expect: exit=42
+// build-mode: pe-bin
+//
+// PE-bin path with internal control flow: a few `let`s, an int Mul, and
+// a comparison. No FFI. Validates that the resolve_internal_relocs pass
+// patches forward jumps correctly when the .text is relocated to
+// virtual address 0x1000 + ENTRY_STUB_SIZE.
+fn main() -> i32 {
+    let a: i64 = 6;
+    let b: i64 = 7;
+    let p: i64 = a * b;
+    if p > 40 { p } else { 0 }
+}

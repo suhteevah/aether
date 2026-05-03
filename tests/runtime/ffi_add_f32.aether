@@ -1,0 +1,9 @@
+// expect: exit=4
+// Calls into libaether_rt's test FFI: aether_test_add_f32(1.5, 2.5) = 4.0.
+// Exercises f32 args in xmm0/xmm1 and f32 return value in xmm0.
+extern fn aether_test_add_f32(a: f32, b: f32) -> f32;
+
+fn main() -> i32 {
+    let r: f32 = aether_test_add_f32(1.5, 2.5);
+    i64(r)
+}

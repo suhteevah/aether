@@ -1,0 +1,14 @@
+// expect: exit=0
+//
+// Demonstrates `use runtime;` resolving to stdlib/runtime.aether and
+// inlining all of libaether_rt's extern decls. The 60+ lines of extern fn
+// boilerplate at the top of every prior model file collapses to one line.
+use runtime;
+
+fn main() -> i32 {
+    let p: i64 = aether_alloc_f32(16);
+    aether_init_normal_f32(p, 16, 1.0, 1);
+    let v: f32 = aether_load_f32(p, 0);
+    aether_free_f32(p, 16);
+    if v == v { 0 } else { 1 }   // any non-NaN passes
+}

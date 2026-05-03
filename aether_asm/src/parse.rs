@@ -62,6 +62,19 @@ pub fn parse_gas(src: &str) -> Result<ObjectBuilder, AsmError> {
             ob.rdata.data.push(0);
             continue;
         }
+        if let Some(rest) = line.strip_prefix(".quad") {
+            if !matches!(current, SectionId::Rdata) {
+                return Err(syn(lineno, ".quad outside .rdata".into()));
+            }
+            let v = rest.trim();
+            let n: u64 = if let Some(hex) = v.strip_prefix("0x") {
+                u64::from_str_radix(hex, 16).map_err(|e| syn(lineno, format!("bad .quad: {e}")))?
+            } else {
+                v.parse().map_err(|e| syn(lineno, format!("bad .quad: {e}")))?
+            };
+            ob.rdata.data.extend_from_slice(&n.to_le_bytes());
+            continue;
+        }
         if let Some(rest) = line.strip_prefix(".byte") {
             if !matches!(current, SectionId::Rdata) {
                 return Err(syn(lineno, ".byte outside .rdata".into()));
@@ -184,12 +197,16 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
         Instr::MovRegImm32 { .. } => 7,
         Instr::MovRegFromRbpDisp { .. } => 7,
         Instr::MovRbpDispFromReg { .. } => 7,
+        Instr::MovRegFromBaseDisp { .. } => 7, // REX + 8B + ModRM + disp32
+        Instr::MovBaseDispFromReg { .. } => 7, // REX + 89 + ModRM + disp32
         Instr::AddRegImm8 { .. } | Instr::SubRegImm8 { .. } => 4,
+        Instr::AddRegImm32 { .. } | Instr::SubRegImm32 { .. } => 7,
         Instr::AddRegRegQ { .. } | Instr::SubRegRegQ { .. } => 3,
         Instr::ImulRegRegQ { .. } => 4,
         Instr::XchgRegRegQ { .. } => 3,
         Instr::XorRegReg32 { dst, src } =>
             if dst.extension() != 0 || src.extension() != 0 { 3 } else { 2 },
+        Instr::AndRegRegQ { .. } | Instr::OrRegRegQ { .. } | Instr::XorRegRegQ { .. } => 3,
         Instr::LeaRipSym { .. } => 7,
         Instr::LeaRegFromRbpDisp { .. } => 7,
         Instr::CallSym { .. } => 5,
@@ -208,6 +225,19 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
             | Instr::MulssXmmXmm { .. } | Instr::DivssXmmXmm { .. } => 4,
         Instr::UcomissXmmXmm { .. } => 3,
         Instr::MovssRspToXmm { .. } | Instr::MovssXmmToRsp { .. } => 5,
+        Instr::MovsdRbpDispToXmm { .. } | Instr::MovsdXmmToRbpDisp { .. } => 8,
+        Instr::MovsdRipSymToXmm { .. } => 8,
+        Instr::MovsdXmmXmm { .. } => 4,
+        Instr::AddsdXmmXmm { .. } | Instr::SubsdXmmXmm { .. }
+            | Instr::MulsdXmmXmm { .. } | Instr::DivsdXmmXmm { .. } => 4,
+        Instr::UcomisdXmmXmm { .. } => 4,
+        Instr::MovsdRspToXmm { .. } | Instr::MovsdXmmToRsp { .. } => 5,
+        Instr::Cvtsi2ssRegToXmm { .. } | Instr::Cvtss2siXmmToReg { .. } => 5,
+        Instr::Cvtsi2sdRegToXmm { .. } | Instr::Cvtsd2siXmmToReg { .. } => 5,
+        Instr::Cvtss2sdXmmXmm { .. } | Instr::Cvtsd2ssXmmXmm { .. } => 4,
+        Instr::MovRspDispFromReg { .. } | Instr::MovRegFromRspDisp { .. } => 8,
+        Instr::MovssXmmToRspDisp { .. } | Instr::MovsdXmmToRspDisp { .. } => 9,
+        Instr::MovssRspDispToXmm { .. } | Instr::MovsdRspDispToXmm { .. } => 9,
     }).sum()
 }
 
@@ -274,6 +304,36 @@ fn parse_rbp_mem(s: &str) -> Option<i32> {
     Some(disp)
 }
 
+/// Parse a memory operand `disp(%rsp)`. Returns the displacement.
+fn parse_rsp_mem(s: &str) -> Option<i32> {
+    let s = s.trim();
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close <= open { return None; }
+    let inside = &s[open + 1..close];
+    if inside.trim() != "%rsp" { return None; }
+    let disp_str = s[..open].trim();
+    let disp: i32 = if disp_str.is_empty() { 0 } else { disp_str.parse().ok()? };
+    Some(disp)
+}
+
+/// Parse `disp(%rXX)` for any 64-bit base reg EXCEPT rbp/rsp (those have
+/// dedicated parsers + dedicated Instr variants because their encodings
+/// require special-cased ModRM/SIB bytes). Returns `(disp, base_reg)`.
+fn parse_base_mem(s: &str, lineno: u32) -> Option<(i32, Reg)> {
+    let s = s.trim();
+    let open = s.find('(')?;
+    let close = s.rfind(')')?;
+    if close <= open { return None; }
+    let inside = s[open + 1..close].trim();
+    if !inside.starts_with('%') { return None; }
+    let base = parse_reg(inside, lineno).ok()?;
+    if matches!(base, Reg::Rbp | Reg::Rsp) { return None; }
+    let disp_str = s[..open].trim();
+    let disp: i32 = if disp_str.is_empty() { 0 } else { disp_str.parse().ok()? };
+    Some((disp, base))
+}
+
 fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
     let mut parts = line.splitn(2, char::is_whitespace);
     let mnem = parts.next().unwrap();
@@ -294,6 +354,7 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             //   movq $imm, %reg
             //   movq disp(%rbp), %reg     (load from rbp slot)
             //   movq %reg, disp(%rbp)     (store to rbp slot)
+            //   movq %reg, disp(%rsp)     (store to outgoing arg slot)
             //   movq %reg, %reg
             if a.trim_start().starts_with('$') {
                 Instr::MovRegImm32 { dst: parse_reg(b, lineno)?, imm: parse_imm(a, lineno)? as i32 }
@@ -301,6 +362,16 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
                 Instr::MovRegFromRbpDisp { dst: parse_reg(b, lineno)?, disp }
             } else if let Some(disp) = parse_rbp_mem(b) {
                 Instr::MovRbpDispFromReg { src: parse_reg(a, lineno)?, disp }
+            } else if let Some(disp) = parse_rsp_mem(b) {
+                Instr::MovRspDispFromReg { src: parse_reg(a, lineno)?, disp }
+            } else if let Some(disp) = parse_rsp_mem(a) {
+                Instr::MovRegFromRspDisp { dst: parse_reg(b, lineno)?, disp }
+            } else if let Some((disp, base)) = parse_base_mem(b, lineno) {
+                // movq %src, disp(%base) — generic base reg form.
+                Instr::MovBaseDispFromReg { src: parse_reg(a, lineno)?, base, disp }
+            } else if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                // movq disp(%base), %dst — generic base reg form.
+                Instr::MovRegFromBaseDisp { dst: parse_reg(b, lineno)?, base, disp }
             } else {
                 Instr::MovRegReg { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
             }
@@ -308,7 +379,13 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "subq"  => {
             let (a, b) = split_comma(rest);
             if a.trim_start().starts_with('$') {
-                Instr::SubRegImm8 { dst: parse_reg(b, lineno)?, imm: parse_imm(a, lineno)? as i8 }
+                let imm = parse_imm(a, lineno)?;
+                let dst = parse_reg(b, lineno)?;
+                if (-128..=127).contains(&imm) {
+                    Instr::SubRegImm8 { dst, imm: imm as i8 }
+                } else {
+                    Instr::SubRegImm32 { dst, imm: imm as i32 }
+                }
             } else {
                 Instr::SubRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
             }
@@ -316,7 +393,13 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "addq"  => {
             let (a, b) = split_comma(rest);
             if a.trim_start().starts_with('$') {
-                Instr::AddRegImm8 { dst: parse_reg(b, lineno)?, imm: parse_imm(a, lineno)? as i8 }
+                let imm = parse_imm(a, lineno)?;
+                let dst = parse_reg(b, lineno)?;
+                if (-128..=127).contains(&imm) {
+                    Instr::AddRegImm8 { dst, imm: imm as i8 }
+                } else {
+                    Instr::AddRegImm32 { dst, imm: imm as i32 }
+                }
             } else {
                 Instr::AddRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
             }
@@ -338,11 +421,6 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         // SSE2 single-precision float instructions.
         "movss" => {
             let (a, b) = split_comma(rest);
-            // Forms:
-            //   movss disp(%rbp), %xmm
-            //   movss %xmm, disp(%rbp)
-            //   movss sym(%rip), %xmm
-            //   movss %xmm, %xmm
             if let Some(disp) = parse_rbp_mem(a) {
                 Instr::MovssRbpDispToXmm { dst: parse_xmm(b, lineno)?, disp }
             } else if let Some(disp) = parse_rbp_mem(b) {
@@ -353,6 +431,10 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
                 Instr::MovssRspToXmm { dst: parse_xmm(b, lineno)? }
             } else if b.trim() == "(%rsp)" {
                 Instr::MovssXmmToRsp { src: parse_xmm(a, lineno)? }
+            } else if let Some(disp) = parse_rsp_mem(b) {
+                Instr::MovssXmmToRspDisp { src: parse_xmm(a, lineno)?, disp }
+            } else if let Some(disp) = parse_rsp_mem(a) {
+                Instr::MovssRspDispToXmm { dst: parse_xmm(b, lineno)?, disp }
             } else {
                 Instr::MovssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
             }
@@ -377,6 +459,71 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             let (a, b) = split_comma(rest);
             Instr::UcomissXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
         }
+        "movsd" => {
+            let (a, b) = split_comma(rest);
+            if let Some(disp) = parse_rbp_mem(a) {
+                Instr::MovsdRbpDispToXmm { dst: parse_xmm(b, lineno)?, disp }
+            } else if let Some(disp) = parse_rbp_mem(b) {
+                Instr::MovsdXmmToRbpDisp { src: parse_xmm(a, lineno)?, disp }
+            } else if let Some(sym) = parse_rip_mem(a) {
+                Instr::MovsdRipSymToXmm { dst: parse_xmm(b, lineno)?, sym }
+            } else if a.trim() == "(%rsp)" {
+                Instr::MovsdRspToXmm { dst: parse_xmm(b, lineno)? }
+            } else if b.trim() == "(%rsp)" {
+                Instr::MovsdXmmToRsp { src: parse_xmm(a, lineno)? }
+            } else if let Some(disp) = parse_rsp_mem(b) {
+                Instr::MovsdXmmToRspDisp { src: parse_xmm(a, lineno)?, disp }
+            } else if let Some(disp) = parse_rsp_mem(a) {
+                Instr::MovsdRspDispToXmm { dst: parse_xmm(b, lineno)?, disp }
+            } else {
+                Instr::MovsdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+            }
+        }
+        "addsd" => {
+            let (a, b) = split_comma(rest);
+            Instr::AddsdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "subsd" => {
+            let (a, b) = split_comma(rest);
+            Instr::SubsdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "mulsd" => {
+            let (a, b) = split_comma(rest);
+            Instr::MulsdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "divsd" => {
+            let (a, b) = split_comma(rest);
+            Instr::DivsdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "ucomisd" => {
+            let (a, b) = split_comma(rest);
+            Instr::UcomisdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        // Cvt forms — AT&T syntax: source first, dst second.
+        "cvtsi2ssq" => {
+            let (a, b) = split_comma(rest);
+            Instr::Cvtsi2ssRegToXmm { dst: parse_xmm(b, lineno)?, src: parse_reg(a, lineno)? }
+        }
+        "cvtss2siq" => {
+            let (a, b) = split_comma(rest);
+            Instr::Cvtss2siXmmToReg { dst: parse_reg(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "cvtsi2sdq" => {
+            let (a, b) = split_comma(rest);
+            Instr::Cvtsi2sdRegToXmm { dst: parse_xmm(b, lineno)?, src: parse_reg(a, lineno)? }
+        }
+        "cvtsd2siq" => {
+            let (a, b) = split_comma(rest);
+            Instr::Cvtsd2siXmmToReg { dst: parse_reg(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "cvtss2sd" => {
+            let (a, b) = split_comma(rest);
+            Instr::Cvtss2sdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
+        "cvtsd2ss" => {
+            let (a, b) = split_comma(rest);
+            Instr::Cvtsd2ssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
+        }
         "seta"  => Instr::SetccAl { cc: CondCode::A  },
         "setb"  => Instr::SetccAl { cc: CondCode::B  },
         "setae" => Instr::SetccAl { cc: CondCode::Ae },
@@ -384,6 +531,18 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "xorl"  => {
             let (a, b) = split_comma(rest);
             Instr::XorRegReg32 { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
+        }
+        "andq" => {
+            let (a, b) = split_comma(rest);
+            Instr::AndRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
+        }
+        "orq" => {
+            let (a, b) = split_comma(rest);
+            Instr::OrRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
+        }
+        "xorq" => {
+            let (a, b) = split_comma(rest);
+            Instr::XorRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
         }
         "leaq"  => {
             // Two forms today:

@@ -70,10 +70,14 @@ fn emit_block(b: &Block, lvl: usize) -> String {
 
 fn emit_stmt(s: &Stmt, lvl: usize) -> String {
     match s {
-        Stmt::Let { name, value, .. } => {
+        Stmt::Let { name, value: Some(value), .. } => {
             let init = emit_expr(value);
             let ty = guess_c_ty(value);
             format!("{}{} {} = {};\n", indent(lvl), ty, name, init)
+        }
+        Stmt::Let { name, value: None, .. } => {
+            // Phase-0 C fallback doesn't support uninit declarations cleanly.
+            format!("{}long {}; (void){};\n", indent(lvl), name, name)
         }
         Stmt::Expr(e) => format!("{}{};\n", indent(lvl), emit_expr(e)),
         Stmt::Return(Some(e)) => format!("{}return {};\n", indent(lvl), emit_expr(e)),
@@ -125,6 +129,7 @@ fn emit_expr(e: &Expr) -> String {
                 BinOp::Mod => "%", BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::Lt => "<",
                 BinOp::Gt => ">", BinOp::Le => "<=", BinOp::Ge => ">=", BinOp::And => "&&",
                 BinOp::Or => "||", BinOp::Assign => "=",
+                BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^",
             };
             format!("({} {} {})", emit_expr(lhs), o, emit_expr(rhs))
         }
@@ -167,5 +172,13 @@ fn emit_expr(e: &Expr) -> String {
             s
         }
         Expr::Ref { expr, .. } => format!("&({})", emit_expr(expr)),
+        Expr::StructLit { name, fields } => {
+            let body: Vec<String> = fields.iter()
+                .map(|(f, v)| format!(".{}={}", f, emit_expr(v))).collect();
+            format!("({}){{{}}}", name, body.join(", "))
+        }
+        Expr::Match { .. } => "/* match unimplemented in c-fallback */ 0".into(),
+        Expr::Cast { expr, ty } => format!("(({}){})", ty, emit_expr(expr)),
+        Expr::Index { recv, idx } => format!("({})[{}]", emit_expr(recv), emit_expr(idx)),
     }
 }

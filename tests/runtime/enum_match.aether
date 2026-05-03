@@ -1,0 +1,30 @@
+// expect: exit=42
+//
+// Discriminant-only enum + match expression. `enum Color { Red, Green,
+// Blue }` is lowered to integer tags 0/1/2 via the const env. The
+// `Color::Green` path expr resolves to IntLit(1) at codegen time; match
+// dispatches via cmp+jmp on the scrutinee's int value.
+//
+// Variants with payload data (`Some(i32)`, `Err(String)`, etc.) are
+// future work — needs the asm backend to grow a tagged-union value layout.
+enum Color { Red, Green, Blue }
+
+fn classify(c: i64) -> i64 {
+    match c {
+        Color::Red => 10,
+        Color::Green => 20,
+        Color::Blue => 30,
+        _ => 99,
+    }
+}
+
+fn main() -> i32 {
+    let g: i64 = Color::Green;
+    let v: i64 = classify(g);          // 20
+    let from_int: i64 = match 7 {
+        1 => 100,
+        7 => 22,                       // hits this
+        _ => 0,
+    };
+    v + from_int                       // 20 + 22 = 42
+}

@@ -1,0 +1,28 @@
+// expect: exit=42
+// Short-circuit && and ||. The rhs of && must NOT run when lhs is 0;
+// the rhs of || must NOT run when lhs is non-zero. The body uses div
+// (which would trap on lhs=0) to prove non-evaluation.
+fn main() -> i32 {
+    let mut acc = 0;
+    let z = 0;
+    let one = 1;
+
+    // && short-circuit: lhs is 0, rhs would div-by-zero — must not run.
+    if z != 0 && (10 / z) > 0 {
+        acc = acc + 100;
+    } else {
+        acc = acc + 7;
+    }
+
+    // || short-circuit: lhs is 1, rhs would div-by-zero — must not run.
+    if one == 1 || (10 / z) > 0 {
+        acc = acc + 5;
+    }
+
+    let a = 3;
+    let b = 4;
+    if a > 0 && b > 0 {
+        acc = acc + 30;
+    }
+    acc
+}

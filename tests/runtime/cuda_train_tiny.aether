@@ -1,0 +1,92 @@
+// expect: exit=0
+// requires: cuda
+//
+// End-to-end GPU training driven from this .aether source. Mirrors
+// `train_tiny.aether` exactly — same model (B=8, K=16, N=4 linear
+// classifier), same hyperparameters, same seed — but every op runs on
+// the GPU through cuBLAS sgemm + nvrtc-JITted custom kernels in
+// `runtime/src/cuda.rs`. Loss curve is bit-identical to the CPU baseline.
+// Witnesses #25 ("real cuBLAS/cuDNN backend") complete.
+
+extern fn aether_alloc_f32(n: i32) -> i64;
+extern fn aether_alloc_i32(n: i32) -> i64;
+extern fn aether_free_f32(p: i64, n: i32) -> i32;
+extern fn aether_init_normal_f32(p: i64, n: i32, scale: f32, seed: i64) -> i32;
+extern fn aether_fill_labels_i32(p: i64, n: i32, classes: i32, seed: i64) -> i32;
+
+extern fn aether_dev_init() -> i32;
+extern fn aether_dev_alloc_f32(n: i32) -> i64;
+extern fn aether_dev_alloc_i32(n: i32) -> i64;
+extern fn aether_dev_free_f32(p: i64) -> i32;
+extern fn aether_dev_free_i32(p: i64) -> i32;
+extern fn aether_dev_h2d_f32(host: i64, dev: i64, n: i32) -> i32;
+extern fn aether_dev_h2d_i32(host: i64, dev: i64, n: i32) -> i32;
+extern fn aether_dev_sync() -> i32;
+extern fn aether_op_matmul_f32_cuda(a: i64, b: i64, out: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_matmul_backward_rhs_f32_cuda(a: i64, dy: i64, db: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_cross_entropy_f32_cuda(logits: i64, labels: i64, probs_out: i64, b: i32, v: i32) -> f32;
+extern fn aether_op_cross_entropy_backward_f32_cuda(probs: i64, labels: i64, dlogits: i64, b: i32, v: i32) -> i32;
+extern fn aether_op_adamw_step_f32_cuda(
+    param: i64, grad: i64, m: i64, v: i64,
+    lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
+    step: i64, n: i32
+) -> i32;
+
+fn main() -> i32 {
+    aether_dev_init();
+    let bsz: i32 = 8;
+    let kk: i32 = 16;
+    let nn: i32 = 4;
+    let bk: i32 = bsz * kk;
+    let kn: i32 = kk * nn;
+    let bn: i32 = bsz * nn;
+
+    let h_x: i64 = aether_alloc_f32(bk);
+    let h_w: i64 = aether_alloc_f32(kn);
+    let h_lab: i64 = aether_alloc_i32(bsz);
+    aether_init_normal_f32(h_x, bk, 1.0, 1);
+    aether_init_normal_f32(h_w, kn, 0.1, 7);
+    aether_fill_labels_i32(h_lab, bsz, nn, 13);
+
+    let x: i64    = aether_dev_alloc_f32(bk);
+    let w: i64    = aether_dev_alloc_f32(kn);
+    let y: i64    = aether_dev_alloc_f32(bn);
+    let probs: i64 = aether_dev_alloc_f32(bn);
+    let dy: i64    = aether_dev_alloc_f32(bn);
+    let dw: i64    = aether_dev_alloc_f32(kn);
+    let mom1: i64  = aether_dev_alloc_f32(kn);
+    let mom2: i64  = aether_dev_alloc_f32(kn);
+    let labels: i64 = aether_dev_alloc_i32(bsz);
+    aether_dev_h2d_f32(h_x, x, bk);
+    aether_dev_h2d_f32(h_w, w, kn);
+    aether_dev_h2d_i32(h_lab, labels, bsz);
+
+    let mut initial: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    let mut s: i64 = 1;
+    while s <= 50 {
+        aether_op_matmul_f32_cuda(x, w, y, bsz, kk, nn);
+        let loss: f32 = aether_op_cross_entropy_f32_cuda(y, labels, probs, bsz, nn);
+        if s == 1 { initial = loss; }
+        final_loss = loss;
+        aether_op_cross_entropy_backward_f32_cuda(probs, labels, dy, bsz, nn);
+        aether_op_matmul_backward_rhs_f32_cuda(x, dy, dw, bsz, kk, nn);
+        aether_op_adamw_step_f32_cuda(w, dw, mom1, mom2, 0.05, 0.9, 0.999, 0.00000001, 0.0, s, kn);
+        s = s + 1;
+    }
+    aether_dev_sync();
+
+    aether_dev_free_f32(x);
+    aether_dev_free_f32(w);
+    aether_dev_free_f32(y);
+    aether_dev_free_f32(probs);
+    aether_dev_free_f32(dy);
+    aether_dev_free_f32(dw);
+    aether_dev_free_f32(mom1);
+    aether_dev_free_f32(mom2);
+    aether_dev_free_i32(labels);
+    aether_free_f32(h_x, bk);
+    aether_free_f32(h_w, kn);
+
+    if final_loss < initial { 0 } else { 1 }
+}

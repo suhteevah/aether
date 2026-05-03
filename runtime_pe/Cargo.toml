@@ -1,0 +1,25 @@
+[package]
+name = "aether_rt_pe"
+version = "0.1.0"
+edition = "2021"
+
+# Slim "PE-friendly" runtime DLL. Same C ABI as `aether_rt` for the symbols it
+# implements, but built without the Rust-std init chain that tries to call
+# `bcryptprimitives.dll!ProcessPrng` from inside its own DllMain. Used by
+# `aetherc --emit=pe-bin` for FFI programs (training, ops). The bigger
+# `aether_rt` crate is still the source of truth for `--emit=aether-bin`
+# (system-linker path, full Rust std).
+
+[lib]
+name = "aether_rt"            # produces aether_rt.dll — same name as the
+                              # std-using cdylib so existing tests find it.
+crate-type = ["cdylib"]
+
+[dependencies]
+libm = "0.2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

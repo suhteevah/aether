@@ -1,0 +1,13 @@
+// expect: exit=0
+// expect: stdout contains hello from self-hosted PE
+// build-mode: pe-bin
+//
+// Multi-DLL self-hosted PE link: kernel32.dll (ExitProcess) + msvcrt.dll
+// (puts). Each external gets a 6-byte indirect-jmp thunk, a Hint/Name
+// table entry in .rdata, and an IAT slot in .idata; the Windows loader
+// resolves them at exec time. Proves the PE writer's multi-DLL import
+// path works without a system linker.
+fn main() -> i32 {
+    println("hello from self-hosted PE");
+    0
+}

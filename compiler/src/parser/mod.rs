@@ -10,12 +10,30 @@ use crate::lexer::{Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// When `false`, `Ident { ... }` does not parse as a struct literal — it
+    /// stays an Ident expression and the `{` belongs to the surrounding
+    /// construct (the body of an `if`/`while`/`for` cond, typically).
+    /// Mirrors Rust's `no_struct_literal` flag. Restored by callers via
+    /// `with_struct_lit_disabled`.
+    struct_lit_allowed: bool,
 }
 
 type PResult<T> = Result<T, String>;
 
 impl Parser {
-    pub fn new(toks: Vec<Token>) -> Self { Self { toks, pos: 0 } }
+    pub fn new(toks: Vec<Token>) -> Self {
+        Self { toks, pos: 0, struct_lit_allowed: true }
+    }
+
+    /// Run `f` with struct literal parsing disabled (for `if`/`while`/`for`
+    /// cond positions). Restores the previous flag value on exit.
+    fn with_struct_lit_disabled<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.struct_lit_allowed;
+        self.struct_lit_allowed = false;
+        let r = f(self);
+        self.struct_lit_allowed = saved;
+        r
+    }
 
     fn peek(&self, off: usize) -> &Tok { &self.toks[self.pos + off].tok }
     fn at(&self, t: &Tok) -> bool { std::mem::discriminant(self.peek(0)) == std::mem::discriminant(t) }
@@ -66,6 +84,8 @@ impl Parser {
             }
             Tok::Const => self.parse_const_item(false),
             Tok::Struct => self.parse_struct_item(false),
+            Tok::Impl => self.parse_impl_item(),
+            Tok::Enum => self.parse_enum_item(),
             Tok::Pub if matches!(self.peek(1), Tok::Const) => {
                 self.bump(); self.parse_const_item(true)
             }
@@ -74,36 +94,8 @@ impl Parser {
             }
             Tok::Pub | Tok::Fn => {
                 let is_pub = if matches!(self.peek(0), Tok::Pub) { self.bump(); true } else { false };
-                self.expect(Tok::Fn)?;
-                let name = self.expect_ident()?;
-                self.expect(Tok::LParen)?;
-                let mut params = Vec::new();
-                while !matches!(self.peek(0), Tok::RParen) {
-                    let pname = if matches!(self.peek(0), Tok::SelfLower) {
-                        self.bump(); "self".to_string()
-                    } else {
-                        self.expect_ident()?
-                    };
-                    self.expect(Tok::Colon)?;
-                    let ty = self.parse_ty()?;
-                    params.push(Param { name: pname, ty });
-                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
-                }
-                self.expect(Tok::RParen)?;
-                let ret = if matches!(self.peek(0), Tok::Arrow) {
-                    self.bump();
-                    Some(self.parse_ty()?)
-                } else { None };
-                let body = if matches!(self.peek(0), Tok::Semi) {
-                    self.bump();
-                    None
-                } else {
-                    Some(self.parse_block()?)
-                };
-                if is_extern && body.is_some() {
-                    return Err(format!("extern fn {} must not have a body", name));
-                }
-                Ok(Item::Fn(FnDecl { attrs, is_pub, is_extern, name, params, ret, body }))
+                let f = self.parse_fn_decl(attrs, is_pub, is_extern, None)?;
+                Ok(Item::Fn(f))
             }
             other => {
                 let (l, c) = self.loc();
@@ -121,6 +113,127 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(Tok::Semi)?;
         Ok(Item::Const(ConstDecl { is_pub, name, ty, value }))
+    }
+
+    /// Parse a fn decl. `impl_type`, when `Some`, supplies the receiver type
+    /// for `&self` / `&mut self` / `self` forms in impl blocks.
+    fn parse_fn_decl(&mut self, attrs: Vec<Attr>, is_pub: bool, is_extern: bool,
+                     impl_type: Option<&str>) -> PResult<FnDecl> {
+        self.expect(Tok::Fn)?;
+        let name = self.expect_ident()?;
+        // Optional const-generic param list: `fn forward<M, K>(...)`.
+        // Each name binds an i32 dim that resolves at each call site.
+        let mut const_params: Vec<String> = Vec::new();
+        if matches!(self.peek(0), Tok::Lt) {
+            self.bump();
+            while !matches!(self.peek(0), Tok::Gt) {
+                let p = self.expect_ident()?;
+                const_params.push(p);
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+            }
+            self.expect(Tok::Gt)?;
+        }
+        self.expect(Tok::LParen)?;
+        let mut params = Vec::new();
+        let mut first_param = true;
+        while !matches!(self.peek(0), Tok::RParen) {
+            // Receiver-shorthand forms inside impl blocks. Only the first
+            // param can be `[&[mut]] self`; subsequent params must be the
+            // standard `name: type`.
+            if first_param && impl_type.is_some() {
+                let recv_ty: Option<Ty> = if matches!(self.peek(0), Tok::SelfLower) {
+                    self.bump();
+                    Some(Ty::Named(impl_type.unwrap().to_string()))
+                } else if matches!(self.peek(0), Tok::Amp) {
+                    self.bump();
+                    let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
+                    if !matches!(self.peek(0), Tok::SelfLower) {
+                        return Err(format!("after `&[mut]` expected `self` in impl method"));
+                    }
+                    self.bump();
+                    Some(Ty::Ref { mutable, inner: Box::new(Ty::Named(impl_type.unwrap().to_string())) })
+                } else { None };
+                if let Some(ty) = recv_ty {
+                    params.push(Param { name: "self".into(), ty });
+                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    first_param = false;
+                    continue;
+                }
+            }
+            first_param = false;
+            let pname = if matches!(self.peek(0), Tok::SelfLower) {
+                self.bump(); "self".to_string()
+            } else {
+                self.expect_ident()?
+            };
+            self.expect(Tok::Colon)?;
+            let ty = self.parse_ty()?;
+            params.push(Param { name: pname, ty });
+            if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+        }
+        self.expect(Tok::RParen)?;
+        let ret = if matches!(self.peek(0), Tok::Arrow) {
+            self.bump();
+            Some(self.parse_ty()?)
+        } else { None };
+        let body = if matches!(self.peek(0), Tok::Semi) {
+            self.bump();
+            None
+        } else {
+            Some(self.parse_block()?)
+        };
+        if is_extern && body.is_some() {
+            return Err(format!("extern fn {} must not have a body", name));
+        }
+        Ok(FnDecl { attrs, is_pub, is_extern, name, const_params, params, ret, body })
+    }
+
+    fn parse_impl_item(&mut self) -> PResult<Item> {
+        self.expect(Tok::Impl)?;
+        let type_name = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut methods = Vec::new();
+        while !matches!(self.peek(0), Tok::RBrace) {
+            let attrs = self.parse_attrs()?;
+            let is_pub = if matches!(self.peek(0), Tok::Pub) { self.bump(); true } else { false };
+            let m = self.parse_fn_decl(attrs, is_pub, false, Some(&type_name))?;
+            methods.push(m);
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(Item::Impl { type_name, methods })
+    }
+
+    fn parse_match_pat(&mut self) -> PResult<MatchPat> {
+        match self.peek(0).clone() {
+            Tok::IntLit(n) => { self.bump(); Ok(MatchPat::Int(n)) }
+            Tok::Ident(s) if s == "_" => { self.bump(); Ok(MatchPat::Wildcard) }
+            Tok::Ident(_) => {
+                let mut path = vec![self.expect_ident()?];
+                while matches!(self.peek(0), Tok::ColonColon) {
+                    self.bump();
+                    path.push(self.expect_ident()?);
+                }
+                Ok(MatchPat::EnumVariant(path))
+            }
+            other => {
+                let (l, c) = self.loc();
+                Err(format!("{}:{}: expected match pattern, got {:?}", l, c, other))
+            }
+        }
+    }
+
+    fn parse_enum_item(&mut self) -> PResult<Item> {
+        self.expect(Tok::Enum)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut variants = Vec::new();
+        while !matches!(self.peek(0), Tok::RBrace) {
+            let v = self.expect_ident()?;
+            variants.push(v);
+            if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(Item::Enum { name, variants })
     }
 
     fn parse_struct_item(&mut self, is_pub: bool) -> PResult<Item> {
@@ -219,6 +332,27 @@ impl Parser {
             return Ok(Ty::Unit);
         }
         if matches!(self.peek(0), Tok::LBracket) {
+            // Disambiguate `[T; N]` (stack array) from `[d1, d2, ...]` (Tensor
+            // shape). A shape's first element is always an int literal or a
+            // bare ident followed by `,` or `]`. An array starts with a Type
+            // followed by `;`. We look one past the first content token: if
+            // it's `;`, parse as array; otherwise fall through to parse_shape.
+            // (Handles single-token Type prefixes; complex generic Types in
+            // arrays would need lookahead — punt until needed.)
+            let is_array = matches!(self.peek(1), Tok::Semi)
+                || matches!(self.peek(2), Tok::Semi);
+            if is_array {
+                self.bump(); // [
+                let elem = self.parse_ty()?;
+                self.expect(Tok::Semi)?;
+                let n_raw = self.bump();
+                let n = match n_raw {
+                    Tok::IntLit(v) if v >= 0 => v as usize,
+                    other => return Err(format!("array length must be a non-negative int literal, got {:?}", other)),
+                };
+                self.expect(Tok::RBracket)?;
+                return Ok(Ty::Array { elem: Box::new(elem), n });
+            }
             return self.parse_shape();
         }
         let name = self.expect_ident()?;
@@ -271,8 +405,13 @@ impl Parser {
                     self.bump();
                     Some(self.parse_ty()?)
                 } else { None };
-                self.expect(Tok::Eq)?;
-                let value = self.parse_expr()?;
+                let value = if matches!(self.peek(0), Tok::Semi) {
+                    // `let x: Ty;` — uninit declaration (struct locals).
+                    None
+                } else {
+                    self.expect(Tok::Eq)?;
+                    Some(self.parse_expr()?)
+                };
                 self.expect(Tok::Semi)?;
                 stmts.push(Stmt::Let { name, mutable, ty, value });
                 continue;
@@ -333,7 +472,7 @@ impl Parser {
     }
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
-        let lhs = self.parse_add()?;
+        let lhs = self.parse_bitor()?;
         let op = match self.peek(0) {
             Tok::EqEq => BinOp::Eq,
             Tok::BangEq => BinOp::Ne,
@@ -344,8 +483,42 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.bump();
-        let rhs = self.parse_add()?;
+        let rhs = self.parse_bitor()?;
         Ok(Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) })
+    }
+
+    fn parse_bitor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bitxor()?;
+        while matches!(self.peek(0), Tok::Pipe) {
+            self.bump();
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::Bin { op: BinOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitxor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_bitand()?;
+        while matches!(self.peek(0), Tok::Caret) {
+            self.bump();
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::Bin { op: BinOp::BitXor, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitand(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_add()?;
+        // Single `&` is overloaded with the address-of-prefix-form. Postfix
+        // here can never be confused: `&` between two complete expressions
+        // is bitwise AND. Address-of only appears at the START of an expr
+        // and is parsed in parse_unary.
+        while matches!(self.peek(0), Tok::Amp) {
+            self.bump();
+            let rhs = self.parse_add()?;
+            lhs = Expr::Bin { op: BinOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
     }
 
     fn parse_add(&mut self) -> PResult<Expr> {
@@ -421,6 +594,21 @@ impl Parser {
                         e = Expr::Field { recv: Box::new(e), name };
                     }
                 }
+                Tok::As => {
+                    self.bump();
+                    let ty = self.parse_ty()?;
+                    let ty_name = match ty {
+                        Ty::Named(n) => n,
+                        _ => return Err("`as` target must be a primitive type name".into()),
+                    };
+                    e = Expr::Cast { expr: Box::new(e), ty: ty_name };
+                }
+                Tok::LBracket => {
+                    self.bump();
+                    let idx = self.parse_expr()?;
+                    self.expect(Tok::RBracket)?;
+                    e = Expr::Index { recv: Box::new(e), idx: Box::new(idx) };
+                }
                 _ => return Ok(e),
             }
         }
@@ -463,7 +651,7 @@ impl Parser {
             Tok::LBrace => Ok(Expr::Block(self.parse_block()?)),
             Tok::If => {
                 self.bump();
-                let cond = self.parse_expr()?;
+                let cond = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                 let then = self.parse_block()?;
                 let else_ = if matches!(self.peek(0), Tok::Else) {
                     self.bump();
@@ -475,16 +663,31 @@ impl Parser {
                 self.bump();
                 let var = self.expect_ident()?;
                 self.expect(Tok::In)?;
-                let iter = self.parse_expr()?;
+                let iter = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                 let distributed = matches!(&iter, Expr::MethodCall { name, .. } if name == "distributed");
                 let body = self.parse_block()?;
                 Ok(Expr::For { var, iter: Box::new(iter), body, parallel: false, distributed })
             }
             Tok::While => {
                 self.bump();
-                let cond = self.parse_expr()?;
+                let cond = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                 let body = self.parse_block()?;
                 Ok(Expr::While { cond: Box::new(cond), body })
+            }
+            Tok::Match => {
+                self.bump();
+                let scrut = self.with_struct_lit_disabled(|p| p.parse_expr())?;
+                self.expect(Tok::LBrace)?;
+                let mut arms = Vec::new();
+                while !matches!(self.peek(0), Tok::RBrace) {
+                    let pat = self.parse_match_pat()?;
+                    self.expect(Tok::FatArrow)?;
+                    let arm_expr = self.parse_expr()?;
+                    arms.push((pat, arm_expr));
+                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                }
+                self.expect(Tok::RBrace)?;
+                Ok(Expr::Match { scrutinee: Box::new(scrut), arms })
             }
             Tok::Break => { self.bump(); Ok(Expr::Break) }
             Tok::Continue => { self.bump(); Ok(Expr::Continue) }
@@ -496,7 +699,7 @@ impl Parser {
                         self.bump(); // for
                         let var = self.expect_ident()?;
                         self.expect(Tok::In)?;
-                        let iter = self.parse_expr()?;
+                        let iter = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                         let distributed = matches!(&iter, Expr::MethodCall { name, .. } if name == "distributed");
                         let body = self.parse_block()?;
                         return Ok(Expr::For {
@@ -524,6 +727,29 @@ impl Parser {
                 while matches!(self.peek(0), Tok::ColonColon) {
                     self.bump();
                     path.push(self.expect_ident()?);
+                }
+                // Struct literal disambiguation: `Foo { ident : …` is a
+                // struct literal in expression contexts where the
+                // surrounding construct didn't disable it (i.e. not in
+                // an if/while/for cond). `Foo { }` (empty) also counts.
+                if path.len() == 1
+                    && self.struct_lit_allowed
+                    && matches!(self.peek(0), Tok::LBrace)
+                    && (matches!(self.peek(1), Tok::RBrace) ||
+                        (matches!(self.peek(1), Tok::Ident(_))
+                         && matches!(self.peek(2), Tok::Colon)))
+                {
+                    self.bump(); // {
+                    let mut fields = Vec::new();
+                    while !matches!(self.peek(0), Tok::RBrace) {
+                        let fname = self.expect_ident()?;
+                        self.expect(Tok::Colon)?;
+                        let value = self.parse_expr()?;
+                        fields.push((fname, value));
+                        if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    }
+                    self.expect(Tok::RBrace)?;
+                    return Ok(Expr::StructLit { name: path.into_iter().next().unwrap(), fields });
                 }
                 if path.len() == 1 {
                     Ok(Expr::Ident(path.into_iter().next().unwrap()))

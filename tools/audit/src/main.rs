@@ -261,6 +261,8 @@ fn main() {
             let (status, detail, ok) = match &r {
                 runtime_check::RuntimeResult::Pass =>
                     ("OK", format!(" exit={}", c.expected_exit), true),
+                runtime_check::RuntimeResult::Skipped(why) =>
+                    ("SKIP", format!(" {}", why), true),
                 runtime_check::RuntimeResult::BuildFailed(_) =>
                     ("BUILD_FAIL", String::new(), false),
                 runtime_check::RuntimeResult::WrongExit { expected, got } =>

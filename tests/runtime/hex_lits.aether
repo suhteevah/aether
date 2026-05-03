@@ -1,0 +1,9 @@
+// expect: exit=42
+// Hex (0x), binary (0b), octal (0o) integer literals + bitwise ops.
+fn main() -> i32 {
+    let h = 0xFF;       // 255
+    let b = 0b1111;     // 15
+    let o = 0o17;       // 15
+    let v = (h & b) + (b ^ o) + 27;    // 15 + 0 + 27 = 42
+    v as i32
+}

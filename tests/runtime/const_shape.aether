@@ -1,0 +1,34 @@
+// expect: exit=0
+// requires: cuda
+//
+// Shape dims pulled from file-level `const`s. The `[BSZ, KK]` and
+// `[KK, NN]` etc. resolve through `Locals.const_env` at the let site,
+// so changing one number at the top changes every Tensor that depends
+// on it. Same trick a numpy / candle user gets from passing dims to a
+// constructor — but it's compile-time here, no runtime dispatch.
+use runtime;
+
+const BSZ: i32 = 8;
+const KK:  i32 = 16;
+const NN:  i32 = 4;
+
+fn main() -> i32 {
+    aether_dev_init();
+    let h_x: i64 = aether_alloc_f32(128);
+    let h_w: i64 = aether_alloc_f32(64);
+    aether_init_normal_f32(h_x, 128, 1.0, 1);
+    aether_init_normal_f32(h_w, 64, 0.1, 7);
+
+    let x: Tensor<f32, [BSZ, KK]>;
+    let w: Tensor<f32, [KK, NN]>;
+    let y: Tensor<f32, [BSZ, NN]>;
+    aether_dev_h2d_f32(h_x, x, 128);
+    aether_dev_h2d_f32(h_w, w, 64);
+
+    x.matmul(&w, &mut y);
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_w, 64);
+    0
+}

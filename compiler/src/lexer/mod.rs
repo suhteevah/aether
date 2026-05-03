@@ -20,6 +20,7 @@ pub enum Tok {
     While,
     Break,
     Continue,
+    As,
     In,
     Pub,
     Module,
@@ -27,6 +28,8 @@ pub enum Tok {
     Const,
     Struct,
     Impl,
+    Enum,
+    Match,
     SelfLower,
     True,
     False,
@@ -61,6 +64,7 @@ pub enum Tok {
     AmpAmp,
     Pipe,
     PipePipe,
+    Caret,
     Dot,
     DotDot,
     Hash,         // #
@@ -206,6 +210,9 @@ impl<'a> Lexer<'a> {
                 "const" => Tok::Const,
                 "struct" => Tok::Struct,
                 "impl" => Tok::Impl,
+                "enum" => Tok::Enum,
+                "match" => Tok::Match,
+                "as" => Tok::As,
                 "self" => Tok::SelfLower,
                 "true" => Tok::True,
                 "false" => Tok::False,
@@ -213,8 +220,32 @@ impl<'a> Lexer<'a> {
             });
         }
 
-        // Number
+        // Number — decimal, hex (`0x...`), binary (`0b...`), octal (`0o...`).
         if b.is_ascii_digit() {
+            // Hex/bin/octal prefix? Bare `0` followed by x/b/o.
+            if b == b'0' && matches!(self.peek(1), Some(b'x') | Some(b'b') | Some(b'o')) {
+                self.bump(); // 0
+                let radix_byte = self.bump().unwrap();
+                let radix = match radix_byte { b'x' => 16, b'b' => 2, b'o' => 8, _ => unreachable!() };
+                let start = self.pos;
+                while let Some(c) = self.peek(0) {
+                    let ok = match radix {
+                        16 => c.is_ascii_hexdigit(),
+                        2  => c == b'0' || c == b'1',
+                        8  => (b'0'..=b'7').contains(&c),
+                        _  => false,
+                    } || c == b'_';
+                    if ok { self.bump(); } else { break; }
+                }
+                let raw: String = std::str::from_utf8(&self.src[start..self.pos])
+                    .unwrap()
+                    .chars()
+                    .filter(|c| *c != '_')
+                    .collect();
+                let n = i64::from_str_radix(&raw, radix)
+                    .map_err(|e| format!("bad int (radix {}): {e}", radix))?;
+                return Ok(Tok::IntLit(n));
+            }
             let start = self.pos;
             let mut is_float = false;
             while let Some(c) = self.peek(0) {
@@ -292,6 +323,7 @@ impl<'a> Lexer<'a> {
             b'%' => Tok::Percent,
             b'&' => if two(b'&', b'&', self) { Tok::AmpAmp } else { Tok::Amp },
             b'|' => if two(b'|', b'|', self) { Tok::PipePipe } else { Tok::Pipe },
+            b'^' => Tok::Caret,
             b'.' => if two(b'.', b'.', self) { Tok::DotDot } else { Tok::Dot },
             b'#' => Tok::Hash,
             b'?' => Tok::Question,

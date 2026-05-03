@@ -1,0 +1,9 @@
+// expect: exit=42
+// build-mode: pe-bin
+//
+// Self-hosted PE32+ path: aetherc → asm → aether-asm --pe → .exe.
+// No system linker, no libaether_rt. The only external dependency
+// embedded by the PE writer is kernel32!ExitProcess. Smallest possible
+// proof that the toolchain can produce a runnable Windows binary
+// without invoking gcc/link/lld.
+fn main() -> i32 { 42 }

@@ -12,6 +12,7 @@
 pub mod encode;
 pub mod coff;
 pub mod parse;
+pub mod pe;
 
 pub use encode::{encode_instruction, Instr, Reg};
 pub use coff::{ObjectBuilder, Reloc, RelocKind, Section, Symbol, SymbolStorage};

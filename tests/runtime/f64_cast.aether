@@ -1,0 +1,7 @@
+// expect: exit=42
+// Round-trip int → f64 → int via cvtsi2sdq + cvtsd2siq.
+fn main() -> i32 {
+    let x: i64 = 42;
+    let f: f64 = f64(x);
+    i64(f)
+}

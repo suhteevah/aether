@@ -1,0 +1,76 @@
+// expect: exit=0
+// requires: cuda
+//
+// Same end-to-end GPU training as `cuda_train_tiny_tensor.aether`, but
+// every op is a method call on a Tensor instead of a verbose 6-arg
+// `aether_op_*_cuda(x, w, y, M, K, N)` call. Shape dims (M, K, N, B, V)
+// are pulled from the Tensor types at compile time and synthesised into
+// the underlying runtime call by the asm backend's method dispatcher.
+//
+// The training-loop body shrinks from this:
+//
+//     aether_op_matmul_f32_cuda(x, w, y, bsz, kk, nn);
+//     let loss = aether_op_cross_entropy_f32_cuda(y, labels, probs, bsz, nn);
+//     aether_op_cross_entropy_backward_f32_cuda(probs, labels, dy, bsz, nn);
+//     aether_op_matmul_backward_rhs_f32_cuda(x, dy, dw, bsz, kk, nn);
+//
+// To this:
+//
+//     x.matmul(&w, &mut y);
+//     let loss: f32 = y.cross_entropy(&labels, &mut probs);
+//     probs.cross_entropy_backward(&labels, &mut dy);
+//     x.matmul_backward_rhs(&dy, &mut dw);
+//
+// Same loss curve, same exit code, four fewer dim-triplet copy/pastes
+// per training step.
+use runtime;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    // Host buffers for initial data.
+    let h_x: i64 = aether_alloc_f32(128);
+    let h_w: i64 = aether_alloc_f32(64);
+    let h_lab: i64 = aether_alloc_i32(8);
+    aether_init_normal_f32(h_x, 128, 1.0, 1);
+    aether_init_normal_f32(h_w, 64, 0.1, 7);
+    aether_fill_labels_i32(h_lab, 8, 4, 13);
+
+    // Device tensors with multi-dim shapes — auto-allocated, auto-freed.
+    let x:      Tensor<f32, [8, 16]>;
+    let w:      Tensor<f32, [16, 4]>;
+    let y:      Tensor<f32, [8, 4]>;
+    let probs:  Tensor<f32, [8, 4]>;
+    let dy:     Tensor<f32, [8, 4]>;
+    let dw:     Tensor<f32, [16, 4]>;
+    let mom1:   Tensor<f32, [64]>;
+    let mom2:   Tensor<f32, [64]>;
+    let labels: Tensor<i32, [8]>;
+
+    aether_dev_h2d_f32(h_x, x, 128);
+    aether_dev_h2d_f32(h_w, w, 64);
+    aether_dev_h2d_i32(h_lab, labels, 8);
+
+    let mut initial: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    let mut s: i64 = 1;
+    while s <= 50 {
+        x.matmul(&w, &mut y);
+        let loss: f32 = y.cross_entropy(&labels, &mut probs);
+        if s == 1 { initial = loss; }
+        final_loss = loss;
+        probs.cross_entropy_backward(&labels, &mut dy);
+        x.matmul_backward_rhs(&dy, &mut dw);
+        // adamw_step still calls the runtime fn directly — its hyperparam
+        // soup is hard to express as a method without further sugar.
+        aether_op_adamw_step_f32_cuda(w, dw, mom1, mom2, 0.05, 0.9, 0.999, 0.00000001, 0.0, s, 64);
+        s = s + 1;
+    }
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_w, 64);
+    aether_free_i32(h_lab, 8);
+
+    if final_loss < initial { 0 } else { 1 }
+}

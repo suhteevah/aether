@@ -1,0 +1,10 @@
+// expect: exit=42
+// `expr as Type` numeric coercion. Same lowering as f32(x)/f64(x)/i64(x)
+// builtins; just ergonomic Rust syntax. We round-trip int→f32→int and
+// cross-check that the cast pipeline preserves the value.
+fn main() -> i32 {
+    let i = 42;
+    let f = i as f32;
+    let back = f as i64;
+    back as i32
+}

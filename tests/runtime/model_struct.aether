@@ -1,0 +1,44 @@
+// expect: exit=0
+// requires: cuda
+//
+// Multi-Tensor model struct + impl forward method. Tests whether the
+// struct-by-value param plumbing works for the common ML pattern of
+// "weights bundled in a Model struct, forward method takes self."
+use runtime;
+
+const BSZ: i32 = 8;
+const KK:  i32 = 16;
+const NN:  i32 = 4;
+
+struct Model {
+    w: Tensor<f32, [KK, NN]>,
+}
+
+impl Model {
+    fn forward(&self, x: Tensor<f32, [BSZ, KK]>, y: Tensor<f32, [BSZ, NN]>) -> i32 {
+        x.matmul(&self.w, &mut y);
+        0
+    }
+}
+
+fn main() -> i32 {
+    aether_dev_init();
+    let h_x: i64 = aether_alloc_f32(128);
+    let h_w: i64 = aether_alloc_f32(64);
+    aether_init_normal_f32(h_x, 128, 1.0, 1);
+    aether_init_normal_f32(h_w, 64, 0.1, 7);
+
+    let x: Tensor<f32, [BSZ, KK]>;
+    let w: Tensor<f32, [KK, NN]>;
+    let y: Tensor<f32, [BSZ, NN]>;
+    aether_dev_h2d_f32(h_x, x, 128);
+    aether_dev_h2d_f32(h_w, w, 64);
+
+    let m: Model = Model { w: w };
+    m.forward(x, y);
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_w, 64);
+    0
+}

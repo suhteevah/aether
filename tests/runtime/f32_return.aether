@@ -1,0 +1,9 @@
+// expect: exit=7
+// f32-returning aether fn called from main; result cast back to int as exit.
+//   add(2.5, 4.5) = 7.0 → i64 → 7
+fn add(a: f32, b: f32) -> f32 { a + b }
+
+fn main() -> i32 {
+    let r: f32 = add(2.5, 4.5);
+    i64(r)
+}

@@ -14,19 +14,19 @@ main:
     movq %rsp, %rbp
     subq $64, %rsp
     movq $7, %rax
-    movq %rax, -8(%rbp)
-    movq $35, %rax
     movq %rax, -16(%rbp)
-    movq -8(%rbp), %rax
-    pushq %rax
+    movq $35, %rax
+    movq %rax, -24(%rbp)
     movq -16(%rbp), %rax
+    pushq %rax
+    movq -24(%rbp), %rax
     popq %r10
     xchgq %rax, %r10
     addq %r10, %rax
-    movq %rax, -24(%rbp)
+    movq %rax, -32(%rbp)
     leaq .LC0(%rip), %rcx
     callq puts
-    movq -24(%rbp), %rax
+    movq -32(%rbp), %rax
     addq $64, %rsp
     popq %rbp
     ret

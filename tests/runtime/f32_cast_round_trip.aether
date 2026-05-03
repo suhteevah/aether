@@ -1,0 +1,8 @@
+// expect: exit=42
+// Round-trip int → f32 → int. Tests cvtsi2ssq + cvtss2siq encoding via the
+// f32(...) and i64(...) builtins.
+fn main() -> i32 {
+    let x: i64 = 42;
+    let f: f32 = f32(x);
+    i64(f)
+}

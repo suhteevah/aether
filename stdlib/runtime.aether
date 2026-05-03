@@ -1,0 +1,55 @@
+// `use runtime;` brings every libaether_rt extern in scope. Mirrors the
+// real C-ABI surface in `runtime/src/lib.rs` and `runtime/src/cuda.rs`,
+// in the form aetherc's asm backend can compile today (i64 handles +
+// i32 sizes — the eventual `Tensor<f32, [M, K]>` shape generics in the
+// other stdlib/*.aether files are aspirational and need more language
+// surface before they round-trip).
+//
+// Cuts the ~60 lines of extern decl boilerplate at the top of every
+// model program down to one line: `use runtime;`.
+
+// ----- host memory + init ---------------------------------------------
+extern fn aether_alloc_f32(n: i32) -> i64;
+extern fn aether_alloc_i32(n: i32) -> i64;
+extern fn aether_free_f32(p: i64, n: i32) -> i32;
+extern fn aether_free_i32(p: i64, n: i32) -> i32;
+extern fn aether_init_normal_f32(p: i64, n: i32, scale: f32, seed: i64) -> i32;
+extern fn aether_fill_labels_i32(p: i64, n: i32, classes: i32, seed: i64) -> i32;
+extern fn aether_load_f32(p: i64, i: i32) -> f32;
+extern fn aether_store_f32(p: i64, i: i32, v: f32) -> i32;
+extern fn aether_print_loss(step: i32, loss: f32) -> i32;
+extern fn aether_print_bench(which: i64, m: i32, n: i32, k: i32, iters: i32, us: i64) -> i32;
+extern fn aether_wall_us() -> i64;
+
+// ----- CPU ops --------------------------------------------------------
+extern fn aether_op_matmul_f32(a: i64, b: i64, out: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_matmul_backward_lhs_f32(dy: i64, b: i64, da: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_matmul_backward_rhs_f32(a: i64, dy: i64, db: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_cross_entropy_f32(logits: i64, labels: i64, probs_out: i64, b: i32, v: i32) -> f32;
+extern fn aether_op_cross_entropy_backward_f32(probs: i64, labels: i64, dlogits: i64, b: i32, v: i32) -> i32;
+extern fn aether_op_adamw_step_f32(
+    param: i64, grad: i64, m: i64, v: i64,
+    lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
+    step: i64, n: i32
+) -> i32;
+
+// ----- CUDA backend (only resolves when libaether_rt was built with
+//        --features cuda; otherwise these will fail at link time). ----
+extern fn aether_dev_init() -> i32;
+extern fn aether_dev_alloc_f32(n: i32) -> i64;
+extern fn aether_dev_alloc_i32(n: i32) -> i64;
+extern fn aether_dev_free_f32(p: i64) -> i32;
+extern fn aether_dev_free_i32(p: i64) -> i32;
+extern fn aether_dev_h2d_f32(host: i64, dev: i64, n: i32) -> i32;
+extern fn aether_dev_h2d_i32(host: i64, dev: i64, n: i32) -> i32;
+extern fn aether_dev_d2h_f32(dev: i64, host: i64, n: i32) -> i32;
+extern fn aether_dev_sync() -> i32;
+extern fn aether_op_matmul_f32_cuda(a: i64, b: i64, out: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_matmul_backward_rhs_f32_cuda(a: i64, dy: i64, db: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_cross_entropy_f32_cuda(logits: i64, labels: i64, probs_out: i64, b: i32, v: i32) -> f32;
+extern fn aether_op_cross_entropy_backward_f32_cuda(probs: i64, labels: i64, dlogits: i64, b: i32, v: i32) -> i32;
+extern fn aether_op_adamw_step_f32_cuda(
+    param: i64, grad: i64, m: i64, v: i64,
+    lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
+    step: i64, n: i32
+) -> i32;

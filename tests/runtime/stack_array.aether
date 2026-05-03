@@ -1,0 +1,20 @@
+// expect: exit=42
+// Stack array `[T; N]`: declare a fixed-size buffer on the frame, write
+// to elements via `buf[i] = v`, read back via `buf[i]`. Sum a few entries
+// to prove both directions work.
+fn main() -> i32 {
+    let buf: [i64; 8];
+    let mut i = 0;
+    while i < 8 {
+        buf[i] = i * 3;
+        i = i + 1;
+    }
+    // 0 + 3 + 6 + 9 + 12 + 15 + 18 + 21 - 42 = 84 - 42 = 42
+    let mut acc = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc + buf[k];
+        k = k + 1;
+    }
+    acc as i32 - 42
+}

@@ -1,0 +1,77 @@
+// expect: exit=0
+// requires: cuda
+//
+// SHOWCASE — exercises the full feature set in one program:
+//   * `use runtime;` import
+//   * file-level `const` decls drive Tensor shapes
+//   * `enum` + `match` for control flow (Phase enum guards what we run)
+//   * `struct` with mixed Tensor + scalar fields
+//   * `impl Model { fn forward(&self, ...) }` — user-defined method
+//   * Tensor auto-alloc/free (no manual aether_dev_alloc/free)
+//   * Method-call dispatch on Tensors (`x.matmul(&w, &mut y)`) AND on
+//     user types (`m.forward(x, y)`)
+//   * Multi-arg FFI (5+) routed through stack-spill ABI
+//   * Nested calls in args
+//   * Struct literal initialisation (`Model { w: w, eps: 1e-7 }`)
+//   * `&self.w` field-of-struct-param Tensor access in method body
+// All running on the cuBLAS GPU path. Exit 0 = end-to-end OK.
+use runtime;
+
+const BSZ: i32 = 8;
+const KK:  i32 = 16;
+const NN:  i32 = 4;
+
+enum Phase { Train, Eval }
+
+struct Model {
+    w:   Tensor<f32, [KK, NN]>,
+    eps: f32,
+}
+
+impl Model {
+    fn forward(
+        &self,
+        x: Tensor<f32, [BSZ, KK]>,
+        y: Tensor<f32, [BSZ, NN]>,
+    ) -> i32 {
+        x.matmul(&self.w, &mut y);
+        0
+    }
+}
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    // Host-side init.
+    let h_x: i64 = aether_alloc_f32(128);
+    let h_w: i64 = aether_alloc_f32(64);
+    aether_init_normal_f32(h_x, 128, 1.0, 1);
+    aether_init_normal_f32(h_w, 64, 0.1, 7);
+
+    // Device tensors with multi-dim shapes.
+    let x: Tensor<f32, [BSZ, KK]>;
+    let w: Tensor<f32, [KK, NN]>;
+    let y: Tensor<f32, [BSZ, NN]>;
+    aether_dev_h2d_f32(h_x, x, 128);
+    aether_dev_h2d_f32(h_w, w, 64);
+
+    // Model struct literal — bundles a Tensor + scalar.
+    let model: Model = Model { w: w, eps: 0.0000001 };
+
+    // Branch on a Phase enum.
+    let phase: i64 = Phase::Train;
+    let action: i64 = match phase {
+        Phase::Train => 1,
+        Phase::Eval => 0,
+        _ => -1,
+    };
+
+    if action == 1 {
+        model.forward(x, y);   // user-defined method, takes Tensors by value
+    }
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_w, 64);
+    0
+}

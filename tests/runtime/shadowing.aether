@@ -1,0 +1,11 @@
+// expect: exit=21
+// Shadowing — re-let an existing name to a new value (and possibly type).
+// Aether's let-allocates-fresh-slot model gives us shadowing for free as
+// long as the new binding's slot wins on subsequent reads.
+fn main() -> i32 {
+    let x = 5;
+    let x = x + 5;
+    let x = x * 2;
+    let x = x + 1;
+    x
+}

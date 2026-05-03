@@ -1,0 +1,11 @@
+// expect: exit=42
+// Bitwise & | ^ on i64 values.
+fn main() -> i32 {
+    let a = 255;
+    let b = 15;
+    let m = a & b;        // 15
+    let o = a | b;        // 255
+    let x = a ^ b;        // 240
+    let total = m + o - x + 12;  // 15 + 255 - 240 + 12 = 42
+    total as i32
+}

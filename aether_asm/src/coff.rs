@@ -118,6 +118,47 @@ impl ObjectBuilder {
         i
     }
 
+    /// Resolve every Rel32Pc relocation that targets an internal symbol
+    /// (one defined in this object's .text or .rdata) by writing the rel32
+    /// disp at the relocation site. After this, the bytes can run as a flat
+    /// blob without a linker — provided no `External` references remain.
+    /// Returns `Err` listing any externals it had to skip.
+    ///
+    /// Internal layout assumption: .text begins at virtual address `text_rva`
+    /// and .rdata begins at `rdata_rva` (caller-supplied PE-image RVAs).
+    pub fn resolve_internal_relocs(&mut self, text_rva: u32, rdata_rva: u32)
+        -> Result<(), Vec<String>>
+    {
+        let mut externals = Vec::new();
+        // Take ownership of relocs so we can mutate .text.data while iterating.
+        let relocs = std::mem::take(&mut self.text.relocs);
+        let kept: Vec<Reloc> = relocs.into_iter().filter_map(|r| {
+            let sym = &self.symbols[r.sym_index as usize];
+            // External targets can't be resolved here; surface them.
+            if matches!(sym.storage, SymbolStorage::External) && sym.section == 0 {
+                externals.push(sym.name.clone());
+                return Some(r);
+            }
+            // Compute target VA. section==1 → .text, section==2 → .rdata.
+            let target_va = match sym.section {
+                1 => text_rva + sym.value,
+                2 => rdata_rva + sym.value,
+                _ => { externals.push(sym.name.clone()); return Some(r); }
+            };
+            // Site VA is text_rva + r.site. The rel32 is from the byte right
+            // after the disp32, i.e. site+4.
+            let site_va = text_rva + r.site;
+            let rip_after = site_va + 4;
+            let rel32: i32 = (target_va as i64 - rip_after as i64) as i32;
+            let bytes = rel32.to_le_bytes();
+            let off = r.site as usize;
+            self.text.data[off..off + 4].copy_from_slice(&bytes);
+            None
+        }).collect();
+        self.text.relocs = kept;
+        if externals.is_empty() { Ok(()) } else { Err(externals) }
+    }
+
     /// Encode `instrs` into .text and resolve every pending symbol reloc.
     pub fn assemble_text(&mut self, instrs: &[Instr]) -> Result<(), String> {
         for i in instrs {

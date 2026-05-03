@@ -1,0 +1,9 @@
+// expect: exit=21
+// Mixed-class FFI args: int slot 0 (rcx), f32 slot 1 (xmm1), int slot 2 (r8).
+//   aether_test_mix_if(2, 3.0, 5) = (2 + 5) * 3.0 = 21.0 → i64 → 21
+extern fn aether_test_mix_if(i: i32, f: f32, j: i32) -> f32;
+
+fn main() -> i32 {
+    let r: f32 = aether_test_mix_if(2, 3.0, 5);
+    i64(r)
+}

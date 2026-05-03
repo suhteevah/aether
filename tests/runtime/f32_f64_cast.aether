@@ -1,0 +1,10 @@
+// expect: exit=42
+// f32 → f64 → f32 round-trip via cvtss2sd/cvtsd2ss; final cast to i64 picks
+// the exit code.
+fn main() -> i32 {
+    let a: f32 = 21.0;
+    let b: f64 = f64(a);
+    let c: f32 = f32(b);
+    let d: f32 = c + 21.0;
+    i64(d)
+}

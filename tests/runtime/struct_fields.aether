@@ -1,0 +1,23 @@
+// expect: exit=42
+//
+// Struct with mixed-type fields. Each field is a separate stack slot under
+// a synthetic key (`p.x`, `p.y`, `p.scale`). The asm backend lays them out
+// during count_locals and emits movq/movss/movsd per field type.
+//   x = 5, y = 6, scale = 2.0
+//   (x + y) * i64(scale * 2.0) + i64(scale)  = 11 * 4 + 2 = 46
+// Hmm, need 42. Use:  (x + y) * 4 - 2 = 11*4 - 2 = 42
+struct Point {
+    x: i32,
+    y: i32,
+    scale: f32,
+}
+
+fn main() -> i32 {
+    let p: Point;
+    p.x = 5;
+    p.y = 6;
+    p.scale = 2.0;
+    let scaled: f32 = p.scale * 2.0;
+    let acc: i64 = p.x + p.y;
+    acc * i64(scaled) - 2
+}

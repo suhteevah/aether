@@ -13,11 +13,11 @@ powershell -ExecutionPolicy Bypass -File scripts\audit.ps1
 4. **Golden artifacts** — committed expected outputs in `tests/golden/expected/` (MIR, asm, LLVM IR for `hello.aether` and `autodiff_step.aether`); diffed byte-for-byte. `--update-golden` to regenerate after intentional codegen changes.
 5. **Aether language conformance** — `tests/aether/positive/` must `--check` clean; `tests/aether/negative/expect_AE####_*.aether` must fail with that exact diagnostic code.
 
-Exit code non-zero if any dimension errors. **Run this before claiming any work is done.** The first run already caught a real parser bug (call args without commas were silently accepted) and a real Phase-1 stub (`silu_f32`).
+Exit code non-zero if any dimension errors. **Run this before claiming any work is done.** The first run already caught a real parser bug (call args without commas were silently accepted) and (historically) a stub return in `silu_f32` — both now fixed; `silu_f32` has a real f32 CPU body alongside the rest of the op surface.
 
 `--json` for machine-readable output; `--only sloc|scan|tests|golden|conformance` to focus a single dimension.
 
-Current snapshot: **8,135 total lines • 6,647 code • 0 todo/unimplemented/unreachable/ignored • 0 stub_return** • 4 explicit `panic!()` (all guard rails) • 44 `Phase N` markers (all explicitly roadmap) • **40/40 tests pass • 9/9 golden artifacts match • 8/8 conformance cases pass • 17/17 runtime end-to-end cases pass.** Runtime suite covers: hello + arith + idivq/cqo + unary + ifelse + nested for + while/break/continue + FFI to libaether_rt + pointer-to-local + **f32 SSE2 (literals, arithmetic, ucomiss compares)**.
+Snapshot is whatever `scripts\audit.ps1` prints — re-run it before quoting any number. As of last update: **0 todo/unimplemented/unreachable/ignored stubs** • a small fixed set of explicit `panic!()` guard rails • all `Phase N` markers point at explicitly-roadmap code • **all unit, golden, conformance, and runtime end-to-end suites green**. Runtime suite covers (alphabetical-ish): hello + arith + idivq/cqo + unary + ifelse + nested for + while/break/continue + FFI to libaether_rt + pointer-to-local + **f32 + f64 SSE2** (literals, arithmetic, ucomi[s|d] compares, int↔float + f32↔f64 casts) + 5+-arg FFI via stack spill at `[rsp+32+8*(i-4)]` + **struct field access** + **end-to-end model training driven from a `.aether` source** (`tests/runtime/train_tiny.aether`, loss `1.649245 → 0.006114` over 50 steps) + **self-hosted PE32+ writer** for FFI-free programs (`pe_exit_42.aether`, `pe_arith.aether`).
 
 The runtime suite proves the asm backend correctness on real programs:
 
@@ -41,7 +41,9 @@ The runtime suite proves the asm backend correctness on real programs:
 
 ## Top-Line State
 
-**Aether compiles to native machine code through its own assembler now.** `aetherc hello.aether --emit=aether-bin -o hello.exe` walks: Aether source → MIR → x86-64 AT&T assembly (aetherc backend) → 252-byte COFF .obj (`aether_asm/` crate, our own x86-64 instruction encoder + PE32+ writer) → linked .exe (system linker, last external dep). No LLVM, no C compiler, no GAS. The system linker is the only external tool left in the chain — Phase 5 self-hosts it.
+**Aether compiles to native machine code through its own assembler AND its own linker now.** `aetherc hello.aether --emit=pe-bin -o hello.exe` walks: Aether source → MIR → x86-64 AT&T assembly (aetherc backend) → COFF .obj (`aether_asm/` crate, our own x86-64 instruction encoder + COFF writer) → **PE32+ executable (our own multi-DLL PE writer at `aether_asm/src/pe.rs`)**. Zero external linker. Multi-DLL imports + per-symbol indirect-jmp thunks + multi-DLL IAT. The Windows OS provides `kernel32.dll` (everyone has it); `aether_rt.dll` (the runtime) ships next to the .exe. **Verified end-to-end by `tests/runtime/pe_train_tiny.aether`, which trains a single-layer linear classifier — loss `1.618 → 0.0081` over 50 steps — entirely through this chain.**
+
+`--emit=aether-bin` is also retained: same compile chain but uses the system linker (gcc) and links statically against `libaether_rt.a` (the full Rust-std runtime). Same loss curve to within numerical noise. Choice is between "self-hosted" (pe-bin, slim runtime) and "static + full Rust std" (aether-bin, system linker).
 
 Plus: a model trains end-to-end through the runtime ABI — no Python, no Rust ML framework, no candle, no torch. `runtime/` is a thin C-ABI shim with real f32 CPU implementations of every primitive op; `trainer/` calls only into that ABI to run forward, backward, and AdamW. Verified loss curve: **5.564 → 1.679 in 40 steps on AetherLM-Nano (~85K params, 2 layers, d=64, h=4, ff=128, seq=32)**. Inference round-trip verified.
 
@@ -170,24 +172,12 @@ Flags: `--emit=mir`, `--emit=llvm-ir`, `--strip-comments` (default on), `--targe
 20. ~~`&local` → `lea reg, disp(%rbp)` for passing pointers to FFI~~ **DONE**
 21. ~~Link `libaether_rt.a` from `--emit=aether-bin` so `extern fn aether_*` resolves~~ **DONE** — proven by `ffi_self_check`, `ffi_tape_push`, `ffi_buffer`, `for_ffi_tape`, `nested_loops` runtime tests.
 22. ~~f32 in the asm backend~~ **DONE** — SSE2 (xmm0–xmm7), `movss/addss/subss/mulss/divss/ucomiss`, f32 literal interning to `.rdata` via `.byte` directive, type-aware `Bin` lowering with stack spill for nested expressions, ucomiss + setcc for compares. Verified by `f32_compare` (1.5 + 2.5 == 4.0 → exit 7) and `f32_arith` ((10.0 * 4.5 - 3.0) / 1.0 == 42 → exit 42). **Next f32 work**: `cvtsi2ss` / `cvtss2si` for int↔float casts, `f32` arg passing via xmm0–xmm3 for FFI, f32 fn return values, f64 (xmm + 0xF2 prefix instead of 0xF3).
-23. **Struct field access** (`x.field`) → load from offset within the local that holds the struct. Needed to express the `Model` struct from `examples/aether_lm.aether` directly in compiled Aether code.
-24. **Self-hosted linker**: replace the system `ld` step in `--emit=aether-bin` with a PE32+ writer in `aether_asm/`. After this, the toolchain has zero external deps for static binaries (still uses msvcrt's `puts`, but resolves it through our own import-table writer).
-25. **Real cuBLAS/cuDNN backend in `runtime/`**: replace each `aether_op_*` no-op with a CUDA implementation.
+23. ~~Struct field access (`x.field`)~~ **DONE** — each field gets its own stack slot under a synthetic `name.field` key; `Stmt::Let.value` is now `Option<Expr>` so `let x: Foo;` (uninit) works. Field assignment + read both via slot lookup. Verified by `tests/runtime/struct_fields.aether`.
+24. ~~**Self-hosted linker**~~ **DONE**: `aether_asm/src/pe.rs::build_full_exe` writes arbitrary `(dll, fns[])` imports with per-symbol indirect-jmp thunks + multi-DLL IAT. `aetherc --emit=pe-bin` drives the chain end-to-end with no system linker. Four DLLs in the symbol→DLL map: `kernel32.dll`, `msvcrt.dll`, `aether_rt.dll`, plus stubs for any other library you wire in. **Witness**: `tests/runtime/pe_train_tiny.aether` trains the linear classifier through the self-hosted path; loss curve `1.618 → 0.0081` over 50 steps. The slim `runtime_pe/` crate sits alongside `runtime/` and provides the cdylib (`no_std`, `panic=abort`, `core` + `libm` only, direct kernel32 externs); the f64 libm entries had alignment-trap AVs in their SAVE_XMM prologues so the slim crate uses f32-only math + hardware `sqrtss` + hand-rolled int-exponent `pow`.
+25. ~~**Real cuBLAS/cuDNN backend in `runtime/`**~~ **DONE** (matmul + matmul_backward_{lhs,rhs} via cuBLAS sgemm; cross_entropy_fwd / cross_entropy_bwd / adamw_step via nvrtc-JITted custom kernels embedded in `runtime/src/cuda.rs::KERNEL_SRC`). End-to-end GPU training in `tests/runtime/cuda_train_tiny.aether` — bit-identical loss curve to the CPU `train_tiny.aether`. Single-op apples-to-apples vs candle-gpu (cuBLAS sgemm both): Aether matches or beats Candle at 3 of 4 sizes; see `docs/BENCH_RESULTS.md`. Feature-gated behind `--features cuda`; the bare build stays pure-Rust f32 CPU.
 26. **First real training run on 3070 Ti**: compile `examples/aether_lm.aether --emit=aether-bin` once #22-#25 land. The Aether source describes the model end-to-end; nothing else changes.
 27. **Self-host the compiler**: rewrite `compiler/`, `aether_asm/`, and `runtime/` in Aether. Drops Rust from the entire stack.
 28. **Spec mode**: `#[spec(intent="…")]` natural-language → impl synthesis with human gate (Phase 5).
-15. **Self-hosted linker**: replace the system `ld` step in `--emit=aether-bin`. Write a PE32+ executable writer (with imports, IAT, base relocs). At that point the toolchain has zero external deps for static binaries.
-16. **Real cuBLAS/cuDNN backend in `runtime/`**: replace each `aether_op_*` no-op with a CUDA implementation.
-17. **Self-host the compiler**: rewrite `compiler/`, `aether_asm/`, and `runtime/` in Aether. Drops Rust from the entire stack.
-18. **3 × P100 scale-out** via `train_step_ddp` once 3070 Ti curve looks healthy.
-19. **Spec mode**: `#[spec(intent="…")]` natural-language → impl synthesis with human gate (Phase 5).
-10. **inkwell swap**: `cargo add inkwell --features llvm15-0` and replace `codegen/llvm/mod.rs` text emitter with a real `Module`/`Builder`. *Blocked on local LLVM 15 dev install on Windows.*
-11. **Real cuBLAS/cuDNN backend in `runtime/`**: replace each `aether_op_*` no-op with a CUDA implementation. The Rust crate stays a thin shim — no framework. Use `cudarc` for raw CUDA bindings if you need it.
-12. **Real NCCL backend in `runtime/`** for `aether_dist_all_reduce` and `aether_op_all_reduce_sum_f32`.
-13. **Real partial computation in runtime**: `aether_autodiff_partial` currently records the call but doesn't compute. Wire it to a value table indexed by node id and dispatch on `op_code`.
-14. **First real training run on 3070 Ti**: compile `examples/aether_lm.aether --emit=llvm-ir` → link `libaether_rt.a` (cuBLAS-backed) → run. The Aether source describes the model end-to-end; nothing else changes.
-15. **Self-host runtime**: rewrite `runtime/` in Aether once Phase 1 codegen lands. Eliminate the Rust bootstrap layer.
-16. **3 × P100 scale-out** via `train_step_ddp` once 3070 Ti curve looks healthy.
 
 ## Non-Negotiables
 

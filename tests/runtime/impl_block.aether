@@ -1,0 +1,29 @@
+// expect: exit=42
+//
+// User-defined methods on a struct via `impl Foo { fn name(...) ... }`.
+// The impl block's methods are name-mangled to `Foo__name` at try_emit
+// time and become regular top-level fns; method-call dispatch
+// (`obj.bar(x)`) looks up the receiver's struct type via
+// `Locals.struct_locals` and routes to the mangled callee.
+//
+// Struct-by-value passing: each declared field maps to one MS x64 ABI
+// arg slot (rcx/rdx/r8/r9 for ints, xmm0..3 for floats). Inside the
+// callee, the param-spill phase allocates one local slot per field and
+// copies from the matching arg reg. So `f.bar(32)` with `f: Foo { x:
+// 10 }` passes `10` in rcx, and inside `bar`, `self.x` reads from the
+// freshly-spilled `self.x` slot.
+struct Foo {
+    x: i32,
+    y: i32,
+}
+
+impl Foo {
+    fn sum_plus(&self, k: i32) -> i32 {
+        self.x + self.y + k
+    }
+}
+
+fn main() -> i32 {
+    let f: Foo = Foo { x: 10, y: 20 };
+    f.sum_plus(12)   // 10 + 20 + 12 = 42
+}

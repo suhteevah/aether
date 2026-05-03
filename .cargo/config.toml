@@ -1,0 +1,32 @@
+# Per-project cargo config. Two purposes:
+#
+# 1. Stop the rustc-fanout fights when an IDE (rust-analyzer, RustRover) is
+#    running `cargo check` or `cargo clippy` in the background while a CLI
+#    `cargo build` / `cargo test` is also running. Each tool spawns its own
+#    rustc fanout against `target/`; the shared file lock thrashes and you
+#    end up with 12+ rustc procs each holding 1 GB+ of RAM.
+#
+#    Fix: put `cargo check` and `cargo clippy` into their own `target/`
+#    subdirs via build aliases. The IDE can still hit the default `target/`
+#    if it wants, but if you tell it to use one of the aliases (e.g.
+#    `cargo ide-check`) the workspaces never collide. See `[alias]` below.
+#
+# 2. Workspace-wide hygiene — keep IDE/CLI stops from corrupting each
+#    other's incremental compilation state.
+
+[build]
+# Default target dir is `target/`. Don't override here — leave that for the
+# IDE to opt into via alias if it wants isolation.
+
+[alias]
+ide-check  = "check --workspace --all-targets --target-dir target/_ide_check"
+ide-clippy = "clippy --workspace --all-targets --target-dir target/_ide_clippy"
+ide-test   = "test --workspace --no-run --target-dir target/_ide_test"
+
+# Default linker: leave Cargo's default. The bench/ subprojects override
+# this when they need MSVC link.exe (see bench/matmul_micro/run_candle.bat).
+
+# `ci` profile: a focused check that runs in-place without competing with
+# the IDE's background scan.
+[profile.ci]
+inherits = "dev"

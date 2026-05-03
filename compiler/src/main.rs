@@ -34,7 +34,7 @@ struct Args {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Emit { Bin, Mir, LlvmIr, C, Asm, AsmBin, AetherBin }
+enum Emit { Bin, Mir, LlvmIr, C, Asm, AsmBin, AetherBin, PeBin }
 
 fn parse_args() -> Result<Args, String> {
     let mut input: Option<PathBuf> = None;
@@ -52,6 +52,7 @@ fn parse_args() -> Result<Args, String> {
             "--emit=asm" => emit = Emit::Asm,
             "--emit=asm-bin" => emit = Emit::AsmBin,
             "--emit=aether-bin" => emit = Emit::AetherBin,
+            "--emit=pe-bin" => emit = Emit::PeBin,
             "--emit=bin" => emit = Emit::Bin,
             "--check" => check_only = true,
             "--json-errors" => json_errors = true,
@@ -65,7 +66,7 @@ fn parse_args() -> Result<Args, String> {
     let output = output.unwrap_or_else(|| {
         let mut p = input.clone();
         match emit {
-            Emit::Bin | Emit::AsmBin | Emit::AetherBin => { p.set_extension(if cfg!(windows) { "exe" } else { "" }); }
+            Emit::Bin | Emit::AsmBin | Emit::AetherBin | Emit::PeBin => { p.set_extension(if cfg!(windows) { "exe" } else { "" }); }
             Emit::Mir => { p.set_extension("mir"); }
             Emit::LlvmIr => { p.set_extension("ll"); }
             Emit::C => { p.set_extension("c"); }
@@ -94,6 +95,57 @@ fn report(sink: &DiagSink, file: &str, json: bool) {
     } else {
         eprintln!("{}", sink.render_human(file));
     }
+}
+
+/// Resolve every `Item::Use(path)` in `prog` by reading the corresponding
+/// stdlib file (`stdlib/<path>.aether` next to the aetherc binary) and
+/// inlining its top-level items in place. Visited names are tracked to
+/// break cycles. The original `Item::Use` entries are dropped.
+fn resolve_uses(prog: &mut ast::Program) -> Result<(), String> {
+    use std::collections::HashSet;
+    let exe_dir = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    // The stdlib lives at `target/debug/../../stdlib` for in-tree builds,
+    // and at `<install>/stdlib` for an installed aetherc. Search both.
+    let candidates = [
+        exe_dir.join("../../stdlib"),
+        exe_dir.join("../stdlib"),
+        exe_dir.join("stdlib"),
+    ];
+    let mut visited: HashSet<String> = HashSet::new();
+    let original = std::mem::take(&mut prog.items);
+    for item in original {
+        match item {
+            ast::Item::Use(path) => {
+                let name = path.join("/");
+                if !visited.insert(name.clone()) { continue; }
+                let mut found: Option<PathBuf> = None;
+                for cand in &candidates {
+                    let p = cand.join(format!("{}.aether", name));
+                    if p.exists() { found = Some(p); break; }
+                }
+                let path = found.ok_or_else(||
+                    format!("stdlib module `{}` not found (looked in {:?})", name, candidates))?;
+                let src = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("read {:?}: {}", path, e))?;
+                let (toks, _stripped) = lexer::Lexer::new(&src).tokenize()
+                    .map_err(|e| format!("lex {:?}: {}", path, e))?;
+                let imported = parser::Parser::new(toks).parse_program()
+                    .map_err(|e| format!("parse {:?}: {}", path, e))?;
+                for it in imported.items {
+                    // Filter out nested module/use forms — only extern decls,
+                    // structs, consts, fns flow through.
+                    match it {
+                        ast::Item::Use(_) | ast::Item::ModuleDecl(_) => {}
+                        other => prog.items.push(other),
+                    }
+                }
+            }
+            other => prog.items.push(other),
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -126,7 +178,7 @@ fn main() {
         eprintln!("[aetherc] stripped {} comment byte(s) at lex time", stripped);
     }
 
-    let prog = match parser::Parser::new(toks).parse_program() {
+    let mut prog = match parser::Parser::new(toks).parse_program() {
         Ok(p) => p,
         Err(e) => {
             sink.push(diag::from_legacy("AE0002", "parse", &e)
@@ -136,6 +188,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Resolve `use <name>;` against the bundled stdlib at `<aetherc>/../../stdlib/<name>.aether`.
+    // Inlines the imported file's items in place. Cycles are broken by a
+    // visited set; missing files are a hard error so typos surface fast.
+    if let Err(e) = resolve_uses(&mut prog) {
+        sink.push(diag::from_legacy("AE0003", "use", &e)
+            .with_hint("`use foo;` looks for `stdlib/foo.aether` next to the aetherc binary; \
+                make sure the name matches a file in there"));
+        report(&sink, &file_str, args.json_errors);
+        std::process::exit(1);
+    }
 
     let mir_prog = mir::run_autodiff_pass(&prog);
 
@@ -206,6 +269,18 @@ fn main() {
                 // that need to be on the link line.
                 link_cmd.arg("-luserenv").arg("-lws2_32").arg("-lbcrypt")
                         .arg("-lntdll").arg("-ladvapi32");
+                // If the runtime was built with --features cuda, the
+                // staticlib pulls in `cudart` + `cublas` symbols. Add the
+                // CUDA toolkit lib dir to the search path and link them.
+                // Auto-detect: if `CUDA_PATH` is set (NVIDIA's installer
+                // does this), use it; otherwise default to v12.6.
+                let cuda_root = std::env::var("CUDA_PATH").unwrap_or_else(|_|
+                    "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6".into());
+                let cuda_libdir = PathBuf::from(&cuda_root).join("lib").join("x64");
+                if cuda_libdir.exists() {
+                    link_cmd.arg(format!("-L{}", cuda_libdir.display()));
+                    link_cmd.arg("-lcudart").arg("-lcublas");
+                }
             }
             let link_status = link_cmd.status();
             match link_status {
@@ -215,6 +290,29 @@ fn main() {
                     eprintln!("aetherc: cannot run linker ({}); .obj left at {:?}", e, obj_path);
                     std::process::exit(1);
                 }
+            }
+        }
+        Emit::PeBin => {
+            // Self-hosted Aether-only path: aetherc emits asm; aether-asm
+            // assembles, resolves internal relocs in-place, and writes a
+            // PE32+ .exe whose only external dependency is kernel32!ExitProcess.
+            // No system linker. No libaether_rt linkage today — programs
+            // that call `extern fn aether_*` must use --emit=aether-bin until
+            // the import-table writer learns to point at libaether_rt.dll.
+            let mut s_path = args.output.clone();
+            s_path.set_extension("s");
+            std::fs::write(&s_path, codegen::asm::emit(&prog)).unwrap();
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let aether_asm = exe_dir.join(if cfg!(windows) { "aether-asm.exe" } else { "aether-asm" });
+            let status = Command::new(&aether_asm)
+                .arg(&s_path).arg("-o").arg(&args.output).arg("--pe").status();
+            match status {
+                Ok(s) if s.success() => eprintln!("[aetherc] built {:?} via self-hosted PE writer (no system linker)", args.output),
+                Ok(s) => { eprintln!("aetherc: aether-asm --pe exited {}", s); std::process::exit(1); }
+                Err(e) => { eprintln!("aetherc: cannot run aether-asm ({})", e); std::process::exit(1); }
             }
         }
         Emit::AsmBin => {

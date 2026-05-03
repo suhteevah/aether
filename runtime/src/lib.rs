@@ -6,33 +6,46 @@
 //! All entry points are `#[no_mangle] extern "C"` so the LLVM IR emitted by
 //! `compiler/src/codegen/llvm/mod.rs` links cleanly without aliasing.
 
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::os::raw::{c_int, c_void};
 
 pub mod ops;
 
-#[derive(Default)]
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+// Single-threaded tape for the bootstrap runtime. Originally `thread_local!`
+// — the TLS init hook for that drags Rust's `std::thread` machinery into the
+// cdylib's DllMain, which in turn calls `bcryptprimitives.dll!ProcessPrng`
+// for the HashMap hasher seed. When our self-hosted PE writer (#24) loads
+// `aether_rt.dll` early in process init, bcryptprimitives' DllMain hasn't
+// run yet, and the call AVs at offset 0x16e99 (a `movaps` to a slot whose
+// alignment depends on prior init). A plain `static UnsafeCell` doesn't go
+// through the TLS init path. Aether-emitted programs are single-threaded;
+// the TLS layer was never load-bearing.
 struct Tape {
     entries: Vec<*const c_void>,
     closed: bool,
 }
 
-thread_local! {
-    static TAPE: RefCell<Tape> = RefCell::new(Tape::default());
+struct TapeCell(UnsafeCell<Tape>);
+unsafe impl Sync for TapeCell {}
+
+static TAPE: TapeCell = TapeCell(UnsafeCell::new(Tape { entries: Vec::new(), closed: false }));
+
+#[inline]
+unsafe fn tape() -> &'static mut Tape { &mut *TAPE.0.get() }
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_autodiff_init(_tape: *mut c_void) {
+    let t = tape();
+    t.entries.clear();
+    t.closed = false;
 }
 
 #[no_mangle]
-pub extern "C" fn aether_autodiff_init(_tape: *mut c_void) {
-    TAPE.with(|t| {
-        let mut t = t.borrow_mut();
-        t.entries.clear();
-        t.closed = false;
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn aether_autodiff_push(_tape: *mut c_void, value: *const c_void) {
-    TAPE.with(|t| t.borrow_mut().entries.push(value));
+pub unsafe extern "C" fn aether_autodiff_push(_tape: *mut c_void, value: *const c_void) {
+    tape().entries.push(value);
 }
 
 #[no_mangle]
@@ -54,11 +67,8 @@ pub extern "C" fn aether_autodiff_partial(
 ) {}
 
 #[no_mangle]
-pub extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
-    TAPE.with(|t| {
-        let mut t = t.borrow_mut();
-        t.closed = true;
-    });
+pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
+    tape().closed = true;
 }
 
 // =====================================================================
@@ -318,10 +328,225 @@ pub extern "C" fn aether_dist_all_reduce(
 /// Compiled aether binaries can call this from `main()` to confirm the runtime
 /// linked correctly without dragging in any platform deps.
 #[no_mangle]
-pub extern "C" fn aether_rt_self_check() -> c_int {
-    let mut entries = 0i32;
-    TAPE.with(|t| entries = t.borrow().entries.len() as i32);
-    entries
+pub unsafe extern "C" fn aether_rt_self_check() -> c_int {
+    tape().entries.len() as c_int
+}
+
+// =====================================================================
+// Bootstrap allocator + init helpers — these let an Aether `main()` set up
+// tensors, fill them with deterministic data, and free them, without needing
+// arrays or struct support in the language. All buffers are heap-allocated
+// f32/i32 slabs returned as i64-sized pointers (the asm backend already has
+// a TyKind::Int that's 64-bit, which is exactly what a pointer is on x64).
+//
+// Phase-1 swap: replace these with cudaMalloc-backed versions; the symbol
+// surface stays identical.
+// =====================================================================
+
+/// Allocate `n` f32 elements, zero-initialized. Returns a thin data pointer
+/// cast to i64. Free with `aether_free_f32(p, n)`.
+#[no_mangle] pub extern "C" fn aether_alloc_f32(n: c_int) -> i64 {
+    let n = n.max(0) as usize;
+    let mut v: Vec<f32> = vec![0.0; n];
+    v.shrink_to_fit();
+    debug_assert_eq!(v.capacity(), n);
+    let ptr = v.as_mut_ptr() as i64;
+    std::mem::forget(v);
+    ptr
+}
+
+#[no_mangle] pub extern "C" fn aether_alloc_i32(n: c_int) -> i64 {
+    let n = n.max(0) as usize;
+    let mut v: Vec<i32> = vec![0; n];
+    v.shrink_to_fit();
+    debug_assert_eq!(v.capacity(), n);
+    let ptr = v.as_mut_ptr() as i64;
+    std::mem::forget(v);
+    ptr
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_free_f32(p: i64, n: c_int) -> c_int {
+    if p == 0 || n <= 0 { return 0; }
+    let n = n as usize;
+    let _ = Vec::from_raw_parts(p as *mut f32, n, n);
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_free_i32(p: i64, n: c_int) -> c_int {
+    if p == 0 || n <= 0 { return 0; }
+    let n = n as usize;
+    let _ = Vec::from_raw_parts(p as *mut i32, n, n);
+    0
+}
+
+/// Splittable-mix64 (variant of SplitMix64). Deterministic PRNG that doesn't
+/// require Rust's `rand` crate. Returns a u64; consumers can mask down.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Fill `n` f32s with N(~0, scale^2) using a Box-Muller transform off
+/// SplitMix64. Deterministic in `seed`.
+#[no_mangle] pub unsafe extern "C" fn aether_init_normal_f32(p: i64, n: c_int, scale: f32, seed: i64) {
+    if p == 0 || n <= 0 { return; }
+    let n = n as usize;
+    let buf = std::slice::from_raw_parts_mut(p as *mut f32, n);
+    let mut state = seed as u64;
+    let mut i = 0;
+    while i < n {
+        let u1 = ((splitmix64(&mut state) >> 11) as f64) / ((1u64 << 53) as f64);
+        let u2 = ((splitmix64(&mut state) >> 11) as f64) / ((1u64 << 53) as f64);
+        let r = (-2.0 * u1.max(1e-30).ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        let z0 = (r * theta.cos()) as f32 * scale;
+        let z1 = (r * theta.sin()) as f32 * scale;
+        buf[i] = z0;
+        if i + 1 < n { buf[i + 1] = z1; }
+        i += 2;
+    }
+}
+
+/// Fill `n` i32 label indices uniformly in `[0, classes)`. Deterministic in `seed`.
+#[no_mangle] pub unsafe extern "C" fn aether_fill_labels_i32(p: i64, n: c_int, classes: c_int, seed: i64) {
+    if p == 0 || n <= 0 || classes <= 0 { return; }
+    let n = n as usize;
+    let buf = std::slice::from_raw_parts_mut(p as *mut i32, n);
+    let c = classes as u64;
+    let mut state = seed as u64;
+    for slot in buf.iter_mut() {
+        *slot = (splitmix64(&mut state) % c) as i32;
+    }
+}
+
+/// Read a single f32 from a buffer at index `i`. Used by Aether `main()` to
+/// observe loss values without needing array indexing in the language.
+#[no_mangle] pub unsafe extern "C" fn aether_load_f32(p: i64, i: c_int) -> f32 {
+    if p == 0 { return 0.0; }
+    *((p as *const f32).add(i as usize))
+}
+
+/// Print one line of bench output: `<which>  M=… N=… K=… iters=… us=…`,
+/// where `which` is 0 for CPU / 1 for GPU. The label_ptr arg is reserved
+/// for a future per-bench tag string and is currently ignored.
+#[no_mangle] pub extern "C" fn aether_print_bench(
+    which: i64, m: c_int, n: c_int, k: c_int, iters: c_int, us: i64,
+) -> c_int {
+    let tag = if which == 0 { "cpu" } else { "gpu" };
+    println!("{:3}  M={:>4}  N={:>4}  K={:>4}  iters={:>4}  us={:>10}", tag, m, n, k, iters, us);
+    0
+}
+
+/// Print "step={step} loss={loss}\n" to stdout. Lets compiled Aether code
+/// emit a training curve without needing format strings or stdio bindings.
+///
+/// Implementation note: writes directly to the Win32 standard-output handle
+/// via WriteFile. This avoids `std::io::stdout()` and the lazy-init chain
+/// behind `println!`, which (on Windows) reaches BCrypt primitives for the
+/// stdio mutex's HashMap hasher seed. That chain AVs when this DLL is
+/// loaded too early in process init under the self-hosted `--emit=pe-bin`
+/// PE writer; the explicit WriteFile call sidesteps the whole thing.
+#[no_mangle] pub extern "C" fn aether_print_loss(step: c_int, loss: f32) -> c_int {
+    let mut buf = [0u8; 64];
+    let n = format_loss_line(&mut buf, step, loss);
+    unsafe { write_stdout(&buf[..n]); }
+    0
+}
+
+#[cfg(windows)]
+unsafe fn write_stdout(bytes: &[u8]) {
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> *mut c_void;
+        fn WriteFile(h: *mut c_void, b: *const c_void, n: u32,
+                     written: *mut u32, overlapped: *mut c_void) -> i32;
+    }
+    let h = GetStdHandle(0xFFFF_FFF5); // STD_OUTPUT_HANDLE
+    let mut written: u32 = 0;
+    WriteFile(h, bytes.as_ptr() as *const c_void, bytes.len() as u32,
+              &mut written, std::ptr::null_mut());
+}
+
+#[cfg(not(windows))]
+unsafe fn write_stdout(bytes: &[u8]) {
+    extern "C" { fn write(fd: c_int, buf: *const c_void, n: usize) -> isize; }
+    let _ = write(1, bytes.as_ptr() as *const c_void, bytes.len());
+}
+
+/// Format `step={step} loss={loss:.6}\n` into `buf` without touching
+/// `core::fmt::Write` (which on cdylibs drags in the same Rust-std stdio
+/// init paths we're trying to avoid). Returns bytes written. `buf` must
+/// be at least 64 bytes; output is truncated otherwise.
+fn format_loss_line(buf: &mut [u8], step: c_int, loss: f32) -> usize {
+    let mut i = 0usize;
+    let prefix = b"step=";
+    for &b in prefix { if i < buf.len() { buf[i] = b; i += 1; } }
+    i += write_int(&mut buf[i..], step as i64);
+    let mid = b" loss=";
+    for &b in mid { if i < buf.len() { buf[i] = b; i += 1; } }
+    i += write_f32(&mut buf[i..], loss, 6);
+    if i < buf.len() { buf[i] = b'\n'; i += 1; }
+    i
+}
+
+fn write_int(buf: &mut [u8], v: i64) -> usize {
+    if buf.is_empty() { return 0; }
+    let neg = v < 0;
+    let mut n = if neg { (!v as u64).wrapping_add(1) } else { v as u64 };
+    let mut tmp = [0u8; 20];
+    let mut t = 0;
+    if n == 0 { tmp[t] = b'0'; t += 1; }
+    while n > 0 { tmp[t] = b'0' + (n % 10) as u8; n /= 10; t += 1; }
+    let mut i = 0;
+    if neg && i < buf.len() { buf[i] = b'-'; i += 1; }
+    while t > 0 && i < buf.len() { t -= 1; buf[i] = tmp[t]; i += 1; }
+    i
+}
+
+fn write_f32(buf: &mut [u8], v: f32, decimals: u32) -> usize {
+    let mut i = 0usize;
+    let neg = v < 0.0;
+    let mut x = if neg { -v } else { v };
+    if neg && i < buf.len() { buf[i] = b'-'; i += 1; }
+    let int_part = x as u64;
+    let mut tmp = [0u8; 20];
+    let mut t = 0;
+    let mut n = int_part;
+    if n == 0 { tmp[t] = b'0'; t += 1; }
+    while n > 0 { tmp[t] = b'0' + (n % 10) as u8; n /= 10; t += 1; }
+    while t > 0 && i < buf.len() { t -= 1; buf[i] = tmp[t]; i += 1; }
+    if i < buf.len() { buf[i] = b'.'; i += 1; }
+    x -= int_part as f32;
+    for _ in 0..decimals {
+        x *= 10.0;
+        let d = x as u32;
+        if i < buf.len() { buf[i] = b'0' + (d % 10) as u8; i += 1; }
+        x -= d as f32;
+    }
+    i
+}
+
+/// Store a single f32 to a buffer at index `i`.
+#[no_mangle] pub unsafe extern "C" fn aether_store_f32(p: i64, i: c_int, v: f32) {
+    if p == 0 { return; }
+    *((p as *mut f32).add(i as usize)) = v;
+}
+
+// =====================================================================
+// Test-only FFI surface — exercises the asm backend's f32 / f64 / cast /
+// FFI-arg pipelines from compiled Aether. Real ops never go through here.
+// =====================================================================
+
+#[no_mangle] pub extern "C" fn aether_test_add_f32(a: f32, b: f32) -> f32 { a + b }
+#[no_mangle] pub extern "C" fn aether_test_add_f64(a: f64, b: f64) -> f64 { a + b }
+#[no_mangle] pub extern "C" fn aether_test_f32_to_i64(x: f32) -> i64 { x as i64 }
+#[no_mangle] pub extern "C" fn aether_test_f64_to_i64(x: f64) -> i64 { x as i64 }
+/// Mixed-class arg passing: int slot 0, f32 slot 1, int slot 2 → f32.
+/// MS x64 puts them in rcx, xmm1, r8 respectively. Returns `(i + j) * f`.
+#[no_mangle] pub extern "C" fn aether_test_mix_if(i: c_int, f: f32, j: c_int) -> f32 {
+    (i + j) as f32 * f
 }
 
 #[cfg(test)]
@@ -331,11 +556,13 @@ mod tests {
 
     #[test]
     fn tape_lifecycle() {
-        aether_autodiff_init(ptr::null_mut());
-        aether_autodiff_push(ptr::null_mut(), ptr::null());
-        aether_autodiff_push(ptr::null_mut(), ptr::null());
-        assert_eq!(aether_rt_self_check(), 2);
-        aether_autodiff_reverse(ptr::null_mut());
+        unsafe {
+            aether_autodiff_init(ptr::null_mut());
+            aether_autodiff_push(ptr::null_mut(), ptr::null());
+            aether_autodiff_push(ptr::null_mut(), ptr::null());
+            assert_eq!(aether_rt_self_check(), 2);
+            aether_autodiff_reverse(ptr::null_mut());
+        }
     }
 
     #[test]

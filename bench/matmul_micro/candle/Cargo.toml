@@ -1,0 +1,15 @@
+[package]
+name = "candle_matmul_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# LOCAL candle fork at J:/candle-src. The user explicitly maintains this
+# fork (production 7B-QLoRA-on-8GB work, custom kernels, TDPI loop). It
+# already builds cleanly against the local CUDA 12.6 + MSVC 14.43 combo
+# via `J:/candle-src/build-cuda.bat`. Crates.io candle is the wrong
+# answer here — fork-only.
+candle-core = { path = "J:/candle-src/candle-core", features = ["cuda"] }

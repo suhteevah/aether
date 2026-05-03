@@ -4,4 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
+# `staticlib`  → `libaether_rt.a`  (used by --emit=aether-bin via system linker)
+# `rlib`       → Rust-side consumers (the trainer crate)
+# Note: this crate used to also produce a `cdylib`, but its DllMain pulled
+# Rust std init (HashMap hasher seed → bcryptprimitives.dll!ProcessPrng)
+# which AVs when the DLL loads at our self-hosted PE's process init time.
+# The `runtime_pe` sibling crate produces a slim no-std-flavoured cdylib
+# with the same C ABI for the `--emit=pe-bin` path.
 crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# `cuda`: route every aether_op_* through cuBLAS / cuDNN / custom CUDA kernels
+# via `cudarc`. Buffers allocated through `aether_alloc_f32` become device-
+# resident (cudaMalloc) instead of host vec; load/store helpers explicitly
+# transfer. Requires a CUDA toolkit + working `cudarc` build at compile
+# time. Without the feature, the runtime stays the pure-Rust f32 CPU path
+# that ships in the base build.
+cuda = ["dep:cudarc"]
+
+[dependencies]
+cudarc = { version = "0.13", optional = true, default-features = false, features = ["cuda-12060", "driver", "cublas", "nvrtc"] }

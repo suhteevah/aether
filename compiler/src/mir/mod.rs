@@ -119,11 +119,14 @@ fn lower_fn(f: &FnDecl) -> MirFunction {
 
 fn lower_stmt(s: &Stmt, autodiff: bool, out: &mut Vec<MirStmt>) {
     match s {
-        Stmt::Let { name, value, .. } => {
+        Stmt::Let { name, value: Some(value), .. } => {
             out.push(MirStmt::Source(format!("let {} = {}", name, render_expr(value))));
             if autodiff && expr_is_diff_relevant(value) {
                 out.push(MirStmt::TapePush { value: name.clone() });
             }
+        }
+        Stmt::Let { name, value: None, .. } => {
+            out.push(MirStmt::Source(format!("let {}: <uninit>", name)));
         }
         Stmt::Expr(e) => lower_expr_stmt(e, autodiff, out),
         Stmt::Return(Some(e)) => out.push(MirStmt::Source(format!("return {}", render_expr(e)))),
@@ -190,6 +193,16 @@ fn render_expr(e: &Expr) -> String {
         Expr::Range { lo, hi, .. } => format!("{}..{}", render_expr(lo), render_expr(hi)),
         Expr::Region { kind, .. } => format!("<region:{:?}>", kind),
         Expr::Ref { mutable, expr } => format!("&{}{}", if *mutable { "mut " } else { "" }, render_expr(expr)),
+        Expr::StructLit { name, fields } => {
+            let body: Vec<String> = fields.iter()
+                .map(|(f, v)| format!("{}: {}", f, render_expr(v))).collect();
+            format!("{} {{ {} }}", name, body.join(", "))
+        }
+        Expr::Match { scrutinee, arms } => {
+            format!("match {} {{ {} arms }}", render_expr(scrutinee), arms.len())
+        }
+        Expr::Cast { expr, ty } => format!("({} as {})", render_expr(expr), ty),
+        Expr::Index { recv, idx } => format!("{}[{}]", render_expr(recv), render_expr(idx)),
     }
 }
 
@@ -199,6 +212,7 @@ fn bin_op_str(op: BinOp) -> &'static str {
         BinOp::Mod => "%", BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::Lt => "<",
         BinOp::Gt => ">", BinOp::Le => "<=", BinOp::Ge => ">=", BinOp::And => "&&",
         BinOp::Or => "||", BinOp::Assign => "=",
+        BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^",
     }
 }
 

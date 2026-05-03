@@ -47,7 +47,7 @@ pub fn build(f: &FnDecl) -> AdGraph {
     let mut g = AdGraph::default();
     let Some(body) = &f.body else { return g; };
     for s in &body.stmts {
-        if let Stmt::Let { name, value, .. } = s {
+        if let Stmt::Let { name, value: Some(value), .. } = s {
             let id = lower(&mut g, value);
             g.bindings.insert(name.clone(), id);
             // First `let loss = ...` becomes the graph root.
