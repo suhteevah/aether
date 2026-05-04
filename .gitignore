@@ -86,3 +86,6 @@ lpt6
 lpt7
 lpt8
 lpt9
+
+tests/runtime/*.exe
+tests/runtime/*.obj
