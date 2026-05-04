@@ -1,0 +1,29 @@
+// roadmap: P7.3
+// expect: exit=0
+// requires: cuda
+//
+// Softmax + scale GPU sanity. Run softmax on a random [B, D] tensor and
+// in-place scale a separate buffer â€” both kernels should complete and
+// the program returns 0 on success.
+use runtime;
+
+const BSZ: i32 = 4;
+const DD:  i32 = 8;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_logits: i64 = aether_alloc_f32(32);   // BSZ*DD
+    aether_init_normal_f32(h_logits, 32, 1.0, 5);
+
+    let logits: Tensor<f32, [BSZ, DD]>;
+    let probs:  Tensor<f32, [BSZ, DD]>;
+    aether_dev_h2d_f32(h_logits, logits, 32);
+
+    logits.softmax(&mut probs);
+    probs.scale(2.0);  // every element doubled in-place
+
+    aether_dev_sync();
+    aether_free_f32(h_logits, 32);
+    0
+}

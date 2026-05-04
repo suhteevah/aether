@@ -77,6 +77,11 @@ pub enum Instr {
     MovBaseDispFromReg { src: Reg, base: Reg, disp: i32 },
     /// `mov [rbp + disp32], r64` — store to stack slot.
     MovRbpDispFromReg { src: Reg, disp: i32 },
+    /// `movq $imm32, disp32(%rbp)` — store sign-extended imm32 directly to a
+    /// stack slot. Used by the asm peephole pass to collapse the
+    /// `movq $imm, %rax / movq %rax, -N(%rbp)` rax round-trip.
+    /// Encoding: REX.W + C7 /0 ; ModR/M = 10_000_101 ; disp32 ; imm32 (11 bytes).
+    MovRbpDispImm32 { disp: i32, imm: i32 },
     AddRegImm8 { dst: Reg, imm: i8 },
     SubRegImm8 { dst: Reg, imm: i8 },
     /// `add r/m64, imm32` — REX.W + 81 /0 imm32. 7 bytes. Use when imm > 127.
@@ -91,6 +96,11 @@ pub enum Instr {
     OrRegRegQ  { dst: Reg, src: Reg },
     /// `xorq %src, %dst` → dst = dst ^ src. REX.W + 31 /r.
     XorRegRegQ { dst: Reg, src: Reg },
+    /// `shlq %cl, %dst` — left shift dst by count in CL. REX.W + D3 /4.
+    ShlRegByCl { dst: Reg },
+    /// `sarq %cl, %dst` — arithmetic right shift (signed) by count in CL.
+    /// Matches Rust's `>>` semantics for signed integers. REX.W + D3 /7.
+    SarRegByCl { dst: Reg },
     /// `add r/m64, r64` — REX.W + 01 /r
     AddRegRegQ { dst: Reg, src: Reg },
     /// `sub r/m64, r64` — REX.W + 29 /r
@@ -189,6 +199,10 @@ pub enum Instr {
     LeaRegFromRbpDisp { dst: Reg, disp: i32 },
     /// `call rel32` — symbol resolved via PLT-style external relocation.
     CallSym { sym: String },
+    /// `callq *%reg` — indirect call through a 64-bit register holding a
+    /// function pointer. Used for invoking fn-typed locals (closures-lite).
+    /// FF /2 with REX.B for r8..r15.
+    CallRegIndirect { reg: Reg },
     Ret,
 }
 
@@ -287,6 +301,18 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
             let modrm = 0b11_000_000 | (src.lo3() << 3) | dst.lo3();
             Encoded { bytes: vec![rex, 0x31, modrm], reloc: None }
         }
+        ShlRegByCl { dst } => {
+            // REX.W + D3 /4 — shl r/m64, CL. ModRM = 11 100 dst.lo3.
+            let rex = 0x48 | dst.extension();
+            let modrm = 0b11_100_000 | dst.lo3();
+            Encoded { bytes: vec![rex, 0xD3, modrm], reloc: None }
+        }
+        SarRegByCl { dst } => {
+            // REX.W + D3 /7 — sar r/m64, CL.
+            let rex = 0x48 | dst.extension();
+            let modrm = 0b11_111_000 | dst.lo3();
+            Encoded { bytes: vec![rex, 0xD3, modrm], reloc: None }
+        }
         XorRegReg32 { dst, src } => {
             // 31 /r   — REX optional. If both regs are RAX..RDI, no REX.
             let need_rex = dst.extension() != 0 || src.extension() != 0;
@@ -324,6 +350,15 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
                     kind: PendingRelocKind::Rel32Pc,
                 }),
             }
+        }
+        CallRegIndirect { reg } => {
+            // FF /2 — call r/m64. ModRM = 11 010 reg.lo3.
+            // REX.B for r8..r15.
+            let mut bytes = Vec::new();
+            if reg.extension() != 0 { bytes.push(0x40 | reg.extension()); }
+            bytes.push(0xFF);
+            bytes.push(0b11_010_000 | reg.lo3());
+            Encoded { bytes, reloc: None }
         }
         Ret => Encoded { bytes: vec![0xC3], reloc: None },
         AddRegRegQ { dst, src } => {
@@ -368,6 +403,14 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
             let modrm = 0b10_000_101 | (src.lo3() << 3);
             let mut b = vec![rex, 0x89, modrm];
             b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        MovRbpDispImm32 { disp, imm } => {
+            // REX.W + C7 /0 ; ModR/M = 10_000_101 (rbp + disp32) ; disp32 ; imm32.
+            // 11 bytes total. Direct memory immediate store — no reg round-trip.
+            let mut b = vec![0x48u8, 0xC7, 0b10_000_101u8];
+            b.extend_from_slice(&disp.to_le_bytes());
+            b.extend_from_slice(&imm.to_le_bytes());
             Encoded { bytes: b, reloc: None }
         }
         MovRegFromBaseDisp { dst, base, disp } => {

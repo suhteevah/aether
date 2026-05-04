@@ -116,10 +116,311 @@ pub enum AsmError {
 }
 
 pub fn emit(p: &Program) -> String {
-    match try_emit(p) {
+    let s = match try_emit(p) {
         Ok(s) => s,
         Err(e) => format!("# asm backend error: {:?}\n", e),
+    };
+    let s = peephole(&s);
+    // P10.5 — instruction scheduling (load-store reorder). Compose after the
+    // peephole pass so we reorder the leaner survivors, not the round-trip
+    // forms peephole would otherwise collapse.
+    let s = schedule(&s);
+    // P10.8 — block layout: hot/cold splitting. Functions carrying `#[cold]`
+    // are moved into a `.text.cold` section so the loader keeps them off the
+    // hot I-cache.
+    let mut cold_fns: HashSet<String> = HashSet::new();
+    for item in &p.items {
+        if let Item::Fn(f) = item {
+            if f.body.is_some() && f.attrs.iter().any(|a| a.name == "cold") {
+                let label = if f.name == "main" {
+                    "main".to_string()
+                } else {
+                    format!("aether_{}", f.name)
+                };
+                cold_fns.insert(label);
+            }
+        }
     }
+    block_layout(&s, &cold_fns)
+}
+
+/// Roadmap P10.8 — block layout / hot-cold splitting.
+///
+/// Splits the post-peephole assembly into per-fn blocks (boundaries are top-
+/// level labels matching `main:` or `aether_<name>:` at column 0) and wraps
+/// each block whose label is in `cold_fns` with section directives that move
+/// it into `.text.cold`. The default `.text` section is restored after each
+/// cold block so subsequent fns continue to land in the hot section.
+fn block_layout(asm: &str, cold_fns: &HashSet<String>) -> String {
+    if cold_fns.is_empty() {
+        return asm.to_string();
+    }
+    let mut out = String::with_capacity(asm.len() + cold_fns.len() * 64);
+    let lines: Vec<&str> = asm.split('\n').collect();
+    // Find the start of every fn block (label at column 0 ending with ':',
+    // not a directive, not indented).
+    let is_fn_label = |s: &str| -> Option<String> {
+        if s.starts_with(' ') || s.starts_with('\t') { return None; }
+        if s.starts_with('.') || s.starts_with('#') { return None; }
+        let trimmed = s.trim_end();
+        let label = trimmed.strip_suffix(':')?;
+        // No spaces, no tabs — labels are single tokens.
+        if label.is_empty() || label.contains(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        Some(label.to_string())
+    };
+
+    // Walk lines, tracking whether we are currently inside a cold block. When
+    // we hit a new fn label we (a) close the prior cold section if needed,
+    // and (b) open a new cold section if the new label is cold.
+    let mut in_cold = false;
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(label) = is_fn_label(line) {
+            // Closing the previous cold block, if any.
+            if in_cold {
+                out.push_str(".section .text,\"x\"\n");
+                in_cold = false;
+            }
+            if cold_fns.contains(&label) {
+                out.push_str(".section .text.cold,\"x\"\n");
+                in_cold = true;
+            }
+        }
+        out.push_str(line);
+        // Re-add newline except after the final element produced by split.
+        if i + 1 < lines.len() {
+            out.push('\n');
+        }
+    }
+    if in_cold {
+        out.push_str("\n.section .text,\"x\"\n");
+    }
+    out
+}
+
+/// Roadmap P10.4 — asm-level peephole optimizer.
+///
+/// Line-based pattern match over the AT&T assembly the backend just produced.
+/// Conservative: only collapses windows where every line exactly matches the
+/// expected pattern, and never touches labels, directives (.global/.section/
+/// .quad/.asciz/etc), or comments. Two patterns today:
+///
+/// 1. `movq $imm, %rax` + `movq %rax, -N(%rbp)`
+///    → `movq $imm, -N(%rbp)`
+///    Eliminates the rax round-trip when the immediate fits in 32 bits
+///    (i.e. when the original `movq $imm, %rax` was already sign-extended
+///    imm32, which is what aetherc emits).
+///
+/// 2. `movq %rax, -N(%rbp)` + `movq -N(%rbp), %rax`
+///    → `movq %rax, -N(%rbp)`
+///    Eliminates the redundant reload — rax already holds the value just
+///    written, so re-loading it is a no-op.
+fn peephole(asm: &str) -> String {
+    // Split preserving exact line content; we'll re-join with '\n'. The input
+    // ends with '\n' on every emitter path so we drop the trailing empty
+    // sentinel produced by split and re-add a final newline at the end.
+    let lines: Vec<&str> = asm.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+
+    let mut i = 0usize;
+    while i < lines.len() {
+        let cur = lines[i];
+        // Try 2-line windows. Both lookups guarded.
+        if i + 1 < lines.len() {
+            let next = lines[i + 1];
+
+            // Pattern 1: movq $imm, %rax  /  movq %rax, -N(%rbp)
+            if let Some(imm) = parse_mov_imm_to_rax(cur) {
+                if let Some(disp) = parse_mov_rax_to_rbp_disp(next) {
+                    // Preserve indentation from the first line so the file
+                    // visually lines up.
+                    let indent = leading_ws(cur);
+                    out.push(format!("{}movq ${}, {}(%rbp)", indent, imm, disp));
+                    i += 2;
+                    continue;
+                }
+            }
+
+            // Pattern 2: movq %rax, -N(%rbp)  /  movq -N(%rbp), %rax
+            if let Some(d1) = parse_mov_rax_to_rbp_disp(cur) {
+                if let Some(d2) = parse_mov_rbp_disp_to_rax(next) {
+                    if d1 == d2 {
+                        // Keep the store, drop the redundant reload.
+                        out.push(cur.to_string());
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        out.push(cur.to_string());
+        i += 1;
+    }
+
+    out.join("\n")
+}
+
+fn leading_ws(s: &str) -> &str {
+    let end = s.bytes().position(|b| b != b' ' && b != b'\t').unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Parse `    movq $<imm>, %rax`. Returns the immediate as a signed i64 if the
+/// line matches exactly that shape (plus optional whitespace). Anything else
+/// (different reg, different op, label, directive, comment, trailing noise)
+/// returns None.
+fn parse_mov_imm_to_rax(line: &str) -> Option<i64> {
+    let t = line.trim();
+    let rest = t.strip_prefix("movq ")?;
+    let (a, b) = split_two(rest)?;
+    if b.trim() != "%rax" { return None; }
+    let a = a.trim();
+    let imm_str = a.strip_prefix('$')?;
+    imm_str.parse::<i64>().ok()
+}
+
+/// Parse `    movq %rax, -<N>(%rbp)`. Returns the disp (as a signed i32) when
+/// matched. Both negative and positive disps accepted.
+fn parse_mov_rax_to_rbp_disp(line: &str) -> Option<i32> {
+    let t = line.trim();
+    let rest = t.strip_prefix("movq ")?;
+    let (a, b) = split_two(rest)?;
+    if a.trim() != "%rax" { return None; }
+    parse_rbp_disp(b.trim())
+}
+
+/// Parse `    movq -<N>(%rbp), %rax`.
+fn parse_mov_rbp_disp_to_rax(line: &str) -> Option<i32> {
+    let t = line.trim();
+    let rest = t.strip_prefix("movq ")?;
+    let (a, b) = split_two(rest)?;
+    if b.trim() != "%rax" { return None; }
+    parse_rbp_disp(a.trim())
+}
+
+/// Parse `<disp>(%rbp)`. disp may be negative or zero.
+fn parse_rbp_disp(s: &str) -> Option<i32> {
+    let s = s.strip_suffix("(%rbp)")?;
+    s.parse::<i32>().ok()
+}
+
+/// Split a single-comma operand list. None if there isn't exactly one comma at
+/// top-level (we never encounter parens-wrapped commas in these instr forms).
+fn split_two(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find(',')?;
+    let (a, b) = s.split_at(idx);
+    Some((a, &b[1..]))
+}
+
+/// Roadmap P10.5 — instruction scheduling (load-store reorder).
+///
+/// Conservative list-scheduler that runs after peephole. Within a maximal run
+/// of plain rbp-relative load/store moves (no labels, branches, calls, or any
+/// other instruction kind), it interleaves paired loads and stores:
+///
+///   load A→r1; store r1→B; load C→r2; store r2→D
+/// becomes
+///   load A→r1; load C→r2; store r1→B; store r2→D
+///
+/// Hides load latency (a 4-5-cycle L1 hit on Skylake/Zen 4) behind the
+/// independent second load instead of stalling on the dependent store.
+///
+/// Safety: the runs contain ONLY rbp-disp loads and stores; reordering is
+/// only emitted when the two pairs use distinct slots A,B,C,D and distinct
+/// destination registers, so neither store can affect the other load and
+/// neither load can clobber the other's value.
+fn schedule(asm: &str) -> String {
+    let lines: Vec<&str> = asm.split('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let run_start = i;
+        while i < lines.len() && is_schedulable(lines[i]) {
+            i += 1;
+        }
+        if i >= run_start + 4 {
+            let run: Vec<&str> = lines[run_start..i].to_vec();
+            let scheduled = reorder_run(&run);
+            out.extend(scheduled);
+        } else {
+            for j in run_start..i {
+                out.push(lines[j].to_string());
+            }
+        }
+        if i < lines.len() {
+            out.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+    out.join("\n")
+}
+
+fn is_schedulable(line: &str) -> bool {
+    parse_load_rbp(line).is_some() || parse_store_rbp(line).is_some()
+}
+
+fn parse_load_rbp(line: &str) -> Option<(i32, &str)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("movq ")?;
+    let (a, b) = split_two(rest)?;
+    let a = a.trim();
+    let b = b.trim();
+    let reg = b.strip_prefix('%')?;
+    if !is_plain_gpr(reg) { return None; }
+    let disp = parse_rbp_disp(a)?;
+    Some((disp, reg))
+}
+
+fn parse_store_rbp(line: &str) -> Option<(&str, i32)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("movq ")?;
+    let (a, b) = split_two(rest)?;
+    let a = a.trim();
+    let b = b.trim();
+    let reg = a.strip_prefix('%')?;
+    if !is_plain_gpr(reg) { return None; }
+    let disp = parse_rbp_disp(b)?;
+    Some((reg, disp))
+}
+
+fn is_plain_gpr(r: &str) -> bool {
+    matches!(r, "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi"
+        | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15")
+}
+
+fn reorder_run(run: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(run.len());
+    let mut i = 0usize;
+    while i < run.len() {
+        if i + 3 < run.len() {
+            let p1l = parse_load_rbp(run[i]);
+            let p1s = parse_store_rbp(run[i + 1]);
+            let p2l = parse_load_rbp(run[i + 2]);
+            let p2s = parse_store_rbp(run[i + 3]);
+            if let (Some((da, ra)), Some((rs1, db)), Some((dc, rc)), Some((rs2, dd))) =
+                (p1l, p1s, p2l, p2s)
+            {
+                let pair1_ok = ra == rs1;
+                let pair2_ok = rc == rs2;
+                let regs_distinct = ra != rc;
+                let slots_distinct = da != db && da != dc && da != dd
+                    && db != dc && db != dd && dc != dd;
+                if pair1_ok && pair2_ok && regs_distinct && slots_distinct {
+                    out.push(run[i].to_string());
+                    out.push(run[i + 2].to_string());
+                    out.push(run[i + 1].to_string());
+                    out.push(run[i + 3].to_string());
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        out.push(run[i].to_string());
+        i += 1;
+    }
+    out
 }
 
 pub fn try_emit(p: &Program) -> Result<String, AsmError> {
@@ -171,7 +472,14 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
 
     let mut sigs: HashMap<String, TyKind> = HashMap::new();
     let mut local_fns: HashSet<String> = HashSet::new();
+    /// Fn name → payload-enum name, for fns whose declared return type is a
+    /// payload-carrying enum (Result-shaped).  Used to drive the 2-register
+    /// return ABI: tag in %rax, value in %rdx. Indexed by both the bare fn
+    /// name and the linker name (`aether_<n>`) for caller-side lookup
+    /// symmetry.
+    let mut fn_returns_enum: HashMap<String, String> = HashMap::new();
     let mut struct_decls: HashMap<String, StructDecl> = HashMap::new();
+    let mut enum_decls: HashMap<String, EnumDecl> = HashMap::new();
     let mut const_env: HashMap<String, i64> = HashMap::new();
     let generics: Rc<RefCell<GenericState>> = Rc::new(RefCell::new(GenericState::default()));
     for item in &p.items {
@@ -184,9 +492,17 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
         // → tag-as-i64. So `Color::Red` lowered as `Expr::Path(["Color",
         // "Red"])` resolves at the Path-codegen site to the same int
         // any other const lookup gives.
-        if let Item::Enum { name, variants } = item {
+        if let Item::Enum { name, variants, payloads } = item {
             for (i, v) in variants.iter().enumerate() {
                 const_env.insert(format!("{}::{}", name, v), i as i64);
+            }
+            // Register payload-aware variants for the codegen rewrites below.
+            let has_any_payload = payloads.iter().any(|p| p.is_some());
+            if has_any_payload {
+                enum_decls.insert(name.clone(), EnumDecl {
+                    variants: variants.clone(),
+                    payloads: payloads.clone(),
+                });
             }
         }
     }
@@ -216,6 +532,15 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
                 // (which use the unmangled name) work.
                 sigs.insert(f.name.clone(), rk);
             }
+            // Detect fns whose declared return type is a payload-enum.
+            // These use the 2-register return ABI (tag in %rax, value in
+            // %rdx) and drive the `?`-operator early-return propagation.
+            if let Some(Ty::Named(rname)) = f.ret.as_ref() {
+                if enum_decls.contains_key(rname) {
+                    fn_returns_enum.insert(f.name.clone(), rname.clone());
+                    fn_returns_enum.insert(format!("aether_{}", f.name), rname.clone());
+                }
+            }
         }
     }
 
@@ -233,7 +558,8 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
             if f.body.is_some() && f.const_params.is_empty() {
                 let (floats, f64s) = emit_fn(
                     f, &mut text, &mut data, &sigs, &local_fns,
-                    &struct_decls, &const_env, Some(generics.clone()))?;
+                    &struct_decls, &enum_decls, &fn_returns_enum,
+                    &const_env, Some(generics.clone()))?;
                 all_floats.extend(floats);
                 all_f64s.extend(f64s);
             }
@@ -270,7 +596,8 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
         }
         let (floats, f64s) = emit_fn(
             &spec, &mut text, &mut data, &sigs, &local_fns,
-            &struct_decls, &spec_env, Some(generics.clone()))?;
+            &struct_decls, &enum_decls, &fn_returns_enum,
+            &spec_env, Some(generics.clone()))?;
         all_floats.extend(floats);
         all_f64s.extend(f64s);
     }
@@ -337,6 +664,150 @@ impl StringTable {
     }
 }
 
+#[derive(Clone)]
+struct EnumDecl {
+    variants: Vec<String>,
+    payloads: Vec<Option<Ty>>,
+}
+
+/// If `e` is `EnumName::Variant(arg)` (`Call(Path([..2]), [arg])`) or the
+/// no-arg form `EnumName::Variant` (`Path([..2])`), and the path resolves
+/// to a known payload-enum, return (enum_name, variant_idx, payload_expr).
+fn resolve_enum_ctor(
+    e: &Expr,
+    enum_decls: &HashMap<String, EnumDecl>,
+) -> Option<(String, usize, Option<Expr>)> {
+    let (path, arg) = match e {
+        Expr::Call { callee, args } => {
+            if let Expr::Path(p) = callee.as_ref() {
+                if p.len() != 2 || args.len() != 1 { return None; }
+                (p.clone(), Some(args[0].clone()))
+            } else { return None; }
+        }
+        Expr::Path(p) if p.len() == 2 => (p.clone(), None),
+        _ => return None,
+    };
+    let decl = enum_decls.get(&path[0])?;
+    let idx = decl.variants.iter().position(|v| *v == path[1])?;
+    Some((path[0].clone(), idx, arg))
+}
+
+/// If `e` is a `Call { callee: Ident(fn_name), .. }` where `fn_name` is a
+/// fn that returns a payload-enum (registered in `fn_returns_enum`), return
+/// the enum's name. Drives the 2-register return ABI on the caller side.
+fn call_returns_enum(e: &Expr, fn_returns_enum: &HashMap<String, String>) -> Option<String> {
+    if let Expr::Call { callee, .. } = e {
+        if let Expr::Ident(n) = callee.as_ref() {
+            return fn_returns_enum.get(n).cloned();
+        }
+    }
+    None
+}
+
+/// Emit code that produces a payload-enum value in (%rax = tag, %rdx = val).
+/// Used by fn-tail and `Stmt::Return` paths when the enclosing fn returns a
+/// payload-enum, and by `Expr::Try` to propagate the Err variant unchanged.
+///
+/// Three accepted shapes for `e`:
+///   * `EnumName::Variant[(payload)]` literal  — tag from variant index, val
+///     from the payload expr (or 0 if no payload).
+///   * Bare ident referring to an existing payload-enum local — load both
+///     `.tag` and `.val` slots.
+///   * `Call(...)` to a fn that itself returns a payload-enum — the call
+///     already leaves (rax, rdx) populated; nothing more to do.
+fn emit_enum_return_value(
+    e: &Expr,
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    // Case 1: enum constructor literal.
+    if let Some((_enum_name, variant_idx, payload_expr)) =
+        resolve_enum_ctor(e, &locals.enum_decls)
+    {
+        // Evaluate the payload first (clobbers rax) then set both regs.
+        // Keep the tag immediate small and dependency-free so it doesn't
+        // get reordered with the payload eval.
+        if let Some(pe) = payload_expr {
+            let pty = emit_expr_value(&pe, out, data, locals)?;
+            if !matches!(pty, TyKind::Int) {
+                return Err(AsmError::UnsupportedExpr(
+                    "enum payload return currently restricted to i64-shaped types"));
+            }
+            out.push_str("    movq %rax, %rdx\n");
+        } else {
+            out.push_str("    xorl %edx, %edx\n");
+        }
+        out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
+        return Ok(());
+    }
+    // Case 2: bare ident → existing payload-enum local.
+    if let Expr::Ident(n) = e {
+        if locals.enum_locals.contains_key(n) {
+            let tag_key = format!("{}.tag", n);
+            let val_key = format!("{}.val", n);
+            let tag_slot = locals.get(&tag_key).ok_or(AsmError::UnsupportedExpr(
+                "enum return: ident missing .tag slot"))?;
+            let val_slot = locals.get(&val_key).ok_or(AsmError::UnsupportedExpr(
+                "enum return: ident missing .val slot"))?;
+            out.push_str(&format!("    movq -{}(%rbp), %rax\n", tag_slot * 8));
+            out.push_str(&format!("    movq -{}(%rbp), %rdx\n", val_slot * 8));
+            return Ok(());
+        }
+    }
+    // Case 3: call returning a payload-enum — falls through (rax, rdx)
+    // already set by the CALL.
+    if call_returns_enum(e, &locals.fn_returns_enum).is_some() {
+        let _ = emit_expr_value(e, out, data, locals)?;
+        return Ok(());
+    }
+    // Case 4: `if cond { then_tail } else { else_tail }` where each branch
+    // independently produces an enum value. Recurse into both arms.
+    if let Expr::If { cond, then, else_ } = e {
+        // Evaluate cond into rax.
+        let cond_kind = emit_expr_value(cond, out, data, locals)?;
+        if !matches!(cond_kind, TyKind::Int) {
+            return Err(AsmError::UnsupportedExpr("enum-return if-cond must be int"));
+        }
+        let else_label = locals.fresh_label("enumret_else");
+        let end_label = locals.fresh_label("enumret_end");
+        out.push_str("    testq %rax, %rax\n");
+        out.push_str(&format!("    je {}\n", else_label));
+        // then-arm: emit stmts then dispatch tail through this same helper.
+        for s in &then.stmts { emit_stmt(s, out, data, locals)?; }
+        if let Some(t) = &then.tail {
+            emit_enum_return_value(t, out, data, locals)?;
+        } else {
+            return Err(AsmError::UnsupportedExpr(
+                "enum-return if-then arm must end in an enum value"));
+        }
+        out.push_str(&format!("    jmp {}\n", end_label));
+        out.push_str(&format!("{}:\n", else_label));
+        let else_block = else_.as_ref().ok_or(AsmError::UnsupportedExpr(
+            "enum-return if must have an else"))?;
+        for s in &else_block.stmts { emit_stmt(s, out, data, locals)?; }
+        if let Some(t) = &else_block.tail {
+            emit_enum_return_value(t, out, data, locals)?;
+        } else {
+            return Err(AsmError::UnsupportedExpr(
+                "enum-return if-else arm must end in an enum value"));
+        }
+        out.push_str(&format!("{}:\n", end_label));
+        return Ok(());
+    }
+    // Case 5: `Block { ... }` — recurse into tail.
+    if let Expr::Block(b) = e {
+        for s in &b.stmts { emit_stmt(s, out, data, locals)?; }
+        if let Some(t) = &b.tail {
+            return emit_enum_return_value(t, out, data, locals);
+        }
+        return Err(AsmError::UnsupportedExpr(
+            "enum-return block must have a tail expression"));
+    }
+    Err(AsmError::UnsupportedExpr(
+        "fn returning a payload-enum: tail/return must be an enum ctor, an enum local, a call to a payload-enum-returning fn, or an if/block whose arms produce enum values"))
+}
+
 #[derive(Default)]
 struct Locals {
     /// name → 1-based slot index (rbp - 8*slot)
@@ -394,6 +865,25 @@ struct Locals {
     /// Struct decls keyed by struct name. Drives struct-typed `let` layout —
     /// each field gets its own slot, accessed as a synthetic `name.field` key.
     struct_decls: HashMap<String, StructDecl>,
+    /// Payload-carrying enum decls. Drives 2-slot (`name.tag` + `name.val`)
+    /// layout for enum locals where any variant carries data.
+    enum_decls: HashMap<String, EnumDecl>,
+    /// Per-local payload-enum type name → enum-decl name. Lets `match local`
+    /// detect that scrutinee is a 2-slot enum and dispatch on `.tag`.
+    enum_locals: HashMap<String, String>,
+    /// Caller-side: fn name → enum-decl name for fns whose return is a
+    /// payload-enum. Drives the 2-register return ABI at call sites.
+    fn_returns_enum: HashMap<String, String>,
+    /// Callee-side: enum-decl name iff the *current* fn returns a payload-enum.
+    /// `Stmt::Return` and the block tail consult this to emit the 2-register
+    /// return (tag → %rax, val → %rdx) instead of single-rax. Drives
+    /// `Expr::Try` early-return: the handler runs when the inner call's tag
+    /// is non-zero (Err), copying both registers to the caller as-is.
+    current_fn_returns_enum: Option<String>,
+    /// Cached fn-frame size in bytes — used by `Expr::Try` and `Stmt::Return`
+    /// to emit `addq $frame, %rsp` epilogues without re-running the
+    /// frame-sizing pass.
+    frame_bytes_cache: usize,
     /// Stack arrays: name → (base_slot, n, elem_kind). `base_slot` is the
     /// slot of element 0 (closest to rbp); element k is at addr
     /// `-8*base_slot(%rbp) - 8*k`. Per-element kind only int/handle for
@@ -488,6 +978,8 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
            sigs: &HashMap<String, TyKind>,
            local_fns: &HashSet<String>,
            struct_decls: &HashMap<String, StructDecl>,
+           enum_decls: &HashMap<String, EnumDecl>,
+           fn_returns_enum: &HashMap<String, String>,
            const_env: &HashMap<String, i64>,
            generics: Option<Rc<RefCell<GenericState>>>)
     -> Result<(Vec<(String, f32)>, Vec<(String, f64)>), AsmError>
@@ -500,6 +992,12 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     locals.sigs = sigs.clone();
     locals.local_fns = local_fns.clone();
     locals.struct_decls = struct_decls.clone();
+    locals.enum_decls = enum_decls.clone();
+    locals.fn_returns_enum = fn_returns_enum.clone();
+    // Callee-side: is THIS fn's declared return type a payload-enum?
+    // (Both the bare fn name and the linker-mangled name are registered in
+    // the caller-side map; either lookup hits.)
+    locals.current_fn_returns_enum = fn_returns_enum.get(&f.name).cloned();
     locals.const_env = const_env.clone();
     locals.generics = generics;
     let body = f.body.as_ref().unwrap();
@@ -511,6 +1009,7 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     // keeps the frame-sizing pass symmetric across the two count passes.
     locals.alloc("_ret_save_");
     let frame = locals.frame_bytes();
+    locals.frame_bytes_cache = frame;
     locals.slots.clear();
     locals.next_slot = 0;
     locals.types.clear();
@@ -566,13 +1065,10 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
             }
         }
 
-        if arg_idx >= 4 { return Err(AsmError::TooManyArgs); }
         let i = arg_idx;
         let kind = TyKind::from_ty_with_env(p_ty, &locals.const_env).unwrap_or(TyKind::Int);
         let slot = locals.alloc(&p.name);
         locals.types.insert(p.name.clone(), kind);
-        // Populate the shape sidecar so method-call dispatch in the fn
-        // body (`x.matmul(...)`) can read M/K/N back.
         if matches!(kind, TyKind::TensorDev(_) | TyKind::TensorDevI32(_)) {
             if let Some(shape) = tensor_type_shape(p_ty, Some(&locals.const_env)) {
                 locals.tensor_shapes.insert(p.name.clone(), shape);
@@ -580,13 +1076,36 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
             let elem = match kind { TyKind::TensorDevI32(_) => "i32", _ => "f32" };
             locals.tensor_elem.insert(p.name.clone(), elem);
         }
-        match kind {
-            TyKind::Int => out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[i], slot * 8)),
-            TyKind::F32 => out.push_str(&format!("    movss %xmm{}, -{}(%rbp)\n", i, slot * 8)),
-            TyKind::F64 => out.push_str(&format!("    movsd %xmm{}, -{}(%rbp)\n", i, slot * 8)),
-            // Tensor handles arrive as i64 in the integer arg reg.
-            TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
-                out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[i], slot * 8)),
+        if i < 4 {
+            // Register-passed arg.
+            match kind {
+                TyKind::Int => out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[i], slot * 8)),
+                TyKind::F32 => out.push_str(&format!("    movss %xmm{}, -{}(%rbp)\n", i, slot * 8)),
+                TyKind::F64 => out.push_str(&format!("    movsd %xmm{}, -{}(%rbp)\n", i, slot * 8)),
+                TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
+                    out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[i], slot * 8)),
+            }
+        } else {
+            // Stack-passed arg (i >= 4): MS x64 ABI puts arg-i at
+            // [rbp + 48 + (i-4)*8] — past the saved rbp (8), saved rip (8),
+            // and the 32-byte shadow space the caller reserved. Float args
+            // are also passed on the stack in this slot (caller stored
+            // %xmm0/etc into that 8-byte slot).
+            let stk_off = 48 + (i - 4) * 8;
+            match kind {
+                TyKind::Int | TyKind::TensorDev(_) | TyKind::TensorDevI32(_) => {
+                    out.push_str(&format!("    movq {}(%rbp), %rax\n", stk_off));
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8));
+                }
+                TyKind::F32 => {
+                    out.push_str(&format!("    movss {}(%rbp), %xmm0\n", stk_off));
+                    out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", slot * 8));
+                }
+                TyKind::F64 => {
+                    out.push_str(&format!("    movsd {}(%rbp), %xmm0\n", stk_off));
+                    out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", slot * 8));
+                }
+            }
         }
         arg_idx += 1;
     }
@@ -601,13 +1120,35 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     if matches!(ret_kind, Some(TyKind::F32) | Some(TyKind::F64)) {
         locals.default_float = ret_kind;
     }
-    emit_block(body, out, data, &mut locals)?;
+    if locals.current_fn_returns_enum.is_some() {
+        // For payload-enum-returning fns the tail expression must produce
+        // a (tag, val) pair in (rax, rdx) — route it through the
+        // enum-aware helper instead of the standard emit_expr_value.
+        for s in &body.stmts {
+            emit_stmt(s, out, data, &mut locals)?;
+        }
+        if let Some(tail) = &body.tail {
+            emit_enum_return_value(tail, out, data, &mut locals)?;
+        } else {
+            // Fall-through with no tail expression isn't meaningful for an
+            // enum-returning fn, but keep behaviour permissive: leave (0, 0)
+            // i.e. the first variant with a zeroed payload.
+            out.push_str("    xorl %eax, %eax\n");
+            out.push_str("    xorl %edx, %edx\n");
+        }
+    } else {
+        emit_block(body, out, data, &mut locals)?;
+    }
     locals.default_float = saved;
 
     // Default-zero %rax only if the fn returns an int (or has no declared ret)
     // *and* the body has no tail expression. For float returns, the tail value
-    // is already in xmm0 and we leave it.
-    if body.tail.is_none() && !matches!(ret_kind, Some(TyKind::F32) | Some(TyKind::F64)) {
+    // is already in xmm0 and we leave it. For payload-enum returns rax+rdx
+    // were set by `emit_enum_return_value` above; don't clobber rax.
+    if body.tail.is_none()
+        && !matches!(ret_kind, Some(TyKind::F32) | Some(TyKind::F64))
+        && locals.current_fn_returns_enum.is_none()
+    {
         out.push_str("    xorl %eax, %eax\n");
     }
     // Auto-free Tensor locals in reverse declaration order. Each free clobbers
@@ -649,9 +1190,34 @@ fn count_locals(b: &Block, locals: &mut Locals) {
         match s {
             Stmt::Let { name, value, ty, .. } => {
                 if let Some(v) = value { count_locals_in_expr(v, locals); }
+                // Payload-enum constructor rhs: reserve `<name>.tag` and
+                // `<name>.val` slots (mirrors emit_stmt's dual-slot layout).
+                if let Some(v) = value {
+                    if resolve_enum_ctor(v, &locals.enum_decls).is_some() {
+                        locals.alloc(&format!("{}.tag", name));
+                        locals.alloc(&format!("{}.val", name));
+                        continue;
+                    }
+                }
+                // Call to a fn returning a payload-enum: same 2-slot layout,
+                // populated from (rax, rdx) instead of from the literal.
+                if let Some(v) = value {
+                    if call_returns_enum(v, &locals.fn_returns_enum).is_some() {
+                        locals.alloc(&format!("{}.tag", name));
+                        locals.alloc(&format!("{}.val", name));
+                        continue;
+                    }
+                }
                 // Struct literal rhs: reserve slot per field, same as the
                 // uninit-struct branch below. Skips the trailing single-slot
                 // alloc since each field gets its own slot.
+                // Tuple literal rhs: reserve N slots `<name>.0` .. `<name>.<N-1>`.
+                if let Some(Expr::Tuple(elems)) = value {
+                    for (i, _) in elems.iter().enumerate() {
+                        locals.alloc(&format!("{}.{}", name, i));
+                    }
+                    continue;
+                }
                 if let Some(Expr::StructLit { name: lit_name, .. }) = value {
                     if let Some(sd) = locals.struct_decls.get(lit_name).cloned() {
                         for f in &sd.fields {
@@ -678,6 +1244,13 @@ fn count_locals(b: &Block, locals: &mut Locals) {
                         continue;
                     }
                 }
+                // Tuple-typed let — reserves N positional slots.
+                if let Some(Ty::Tuple(elem_tys)) = ty {
+                    for i in 0..elem_tys.len() {
+                        locals.alloc(&format!("{}.{}", name, i));
+                    }
+                    continue;
+                }
                 // Stack array `let buf: [T; N];` — reserves N consecutive slots.
                 // Element 0 lives in the slot allocated FIRST (closest to rbp);
                 // element k is at addr `&buf[0] - 8*k` so the index codegen can
@@ -689,6 +1262,10 @@ fn count_locals(b: &Block, locals: &mut Locals) {
                     continue;
                 }
                 locals.alloc(name);
+            }
+            Stmt::LetTuple { names, value } => {
+                count_locals_in_expr(value, locals);
+                for n in names { locals.alloc(n); }
             }
             Stmt::Expr(e) => count_locals_in_expr(e, locals),
             Stmt::Return(Some(e)) => count_locals_in_expr(e, locals),
@@ -815,12 +1392,21 @@ fn count_locals_in_expr(e: &Expr, locals: &mut Locals) {
             // subsequent matches reuse via name (alloc returns a fresh
             // slot but that's fine).
             locals.alloc("_match_scrut_");
-            for (_pat, body) in arms { count_locals_in_expr(body, locals); }
+            for (pat, body) in arms {
+                if let MatchPat::EnumVariantBind(_, bind) = pat {
+                    locals.alloc(bind);
+                }
+                count_locals_in_expr(body, locals);
+            }
         }
         Expr::Cast { expr, .. } => count_locals_in_expr(expr, locals),
+        Expr::Try(inner) => count_locals_in_expr(inner, locals),
         Expr::Index { recv, idx } => {
             count_locals_in_expr(recv, locals);
             count_locals_in_expr(idx, locals);
+        }
+        Expr::Tuple(elems) => {
+            for e in elems { count_locals_in_expr(e, locals); }
         }
         _ => {}
     }
@@ -841,9 +1427,37 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
     -> Result<(), AsmError>
 {
     match s {
+        Stmt::LetTuple { names, value } => {
+            // `let (a, b, ...) = (e1, e2, ...);` — must be a tuple literal of
+            // matching arity. Each name binds to its own top-level slot.
+            let elems = match value {
+                Expr::Tuple(es) => es,
+                _ => return Err(AsmError::UnsupportedExpr(
+                    "let-tuple rhs must be a tuple literal (fn-tuple-returns require sret)")),
+            };
+            if elems.len() != names.len() {
+                return Err(AsmError::UnsupportedExpr("let-tuple arity mismatch"));
+            }
+            for (n, e) in names.iter().zip(elems.iter()) {
+                let val_ty = emit_expr_value(e, out, data, locals)?;
+                let slot = locals.alloc(n);
+                locals.types.insert(n.clone(), val_ty);
+                match val_ty {
+                    TyKind::Int | TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
+                    TyKind::F32 => out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", slot * 8)),
+                    TyKind::F64 => out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", slot * 8)),
+                }
+            }
+            Ok(())
+        }
         Stmt::Expr(e) => { emit_expr_value(e, out, data, locals)?; Ok(()) }
         Stmt::Return(Some(e)) => {
-            emit_expr_value(e, out, data, locals)?;
+            if locals.current_fn_returns_enum.is_some() {
+                emit_enum_return_value(e, out, data, locals)?;
+            } else {
+                emit_expr_value(e, out, data, locals)?;
+            }
             let frame = locals.frame_bytes();
             out.push_str(&format!("    addq ${}, %rsp\n", frame));
             out.push_str("    popq %rbp\n");
@@ -898,6 +1512,17 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                     _ => {}
                 }
             }
+            // Tuple `let pair: (i32, f32);` — reserve N positional slots.
+            if let Some(Ty::Tuple(elem_tys)) = ty {
+                for (i, t) in elem_tys.iter().enumerate() {
+                    let key = format!("{}.{}", name, i);
+                    let slot = locals.alloc(&key);
+                    let kind = TyKind::from_ty(t).unwrap_or(TyKind::Int);
+                    locals.types.insert(key, kind);
+                    let _ = slot;
+                }
+                return Ok(());
+            }
             // Stack array `let buf: [T; N];` — N slots already reserved by
             // count_locals (named "<buf>.0" .. "<buf>.<N-1>"). Allocate them
             // here in the same order to fix the base_slot, and record the
@@ -933,10 +1558,90 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             Ok(())
         }
         Stmt::Let { name, value: Some(value), ty, .. } => {
+            // Payload-enum constructor: `let b = Box::Full(42);` →
+            // allocate `name.tag` (i64) + `name.val` (i64), write tag from
+            // the variant index, write the payload arg into `.val`.
+            if let Some((enum_name, variant_idx, payload_expr)) =
+                resolve_enum_ctor(value, &locals.enum_decls)
+            {
+                let tag_key = format!("{}.tag", name);
+                let val_key = format!("{}.val", name);
+                let tag_slot = locals.alloc(&tag_key);
+                locals.types.insert(tag_key, TyKind::Int);
+                let val_slot = locals.alloc(&val_key);
+                locals.types.insert(val_key, TyKind::Int);
+                locals.enum_locals.insert(name.clone(), enum_name);
+                out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", tag_slot * 8));
+                if let Some(pe) = payload_expr {
+                    let pty = emit_expr_value(&pe, out, data, locals)?;
+                    if !matches!(pty, TyKind::Int) {
+                        return Err(AsmError::UnsupportedExpr(
+                            "enum payload currently restricted to i64-shaped types"));
+                    }
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", val_slot * 8));
+                } else {
+                    out.push_str("    xorl %eax, %eax\n");
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", val_slot * 8));
+                }
+                let _ = ty;
+                return Ok(());
+            }
+            // Call to a fn returning a payload-enum: same 2-slot layout
+            // populated from the 2-register return ABI (rax=tag, rdx=val).
+            // `let r = parse_one(x);` materialises `r.tag` + `r.val` from
+            // the call result so subsequent `match r { ... }` can decode it.
+            if let Some(enum_name) = call_returns_enum(value, &locals.fn_returns_enum) {
+                let tag_key = format!("{}.tag", name);
+                let val_key = format!("{}.val", name);
+                let tag_slot = locals.alloc(&tag_key);
+                locals.types.insert(tag_key, TyKind::Int);
+                let val_slot = locals.alloc(&val_key);
+                locals.types.insert(val_key, TyKind::Int);
+                locals.enum_locals.insert(name.clone(), enum_name);
+                // Evaluate the call. The 2-register return convention leaves
+                // tag in rax and val in rdx — emit_expr_value reports Int
+                // (rax) and we capture rdx ourselves before any subsequent
+                // instruction can clobber it.
+                let _ = emit_expr_value(value, out, data, locals)?;
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", tag_slot * 8));
+                out.push_str(&format!("    movq %rdx, -{}(%rbp)\n", val_slot * 8));
+                let _ = ty;
+                return Ok(());
+            }
             // Struct literal as let rhs — desugars to "uninit struct let,
             // then per-field assignment." The struct decl's field list
             // gives types; lit's `(field_name, expr)` pairs give values.
             // Order doesn't matter — fields are matched by name.
+            // Tuple literal `let pair = (1, 2.0);` — same machinery as a struct
+            // lit but elements are positional `<name>.0`, `<name>.1`, etc. Type
+            // is inferred elementwise from the rhs values; an explicit annotation
+            // (`let pair: (i32, f32) = ...`) is allowed but informational.
+            if let Expr::Tuple(elems) = value {
+                for (i, elem) in elems.iter().enumerate() {
+                    let key = format!("{}.{}", name, i);
+                    let slot = locals.alloc(&key);
+                    let saved = locals.default_float;
+                    let annot_kind = if let Some(Ty::Tuple(tys)) = ty {
+                        tys.get(i).and_then(TyKind::from_ty)
+                    } else { None };
+                    if matches!(annot_kind, Some(TyKind::F32) | Some(TyKind::F64)) {
+                        locals.default_float = annot_kind;
+                    }
+                    let val_ty = emit_expr_value(elem, out, data, locals)?;
+                    locals.default_float = saved;
+                    let kind = annot_kind.unwrap_or(val_ty);
+                    locals.types.insert(key, kind);
+                    match kind {
+                        TyKind::Int => out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
+                        TyKind::F32 => out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", slot * 8)),
+                        TyKind::F64 => out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", slot * 8)),
+                        TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
+                            out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
+                    }
+                }
+                return Ok(());
+            }
             if let Expr::StructLit { name: lit_name, fields } = value {
                 let sd = locals.struct_decls.get(lit_name).cloned()
                     .ok_or(AsmError::UnsupportedExpr("struct literal: unknown type"))?;
@@ -1032,6 +1737,23 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             Ok(TyKind::Int)
         }
         Expr::Ident(name) => {
+            // Ident name might be a local OR a registered fn — function pointer
+            // case takes precedence ONLY when no local of that name exists,
+            // so shadowing of a fn name by a local works as expected.
+            if locals.get(name).is_none() && locals.local_fns.contains(name) {
+                // Load the address of `aether_<name>` into rax — works for any
+                // local fn since we ALWAYS prefix at codegen time. Acts as a
+                // value of TyKind::Int (function pointer is just a 64-bit int).
+                out.push_str(&format!("    leaq aether_{}(%rip), %rax\n", name));
+                return Ok(TyKind::Int);
+            }
+            // File-level int const? Inline the literal value.
+            if locals.get(name).is_none() {
+                if let Some(v) = locals.const_env.get(name).copied() {
+                    out.push_str(&format!("    movq ${}, %rax\n", v));
+                    return Ok(TyKind::Int);
+                }
+            }
             let slot = locals.get(name).ok_or_else(|| AsmError::UnknownIdent(name.clone()))?;
             let kind = locals.types.get(name).copied().unwrap_or(TyKind::Int);
             match kind {
@@ -1197,6 +1919,20 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                         BinOp::BitAnd => { out.push_str("    andq %r10, %rax\n"); Ok(TyKind::Int) }
                         BinOp::BitOr  => { out.push_str("    orq %r10, %rax\n");  Ok(TyKind::Int) }
                         BinOp::BitXor => { out.push_str("    xorq %r10, %rax\n"); Ok(TyKind::Int) }
+                        // Shifts use the CL form so any RHS value works; we
+                        // already have the count in r10, so move r10 into rcx
+                        // (low 8 bits = cl). `sarq` for `>>` matches Rust
+                        // signed-shift semantics.
+                        BinOp::Shl => {
+                            out.push_str("    movq %r10, %rcx\n");
+                            out.push_str("    shlq %cl, %rax\n");
+                            Ok(TyKind::Int)
+                        }
+                        BinOp::Shr => {
+                            out.push_str("    movq %r10, %rcx\n");
+                            out.push_str("    sarq %cl, %rax\n");
+                            Ok(TyKind::Int)
+                        }
                         other => Err(AsmError::UnsupportedBinOp(*other)),
                     }
                 }
@@ -1580,6 +2316,15 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 }
             }
             out.push_str(&format!("    addq ${}, %rsp\n", n * 16));
+            // Indirect call through a local fn-pointer: `let f = my_fn; f(x)`.
+            // `name` resolves to a local slot whose value is a code address
+            // (loaded from a fn-name Ident or any other 64-bit-int source).
+            if locals.get(&name).is_some() && !locals.local_fns.contains(&name) {
+                let slot = locals.get(&name).unwrap();
+                out.push_str(&format!("    movq -{}(%rbp), %r10\n", slot * 8));
+                out.push_str("    callq *%r10\n");
+                return Ok(locals.sigs.get(&name).copied().unwrap_or(TyKind::Int));
+            }
             let linker_name = if locals.local_fns.contains(&name) {
                 format!("aether_{}", name)
             } else {
@@ -1641,13 +2386,34 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             // jump to a shared end label. The result type is taken from
             // the first arm (other arms must agree — we don't enforce
             // beyond what runtime tests catch).
-            let scrut_kind = emit_expr_value(scrutinee, out, data, locals)?;
-            if !matches!(scrut_kind, TyKind::Int) {
-                return Err(AsmError::UnsupportedExpr("match scrutinee must be int (or enum variant)"));
-            }
-            // Save scrutinee to a local for repeat compares.
+            //
+            // Special case: payload-enum scrutinees. If the scrutinee is
+            // an Ident resolving to a known payload-enum local, the "value"
+            // we compare against is `<name>.tag`, and binding patterns
+            // copy `<name>.val` into a fresh local for the arm body.
+            let payload_enum_scrut: Option<String> = match scrutinee.as_ref() {
+                Expr::Ident(n) if locals.enum_locals.contains_key(n) => Some(n.clone()),
+                _ => None,
+            };
             let save_slot = locals.alloc("_match_scrut_");
-            out.push_str(&format!("    movq %rax, -{}(%rbp)\n", save_slot * 8));
+            let payload_val_slot = if let Some(enum_local) = &payload_enum_scrut {
+                let tag_key = format!("{}.tag", enum_local);
+                let tag_slot = locals.get(&tag_key)
+                    .ok_or(AsmError::UnsupportedExpr("payload-enum match: missing .tag slot"))?;
+                out.push_str(&format!("    movq -{}(%rbp), %rax\n", tag_slot * 8));
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", save_slot * 8));
+                let val_key = format!("{}.val", enum_local);
+                let val_slot = locals.get(&val_key)
+                    .ok_or(AsmError::UnsupportedExpr("payload-enum match: missing .val slot"))?;
+                Some(val_slot)
+            } else {
+                let scrut_kind = emit_expr_value(scrutinee, out, data, locals)?;
+                if !matches!(scrut_kind, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("match scrutinee must be int (or enum variant)"));
+                }
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", save_slot * 8));
+                None
+            };
             let end_label = locals.fresh_label("match_end");
             let mut arm_kind: Option<TyKind> = None;
             for (i, (pat, body)) in arms.iter().enumerate() {
@@ -1682,6 +2448,30 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                             out.push_str(&format!("    jne {}\n", end_label));
                         }
                     }
+                    MatchPat::EnumVariantBind(parts, _bind) => {
+                        let key = parts.join("::");
+                        let v = locals.const_env.get(&key).copied()
+                            .ok_or_else(|| AsmError::UnsupportedExpr(string_to_static(format!("match: unknown enum variant {}", key))))?;
+                        out.push_str(&format!("    movq -{}(%rbp), %rax\n", save_slot * 8));
+                        out.push_str(&format!("    movq ${}, %r10\n", v));
+                        out.push_str("    cmpq %r10, %rax\n");
+                        if let Some(nl) = &next_label {
+                            out.push_str(&format!("    jne {}\n", nl));
+                        } else {
+                            out.push_str(&format!("    jne {}\n", end_label));
+                        }
+                    }
+                }
+                // For binding patterns, copy the payload into the bound local
+                // BEFORE emitting the arm body so the body sees `bind` as a local.
+                if let MatchPat::EnumVariantBind(_, bind) = pat {
+                    let val_slot = payload_val_slot
+                        .ok_or(AsmError::UnsupportedExpr(
+                            "binding pattern requires a payload-enum scrutinee"))?;
+                    let bind_slot = locals.alloc(bind);
+                    locals.types.insert(bind.clone(), TyKind::Int);
+                    out.push_str(&format!("    movq -{}(%rbp), %rax\n", val_slot * 8));
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", bind_slot * 8));
                 }
                 let body_kind = emit_expr_value(body, out, data, locals)?;
                 arm_kind.get_or_insert(body_kind);
@@ -1809,6 +2599,48 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             };
             emit_expr_value(&desugared, out, data, locals)
         }
+        Expr::Try(inner) => {
+            // `expr?` — early-return propagation for payload-enum returns.
+            // Desugars to:
+            //   match expr {
+            //     Ok(v)  => v,
+            //     Err(e) => return Err(e),
+            //   }
+            //
+            // Implementation:
+            //   * The enclosing fn MUST itself return a payload-enum (the same
+            //     2-register ABI is reused for the propagation path).
+            //   * `inner` MUST be a `Call` to a fn that returns a payload-enum.
+            //     The call leaves (rax = tag, rdx = val) on return.
+            //   * If tag != 0 (Err variant), run the fn epilogue with rax/rdx
+            //     unchanged so the caller observes the same Err verbatim.
+            //   * Else (Ok variant), the result of `expr?` is the payload —
+            //     move rdx into rax and continue.
+            if locals.current_fn_returns_enum.is_none() {
+                return Err(AsmError::UnsupportedExpr(
+                    "`?` operator is only valid inside a fn that returns a payload-enum"));
+            }
+            if call_returns_enum(inner.as_ref(), &locals.fn_returns_enum).is_none() {
+                return Err(AsmError::UnsupportedExpr(
+                    "`?` operand must be a call to a fn returning a payload-enum"));
+            }
+            // Evaluate the inner call. (rax, rdx) are now (tag, val).
+            let _ = emit_expr_value(inner.as_ref(), out, data, locals)?;
+            // If tag != 0, branch to the fn epilogue.
+            let ok_label = locals.fresh_label("try_ok");
+            out.push_str("    testq %rax, %rax\n");
+            out.push_str(&format!("    je {}\n", ok_label));
+            // Err path: rax/rdx already hold the propagated Err variant.
+            // Run the same epilogue shape as `Stmt::Return`.
+            let frame = locals.frame_bytes_cache;
+            out.push_str(&format!("    addq ${}, %rsp\n", frame));
+            out.push_str("    popq %rbp\n");
+            out.push_str("    ret\n");
+            // Ok path: result of `?` is the payload (rdx) — move to rax.
+            out.push_str(&format!("{}:\n", ok_label));
+            out.push_str("    movq %rdx, %rax\n");
+            Ok(TyKind::Int)
+        }
         _ => Err(AsmError::UnsupportedExpr("unhandled expr in asm backend")),
     }
 }
@@ -1823,16 +2655,50 @@ fn method_dispatch(
     arg_shapes: &[Option<Vec<usize>>],
 ) -> Result<(&'static str, Vec<usize>), AsmError> {
     match method {
+        // q.matmul_t(&k, &mut scores) → matmul_nt(q, k, scores, M, K, N)
+        //   q: [M, K], k: [N, K]   (k is transposed on the fly), scores: [M, N]
+        "matmul_t" => {
+            let s = recv_shape;
+            let kk = arg_shapes.get(0).and_then(|x| x.as_ref())
+                .ok_or(AsmError::UnsupportedExpr("matmul_t: k must be a Tensor with shape"))?;
+            if s.len() != 2 || kk.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("matmul_t: shapes must be 2-dim"));
+            }
+            // M=s[0], K=s[1], N=kk[0]. (k.cols must == K.)
+            Ok(("aether_op_matmul_nt_f32_cuda", vec![s[0], s[1], kk[0]]))
+        }
         // x.matmul(&w, &mut y) → matmul_f32_cuda(x, w, y, M, K, N)
-        //   x: [M, K], w: [K, N], y: [M, N]
+        //   2D × 2D: x:[M, K], w:[K, N], y:[M, N]
+        //   3D × 2D: x:[B, S, K], w:[K, N], y:[B, S, N]   (batch flattened)
+        //
+        // The 3D case lets transformer code write `x.matmul(&proj, &mut y)`
+        // where x/y are [batch, seq, hidden] and the projection is
+        // [hidden, hidden_out]. cuBLAS sees a single sgemm of (B*S) × K @
+        // K × N → (B*S) × N — same byte layout, no reshape allocation needed.
         "matmul" => {
             let s = recv_shape;
             let w = arg_shapes.get(0).and_then(|x| x.as_ref())
                 .ok_or(AsmError::UnsupportedExpr("matmul: w must be a Tensor with shape"))?;
-            if s.len() != 2 || w.len() != 2 {
-                return Err(AsmError::UnsupportedExpr("matmul: shapes must be 2-dim"));
+            if w.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("matmul: w must be 2-dim"));
             }
-            Ok(("aether_op_matmul_f32_cuda", vec![s[0], s[1], w[1]]))
+            let (m, k) = match s.len() {
+                2 => (s[0], s[1]),
+                3 => (s[0] * s[1], s[2]),
+                _ => return Err(AsmError::UnsupportedExpr("matmul: receiver must be 2- or 3-dim")),
+            };
+            Ok(("aether_op_matmul_f32_cuda", vec![m, k, w[1]]))
+        }
+        // x.matmul_gelu(&w, &mut y) → matmul + in-place gelu fused.
+        // Same shape recipe as matmul; the only difference is the runtime fn.
+        "matmul_gelu" => {
+            let s = recv_shape;
+            let w = arg_shapes.get(0).and_then(|x| x.as_ref())
+                .ok_or(AsmError::UnsupportedExpr("matmul_gelu: w must be a Tensor with shape"))?;
+            if s.len() != 2 || w.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("matmul_gelu: shapes must be 2-dim"));
+            }
+            Ok(("aether_op_matmul_gelu_f32_cuda", vec![s[0], s[1], w[1]]))
         }
         // x.matmul_backward_rhs(&dy, &mut dw) → mm_bwd_rhs(x, dy, dw, M, K, N)
         //   x: [M, K], dy: [M, N], dw: [K, N]
@@ -1868,6 +2734,107 @@ fn method_dispatch(
         "adamw_step" => {
             let n = recv_shape.iter().product();
             Ok(("aether_op_adamw_step_f32_cuda", vec![n]))
+        }
+        // a.add(&b, &mut out) → add_f32(a, b, out, n=numel(a))
+        "add" => {
+            let n = recv_shape.iter().product();
+            Ok(("aether_op_add_f32_cuda", vec![n]))
+        }
+        // x.gelu(&mut y) → gelu_fwd(x, y, n=numel(x))
+        "gelu" => {
+            let n = recv_shape.iter().product();
+            Ok(("aether_op_gelu_f32_cuda", vec![n]))
+        }
+        // x.softmax(&mut y) → softmax(x, y, B, D); receiver must be 2-dim.
+        "softmax" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("softmax: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_softmax_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // y.softmax_backward(&dy, &mut dx) → softmax_bwd(y, dy, dx, B, D)
+        "softmax_backward" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("softmax_backward: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_softmax_backward_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // y.softmax_backward_scaled(&dy, &mut dx, s) — fused softmax_bwd + scale.
+        // Emitted by the MIR fusion pass; user-callable too.
+        "softmax_backward_scaled" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("softmax_backward_scaled: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_softmax_backward_scaled_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // a.matmul_tn(&b, &mut out): out[m,n] = a[k,m]^T @ b[k,n]
+        "matmul_tn" => {
+            let s = recv_shape;
+            let bb = arg_shapes.get(0).and_then(|x| x.as_ref())
+                .ok_or(AsmError::UnsupportedExpr("matmul_tn: b must be a Tensor with shape"))?;
+            if s.len() != 2 || bb.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("matmul_tn: shapes must be 2-dim"));
+            }
+            // a is [K, M] (interpreted T → [M, K]); b is [K, N]; out is [M, N].
+            // → M = s[1], K = s[0], N = bb[1].
+            Ok(("aether_op_matmul_tn_f32_cuda", vec![s[1], s[0], bb[1]]))
+        }
+        // x.scale(s) → scale(x, s, n=numel(x)). In-place. `s` is a user-supplied
+        // f32 arg; we synthesize n only.
+        "scale" => {
+            let n = recv_shape.iter().product();
+            Ok(("aether_op_scale_f32_cuda", vec![n]))
+        }
+        // x.gelu_backward(&dy, &mut dx) → gelu_bwd(x, dy, dx, n=numel(x))
+        "gelu_backward" => {
+            let n = recv_shape.iter().product();
+            Ok(("aether_op_gelu_backward_f32_cuda", vec![n]))
+        }
+        // a.add_layer_norm(&b, &gamma, &beta, &mut y, &mut mean, &mut rstd, eps)
+        //   → add_layer_norm_fwd(a, b, gamma, beta, y, mean, rstd, eps, B, D)
+        // Receiver is `a` ([B, D]); first arg is `b` (other addend, [B, D]).
+        "add_layer_norm" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("add_layer_norm: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_add_layer_norm_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // x.layer_norm(&gamma, &beta, &mut y, &mut mean, &mut rstd, eps)
+        //   → layer_norm_fwd(x, gamma, beta, y, mean, rstd, B, D, eps)
+        // x is [B, D]; gamma/beta are [D]; mean/rstd are [B].
+        "layer_norm" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("layer_norm: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_layer_norm_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // x.layer_norm_backward_dx(&gamma, &mean, &rstd, &dy, &mut dx)
+        //   → layer_norm_bwd_dx(x, gamma, mean, rstd, dy, dx, B, D)
+        "layer_norm_backward_dx" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("layer_norm_backward_dx: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_layer_norm_backward_dx_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // x.layer_norm_backward_params(&mean, &rstd, &dy, &mut dgamma, &mut dbeta)
+        //   → layer_norm_bwd_params(x, mean, rstd, dy, dgamma, dbeta, B, D)
+        "layer_norm_backward_params" => {
+            if recv_shape.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("layer_norm_backward_params: receiver must be 2-dim [B, D]"));
+            }
+            Ok(("aether_op_layer_norm_backward_params_f32_cuda", vec![recv_shape[0], recv_shape[1]]))
+        }
+        // dy.matmul_backward_lhs(&w, &mut dx) → mm_bwd_lhs(dy, w, dx, M, K, N)
+        //   dy: [M, N], w: [K, N], dx: [M, K]
+        "matmul_backward_lhs" => {
+            let s = recv_shape;
+            let w = arg_shapes.get(0).and_then(|x| x.as_ref())
+                .ok_or(AsmError::UnsupportedExpr("matmul_backward_lhs: w must be Tensor with shape"))?;
+            if s.len() != 2 || w.len() != 2 {
+                return Err(AsmError::UnsupportedExpr("matmul_backward_lhs: shapes must be 2-dim"));
+            }
+            // M = s[0] (dy.rows), N = s[1] (dy.cols), K = w[0] (w.rows)
+            Ok(("aether_op_matmul_backward_lhs_f32_cuda", vec![s[0], w[0], s[1]]))
         }
         // (h2d / d2h would want a receiver-as-second-arg form; skipping
         // until we have a more flexible dispatch table or a small Aether

@@ -31,6 +31,7 @@ struct Args {
     emit: Emit,
     check_only: bool,
     json_errors: bool,
+    test_mode: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +43,7 @@ fn parse_args() -> Result<Args, String> {
     let mut emit = Emit::Bin;
     let mut check_only = false;
     let mut json_errors = false;
+    let mut test_mode = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -56,6 +58,7 @@ fn parse_args() -> Result<Args, String> {
             "--emit=bin" => emit = Emit::Bin,
             "--check" => check_only = true,
             "--json-errors" => json_errors = true,
+            "--test" => test_mode = true,
             "-h" | "--help" => { print_help(); std::process::exit(0); }
             "--version" => { println!("aetherc 0.1.0 (Phase 0/0.5)"); std::process::exit(0); }
             other if !other.starts_with('-') => input = Some(PathBuf::from(other)),
@@ -74,7 +77,7 @@ fn parse_args() -> Result<Args, String> {
         }
         p
     });
-    Ok(Args { input, output, emit, check_only, json_errors })
+    Ok(Args { input, output, emit, check_only, json_errors, test_mode })
 }
 
 fn print_help() {
@@ -102,17 +105,24 @@ fn report(sink: &DiagSink, file: &str, json: bool) {
 /// inlining its top-level items in place. Visited names are tracked to
 /// break cycles. The original `Item::Use` entries are dropped.
 fn resolve_uses(prog: &mut ast::Program) -> Result<(), String> {
+    resolve_uses_with_src(prog, None)
+}
+
+fn resolve_uses_with_src(prog: &mut ast::Program, src_dir: Option<&std::path::Path>)
+    -> Result<(), String>
+{
     use std::collections::HashSet;
     let exe_dir = std::env::current_exe().ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    // The stdlib lives at `target/debug/../../stdlib` for in-tree builds,
-    // and at `<install>/stdlib` for an installed aetherc. Search both.
-    let candidates = [
-        exe_dir.join("../../stdlib"),
-        exe_dir.join("../stdlib"),
-        exe_dir.join("stdlib"),
-    ];
+    // Search order:
+    //   1. The source file's own directory — multi-file projects use this.
+    //   2. stdlib bundled with aetherc.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(d) = src_dir { candidates.push(d.to_path_buf()); }
+    candidates.push(exe_dir.join("../../stdlib"));
+    candidates.push(exe_dir.join("../stdlib"));
+    candidates.push(exe_dir.join("stdlib"));
     let mut visited: HashSet<String> = HashSet::new();
     let original = std::mem::take(&mut prog.items);
     for item in original {
@@ -192,12 +202,56 @@ fn main() {
     // Resolve `use <name>;` against the bundled stdlib at `<aetherc>/../../stdlib/<name>.aether`.
     // Inlines the imported file's items in place. Cycles are broken by a
     // visited set; missing files are a hard error so typos surface fast.
-    if let Err(e) = resolve_uses(&mut prog) {
+    let src_dir = args.input.parent().map(|p| p.to_path_buf());
+    if let Err(e) = resolve_uses_with_src(&mut prog, src_dir.as_deref()) {
         sink.push(diag::from_legacy("AE0003", "use", &e)
             .with_hint("`use foo;` looks for `stdlib/foo.aether` next to the aetherc binary; \
                 make sure the name matches a file in there"));
         report(&sink, &file_str, args.json_errors);
         std::process::exit(1);
+    }
+
+    // Spec-mode synthesis pass — roadmap item #28. Looks for fns with
+    // `#[spec(intent="…")]`; if a sibling `<fnname>.spec.aether` exists,
+    // splices its body into the fn. Else writes a `<fnname>.spec` request
+    // file describing what needs to be implemented and leaves the stub.
+    {
+        let (synth, miss) = mir::spec::run(&mut prog, src_dir.as_deref());
+        if (synth + miss) > 0 && !args.json_errors {
+            eprintln!("[aetherc] spec: synthesised {} fn(s), {} missing", synth, miss);
+        }
+    }
+
+    // Roadmap P6.14 — `--test` synthesises a `main` that runs every
+    // `#[test]`-tagged fn (returning 0 = pass, nonzero = fail) and exits
+    // with code 0 iff all passed. Must run after `use` resolution (so the
+    // user's test source can pull in stdlib helpers) and before the
+    // closure / fusion / autodiff passes so they see the synthesised main.
+    if args.test_mode {
+        let n = mir::test_harness::install_harness(&mut prog);
+        if !args.json_errors {
+            eprintln!("[aetherc] test harness wired {} #[test] fn(s)", n);
+        }
+    }
+
+    // Closure-lifting pass. Walks every `Expr::Closure { params, body }` in
+    // the program and lifts it to a synthetic `__closure_<n>` top-level fn,
+    // rewriting the closure expression in-place to `Expr::Ident(<lifted_name>)`
+    // (which the asm backend loads as a function pointer). MUST run before
+    // any pass that touches Items list — the fusion pass below is happy to
+    // see the resulting plain-Ident form.
+    let lifted = mir::closures::run(&mut prog);
+    if lifted > 0 && !args.json_errors {
+        eprintln!("[aetherc] lifted {} closure(s) to top-level fns", lifted);
+    }
+
+    // MIR-level kernel-fusion peephole pass. Runs over the AST today (the
+    // proper MIR isn't on the codegen path yet) — rewrites adjacent
+    // `matmul → gelu` (and future patterns) into single fused method calls.
+    // Reports the count to stderr so users see the fusion is firing.
+    let fused = mir::fuse::run(&mut prog);
+    if fused > 0 && !args.json_errors {
+        eprintln!("[aetherc] MIR fusion applied {} pattern(s)", fused);
     }
 
     let mir_prog = mir::run_autodiff_pass(&prog);

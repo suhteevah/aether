@@ -79,6 +79,8 @@ fn emit_stmt(s: &Stmt, lvl: usize) -> String {
             // Phase-0 C fallback doesn't support uninit declarations cleanly.
             format!("{}long {}; (void){};\n", indent(lvl), name, name)
         }
+        Stmt::LetTuple { names, .. } => format!("{}/* let-tuple {:?} unimplemented in c-fallback */\n",
+            indent(lvl), names),
         Stmt::Expr(e) => format!("{}{};\n", indent(lvl), emit_expr(e)),
         Stmt::Return(Some(e)) => format!("{}return {};\n", indent(lvl), emit_expr(e)),
         Stmt::Return(None) => format!("{}return 0;\n", indent(lvl)),
@@ -130,6 +132,7 @@ fn emit_expr(e: &Expr) -> String {
                 BinOp::Gt => ">", BinOp::Le => "<=", BinOp::Ge => ">=", BinOp::And => "&&",
                 BinOp::Or => "||", BinOp::Assign => "=",
                 BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^",
+                BinOp::Shl => "<<", BinOp::Shr => ">>",
             };
             format!("({} {} {})", emit_expr(lhs), o, emit_expr(rhs))
         }
@@ -180,5 +183,8 @@ fn emit_expr(e: &Expr) -> String {
         Expr::Match { .. } => "/* match unimplemented in c-fallback */ 0".into(),
         Expr::Cast { expr, ty } => format!("(({}){})", ty, emit_expr(expr)),
         Expr::Index { recv, idx } => format!("({})[{}]", emit_expr(recv), emit_expr(idx)),
+        Expr::Tuple(_) => "/* tuple unimplemented in c-fallback */ 0".into(),
+        Expr::Closure { .. } => "/* closure unimplemented in c-fallback */ 0".into(),
+        Expr::Try(inner) => format!("/* try */ {}", emit_expr(inner)),
     }
 }

@@ -1,0 +1,117 @@
+// expect: exit=0
+// requires: cuda
+//
+// Residual MLP training. Demonstrates that gradients flow back through a
+// residual connection on GPU end-to-end:
+//   pre_act  = x @ w1
+//   act      = gelu(pre_act)
+//   proj     = act @ w2
+//   block_out = x + proj          (residual)
+//   logits   = block_out @ w_out
+//   loss     = ce(logits, labels)
+//
+// Backward needs to sum two gradient contributions into dx:
+//   dx_through_proj  = (gelu_bwd(pre_act, dh_act)) @ w1^T
+//   dx_through_resid = dblock_out
+//   total dx flows nowhere (x is the input) so we just add the gradients
+//   along the proj path; the residual path's gradient is added INTO
+//   dblock_out for w2 backprop and to dh_act for the MLP backward.
+use runtime;
+
+const BSZ: i32 = 8;
+const DM:  i32 = 16;       // model dim (= residual width)
+const HH:  i32 = 32;       // mlp hidden
+const NN:  i32 = 4;        // num classes
+const KH:  i32 = 512;      // DM*HH
+const HK:  i32 = 512;      // HH*DM
+const KO:  i32 = 64;       // DM*NN
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:    i64 = aether_alloc_f32(128);
+    let h_w1:   i64 = aether_alloc_f32(512);
+    let h_w2:   i64 = aether_alloc_f32(512);
+    let h_wout: i64 = aether_alloc_f32(64);
+    let h_lab:  i64 = aether_alloc_i32(8);
+    aether_init_normal_f32(h_x,  128, 1.0, 1);
+    aether_init_normal_f32(h_w1, 512, 0.1, 7);
+    aether_init_normal_f32(h_w2, 512, 0.1, 11);
+    aether_init_normal_f32(h_wout, 64, 0.1, 13);
+    aether_fill_labels_i32(h_lab, 8, 4, 19);
+
+    let x:        Tensor<f32, [BSZ, DM]>;
+    let w1:       Tensor<f32, [DM, HH]>;
+    let w2:       Tensor<f32, [HH, DM]>;
+    let wout:     Tensor<f32, [DM, NN]>;
+    let pre_act:  Tensor<f32, [BSZ, HH]>;
+    let act:      Tensor<f32, [BSZ, HH]>;
+    let proj:     Tensor<f32, [BSZ, DM]>;
+    let block_out:Tensor<f32, [BSZ, DM]>;
+    let logits:   Tensor<f32, [BSZ, NN]>;
+    let probs:    Tensor<f32, [BSZ, NN]>;
+    let dlogits:  Tensor<f32, [BSZ, NN]>;
+    let dblock:   Tensor<f32, [BSZ, DM]>;
+    let dwout:    Tensor<f32, [DM, NN]>;
+    let dproj:    Tensor<f32, [BSZ, DM]>;   // dproj = dblock (residual unfused)
+    let dh_act:   Tensor<f32, [BSZ, HH]>;
+    let dh_pre:   Tensor<f32, [BSZ, HH]>;
+    let dw2:      Tensor<f32, [HH, DM]>;
+    let dw1:      Tensor<f32, [DM, HH]>;
+    let m_w1:     Tensor<f32, [KH]>;
+    let v_w1:     Tensor<f32, [KH]>;
+    let m_w2:     Tensor<f32, [HK]>;
+    let v_w2:     Tensor<f32, [HK]>;
+    let m_wo:     Tensor<f32, [KO]>;
+    let v_wo:     Tensor<f32, [KO]>;
+    let labels:   Tensor<i32, [BSZ]>;
+
+    aether_dev_h2d_f32(h_x,    x,    128);
+    aether_dev_h2d_f32(h_w1,   w1,   512);
+    aether_dev_h2d_f32(h_w2,   w2,   512);
+    aether_dev_h2d_f32(h_wout, wout, 64);
+    aether_dev_h2d_i32(h_lab,  labels, 8);
+
+    let mut step: i64 = 1;
+    let mut initial_loss: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    while step <= 80 {
+        // Forward.
+        x.matmul(&w1, &mut pre_act);
+        pre_act.gelu(&mut act);
+        act.matmul(&w2, &mut proj);
+        x.add(&proj, &mut block_out);
+        block_out.matmul(&wout, &mut logits);
+        let loss: f32 = logits.cross_entropy(&labels, &mut probs);
+        if step == 1 { initial_loss = loss; }
+        final_loss = loss;
+        // Backward — head.
+        probs.cross_entropy_backward(&labels, &mut dlogits);
+        block_out.matmul_backward_rhs(&dlogits, &mut dwout);
+        dlogits.matmul_backward_lhs(&wout, &mut dblock);
+        // dblock flows INTO both the proj path AND the residual path. The
+        // residual path goes nowhere (x is input) so we don't materialise it.
+        // The proj path: dproj = dblock; act backprop receives dh_act =
+        // dproj @ w2^T; etc.
+        act.matmul_backward_rhs(&dblock, &mut dw2);
+        dblock.matmul_backward_lhs(&w2, &mut dh_act);
+        pre_act.gelu_backward(&dh_act, &mut dh_pre);
+        x.matmul_backward_rhs(&dh_pre, &mut dw1);
+        // (dx unused — x is the network input.)
+        let _ = dproj;
+        // Optim.
+        w1.adamw_step(&dw1, &mut m_w1, &mut v_w1, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        w2.adamw_step(&dw2, &mut m_w2, &mut v_w2, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wout.adamw_step(&dwout, &mut m_wo, &mut v_wo, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        step = step + 1;
+    }
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_w1, 512);
+    aether_free_f32(h_w2, 512);
+    aether_free_f32(h_wout, 64);
+    aether_free_i32(h_lab, 8);
+
+    if final_loss < initial_loss { 0 } else { 1 }
+}

@@ -213,7 +213,15 @@ impl Parser {
                     self.bump();
                     path.push(self.expect_ident()?);
                 }
-                Ok(MatchPat::EnumVariant(path))
+                // `Box::Full(x)` → bind payload into local `x`.
+                if matches!(self.peek(0), Tok::LParen) {
+                    self.bump();
+                    let bind = self.expect_ident()?;
+                    self.expect(Tok::RParen)?;
+                    Ok(MatchPat::EnumVariantBind(path, bind))
+                } else {
+                    Ok(MatchPat::EnumVariant(path))
+                }
             }
             other => {
                 let (l, c) = self.loc();
@@ -227,13 +235,22 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
         let mut variants = Vec::new();
+        let mut payloads = Vec::new();
         while !matches!(self.peek(0), Tok::RBrace) {
             let v = self.expect_ident()?;
+            // Optional `( ty )` payload. Single-element only for now.
+            let payload = if matches!(self.peek(0), Tok::LParen) {
+                self.bump();
+                let ty = self.parse_ty()?;
+                self.expect(Tok::RParen)?;
+                Some(ty)
+            } else { None };
             variants.push(v);
+            payloads.push(payload);
             if matches!(self.peek(0), Tok::Comma) { self.bump(); }
         }
         self.expect(Tok::RBrace)?;
-        Ok(Item::Enum { name, variants })
+        Ok(Item::Enum { name, variants, payloads })
     }
 
     fn parse_struct_item(&mut self, is_pub: bool) -> PResult<Item> {
@@ -328,8 +345,27 @@ impl Parser {
         }
         if matches!(self.peek(0), Tok::LParen) {
             self.bump();
+            // `()` = unit; `(T1, T2, ...)` = tuple type.
+            if matches!(self.peek(0), Tok::RParen) {
+                self.bump();
+                return Ok(Ty::Unit);
+            }
+            let first = self.parse_ty()?;
+            if matches!(self.peek(0), Tok::RParen) {
+                // Single-elem parens — treat as the inner type itself, NOT a
+                // 1-tuple (Rust requires `(T,)` for that — we don't bother).
+                self.bump();
+                return Ok(first);
+            }
+            // Comma — tuple.
+            self.expect(Tok::Comma)?;
+            let mut elems = vec![first];
+            while !matches!(self.peek(0), Tok::RParen) {
+                elems.push(self.parse_ty()?);
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+            }
             self.expect(Tok::RParen)?;
-            return Ok(Ty::Unit);
+            return Ok(Ty::Tuple(elems));
         }
         if matches!(self.peek(0), Tok::LBracket) {
             // Disambiguate `[T; N]` (stack array) from `[d1, d2, ...]` (Tensor
@@ -400,6 +436,25 @@ impl Parser {
             if matches!(self.peek(0), Tok::Let) {
                 self.bump();
                 let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
+                // Tuple destructuring: `let (a, b, ...) = (x, y, ...);`. Each
+                // name becomes its own top-level local; the rhs MUST be a
+                // tuple literal of matching arity (more general fn-tuple-
+                // returns awaits sret ABI).
+                if matches!(self.peek(0), Tok::LParen) {
+                    self.bump();
+                    let mut names = Vec::new();
+                    while !matches!(self.peek(0), Tok::RParen) {
+                        names.push(self.expect_ident()?);
+                        if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    }
+                    self.expect(Tok::RParen)?;
+                    self.expect(Tok::Eq)?;
+                    let value = self.parse_expr()?;
+                    self.expect(Tok::Semi)?;
+                    let _ = mutable;
+                    stmts.push(Stmt::LetTuple { names, value });
+                    continue;
+                }
                 let name = self.expect_ident()?;
                 let ty = if matches!(self.peek(0), Tok::Colon) {
                     self.bump();
@@ -443,12 +498,36 @@ impl Parser {
 
     fn parse_assign(&mut self) -> PResult<Expr> {
         let lhs = self.parse_or()?;
-        if matches!(self.peek(0), Tok::Eq) {
+        // Compound assignments desugar to `lhs = lhs <op> rhs`. The lhs has
+        // to be evaluated TWICE textually but that's fine because lvalues
+        // here are bare idents / field paths / array indices — pure address
+        // computations with no side effects. (When method-call lvalues
+        // appear someday, this will need a temporary.)
+        let compound_op = match self.peek(0) {
+            Tok::Eq      => return self.finish_assign(lhs),
+            Tok::PlusEq  => Some(BinOp::Add),
+            Tok::MinusEq => Some(BinOp::Sub),
+            Tok::StarEq  => Some(BinOp::Mul),
+            Tok::SlashEq => Some(BinOp::Div),
+            _ => None,
+        };
+        if let Some(op) = compound_op {
             self.bump();
             let rhs = self.parse_assign()?;
-            return Ok(Expr::Bin { op: BinOp::Assign, lhs: Box::new(lhs), rhs: Box::new(rhs) });
+            let new_rhs = Expr::Bin { op, lhs: Box::new(lhs.clone()), rhs: Box::new(rhs) };
+            return Ok(Expr::Bin {
+                op: BinOp::Assign,
+                lhs: Box::new(lhs),
+                rhs: Box::new(new_rhs),
+            });
         }
         Ok(lhs)
+    }
+
+    fn finish_assign(&mut self, lhs: Expr) -> PResult<Expr> {
+        self.bump(); // =
+        let rhs = self.parse_assign()?;
+        Ok(Expr::Bin { op: BinOp::Assign, lhs: Box::new(lhs), rhs: Box::new(rhs) })
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
@@ -508,15 +587,33 @@ impl Parser {
     }
 
     fn parse_bitand(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_add()?;
+        let mut lhs = self.parse_shift()?;
         // Single `&` is overloaded with the address-of-prefix-form. Postfix
         // here can never be confused: `&` between two complete expressions
         // is bitwise AND. Address-of only appears at the START of an expr
         // and is parsed in parse_unary.
         while matches!(self.peek(0), Tok::Amp) {
             self.bump();
-            let rhs = self.parse_add()?;
+            let rhs = self.parse_shift()?;
             lhs = Expr::Bin { op: BinOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> PResult<Expr> {
+        // Bitwise shifts. `<<` and `>>` lex as TWO tokens (Lt+Lt / Gt+Gt) so
+        // they don't conflict with generic-args `Vec<Vec<T>>`. Here we peek
+        // two-deep to recognise the shift pair.
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op = match (self.peek(0), self.peek(1)) {
+                (Tok::Lt, Tok::Lt) => BinOp::Shl,
+                (Tok::Gt, Tok::Gt) => BinOp::Shr,
+                _ => break,
+            };
+            self.bump(); self.bump();
+            let rhs = self.parse_add()?;
+            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
         Ok(lhs)
     }
@@ -570,6 +667,25 @@ impl Parser {
                 let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
                 Ok(Expr::Ref { mutable, expr: Box::new(self.parse_unary()?) })
             }
+            // `|x| expr` or `|x: T, y: T| expr` — closure literal. Position
+            // disambiguates against bitwise `|` (which only appears between
+            // two complete expressions, never at the start of a unary slot).
+            Tok::Pipe => {
+                self.bump();
+                let mut params = Vec::new();
+                while !matches!(self.peek(0), Tok::Pipe) {
+                    let name = self.expect_ident()?;
+                    let ty = if matches!(self.peek(0), Tok::Colon) {
+                        self.bump();
+                        Some(self.parse_ty()?)
+                    } else { None };
+                    params.push((name, ty));
+                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                }
+                self.expect(Tok::Pipe)?;
+                let body = self.parse_expr()?;
+                Ok(Expr::Closure { params, body: Box::new(body) })
+            }
             _ => self.parse_postfix(),
         }
     }
@@ -585,6 +701,14 @@ impl Parser {
                 }
                 Tok::Dot => {
                     self.bump();
+                    // Tuple field syntax: `.0`, `.1`, etc. Numeric index is
+                    // converted to the synthetic `<base>.<n>` slot key by the
+                    // asm backend.
+                    if let Tok::IntLit(n) = self.peek(0).clone() {
+                        self.bump();
+                        e = Expr::Field { recv: Box::new(e), name: n.to_string() };
+                        continue;
+                    }
                     let name = self.expect_ident()?;
                     if matches!(self.peek(0), Tok::LParen) {
                         self.bump();
@@ -608,6 +732,13 @@ impl Parser {
                     let idx = self.parse_expr()?;
                     self.expect(Tok::RBracket)?;
                     e = Expr::Index { recv: Box::new(e), idx: Box::new(idx) };
+                }
+                Tok::Question => {
+                    // `expr?` — postfix try-operator.  Wrap the lhs in
+                    // `Expr::Try(...)`; the asm backend desugars this to
+                    // tag-check + early-return propagation.
+                    self.bump();
+                    e = Expr::Try(Box::new(e));
                 }
                 _ => return Ok(e),
             }
@@ -644,9 +775,25 @@ impl Parser {
             Tok::False => { self.bump(); Ok(Expr::BoolLit(false)) }
             Tok::LParen => {
                 self.bump();
-                let e = self.parse_expr()?;
+                // `()` parses as Unit-typed something (currently unused as an
+                // expression — but keeps the parser symmetric).
+                if matches!(self.peek(0), Tok::RParen) {
+                    self.bump();
+                    return Ok(Expr::Tuple(Vec::new()));
+                }
+                let first = self.parse_expr()?;
+                if matches!(self.peek(0), Tok::Comma) {
+                    self.bump();
+                    let mut elems = vec![first];
+                    while !matches!(self.peek(0), Tok::RParen) {
+                        elems.push(self.parse_expr()?);
+                        if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    }
+                    self.expect(Tok::RParen)?;
+                    return Ok(Expr::Tuple(elems));
+                }
                 self.expect(Tok::RParen)?;
-                Ok(e)
+                Ok(first)
             }
             Tok::LBrace => Ok(Expr::Block(self.parse_block()?)),
             Tok::If => {
@@ -655,7 +802,15 @@ impl Parser {
                 let then = self.parse_block()?;
                 let else_ = if matches!(self.peek(0), Tok::Else) {
                     self.bump();
-                    Some(self.parse_block()?)
+                    // `else if cond { ... }` desugars to `else { if cond { ... } }`
+                    // so the chain composes the same way as Rust without nested
+                    // braces in source.
+                    if matches!(self.peek(0), Tok::If) {
+                        let nested = self.parse_atom()?; // recurses into the If arm
+                        Some(Block { stmts: Vec::new(), tail: Some(Box::new(nested)) })
+                    } else {
+                        Some(self.parse_block()?)
+                    }
                 } else { None };
                 Ok(Expr::If { cond: Box::new(cond), then, else_ })
             }

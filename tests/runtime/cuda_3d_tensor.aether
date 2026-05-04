@@ -1,0 +1,35 @@
+// roadmap: P7.2
+// expect: exit=0
+// requires: cuda
+//
+// 3D Tensor support: `Tensor<f32, [B, S, D]>` for transformer-style
+// batched-sequence inputs. matmul on a 3D recv flattens the leading
+// dims (B*S) so cuBLAS sees a single sgemm â€” no reshape allocation.
+use runtime;
+
+const BB: i32 = 4;
+const SS: i32 = 8;
+const DD: i32 = 16;
+const FF: i32 = 32;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x: i64 = aether_alloc_f32(512);   // BB*SS*DD
+    let h_w: i64 = aether_alloc_f32(512);   // DD*FF
+    aether_init_normal_f32(h_x, 512, 1.0, 1);
+    aether_init_normal_f32(h_w, 512, 0.1, 7);
+
+    let x: Tensor<f32, [BB, SS, DD]>;
+    let w: Tensor<f32, [DD, FF]>;
+    let y: Tensor<f32, [BB, SS, FF]>;
+    aether_dev_h2d_f32(h_x, x, 512);
+    aether_dev_h2d_f32(h_w, w, 512);
+
+    x.matmul(&w, &mut y);
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 512);
+    aether_free_f32(h_w, 512);
+    0
+}

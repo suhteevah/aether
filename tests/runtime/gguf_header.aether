@@ -1,0 +1,43 @@
+// roadmap: P7.4
+// expect: exit=0
+//
+// GGUF header parser witness. Hand-builds the first 24 bytes of a GGUF
+// file: "GGUF" magic, u32 version=3, u64 tensor_count=2, u64 metadata=5.
+// Asserts the parser returns each field correctly. Does NOT exercise
+// quant dequantization — that's the L follow-on for P7.4.
+use runtime;
+
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(24);
+    if buf == 0 { return 1; }
+
+    aether_byte_set(buf, 0, 71);  // 'G'
+    aether_byte_set(buf, 1, 71);  // 'G'
+    aether_byte_set(buf, 2, 85);  // 'U'
+    aether_byte_set(buf, 3, 70);  // 'F'
+
+    aether_byte_set(buf, 4, 3); aether_byte_set(buf, 5, 0);
+    aether_byte_set(buf, 6, 0); aether_byte_set(buf, 7, 0);
+
+    aether_byte_set(buf,  8, 2); aether_byte_set(buf,  9, 0);
+    aether_byte_set(buf, 10, 0); aether_byte_set(buf, 11, 0);
+    aether_byte_set(buf, 12, 0); aether_byte_set(buf, 13, 0);
+    aether_byte_set(buf, 14, 0); aether_byte_set(buf, 15, 0);
+
+    aether_byte_set(buf, 16, 5); aether_byte_set(buf, 17, 0);
+    aether_byte_set(buf, 18, 0); aether_byte_set(buf, 19, 0);
+    aether_byte_set(buf, 20, 0); aether_byte_set(buf, 21, 0);
+    aether_byte_set(buf, 22, 0); aether_byte_set(buf, 23, 0);
+
+    let n: i64 = 24;
+    if gguf_parse_magic(buf, n)    != 1 { return 2; }
+    if gguf_version(buf, n)        != 3 { return 3; }
+    if gguf_tensor_count(buf, n)   != 2 { return 4; }
+    if gguf_metadata_count(buf, n) != 5 { return 5; }
+
+    aether_byte_set(buf, 0, 88);
+    if gguf_parse_magic(buf, n) != 0 { return 6; }
+
+    aether_free_bytes(buf, 24);
+    0
+}

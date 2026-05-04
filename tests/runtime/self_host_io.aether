@@ -1,0 +1,38 @@
+// roadmap: P9.1
+// expect: stdout contains Hello, Aether!
+// requires: cuda
+// (cuda gate: forces the audit to use the libaether_rt.a built with cuda
+// â€” same lib hosts the new I/O primitives. Test itself does NOT use GPU.)
+//
+// Self-host bootstrap I/O primitives smoke test:
+//   aether_alloc_bytes / aether_byte_set / aether_byte_at /
+//   aether_print_bytes / aether_free_bytes.
+// Builds the string "Hello, Aether!\n" byte-by-byte in an alloc'd
+// buffer, prints it, frees, exits 0.
+use runtime;
+
+fn main() -> i32 {
+    let n: i64 = 16;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 1; }
+    aether_byte_set(buf,  0, 72);   // 'H'
+    aether_byte_set(buf,  1, 101);  // 'e'
+    aether_byte_set(buf,  2, 108);  // 'l'
+    aether_byte_set(buf,  3, 108);  // 'l'
+    aether_byte_set(buf,  4, 111);  // 'o'
+    aether_byte_set(buf,  5, 44);   // ','
+    aether_byte_set(buf,  6, 32);   // ' '
+    aether_byte_set(buf,  7, 65);   // 'A'
+    aether_byte_set(buf,  8, 101);  // 'e'
+    aether_byte_set(buf,  9, 116);  // 't'
+    aether_byte_set(buf, 10, 104);  // 'h'
+    aether_byte_set(buf, 11, 101);  // 'e'
+    aether_byte_set(buf, 12, 114);  // 'r'
+    aether_byte_set(buf, 13, 33);   // '!'
+    aether_byte_set(buf, 14, 10);   // '\n'
+    aether_print_bytes(buf, 15);
+    // Round-trip read.
+    let h = aether_byte_at(buf, 0);
+    aether_free_bytes(buf, n);
+    if h == 72 { 0 } else { 1 }
+}

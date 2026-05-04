@@ -1,0 +1,7 @@
+// Synthesised body for `add_two`. The spec pass in compiler/src/mir/spec.rs
+// looks for this file when `add_two` carries a `#[spec(...)]` attribute,
+// parses the fn out of it, and splices the body into the original decl.
+// The signature MUST match — params + names + types + return type.
+fn add_two(a: i64, b: i64) -> i64 {
+    a + b
+}

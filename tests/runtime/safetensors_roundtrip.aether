@@ -1,0 +1,94 @@
+// roadmap: P7.5
+// expect: exit=0
+//
+// SafeTensors round-trip witness. Hand-builds a minimal SafeTensors blob
+// for a single f32 tensor "w" of shape [2,2] with values [1.0,2.0,3.0,4.0]:
+//   - 8-byte little-endian header length (= 57)
+//   - 57 bytes JSON: {"w":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}
+//   - 16-byte raw f32 payload
+// Writes to disk via aether_write_file, reads back via aether_read_file,
+// then exercises the stdlib parser (`safetensors_parse_header` +
+// `safetensors_get_tensor_f32`) and asserts the recovered f32 values are
+// bit-equal to the originals. Exit 0 on success; nonzero codes localise
+// the failure (1=alloc, 2=write, 3=read, 4=hdr-mismatch, 5=lookup-fail,
+// 6..9 = value mismatch on element 0..3).
+use runtime;
+
+fn main() -> i32 {
+    let json_len: i64 = 57;
+    let payload_len: i64 = 16;
+    let total_len: i64 = 8 + json_len + payload_len;
+
+    let buf: i64 = aether_alloc_bytes(total_len);
+    if buf == 0 { return 1; }
+
+    // 8-byte LE header length = 57.
+    aether_byte_set(buf, 0, 57);
+    aether_byte_set(buf, 1, 0);
+    aether_byte_set(buf, 2, 0);
+    aether_byte_set(buf, 3, 0);
+    aether_byte_set(buf, 4, 0);
+    aether_byte_set(buf, 5, 0);
+    aether_byte_set(buf, 6, 0);
+    aether_byte_set(buf, 7, 0);
+
+    // {"w":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]}}
+    let json: [i64; 57];
+    json[ 0]=123; json[ 1]= 34; json[ 2]=119; json[ 3]= 34; json[ 4]= 58;
+    json[ 5]=123; json[ 6]= 34; json[ 7]=100; json[ 8]=116; json[ 9]=121;
+    json[10]=112; json[11]=101; json[12]= 34; json[13]= 58; json[14]= 34;
+    json[15]= 70; json[16]= 51; json[17]= 50; json[18]= 34; json[19]= 44;
+    json[20]= 34; json[21]=115; json[22]=104; json[23]= 97; json[24]=112;
+    json[25]=101; json[26]= 34; json[27]= 58; json[28]= 91; json[29]= 50;
+    json[30]= 44; json[31]= 50; json[32]= 93; json[33]= 44; json[34]= 34;
+    json[35]=100; json[36]= 97; json[37]=116; json[38]= 97; json[39]= 95;
+    json[40]=111; json[41]=102; json[42]=102; json[43]=115; json[44]=101;
+    json[45]=116; json[46]=115; json[47]= 34; json[48]= 58; json[49]= 91;
+    json[50]= 48; json[51]= 44; json[52]= 49; json[53]= 54; json[54]= 93;
+    json[55]=125; json[56]=125;
+    let mut i = 0;
+    while i < json_len {
+        aether_byte_set(buf, 8 + i, json[i]);
+        i = i + 1;
+    }
+
+    // f32 payload [1.0,2.0,3.0,4.0] little-endian IEEE-754:
+    //   1.0=0x3F800000  2.0=0x40000000  3.0=0x40400000  4.0=0x40800000
+    let off: i64 = 8 + json_len;
+    aether_byte_set(buf, off+ 0,   0); aether_byte_set(buf, off+ 1,   0);
+    aether_byte_set(buf, off+ 2, 128); aether_byte_set(buf, off+ 3,  63);
+    aether_byte_set(buf, off+ 4,   0); aether_byte_set(buf, off+ 5,   0);
+    aether_byte_set(buf, off+ 6,   0); aether_byte_set(buf, off+ 7,  64);
+    aether_byte_set(buf, off+ 8,   0); aether_byte_set(buf, off+ 9,   0);
+    aether_byte_set(buf, off+10,  64); aether_byte_set(buf, off+11,  64);
+    aether_byte_set(buf, off+12,   0); aether_byte_set(buf, off+13,   0);
+    aether_byte_set(buf, off+14, 128); aether_byte_set(buf, off+15,  64);
+
+    if aether_write_file("target/audit-tmp/_roundtrip.safetensors", buf, total_len) != 0 {
+        return 2;
+    }
+
+    let rd: i64 = aether_read_file("target/audit-tmp/_roundtrip.safetensors");
+    if rd == 0 { return 3; }
+    let rd_len: i64 = aether_file_size_last();
+    if rd_len != total_len { return 3; }
+
+    let hdr_len: i64 = safetensors_parse_header(rd, rd_len);
+    if hdr_len != json_len { return 4; }
+
+    let data: i64 = safetensors_get_tensor_f32(rd, rd_len, "w", 1);
+    if data == 0 { return 5; }
+
+    let v0: f32 = aether_load_f32(data, 0);
+    let v1: f32 = aether_load_f32(data, 1);
+    let v2: f32 = aether_load_f32(data, 2);
+    let v3: f32 = aether_load_f32(data, 3);
+    if v0 != 1.0 { return 6; }
+    if v1 != 2.0 { return 7; }
+    if v2 != 3.0 { return 8; }
+    if v3 != 4.0 { return 9; }
+
+    aether_free_bytes(rd, rd_len);
+    aether_free_bytes(buf, total_len);
+    0
+}

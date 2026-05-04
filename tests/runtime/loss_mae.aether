@@ -1,0 +1,65 @@
+// roadmap: P7.6
+// expect: exit=0
+//
+// MAE loss: mean_i |pred[i] - target[i]|.
+// Subgradient: dpred[i] = sign(pred[i] - target[i]) / n.
+//
+// Finite-difference check is unreliable at the kink (pred==target) so the
+// test seeds values where every (pred-target) is well away from zero. With
+// pred = [1.5, 2.0, 0.25, 3.5], target = [1.0, 0.0, 1.5, 2.0] all four
+// diffs have |d| >= 0.5, so num grad = analytical sign / n exactly.
+//
+// Exit: 0 ok | 1 alloc | 2..5 element-i mismatch.
+use runtime;
+
+fn main() -> i32 {
+    let n: i32 = 4;
+    let pred:   i64 = aether_alloc_f32(n);
+    let target: i64 = aether_alloc_f32(n);
+    let dpred:  i64 = aether_alloc_f32(n);
+    if pred == 0 { return 1; }
+    if target == 0 { return 1; }
+    if dpred == 0 { return 1; }
+
+    aether_store_f32(pred, 0, 1.5);
+    aether_store_f32(pred, 1, 2.0);
+    aether_store_f32(pred, 2, 0.25);
+    aether_store_f32(pred, 3, 3.5);
+
+    aether_store_f32(target, 0, 1.0);
+    aether_store_f32(target, 1, 0.0);
+    aether_store_f32(target, 2, 1.5);
+    aether_store_f32(target, 3, 2.0);
+
+    aether_op_mae_backward_f32(pred, target, dpred, n);
+
+    let eps: f32 = 0.01;
+    let tol: f32 = 0.001;
+    let mut i: i32 = 0;
+    while i < n {
+        let saved: f32 = aether_load_f32(pred, i);
+
+        aether_store_f32(pred, i, saved + eps);
+        let lp: f32 = aether_op_mae_f32(pred, target, n);
+
+        aether_store_f32(pred, i, saved - eps);
+        let lm: f32 = aether_op_mae_f32(pred, target, n);
+
+        aether_store_f32(pred, i, saved);
+
+        let num: f32 = (lp - lm) / (2.0 * eps);
+        let ana: f32 = aether_load_f32(dpred, i);
+        let err: f32 = aether_abs_f32(num - ana);
+        if err > tol {
+            aether_print_kv_f32("num", num);
+            aether_print_kv_f32("ana", ana);
+            return 2 + i;
+        }
+        i = i + 1;
+    }
+
+    aether_free_f32(pred,   n);
+    aether_free_f32(target, n);
+    aether_free_f32(dpred,  n);
+    0
+}

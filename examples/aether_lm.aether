@@ -1,140 +1,218 @@
-// AetherLM-Tiny - byte-level decoder transformer in pure Aether.
+// AetherLM-Tiny — runnable transformer block trained end-to-end on
+// a single RTX 3070 Ti, ENTIRELY from this .aether source. No Python,
+// no PyTorch, no candle — `aetherc <this> --emit=aether-bin -o
+// aether_lm.exe` produces a binary that trains and prints the loss curve.
 //
-// Targets:
-//   train -> single RTX 3070 Ti  (8 GB, bf16 + AMP, batch 32, seq 256)
-//   serve -> same card, paged KV cache
+// Architecture (single pre-norm transformer block + classification head):
+//   x_after_attn = x + Wo @ (softmax(Q @ K^T / sqrt(D)) @ V)         (residual 1)
+//   x_norm       = LN(x_after_attn; gamma, beta)
+//   block_out    = x_after_attn + w2 @ gelu(w1 @ x_norm)              (residual 2)
+//   logits       = block_out @ w_head
+//   loss         = cross_entropy(logits, labels)
 //
-// Spec:
-//   vocab     = 256          (raw bytes, no tokenizer)
-//   d_model   = 320
-//   n_layers  = 6
-//   n_heads   = 5            (head_dim 64)
-//   d_ff      = 1280
-//   seq_len   = 256
-//   params   ~= 7.46 M
+// 9 learnable parameter tensors: Wq, Wk, Wv, Wo, gamma, beta, w1, w2, w_head.
+// Backward closes through every kernel (softmax_bwd + matmul_tn for dK +
+// matmul_nt for dattn + layer_norm_bwd_dx + layer_norm_bwd_params + gelu_bwd).
+// AdamW step on every parameter.
 //
-// Every op is a forward decl into libaether_rt (aether::ops::*). Phase 0
-// stubs return without computing; Phase 1 routes the same symbols to
-// cuBLAS / cuDNN. The Aether source never changes.
+// The aspirational spec (multi-block, embeddings, KV cache, distributed
+// training) lives at `examples/aether_lm_spec.aether`. THIS file is the
+// real-running flagship.
+use runtime;
 
-module models::aether_lm;
+const SS:  i32 = 16;     // sequence length (cross-entropy batch axis)
+const DD:  i32 = 32;     // model dim / head dim
+const HH:  i32 = 64;     // mlp hidden
+const NN:  i32 = 8;      // num classes
+const DSQ: i32 = 1024;   // DD*DD  -- AdamW state size for projections
+const DH:  i32 = 2048;   // DD*HH
+const HD:  i32 = 2048;   // HH*DD
+const DON: i32 = 256;    // DD*NN
 
-use core::tensor::Tensor;
-use aether::nn::Linear;
-use aether::nn::Embedding;
-use aether::nn::LayerNorm;
-use aether::ops::cross_entropy_f32;
-use aether::ops::scaled_dot_product_attention_f32;
-use aether::ops::gelu_f32;
-use aether::ops::softmax_f32;
-use aether::optim::adamw_step_f32;
+fn main() -> i32 {
+    aether_dev_init();
 
-const VOCAB: i64 = 256;
-const D_MODEL: i64 = 320;
-const N_LAYERS: i64 = 6;
-const N_HEADS: i64 = 5;
-const HEAD_DIM: i64 = 64;
-const D_FF: i64 = 1280;
-const SEQ_LEN: i64 = 256;
+    // === Host weight init ===
+    let h_x:    i64 = aether_alloc_f32(512);     // SS*DD
+    let h_wq:   i64 = aether_alloc_f32(1024);
+    let h_wk:   i64 = aether_alloc_f32(1024);
+    let h_wv:   i64 = aether_alloc_f32(1024);
+    let h_wo:   i64 = aether_alloc_f32(1024);
+    let h_g:    i64 = aether_alloc_f32(32);
+    let h_b:    i64 = aether_alloc_f32(32);
+    let h_w1:   i64 = aether_alloc_f32(2048);    // DD*HH
+    let h_w2:   i64 = aether_alloc_f32(2048);    // HH*DD
+    let h_whd:  i64 = aether_alloc_f32(256);     // DD*NN
+    let h_lab:  i64 = aether_alloc_i32(16);
+    aether_init_normal_f32(h_x,  512, 1.0, 1);
+    aether_init_normal_f32(h_wq, 1024, 0.1, 7);
+    aether_init_normal_f32(h_wk, 1024, 0.1, 11);
+    aether_init_normal_f32(h_wv, 1024, 0.1, 13);
+    aether_init_normal_f32(h_wo, 1024, 0.1, 17);
+    aether_init_constant_f32(h_g, 32, 1.0);
+    aether_init_constant_f32(h_b, 32, 0.0);
+    aether_init_normal_f32(h_w1, 2048, 0.1, 19);
+    aether_init_normal_f32(h_w2, 2048, 0.1, 23);
+    aether_init_normal_f32(h_whd, 256, 0.1, 29);
+    aether_fill_labels_i32(h_lab, 16, 8, 31);
 
-// --- attention ---------------------------------------------------------
+    // === Device tensors (auto-alloc, auto-free at fn end) ===
+    let x:        Tensor<f32, [SS, DD]>;
+    let wq:       Tensor<f32, [DD, DD]>;
+    let wk:       Tensor<f32, [DD, DD]>;
+    let wv:       Tensor<f32, [DD, DD]>;
+    let wo:       Tensor<f32, [DD, DD]>;
+    let gamma:    Tensor<f32, [DD]>;
+    let beta:     Tensor<f32, [DD]>;
+    let w1:       Tensor<f32, [DD, HH]>;
+    let w2:       Tensor<f32, [HH, DD]>;
+    let whd:      Tensor<f32, [DD, NN]>;
+    // forward intermediates
+    let q:        Tensor<f32, [SS, DD]>;
+    let k:        Tensor<f32, [SS, DD]>;
+    let v:        Tensor<f32, [SS, DD]>;
+    let scores:   Tensor<f32, [SS, SS]>;
+    let attn:     Tensor<f32, [SS, SS]>;
+    let ctx_buf:  Tensor<f32, [SS, DD]>;
+    let attn_out: Tensor<f32, [SS, DD]>;
+    let x_aa:     Tensor<f32, [SS, DD]>;
+    let ln_mean:  Tensor<f32, [SS]>;
+    let ln_rstd:  Tensor<f32, [SS]>;
+    let x_norm:   Tensor<f32, [SS, DD]>;
+    let h_pre:    Tensor<f32, [SS, HH]>;
+    let h_act:    Tensor<f32, [SS, HH]>;
+    let proj:     Tensor<f32, [SS, DD]>;
+    let block_out:Tensor<f32, [SS, DD]>;
+    let logits:   Tensor<f32, [SS, NN]>;
+    let probs:    Tensor<f32, [SS, NN]>;
+    // backward intermediates
+    let dlogits:  Tensor<f32, [SS, NN]>;
+    let dwhd:     Tensor<f32, [DD, NN]>;
+    let dblock:   Tensor<f32, [SS, DD]>;
+    let dh_act:   Tensor<f32, [SS, HH]>;
+    let dh_pre:   Tensor<f32, [SS, HH]>;
+    let dw1:      Tensor<f32, [DD, HH]>;
+    let dw2:      Tensor<f32, [HH, DD]>;
+    let dx_norm:  Tensor<f32, [SS, DD]>;
+    let dx_aa_ln: Tensor<f32, [SS, DD]>;
+    let dgamma:   Tensor<f32, [DD]>;
+    let dbeta:    Tensor<f32, [DD]>;
+    let dx_aa:    Tensor<f32, [SS, DD]>;
+    let dctx:     Tensor<f32, [SS, DD]>;
+    let dwo:      Tensor<f32, [DD, DD]>;
+    let dattn:    Tensor<f32, [SS, SS]>;
+    let dv:       Tensor<f32, [SS, DD]>;
+    let dscores:  Tensor<f32, [SS, SS]>;
+    let dq:       Tensor<f32, [SS, DD]>;
+    let dk:       Tensor<f32, [SS, DD]>;
+    let dwq:      Tensor<f32, [DD, DD]>;
+    let dwk:      Tensor<f32, [DD, DD]>;
+    let dwv:      Tensor<f32, [DD, DD]>;
+    // adamw state (m + v) for every parameter
+    let m_wq: Tensor<f32, [DSQ]>; let v_wq: Tensor<f32, [DSQ]>;
+    let m_wk: Tensor<f32, [DSQ]>; let v_wk: Tensor<f32, [DSQ]>;
+    let m_wv: Tensor<f32, [DSQ]>; let v_wv: Tensor<f32, [DSQ]>;
+    let m_wo: Tensor<f32, [DSQ]>; let v_wo: Tensor<f32, [DSQ]>;
+    let m_g:  Tensor<f32, [DD]>;  let v_g:  Tensor<f32, [DD]>;
+    let m_b:  Tensor<f32, [DD]>;  let v_b:  Tensor<f32, [DD]>;
+    let m_w1: Tensor<f32, [DH]>;  let v_w1: Tensor<f32, [DH]>;
+    let m_w2: Tensor<f32, [HD]>;  let v_w2: Tensor<f32, [HD]>;
+    let m_whd:Tensor<f32, [DON]>; let v_whd:Tensor<f32, [DON]>;
+    let labels: Tensor<i32, [SS]>;
 
-#[autodiff]
-fn causal_attention(
-    q: &Tensor<f32, [B, H, S, D]>,
-    k: &Tensor<f32, [B, H, S, D]>,
-    v: &Tensor<f32, [B, H, S, D]>,
-) -> Tensor<f32, [B, H, S, D]> {
-    let scale = 0.125;
-    let scores = q.matmul(k.transpose());
-    let masked = scores.causal_mask().scale(scale);
-    let attn = masked.softmax();
-    attn.matmul(v)
-}
+    aether_dev_h2d_f32(h_x,   x,   512);
+    aether_dev_h2d_f32(h_wq,  wq,  1024);
+    aether_dev_h2d_f32(h_wk,  wk,  1024);
+    aether_dev_h2d_f32(h_wv,  wv,  1024);
+    aether_dev_h2d_f32(h_wo,  wo,  1024);
+    aether_dev_h2d_f32(h_g,   gamma, 32);
+    aether_dev_h2d_f32(h_b,   beta,  32);
+    aether_dev_h2d_f32(h_w1,  w1, 2048);
+    aether_dev_h2d_f32(h_w2,  w2, 2048);
+    aether_dev_h2d_f32(h_whd, whd, 256);
+    aether_dev_h2d_i32(h_lab, labels, 16);
 
-// --- feed-forward ------------------------------------------------------
+    let t_start: i64 = aether_wall_us();
+    let mut step: i64 = 1;
+    let mut initial_loss: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    while step <= 100 {
+        // === Forward ===
+        x.matmul(&wq, &mut q);
+        x.matmul(&wk, &mut k);
+        x.matmul(&wv, &mut v);
+        q.matmul_t(&k, &mut scores);
+        scores.scale(0.1767767);                          // 1/sqrt(DD=32)
+        scores.softmax(&mut attn);
+        attn.matmul(&v, &mut ctx_buf);
+        ctx_buf.matmul(&wo, &mut attn_out);
+        x.add(&attn_out, &mut x_aa);                      // residual 1
+        // Note: `x_aa.add(...)` followed by `... .layer_norm(...)` would
+        // fuse via the MIR pass; we keep them separate here so the
+        // forward-cached mean/rstd are written under the unfused entry.
+        x_aa.layer_norm(&gamma, &beta, &mut x_norm, &mut ln_mean, &mut ln_rstd, 0.00001);
+        x_norm.matmul(&w1, &mut h_pre);
+        h_pre.gelu(&mut h_act);
+        h_act.matmul(&w2, &mut proj);
+        x_aa.add(&proj, &mut block_out);                  // residual 2
+        block_out.matmul(&whd, &mut logits);
+        let loss: f32 = logits.cross_entropy(&labels, &mut probs);
+        if step == 1   { initial_loss = loss; aether_print_kv_f32("initial loss", loss); }
+        if step == 25  { aether_print_kv_f32("step 25 loss", loss); }
+        if step == 50  { aether_print_kv_f32("step 50 loss", loss); }
+        if step == 75  { aether_print_kv_f32("step 75 loss", loss); }
+        if step == 100 { aether_print_kv_f32("final loss",   loss); final_loss = loss; }
+        // === Backward ===
+        probs.cross_entropy_backward(&labels, &mut dlogits);
+        block_out.matmul_backward_rhs(&dlogits, &mut dwhd);
+        dlogits.matmul_backward_lhs(&whd, &mut dblock);
+        h_act.matmul_backward_rhs(&dblock, &mut dw2);
+        dblock.matmul_backward_lhs(&w2, &mut dh_act);
+        h_pre.gelu_backward(&dh_act, &mut dh_pre);
+        x_norm.matmul_backward_rhs(&dh_pre, &mut dw1);
+        dh_pre.matmul_backward_lhs(&w1, &mut dx_norm);
+        x_aa.layer_norm_backward_params(&ln_mean, &ln_rstd, &dx_norm, &mut dgamma, &mut dbeta);
+        x_aa.layer_norm_backward_dx(&gamma, &ln_mean, &ln_rstd, &dx_norm, &mut dx_aa_ln);
+        dx_aa_ln.add(&dblock, &mut dx_aa);
+        ctx_buf.matmul_backward_rhs(&dx_aa, &mut dwo);
+        dx_aa.matmul_backward_lhs(&wo, &mut dctx);
+        dctx.matmul_t(&v, &mut dattn);
+        attn.matmul_tn(&dctx, &mut dv);
+        attn.softmax_backward(&dattn, &mut dscores);
+        dscores.scale(0.1767767);
+        dscores.matmul(&k, &mut dq);
+        dscores.matmul_tn(&q, &mut dk);
+        x.matmul_backward_rhs(&dq, &mut dwq);
+        x.matmul_backward_rhs(&dk, &mut dwk);
+        x.matmul_backward_rhs(&dv, &mut dwv);
+        // === Optim ===
+        wq.adamw_step(&dwq, &mut m_wq, &mut v_wq, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wk.adamw_step(&dwk, &mut m_wk, &mut v_wk, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wv.adamw_step(&dwv, &mut m_wv, &mut v_wv, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wo.adamw_step(&dwo, &mut m_wo, &mut v_wo, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        gamma.adamw_step(&dgamma, &mut m_g, &mut v_g, 0.01, 0.9, 0.999, 0.00000001, 0.0, step);
+        beta.adamw_step(&dbeta,   &mut m_b, &mut v_b, 0.01, 0.9, 0.999, 0.00000001, 0.0, step);
+        w1.adamw_step(&dw1, &mut m_w1, &mut v_w1, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        w2.adamw_step(&dw2, &mut m_w2, &mut v_w2, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        whd.adamw_step(&dwhd, &mut m_whd, &mut v_whd, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        step = step + 1;
+    }
+    aether_dev_sync();
+    let t_end: i64 = aether_wall_us();
+    let elapsed_ms: i64 = (t_end - t_start) / 1000;
+    aether_print_kv_i64("elapsed_ms", elapsed_ms);
 
-#[autodiff]
-fn ffn(x: &Tensor<f32, [B, S, D]>, w1: &Tensor<f32, [D, F]>, w2: &Tensor<f32, [F, D]>)
-    -> Tensor<f32, [B, S, D]>
-{
-    let h = x.matmul(w1).gelu();
-    h.matmul(w2)
-}
+    aether_free_f32(h_x, 512);
+    aether_free_f32(h_wq, 1024);
+    aether_free_f32(h_wk, 1024);
+    aether_free_f32(h_wv, 1024);
+    aether_free_f32(h_wo, 1024);
+    aether_free_f32(h_g, 32);
+    aether_free_f32(h_b, 32);
+    aether_free_f32(h_w1, 2048);
+    aether_free_f32(h_w2, 2048);
+    aether_free_f32(h_whd, 256);
+    aether_free_i32(h_lab, 16);
 
-// --- transformer block -------------------------------------------------
-
-pub struct Block {
-    ln1: LayerNorm<D_MODEL>,
-    qkv: Linear<D_MODEL, 960>,    // 3 * d_model
-    out: Linear<D_MODEL, D_MODEL>,
-    ln2: LayerNorm<D_MODEL>,
-    fc1: Linear<D_MODEL, D_FF>,
-    fc2: Linear<D_FF, D_MODEL>,
-}
-
-#[autodiff]
-fn block_forward(self: &Block, x: &Tensor<f32, [B, S, D]>)
-    -> Tensor<f32, [B, S, D]>
-{
-    let h1 = self.ln1.forward(x);
-    let qkv = self.qkv.forward(h1);
-    let attn = causal_attention(qkv.q(), qkv.k(), qkv.v());
-    let post_attn = self.out.forward(attn).add(x);
-    let h2 = self.ln2.forward(post_attn);
-    let mlp = ffn(h2, self.fc1.w, self.fc2.w);
-    mlp.add(post_attn)
-}
-
-// --- whole model -------------------------------------------------------
-
-pub struct AetherLm {
-    tok_emb: Embedding<VOCAB, D_MODEL>,
-    pos_emb: Embedding<SEQ_LEN, D_MODEL>,
-    blocks: Block,
-    ln_f: LayerNorm<D_MODEL>,
-}
-
-#[autodiff]
-fn forward(self: &AetherLm, idx: &Tensor<i32, [B, S]>) -> Tensor<f32, [B, S, V]> {
-    let pos = idx.arange_like();
-    let x = self.tok_emb.forward(idx).add(self.pos_emb.forward(pos));
-    let h = self.blocks.forward(x);
-    let z = self.ln_f.forward(h);
-    z.tied_lm_head(self.tok_emb.w)
-}
-
-// --- training ----------------------------------------------------------
-
-pub struct Batch {
-    input_ids: Tensor<i32, [B, S]>,
-    labels: Tensor<i32, [B, S]>,
-}
-
-#[autodiff]
-fn train_step(model: &mut AetherLm, batch: &Batch, optim_state: &mut OptimState) {
-    let logits = model.forward(&batch.input_ids);
-    let loss = logits.cross_entropy(&batch.labels);
-    loss.backward();
-    optim_state.adamw_step(&model);
-}
-
-// Multi-GPU variant. Exact same body, one extra attribute. Aetherc inserts
-// a ring all_reduce on `grads` at MIR before the optimiser step.
-#[autodiff]
-#[distributed(world_size=3, backend="nccl", algorithm="ring")]
-fn train_step_ddp(model: &mut AetherLm, batch: &Batch, optim_state: &mut OptimState) {
-    let logits = model.forward(&batch.input_ids);
-    let loss = logits.cross_entropy(&batch.labels);
-    loss.backward();
-    optim_state.adamw_step(&model);
-}
-
-// --- generation --------------------------------------------------------
-
-#[server(port=8080, continuous_batching=true, paged_attention=true)]
-fn serve(prompt: &Tensor<u8, [N]>) -> Tensor<u8, [M]> {
-    let model = AetherLm::load("checkpoints/aether_lm_tiny.safetensors");
-    let cache = PagedKVCache::new(2048, 64);
-    model.generate(prompt, cache, 256)
+    if final_loss < initial_loss { 0 } else { 1 }
 }

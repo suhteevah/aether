@@ -1,0 +1,50 @@
+// roadmap: P8.5
+// expect: exit=0
+//
+// TCP-primitive smoke test (P8.5 inference + serving).
+// Witnesses the listener bind+close path. Send/recv/accept are
+// exercised by the runtime unit tests in `runtime/src/lib.rs`
+// (search `tcp_send_recv_loopback`) which can spawn a peer thread;
+// doing the same from .aether requires fn-ptr threading which the
+// asm backend doesn't expose yet.
+//
+// Note: we test "second close fails" via `== 0` (success) rather than
+// `== -1` (the actual error code), because the asm backend doesn't yet
+// sign-extend i32 returns into the full rax slot — the upper bits of
+// rax can hold non-zero garbage from the prior call site, so an i32
+// `-1` doesn't compare equal to an i64 `-1`. Comparing against `== 0`
+// is robust either way: success vs failure, regardless of which
+// negative sentinel the runtime picked.
+use runtime;
+
+fn main() -> i32 {
+    // Bind ephemeral, read back the port, close.
+    let l: i64 = aether_tcp_listen(0);
+    if l < 0 { return 1; }
+    let p: i64 = aether_tcp_listener_port(l);
+    if p < 1 { return 2; }
+    if p > 65535 { return 3; }
+
+    // A second listener succeeds with a distinct handle.
+    let l2: i64 = aether_tcp_listen(0);
+    if l2 < 0 { return 4; }
+    if l2 == l { return 5; }
+
+    // Close both. First close must succeed (== 0); second close on the
+    // SAME handle must NOT succeed.
+    if aether_tcp_close(l) != 0 { return 6; }
+    if aether_tcp_close(l) == 0 { return 7; }
+    if aether_tcp_close(l2) != 0 { return 8; }
+
+    // Bogus handles must be rejected, not panic, not return 0.
+    if aether_tcp_close(9999) == 0 { return 9; }
+    if aether_tcp_stream_close(9999) == 0 { return 10; }
+
+    // After both listeners dropped, the next bind reuses slot 0.
+    let l3: i64 = aether_tcp_listen(0);
+    if l3 < 0 { return 11; }
+    if l3 != 0 { return 12; }
+    if aether_tcp_close(l3) != 0 { return 13; }
+
+    0
+}

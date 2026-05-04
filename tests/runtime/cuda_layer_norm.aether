@@ -1,0 +1,42 @@
+// roadmap: P7.3
+// expect: exit=0
+// requires: cuda
+//
+// LayerNorm forward sanity. Each row of x normalises to meanâ‰ˆ0 / varâ‰ˆ1
+// then is rescaled by gamma + beta. With gamma=1 / beta=0, y[i] should
+// have row-mean â‰ˆ 0 and row-rstd â‰ˆ 1/sqrt(var+eps) cached out.
+use runtime;
+
+const BSZ: i32 = 4;
+const DD:  i32 = 16;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:     i64 = aether_alloc_f32(64);   // BSZ*DD
+    let h_gamma: i64 = aether_alloc_f32(16);
+    let h_beta:  i64 = aether_alloc_f32(16);
+    aether_init_normal_f32(h_x, 64, 1.5, 1);
+    // gamma=1, beta=0 â€” so y is just the standardised x.
+    aether_init_constant_f32(h_gamma, 16, 1.0);
+    aether_init_constant_f32(h_beta, 16, 0.0);
+
+    let x:     Tensor<f32, [BSZ, DD]>;
+    let gamma: Tensor<f32, [DD]>;
+    let beta:  Tensor<f32, [DD]>;
+    let y:     Tensor<f32, [BSZ, DD]>;
+    let mean:  Tensor<f32, [BSZ]>;
+    let rstd:  Tensor<f32, [BSZ]>;
+
+    aether_dev_h2d_f32(h_x, x, 64);
+    aether_dev_h2d_f32(h_gamma, gamma, 16);
+    aether_dev_h2d_f32(h_beta, beta, 16);
+
+    x.layer_norm(&gamma, &beta, &mut y, &mut mean, &mut rstd, 0.00001);
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 64);
+    aether_free_f32(h_gamma, 16);
+    aether_free_f32(h_beta, 16);
+    0
+}

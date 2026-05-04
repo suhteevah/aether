@@ -1,0 +1,49 @@
+// expect: exit=0
+// requires: cuda
+//
+// MIR fusion: `x.add(&residual, &mut sum); sum.layer_norm(...);` collapses
+// to a single `x.add_layer_norm(...)` call. The single-kernel path reads
+// each row of (a + b) only once during the LN reduction (vs. add's full
+// pass through the buffer + LN's two passes).
+use runtime;
+
+const BSZ: i32 = 8;
+const DD:  i32 = 16;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_a:     i64 = aether_alloc_f32(128);
+    let h_b:     i64 = aether_alloc_f32(128);
+    let h_gamma: i64 = aether_alloc_f32(16);
+    let h_beta:  i64 = aether_alloc_f32(16);
+    aether_init_normal_f32(h_a, 128, 1.0, 1);
+    aether_init_normal_f32(h_b, 128, 0.5, 7);
+    aether_init_constant_f32(h_gamma, 16, 1.0);
+    aether_init_constant_f32(h_beta,  16, 0.0);
+
+    let a:    Tensor<f32, [BSZ, DD]>;
+    let b:    Tensor<f32, [BSZ, DD]>;
+    let gamma:Tensor<f32, [DD]>;
+    let beta: Tensor<f32, [DD]>;
+    let sum:  Tensor<f32, [BSZ, DD]>;
+    let out:  Tensor<f32, [BSZ, DD]>;
+    let mean: Tensor<f32, [BSZ]>;
+    let rstd: Tensor<f32, [BSZ]>;
+
+    aether_dev_h2d_f32(h_a, a, 128);
+    aether_dev_h2d_f32(h_b, b, 128);
+    aether_dev_h2d_f32(h_gamma, gamma, 16);
+    aether_dev_h2d_f32(h_beta,  beta,  16);
+
+    // Fusion candidate — gets collapsed.
+    a.add(&b, &mut sum);
+    sum.layer_norm(&gamma, &beta, &mut out, &mut mean, &mut rstd, 0.00001);
+
+    aether_dev_sync();
+    aether_free_f32(h_a, 128);
+    aether_free_f32(h_b, 128);
+    aether_free_f32(h_gamma, 16);
+    aether_free_f32(h_beta, 16);
+    0
+}

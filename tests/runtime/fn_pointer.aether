@@ -1,0 +1,20 @@
+// roadmap: P6.6
+// expect: exit=42
+// Function pointers â€” assign a fn name to a local, call it indirectly.
+// Closures-without-captures: enables higher-order programming style.
+fn add(a: i64, b: i64) -> i64 { a + b }
+fn mul(a: i64, b: i64) -> i64 { a * b }
+
+fn apply(op: i64, x: i64, y: i64) -> i64 {
+    // op is a function pointer typed as i64 â€” invoke it indirectly.
+    op(x, y)
+}
+
+fn main() -> i32 {
+    let f = add;
+    let g = mul;
+    let s = f(10, 5);          // 15
+    let p = g(3, 9);           // 27
+    let total = apply(add, s, p);   // 15 + 27 = 42
+    total as i32
+}

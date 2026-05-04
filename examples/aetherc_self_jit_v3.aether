@@ -1,0 +1,356 @@
+// Self-hosting bootstrap step 9 — JIT compiler in Aether reading a real
+// source file. Same codegen as step 8 but takes the source from a real
+// .miniaether file via aether_read_file. Now actually USABLE: any program
+// in the (let-binding + arith) subset can be compiled and run from disk.
+//
+// Original step-8 doc kept verbatim below for reference --------------
+//
+// Extends step 7 to handle `let x = expr;` bindings. Each `let` reserves
+// a stack slot in the JIT'd fn (rbp - 8*N). Identifier references load
+// from their slot. Function emits proper prologue/epilogue:
+//   pushq %rbp                  55
+//   movq %rsp, %rbp             48 89 E5
+//   subq $FRAME, %rsp           48 81 EC <imm32>
+//   ... body ...
+//   movq %rbp, %rsp             48 89 EC
+//   popq %rbp                   5D
+//   retq                        C3
+//
+// Source compiled (hardcoded for now):
+//   let x = 5; let y = 18; let z = 2; x + y * z + 1
+// Same target value as the step 6 interpreter — cross-checks the codegen.
+use runtime;
+
+const TOK_NUM:    i64 = 1;
+const TOK_IDENT:  i64 = 2;
+const TOK_LET:    i64 = 3;
+const TOK_EQ:     i64 = 4;
+const TOK_SEMI:   i64 = 5;
+const TOK_PLUS:   i64 = 6;
+const TOK_MINUS:  i64 = 7;
+const TOK_STAR:   i64 = 8;
+const TOK_EOF:    i64 = 0;
+
+const MAX_TOKENS: i64 = 256;
+const ENV_CAP:    i64 = 32;
+
+fn is_digit(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+fn is_alpha(b: i64) -> i64 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 { return 1; }
+    return 0;
+}
+
+// Token = 3 i64s (kind, start, len).
+fn write_tok(buf: i64, idx: i64, kind: i64, start: i64, len: i64) {
+    let base = idx * 24;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(buf, base + k,      (kind  >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 8  + k, (start >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 16 + k, (len   >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+fn read_tok(buf: i64, idx: i64, field: i64) -> i64 {
+    let base = idx * 24 + field * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(buf, base + k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+// Single i64 cursor stored in an 8-byte buffer.
+fn cur_get(p: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(p, k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+fn cur_set(p: i64, v: i64) {
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(p, k, (v >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+
+fn lex(src: i64, n: i64, toks: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut tn: i64 = 0;
+    while i < n {
+        let b = aether_byte_at(src, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if is_digit(b) == 1 {
+            let start = i;
+            while i < n && is_digit(aether_byte_at(src, i)) == 1 { i += 1; }
+            write_tok(toks, tn, TOK_NUM, start, i - start);
+            tn += 1;
+            continue;
+        }
+        if is_alpha(b) == 1 {
+            let start = i;
+            i += 1;
+            while i < n && (is_alpha(aether_byte_at(src, i)) == 1 || is_digit(aether_byte_at(src, i)) == 1) {
+                i += 1;
+            }
+            if (i - start) == 3 && aether_bytes_eq(src + start, "let", 3) == 1 {
+                write_tok(toks, tn, TOK_LET, start, 3);
+            } else {
+                write_tok(toks, tn, TOK_IDENT, start, i - start);
+            }
+            tn += 1;
+            continue;
+        }
+        let kind = if b == 61 { TOK_EQ } else if b == 59 { TOK_SEMI }
+                   else if b == 43 { TOK_PLUS } else if b == 45 { TOK_MINUS }
+                   else if b == 42 { TOK_STAR } else { 0 };
+        if kind == 0 { i += 1; continue; }
+        write_tok(toks, tn, kind, i, 1);
+        tn += 1;
+        i += 1;
+    }
+    write_tok(toks, tn, TOK_EOF, 0, 0);
+    return tn;
+}
+
+// --- Env: parallel buffers (name_start, name_len) → slot_index ----
+// Each let increments slot_count; the slot in the JIT'd frame is at rbp-8*slot.
+
+fn env_lookup_slot(names: i64, src: i64, count: i64,
+                   name_start: i64, name_len: i64) -> i64 {
+    let mut i = 0;
+    while i < count {
+        let nb = i * 16;
+        let mut s: i64 = 0; let mut l: i64 = 0;
+        let mut k = 0;
+        while k < 8 {
+            s = s | (aether_byte_at(names, nb + k)     << (k * 8));
+            l = l | (aether_byte_at(names, nb + 8 + k) << (k * 8));
+            k += 1;
+        }
+        if l == name_len && aether_bytes_eq(src + s, src + name_start, name_len) == 1 {
+            return i + 1;        // 1-based slot
+        }
+        i += 1;
+    }
+    aether_print_kv_i64("ENV miss len", name_len);
+    return 0;
+}
+
+fn env_define(names: i64, count_p: i64, name_start: i64, name_len: i64) -> i64 {
+    let count = cur_get(count_p);
+    let nb = count * 16;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(names, nb + k,     (name_start >> (k * 8)) & 255);
+        aether_byte_set(names, nb + 8 + k, (name_len   >> (k * 8)) & 255);
+        k += 1;
+    }
+    cur_set(count_p, count + 1);
+    return count + 1;            // 1-based slot
+}
+
+// --- Codegen primitives ----------------------------------------------
+
+fn emit_byte(code: i64, cur_p: i64, b: i64) {
+    let p = cur_get(cur_p);
+    aether_byte_set(code, p, b);
+    cur_set(cur_p, p + 1);
+}
+fn emit_imm32_le(code: i64, cur_p: i64, v: i64) {
+    let mut k = 0;
+    while k < 4 { emit_byte(code, cur_p, (v >> (k * 8)) & 255); k += 1; }
+}
+fn emit_imm64(code: i64, cur_p: i64, v: i64) {
+    let mut k = 0;
+    while k < 8 { emit_byte(code, cur_p, (v >> (k * 8)) & 255); k += 1; }
+}
+
+fn emit_prologue(code: i64, cur_p: i64, frame: i64) {
+    emit_byte(code, cur_p, 85);              // pushq %rbp                = 0x55
+    emit_byte(code, cur_p, 72); emit_byte(code, cur_p, 137); emit_byte(code, cur_p, 229); // movq %rsp, %rbp = 48 89 E5
+    // subq $frame, %rsp        = REX.W 81 /5 imm32 ; modrm = 11 101 100 = 0xEC
+    emit_byte(code, cur_p, 72); emit_byte(code, cur_p, 129); emit_byte(code, cur_p, 236);
+    emit_imm32_le(code, cur_p, frame);
+}
+fn emit_epilogue(code: i64, cur_p: i64) {
+    // movq %rbp, %rsp          = 48 89 EC
+    emit_byte(code, cur_p, 72); emit_byte(code, cur_p, 137); emit_byte(code, cur_p, 236);
+    emit_byte(code, cur_p, 93);              // popq %rbp                 = 0x5D
+    emit_byte(code, cur_p, 195);             // retq                      = 0xC3
+}
+
+// Emit `movq $imm64, %rax`        — 48 B8 imm64
+fn emit_mov_rax_imm(code: i64, cur_p: i64, v: i64) {
+    emit_byte(code, cur_p, 72); emit_byte(code, cur_p, 184); emit_imm64(code, cur_p, v);
+}
+// Emit `movq %rax, -off(%rbp)` for off in [-128, 127] using disp8 — 48 89 45 disp8
+fn emit_mov_rbpdisp_rax(code: i64, cur_p: i64, off_neg: i64) {
+    // off_neg is positive number to subtract from rbp; encoded as signed disp8 = -off_neg
+    emit_byte(code, cur_p, 72); emit_byte(code, cur_p, 137); emit_byte(code, cur_p, 69);
+    emit_byte(code, cur_p, (256 - off_neg) & 255);
+}
+// Emit `movq -off(%rbp), %rax`    — 48 8B 45 disp8
+fn emit_mov_rax_rbpdisp(code: i64, cur_p: i64, off_neg: i64) {
+    emit_byte(code, cur_p, 72); emit_byte(code, cur_p, 139); emit_byte(code, cur_p, 69);
+    emit_byte(code, cur_p, (256 - off_neg) & 255);
+}
+fn emit_push_rax(code: i64, cur_p: i64) { emit_byte(code, cur_p, 80); }
+fn emit_pop_r10(code: i64, cur_p: i64) { emit_byte(code, cur_p, 65); emit_byte(code, cur_p, 90); }
+fn emit_xchg_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 76); emit_byte(code, cur_p, 135); emit_byte(code, cur_p, 208);
+}
+fn emit_add_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 76); emit_byte(code, cur_p, 1); emit_byte(code, cur_p, 208);
+}
+fn emit_sub_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 76); emit_byte(code, cur_p, 41); emit_byte(code, cur_p, 208);
+}
+fn emit_imul_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 73); emit_byte(code, cur_p, 15);
+    emit_byte(code, cur_p, 175); emit_byte(code, cur_p, 194);
+}
+
+// --- Pratt parser that EMITS code -----------------------------------
+
+fn pos_get(p: i64) -> i64 { return cur_get(p); }
+fn pos_set(p: i64, v: i64) { cur_set(p, v); }
+fn peek_kind(toks: i64, pos_p: i64) -> i64 { return read_tok(toks, pos_get(pos_p), 0); }
+
+fn cg_factor(toks: i64, pos_p: i64, code: i64, cur_p: i64,
+             names: i64, env_count_p: i64, src: i64) {
+    let p = pos_get(pos_p);
+    let k = read_tok(toks, p, 0);
+    let s = read_tok(toks, p, 1);
+    let l = read_tok(toks, p, 2);
+    pos_set(pos_p, p + 1);
+    if k == TOK_NUM {
+        // Decode decimal value from src[s..s+l] now (parser knows lit text).
+        let mut acc: i64 = 0;
+        let mut i = 0;
+        while i < l {
+            acc = acc * 10 + (aether_byte_at(src, s + i) - 48);
+            i += 1;
+        }
+        emit_mov_rax_imm(code, cur_p, acc);
+        return;
+    }
+    if k == TOK_IDENT {
+        let slot = env_lookup_slot(names, src, cur_get(env_count_p), s, l);
+        emit_mov_rax_rbpdisp(code, cur_p, slot * 8);
+        return;
+    }
+    aether_print_kv_i64("CG bad factor", k);
+}
+
+fn cg_term(toks: i64, pos_p: i64, code: i64, cur_p: i64,
+           names: i64, env_count_p: i64, src: i64) {
+    cg_factor(toks, pos_p, code, cur_p, names, env_count_p, src);
+    while peek_kind(toks, pos_p) == TOK_STAR {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        emit_push_rax(code, cur_p);
+        cg_factor(toks, pos_p, code, cur_p, names, env_count_p, src);
+        emit_pop_r10(code, cur_p);
+        emit_imul_rax_r10(code, cur_p);
+    }
+}
+
+fn cg_expr(toks: i64, pos_p: i64, code: i64, cur_p: i64,
+           names: i64, env_count_p: i64, src: i64) {
+    cg_term(toks, pos_p, code, cur_p, names, env_count_p, src);
+    while peek_kind(toks, pos_p) == TOK_PLUS || peek_kind(toks, pos_p) == TOK_MINUS {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        emit_push_rax(code, cur_p);
+        cg_term(toks, pos_p, code, cur_p, names, env_count_p, src);
+        emit_pop_r10(code, cur_p);
+        if op == TOK_PLUS {
+            emit_add_rax_r10(code, cur_p);
+        } else {
+            emit_xchg_rax_r10(code, cur_p);
+            emit_sub_rax_r10(code, cur_p);
+        }
+    }
+}
+
+fn cg_program(toks: i64, code: i64, cur_p: i64,
+              names: i64, env_count_p: i64, src: i64) {
+    let pos_p = aether_alloc_bytes(8);
+    pos_set(pos_p, 0);
+    while peek_kind(toks, pos_p) != TOK_EOF {
+        if peek_kind(toks, pos_p) == TOK_LET {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            // IDENT
+            let p = pos_get(pos_p);
+            let name_s = read_tok(toks, p, 1);
+            let name_l = read_tok(toks, p, 2);
+            pos_set(pos_p, p + 1);
+            // = (skip)
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            // value expr leaves rax
+            cg_expr(toks, pos_p, code, cur_p, names, env_count_p, src);
+            // ; (skip)
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            let slot = env_define(names, env_count_p, name_s, name_l);
+            emit_mov_rbpdisp_rax(code, cur_p, slot * 8);
+            continue;
+        }
+        // Tail expr — leaves result in rax.
+        cg_expr(toks, pos_p, code, cur_p, names, env_count_p, src);
+    }
+    aether_free_bytes(pos_p, 8);
+}
+
+fn main() -> i32 {
+    let path = "examples/_mini_program.miniaether";
+    let src = aether_read_file(path);
+    if src == 0 {
+        aether_print_kv_i64("read failed", 0);
+        return 1;
+    }
+    let n = aether_file_size_last();
+    aether_print_kv_i64("source bytes", n);
+
+    let toks = aether_alloc_bytes(MAX_TOKENS * 24);
+    let tn = lex(src, n, toks);
+    aether_print_kv_i64("token count", tn);
+
+    let code_cap: i64 = 4096;
+    let code = aether_alloc_executable(code_cap);
+    if code == 0 { return 1; }
+    let cur_p = aether_alloc_bytes(8);
+    cur_set(cur_p, 0);
+
+    let names = aether_alloc_bytes(ENV_CAP * 16);
+    let env_count_p = aether_alloc_bytes(8);
+    cur_set(env_count_p, 0);
+
+    // Frame for ENV_CAP slots = 32 * 8 = 256 bytes (always 16-aligned).
+    emit_prologue(code, cur_p, 256);
+    cg_program(toks, code, cur_p, names, env_count_p, src);
+    emit_epilogue(code, cur_p);
+
+    let code_len = cur_get(cur_p);
+    let env_used = cur_get(env_count_p);
+    aether_print_kv_i64("emitted bytes", code_len);
+    aether_print_kv_i64("env locals",    env_used);
+
+    let result = aether_call_jit_i64(code);
+    aether_print_kv_i64("JIT result", result);
+
+    aether_free_bytes(src, n);
+    aether_free_bytes(toks, MAX_TOKENS * 24);
+    aether_free_bytes(cur_p, 8);
+    aether_free_bytes(names, ENV_CAP * 16);
+    aether_free_bytes(env_count_p, 8);
+    aether_free_executable(code, code_cap);
+    result as i32
+}

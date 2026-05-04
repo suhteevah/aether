@@ -1,0 +1,117 @@
+// roadmap: P7.3
+// expect: exit=0
+// requires: cuda
+//
+// LayerNorm + 2-layer GELU MLP, full training: every parameter (gamma, beta,
+// w1, w2) gets gradients and AdamW updates. Forward:
+//   x_norm = LN(x; gamma, beta)
+//   h_pre  = x_norm @ w1
+//   h_act  = gelu(h_pre)
+//   logits = h_act @ w2
+//   loss   = ce(logits, labels)
+//
+// Backward fully closes through LN's gamma/beta + dx, GELU, and both matmuls.
+// Exit 0 iff final loss < initial loss (proves the LN-param backward path
+// genuinely learns).
+use runtime;
+
+const BSZ: i32 = 8;
+const KK:  i32 = 16;
+const HH:  i32 = 32;
+const NN:  i32 = 4;
+const KH:  i32 = 512;
+const HN:  i32 = 128;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:    i64 = aether_alloc_f32(128);
+    let h_g:    i64 = aether_alloc_f32(16);
+    let h_b:    i64 = aether_alloc_f32(16);
+    let h_w1:   i64 = aether_alloc_f32(512);
+    let h_w2:   i64 = aether_alloc_f32(128);
+    let h_lab:  i64 = aether_alloc_i32(8);
+    aether_init_normal_f32(h_x,  128, 1.0, 1);
+    aether_init_constant_f32(h_g, 16, 1.0);
+    aether_init_constant_f32(h_b, 16, 0.0);
+    aether_init_normal_f32(h_w1, 512, 0.1, 7);
+    aether_init_normal_f32(h_w2, 128, 0.1, 11);
+    aether_fill_labels_i32(h_lab, 8, 4, 19);
+
+    let x:        Tensor<f32, [BSZ, KK]>;
+    let gamma:    Tensor<f32, [KK]>;
+    let beta:     Tensor<f32, [KK]>;
+    let x_norm:   Tensor<f32, [BSZ, KK]>;
+    let ln_mean:  Tensor<f32, [BSZ]>;
+    let ln_rstd:  Tensor<f32, [BSZ]>;
+    let w1:       Tensor<f32, [KK, HH]>;
+    let w2:       Tensor<f32, [HH, NN]>;
+    let h_pre:    Tensor<f32, [BSZ, HH]>;
+    let h_act:    Tensor<f32, [BSZ, HH]>;
+    let logits:   Tensor<f32, [BSZ, NN]>;
+    let probs:    Tensor<f32, [BSZ, NN]>;
+    let dlogits:  Tensor<f32, [BSZ, NN]>;
+    let dh_act:   Tensor<f32, [BSZ, HH]>;
+    let dh_pre:   Tensor<f32, [BSZ, HH]>;
+    let dx_norm:  Tensor<f32, [BSZ, KK]>;
+    let dw1:      Tensor<f32, [KK, HH]>;
+    let dw2:      Tensor<f32, [HH, NN]>;
+    let dgamma:   Tensor<f32, [KK]>;
+    let dbeta:    Tensor<f32, [KK]>;
+    let m_w1:     Tensor<f32, [KH]>;
+    let v_w1:     Tensor<f32, [KH]>;
+    let m_w2:     Tensor<f32, [HN]>;
+    let v_w2:     Tensor<f32, [HN]>;
+    let m_g:      Tensor<f32, [KK]>;
+    let v_g:      Tensor<f32, [KK]>;
+    let m_b:      Tensor<f32, [KK]>;
+    let v_b:      Tensor<f32, [KK]>;
+    let labels:   Tensor<i32, [BSZ]>;
+
+    aether_dev_h2d_f32(h_x,  x,  128);
+    aether_dev_h2d_f32(h_g,  gamma, 16);
+    aether_dev_h2d_f32(h_b,  beta,  16);
+    aether_dev_h2d_f32(h_w1, w1, 512);
+    aether_dev_h2d_f32(h_w2, w2, 128);
+    aether_dev_h2d_i32(h_lab, labels, 8);
+
+    let mut step: i64 = 1;
+    let mut initial_loss: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    while step <= 80 {
+        // Forward.
+        x.layer_norm(&gamma, &beta, &mut x_norm, &mut ln_mean, &mut ln_rstd, 0.00001);
+        x_norm.matmul(&w1, &mut h_pre);
+        h_pre.gelu(&mut h_act);
+        h_act.matmul(&w2, &mut logits);
+        let loss: f32 = logits.cross_entropy(&labels, &mut probs);
+        if step == 1 { initial_loss = loss; }
+        final_loss = loss;
+        // Backward.
+        probs.cross_entropy_backward(&labels, &mut dlogits);
+        h_act.matmul_backward_rhs(&dlogits, &mut dw2);
+        dlogits.matmul_backward_lhs(&w2, &mut dh_act);
+        h_pre.gelu_backward(&dh_act, &mut dh_pre);
+        x_norm.matmul_backward_rhs(&dh_pre, &mut dw1);
+        // Backward into LN: needs dx_norm (= dh_pre @ w1^T) which is the dy
+        // for LayerNorm. dh_pre's matmul_backward_lhs(&w1, ...) gives that.
+        dh_pre.matmul_backward_lhs(&w1, &mut dx_norm);
+        x.layer_norm_backward_params(&ln_mean, &ln_rstd, &dx_norm, &mut dgamma, &mut dbeta);
+        // Optim â€” AdamW on every learnable.
+        w1.adamw_step(&dw1, &mut m_w1, &mut v_w1, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        w2.adamw_step(&dw2, &mut m_w2, &mut v_w2, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        gamma.adamw_step(&dgamma, &mut m_g, &mut v_g, 0.01, 0.9, 0.999, 0.00000001, 0.0, step);
+        beta.adamw_step(&dbeta,   &mut m_b, &mut v_b, 0.01, 0.9, 0.999, 0.00000001, 0.0, step);
+        step = step + 1;
+    }
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_g, 16);
+    aether_free_f32(h_b, 16);
+    aether_free_f32(h_w1, 512);
+    aether_free_f32(h_w2, 128);
+    aether_free_i32(h_lab, 8);
+
+    if final_loss < initial_loss { 0 } else { 1 }
+}

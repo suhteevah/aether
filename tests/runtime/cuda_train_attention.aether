@@ -1,0 +1,130 @@
+// roadmap: P7.3
+// expect: exit=0
+// requires: cuda
+//
+// Single-head self-attention TRAINING on GPU end-to-end. Every Q/K/V/Wo
+// projection learns via full SDPA backward path through softmax_bwd +
+// matmul_tn (the "dK = scores^T @ Q" step) + matmul_nt (the "dattn =
+// dctx @ V^T" step).
+//
+// Forward:   q,k,v = x @ {Wq,Wk,Wv}; scores = q @ k^T; scores *= 1/sqrt(D);
+//            attn = softmax(scores); ctx = attn @ v; out = ctx @ Wo;
+//            loss = cross_entropy(out, labels)
+//
+// Exit 0 iff final loss < initial loss. Proves attention backward correctness.
+use runtime;
+
+const SS: i32 = 8;        // sequence length (used as the cross-entropy batch axis)
+const DD: i32 = 16;       // model / head dim
+const NN: i32 = 4;        // num classes
+const DSQ: i32 = 256;     // DD*DD (for AdamW state on the projections)
+const DON: i32 = 64;      // DD*NN (for Wo's AdamW state)
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:   i64 = aether_alloc_f32(128);   // SS*DD
+    let h_wq:  i64 = aether_alloc_f32(256);
+    let h_wk:  i64 = aether_alloc_f32(256);
+    let h_wv:  i64 = aether_alloc_f32(256);
+    let h_wo:  i64 = aether_alloc_f32(64);    // DD*NN
+    let h_lab: i64 = aether_alloc_i32(8);
+    aether_init_normal_f32(h_x,  128, 1.0, 1);
+    aether_init_normal_f32(h_wq, 256, 0.1, 7);
+    aether_init_normal_f32(h_wk, 256, 0.1, 11);
+    aether_init_normal_f32(h_wv, 256, 0.1, 13);
+    aether_init_normal_f32(h_wo,  64, 0.1, 17);
+    aether_fill_labels_i32(h_lab, 8, 4, 19);
+
+    let x:        Tensor<f32, [SS, DD]>;
+    let wq:       Tensor<f32, [DD, DD]>;
+    let wk:       Tensor<f32, [DD, DD]>;
+    let wv:       Tensor<f32, [DD, DD]>;
+    let wo:       Tensor<f32, [DD, NN]>;
+    let q:        Tensor<f32, [SS, DD]>;
+    let k:        Tensor<f32, [SS, DD]>;
+    let v:        Tensor<f32, [SS, DD]>;
+    let scores:   Tensor<f32, [SS, SS]>;
+    let attn:     Tensor<f32, [SS, SS]>;
+    let ctx_buf:  Tensor<f32, [SS, DD]>;
+    let out_buf:  Tensor<f32, [SS, NN]>;
+    let probs:    Tensor<f32, [SS, NN]>;
+    let dout:     Tensor<f32, [SS, NN]>;
+    let dctx:     Tensor<f32, [SS, DD]>;
+    let dwo:      Tensor<f32, [DD, NN]>;
+    let dattn:    Tensor<f32, [SS, SS]>;
+    let dv:       Tensor<f32, [SS, DD]>;
+    let dscores:  Tensor<f32, [SS, SS]>;
+    let dq:       Tensor<f32, [SS, DD]>;
+    let dk:       Tensor<f32, [SS, DD]>;
+    let dwq:      Tensor<f32, [DD, DD]>;
+    let dwk:      Tensor<f32, [DD, DD]>;
+    let dwv:      Tensor<f32, [DD, DD]>;
+    let m_wq: Tensor<f32, [DSQ]>;
+    let v_wq: Tensor<f32, [DSQ]>;
+    let m_wk: Tensor<f32, [DSQ]>;
+    let v_wk: Tensor<f32, [DSQ]>;
+    let m_wv: Tensor<f32, [DSQ]>;
+    let v_wv: Tensor<f32, [DSQ]>;
+    let m_wo: Tensor<f32, [DON]>;
+    let v_wo: Tensor<f32, [DON]>;
+    let labels: Tensor<i32, [SS]>;
+
+    aether_dev_h2d_f32(h_x,  x,  128);
+    aether_dev_h2d_f32(h_wq, wq, 256);
+    aether_dev_h2d_f32(h_wk, wk, 256);
+    aether_dev_h2d_f32(h_wv, wv, 256);
+    aether_dev_h2d_f32(h_wo, wo,  64);
+    aether_dev_h2d_i32(h_lab, labels, 8);
+
+    let mut step: i64 = 1;
+    let mut initial_loss: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    while step <= 80 {
+        // Forward.
+        x.matmul(&wq, &mut q);
+        x.matmul(&wk, &mut k);
+        x.matmul(&wv, &mut v);
+        q.matmul_t(&k, &mut scores);
+        scores.scale(0.25);                     // 1/sqrt(DD=16) = 0.25
+        scores.softmax(&mut attn);
+        attn.matmul(&v, &mut ctx_buf);
+        ctx_buf.matmul(&wo, &mut out_buf);
+        let loss: f32 = out_buf.cross_entropy(&labels, &mut probs);
+        if step == 1 { initial_loss = loss; }
+        final_loss = loss;
+        // Backward â€” output proj.
+        probs.cross_entropy_backward(&labels, &mut dout);
+        ctx_buf.matmul_backward_rhs(&dout, &mut dwo);
+        dout.matmul_backward_lhs(&wo, &mut dctx);
+        // Back through ctx = attn @ v: dattn = dctx @ v^T; dv = attn^T @ dctx.
+        dctx.matmul_t(&v, &mut dattn);          // matmul_nt: (S, D) Â· (S, D)^T â†’ (S, S)
+        attn.matmul_tn(&dctx, &mut dv);         // (S,S)^T Â· (S,D) â†’ (S, D)
+        // Back through softmax + scale.
+        attn.softmax_backward(&dattn, &mut dscores);
+        dscores.scale(0.25);                    // chain rule through scale(0.25)
+        // Back through scores = q @ k^T: dq = dscores @ k; dk = dscores^T @ q.
+        dscores.matmul(&k, &mut dq);
+        dscores.matmul_tn(&q, &mut dk);
+        // Back through Q/K/V projections â€” gradients on the weights only.
+        x.matmul_backward_rhs(&dq, &mut dwq);
+        x.matmul_backward_rhs(&dk, &mut dwk);
+        x.matmul_backward_rhs(&dv, &mut dwv);
+        // Optim â€” AdamW on every projection.
+        wq.adamw_step(&dwq, &mut m_wq, &mut v_wq, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wk.adamw_step(&dwk, &mut m_wk, &mut v_wk, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wv.adamw_step(&dwv, &mut m_wv, &mut v_wv, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        wo.adamw_step(&dwo, &mut m_wo, &mut v_wo, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        step = step + 1;
+    }
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_wq, 256);
+    aether_free_f32(h_wk, 256);
+    aether_free_f32(h_wv, 256);
+    aether_free_f32(h_wo,  64);
+    aether_free_i32(h_lab, 8);
+
+    if final_loss < initial_loss { 0 } else { 1 }
+}

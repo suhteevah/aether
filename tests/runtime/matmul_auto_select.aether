@@ -1,0 +1,40 @@
+// roadmap: P10.10
+// expect: exit=0
+use runtime;
+
+fn main() -> i32 {
+    let m: i32 = 64;
+    let nm: i32 = m * m;
+
+    let a:   i64 = aether_alloc_f32(nm);
+    let b:   i64 = aether_alloc_f32(nm);
+    let out: i64 = aether_alloc_f32(nm);
+    let ref_buf: i64 = aether_alloc_f32(nm);
+    if a == 0 { return 1; }
+
+    aether_init_normal_f32(a, nm, 0.05, 17);
+    aether_init_normal_f32(b, nm, 0.05, 23);
+
+    aether_op_matmul_f32(a, b, ref_buf, m, m, m);
+    aether_op_matmul_f32_auto(a, b, out, m, m, m);
+
+    let chosen: i32 = aether_op_matmul_f32_auto_kernel(m, m, m);
+    if chosen == -1 { return 3; }
+
+    let mut i: i32 = 0;
+    while i < nm {
+        let r: f32 = aether_load_f32(ref_buf, i);
+        let o: f32 = aether_load_f32(out, i);
+        if aether_abs_f32(r - o) > 0.0001 { return 4; }
+        i = i + 1;
+    }
+
+    aether_op_matmul_f32_auto(a, b, out, m, m, m);
+    if aether_op_matmul_f32_auto_kernel(m, m, m) != chosen { return 5; }
+
+    aether_free_f32(a, nm);
+    aether_free_f32(b, nm);
+    aether_free_f32(out, nm);
+    aether_free_f32(ref_buf, nm);
+    0
+}

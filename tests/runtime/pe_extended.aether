@@ -1,0 +1,51 @@
+// expect: exit=0
+// expect: stdout contains answer: 42
+// build-mode: pe-bin
+// roadmap: P9.4
+//
+// Witness for P9.4 — the slim runtime_pe cdylib now covers the byte-buffer
+// + i64 print surface end-to-end via kernel32!WriteFile only (no msvcrt,
+// no libc). Programs that previously needed --emit=aether-bin to reach
+// `aether_alloc_bytes` / `aether_byte_set` / `aether_byte_at` /
+// `aether_free_bytes` / `aether_print_bytes` / `aether_print_kv_i64` can
+// now compile under --emit=pe-bin and link only against aether_rt.dll +
+// kernel32.dll.
+
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(p: i64, n: i64) -> i32;
+extern fn aether_byte_at(p: i64, i: i64) -> i64;
+extern fn aether_byte_set(p: i64, i: i64, v: i64) -> i32;
+extern fn aether_print_bytes(p: i64, n: i64) -> i32;
+extern fn aether_print_kv_i64(label: i64, value: i64) -> i32;
+
+fn main() -> i32 {
+    let n: i64 = 8;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 1; }
+
+    // Write "ABCDEFGH" then read back two specific bytes and sum
+    // their indices into a value we'll print + return as exit code.
+    aether_byte_set(buf, 0, 65);
+    aether_byte_set(buf, 1, 66);
+    aether_byte_set(buf, 2, 67);
+    aether_byte_set(buf, 3, 68);
+    aether_byte_set(buf, 4, 69);
+    aether_byte_set(buf, 5, 70);
+    aether_byte_set(buf, 6, 71);
+    aether_byte_set(buf, 7, 72);
+
+    // 'D' (68) + 'F' (70) - 96 = 42
+    let a: i64 = aether_byte_at(buf, 3);
+    let b: i64 = aether_byte_at(buf, 5);
+    let v: i64 = a + b - 96;
+
+    aether_print_kv_i64("answer", v);
+
+    // Also exercise aether_print_bytes — print the first 4 chars + newline.
+    aether_byte_set(buf, 4, 10);
+    aether_print_bytes(buf, 5);
+
+    aether_free_bytes(buf, n);
+
+    if v == 42 { 0 } else { 2 }
+}

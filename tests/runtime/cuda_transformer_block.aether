@@ -1,0 +1,115 @@
+// expect: exit=0
+// requires: cuda
+//
+// Full transformer-block forward, single-head, pre-norm style:
+//
+//   x1 = x + attention(x)              (residual)
+//   x2 = LN(x1)
+//   x3 = x1 + MLP(x2)                  (residual, post-norm-on-input MLP)
+//
+// Where:
+//   attention(x): Q,K,V projections; scaled dot-product softmax; output proj.
+//   MLP(x): linear → gelu → linear.
+//
+// Every primitive lives in cuda.rs as a real cuBLAS or nvrtc-JIT kernel.
+// The .aether source is structurally identical to a transformer block —
+// no Python, no pytorch, no candle — just our runtime ABI.
+use runtime;
+
+const SS: i32 = 8;    // sequence length
+const DM: i32 = 16;   // model dim
+const DK: i32 = 16;   // head/key dim
+const FF: i32 = 32;   // ffn inner dim
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    // Host buffers + init.
+    let h_x:    i64 = aether_alloc_f32(128);
+    let h_wq:   i64 = aether_alloc_f32(256);
+    let h_wk:   i64 = aether_alloc_f32(256);
+    let h_wv:   i64 = aether_alloc_f32(256);
+    let h_wo:   i64 = aether_alloc_f32(256);   // attn out proj
+    let h_g:    i64 = aether_alloc_f32(16);    // LN gamma
+    let h_b:    i64 = aether_alloc_f32(16);    // LN beta
+    let h_w1:   i64 = aether_alloc_f32(512);   // ffn[DM, FF]
+    let h_w2:   i64 = aether_alloc_f32(512);   // ffn[FF, DM]
+    aether_init_normal_f32(h_x,  128, 1.0, 1);
+    aether_init_normal_f32(h_wq, 256, 0.1, 7);
+    aether_init_normal_f32(h_wk, 256, 0.1, 11);
+    aether_init_normal_f32(h_wv, 256, 0.1, 13);
+    aether_init_normal_f32(h_wo, 256, 0.1, 17);
+    aether_init_constant_f32(h_g, 16, 1.0);
+    aether_init_constant_f32(h_b, 16, 0.0);
+    aether_init_normal_f32(h_w1, 512, 0.1, 19);
+    aether_init_normal_f32(h_w2, 512, 0.1, 23);
+
+    // Device tensors.
+    let x:       Tensor<f32, [SS, DM]>;
+    let wq:      Tensor<f32, [DM, DK]>;
+    let wk:      Tensor<f32, [DM, DK]>;
+    let wv:      Tensor<f32, [DM, DK]>;
+    let wo:      Tensor<f32, [DK, DM]>;
+    let q:       Tensor<f32, [SS, DK]>;
+    let k:       Tensor<f32, [SS, DK]>;
+    let v:       Tensor<f32, [SS, DK]>;
+    let scores:  Tensor<f32, [SS, SS]>;
+    let attn:    Tensor<f32, [SS, SS]>;
+    let attn_v:  Tensor<f32, [SS, DK]>;
+    let attn_out:Tensor<f32, [SS, DM]>;
+    let x1:      Tensor<f32, [SS, DM]>;
+    let gamma:   Tensor<f32, [DM]>;
+    let beta:    Tensor<f32, [DM]>;
+    let ln_mean: Tensor<f32, [SS]>;
+    let ln_rstd: Tensor<f32, [SS]>;
+    let x2:      Tensor<f32, [SS, DM]>;
+    let w1:      Tensor<f32, [DM, FF]>;
+    let w2:      Tensor<f32, [FF, DM]>;
+    let h_pre:   Tensor<f32, [SS, FF]>;
+    let h_act:   Tensor<f32, [SS, FF]>;
+    let mlp_out: Tensor<f32, [SS, DM]>;
+    let x3:      Tensor<f32, [SS, DM]>;
+
+    aether_dev_h2d_f32(h_x,  x,  128);
+    aether_dev_h2d_f32(h_wq, wq, 256);
+    aether_dev_h2d_f32(h_wk, wk, 256);
+    aether_dev_h2d_f32(h_wv, wv, 256);
+    aether_dev_h2d_f32(h_wo, wo, 256);
+    aether_dev_h2d_f32(h_g, gamma, 16);
+    aether_dev_h2d_f32(h_b, beta,  16);
+    aether_dev_h2d_f32(h_w1, w1, 512);
+    aether_dev_h2d_f32(h_w2, w2, 512);
+
+    // === Attention sublayer ===
+    x.matmul(&wq, &mut q);
+    x.matmul(&wk, &mut k);
+    x.matmul(&wv, &mut v);
+    q.matmul_t(&k, &mut scores);
+    scores.scale(0.25);                  // 1/sqrt(DK=16)
+    scores.softmax(&mut attn);
+    attn.matmul(&v, &mut attn_v);
+    attn_v.matmul(&wo, &mut attn_out);
+    x.add(&attn_out, &mut x1);           // residual
+
+    // === LN ===
+    x1.layer_norm(&gamma, &beta, &mut x2, &mut ln_mean, &mut ln_rstd, 0.00001);
+
+    // === MLP sublayer ===
+    x2.matmul(&w1, &mut h_pre);
+    h_pre.gelu(&mut h_act);
+    h_act.matmul(&w2, &mut mlp_out);
+    x1.add(&mlp_out, &mut x3);           // residual
+
+    aether_dev_sync();
+
+    aether_free_f32(h_x,  128);
+    aether_free_f32(h_wq, 256);
+    aether_free_f32(h_wk, 256);
+    aether_free_f32(h_wv, 256);
+    aether_free_f32(h_wo, 256);
+    aether_free_f32(h_g, 16);
+    aether_free_f32(h_b, 16);
+    aether_free_f32(h_w1, 512);
+    aether_free_f32(h_w2, 512);
+    0
+}

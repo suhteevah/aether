@@ -160,13 +160,33 @@ enum SectionId { Text, Rdata }
 fn syn(line: u32, msg: String) -> AsmError { AsmError::Syntax { line, msg } }
 
 fn strip_comment(s: &str) -> &str {
-    let s = s.split_once('#').map(|p| p.0).unwrap_or(s);
-    s.split_once("//").map(|p| p.0).unwrap_or(s)
+    // String-literal-aware: `#` and `//` inside `"..."` (e.g.
+    // `.asciz "# header\n"`) MUST NOT be treated as comment starts.
+    let bytes = s.as_bytes();
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if esc { esc = false; }
+            else if c == b'\\' { esc = true; }
+            else if c == b'"' { in_str = false; }
+        } else {
+            if c == b'"' { in_str = true; }
+            else if c == b'#' { return &s[..i]; }
+            else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                return &s[..i];
+            }
+        }
+        i += 1;
+    }
+    s
 }
 
 fn parse_str_literal(s: &str) -> Option<String> {
     let s = s.trim();
-    if !s.starts_with('"') || !s.ends_with('"') { return None; }
+    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') { return None; }
     let inner = &s[1..s.len() - 1];
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
@@ -197,6 +217,8 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
         Instr::MovRegImm32 { .. } => 7,
         Instr::MovRegFromRbpDisp { .. } => 7,
         Instr::MovRbpDispFromReg { .. } => 7,
+        Instr::MovRbpDispImm32 { .. } => 11, // REX + C7 + ModRM + disp32 + imm32
+
         Instr::MovRegFromBaseDisp { .. } => 7, // REX + 8B + ModRM + disp32
         Instr::MovBaseDispFromReg { .. } => 7, // REX + 89 + ModRM + disp32
         Instr::AddRegImm8 { .. } | Instr::SubRegImm8 { .. } => 4,
@@ -207,9 +229,11 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
         Instr::XorRegReg32 { dst, src } =>
             if dst.extension() != 0 || src.extension() != 0 { 3 } else { 2 },
         Instr::AndRegRegQ { .. } | Instr::OrRegRegQ { .. } | Instr::XorRegRegQ { .. } => 3,
+        Instr::ShlRegByCl { .. } | Instr::SarRegByCl { .. } => 3,
         Instr::LeaRipSym { .. } => 7,
         Instr::LeaRegFromRbpDisp { .. } => 7,
         Instr::CallSym { .. } => 5,
+        Instr::CallRegIndirect { reg } => if reg.extension() != 0 { 3 } else { 2 },
         Instr::Ret => 1,
         Instr::CmpRegRegQ { .. } | Instr::TestRegRegQ { .. } => 3,
         Instr::SetccAl { .. } | Instr::MovzblAlEax => 3,
@@ -245,7 +269,7 @@ fn parse_reg(s: &str, line: u32) -> Result<Reg, AsmError> {
     let s = s.trim().trim_start_matches('%');
     Ok(match s {
         "rax" | "eax" => Reg::Rax,
-        "rcx" | "ecx" => Reg::Rcx,
+        "rcx" | "ecx" | "cl" => Reg::Rcx,
         "rdx" | "edx" => Reg::Rdx,
         "rbx" | "ebx" => Reg::Rbx,
         "rsp" | "esp" => Reg::Rsp,
@@ -357,7 +381,12 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             //   movq %reg, disp(%rsp)     (store to outgoing arg slot)
             //   movq %reg, %reg
             if a.trim_start().starts_with('$') {
-                Instr::MovRegImm32 { dst: parse_reg(b, lineno)?, imm: parse_imm(a, lineno)? as i32 }
+                // movq $imm, disp(%rbp) — peephole-emitted direct imm-to-mem store.
+                if let Some(disp) = parse_rbp_mem(b) {
+                    Instr::MovRbpDispImm32 { disp, imm: parse_imm(a, lineno)? as i32 }
+                } else {
+                    Instr::MovRegImm32 { dst: parse_reg(b, lineno)?, imm: parse_imm(a, lineno)? as i32 }
+                }
             } else if let Some(disp) = parse_rbp_mem(a) {
                 Instr::MovRegFromRbpDisp { dst: parse_reg(b, lineno)?, disp }
             } else if let Some(disp) = parse_rbp_mem(b) {
@@ -544,6 +573,17 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             let (a, b) = split_comma(rest);
             Instr::XorRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }
         }
+        "shlq" => {
+            // `shlq %cl, %reg` — only the CL form is emitted by the compiler.
+            let (a, b) = split_comma(rest);
+            let _ = a; // must be %cl
+            Instr::ShlRegByCl { dst: parse_reg(b, lineno)? }
+        }
+        "sarq" => {
+            let (a, b) = split_comma(rest);
+            let _ = a;
+            Instr::SarRegByCl { dst: parse_reg(b, lineno)? }
+        }
         "leaq"  => {
             // Two forms today:
             //   `leaq SYM(%rip), %REG`     — RIP-relative symbol load
@@ -562,7 +602,15 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             }
             Instr::LeaRipSym { dst, sym }
         }
-        "callq" | "call" => Instr::CallSym { sym: rest.to_string() },
+        "callq" | "call" => {
+            // `callq *%reg` — indirect through reg (closures-lite); else direct.
+            if rest.starts_with('*') {
+                let reg_str = rest[1..].trim();
+                Instr::CallRegIndirect { reg: parse_reg(reg_str, lineno)? }
+            } else {
+                Instr::CallSym { sym: rest.to_string() }
+            }
+        }
         "cmpq" => {
             let (a, b) = split_comma(rest);
             Instr::CmpRegRegQ { dst: parse_reg(b, lineno)?, src: parse_reg(a, lineno)? }

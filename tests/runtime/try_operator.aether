@@ -1,0 +1,49 @@
+// roadmap: P6.5
+// expect: exit=42
+//
+// `?` operator — early return on the Err variant of a payload-carrying
+// enum. Exercises the full P6.5 surface:
+//   - parser: `expr?` postfix in expression position
+//   - asm backend: 2-register return ABI for payload-enum-returning fns
+//     (tag in %rax, value in %rdx)
+//   - asm backend: `let r = call_returning_enum(...);` materialises a 2-slot
+//     local (`r.tag` + `r.val`) from (rax, rdx)
+//   - asm backend: `expr?` checks tag, branches to the fn epilogue with
+//     rax/rdx unchanged on Err, falls through with rdx moved to rax on Ok
+//   - From-trait `.into()` cast is intentionally OUT of scope (depends 6.2);
+//     this test uses a single concrete `Result<i64, i64>` type.
+enum Result { Ok(i64), Err(i64) }
+
+fn parse_one(x: i64) -> Result {
+    if x > 0 {
+        Result::Ok(x)
+    } else {
+        Result::Err(99)
+    }
+}
+
+fn parse_chain(a: i64, b: i64) -> Result {
+    let x: i64 = parse_one(a)?;   // propagates Err(99) if a <= 0
+    let y: i64 = parse_one(b)?;   // propagates Err(99) if b <= 0
+    Result::Ok(x + y)
+}
+
+fn main() -> i32 {
+    // Happy path: 20 + 22 = 42 → Result::Ok(42).
+    let ok_chain = parse_chain(20, 22);
+    let ok_val: i64 = match ok_chain {
+        Result::Ok(v)  => v,         // 42
+        Result::Err(e) => -e,        // would be -99
+    };
+
+    // Error-propagation path: -1 short-circuits at the first `?`.
+    // The enclosing `parse_chain` returns Result::Err(99) with rax=1, rdx=99.
+    let err_chain = parse_chain(-1, 5);
+    let err_tag: i64 = match err_chain {
+        Result::Ok(_v)  => 0,        // wrong branch
+        Result::Err(e)  => e,        // 99
+    };
+
+    // ok_val (42) - err_tag (99) + 99 = 42. Verifies BOTH paths.
+    (ok_val - err_tag + 99) as i32
+}

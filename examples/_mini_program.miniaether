@@ -1,0 +1,4 @@
+let a = 7;
+let b = 6;
+let c = 100;
+c - a * b + a - b - 17

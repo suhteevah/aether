@@ -1,0 +1,8 @@
+// roadmap: P6.4
+// expect: exit=42
+// Tuple destructuring: `let (a, b, c) = (e1, e2, e3);` binds 3 separate
+// top-level locals.
+fn main() -> i32 {
+    let (a, b, c) = (10, 20, 12);
+    a + b + c     // 42
+}

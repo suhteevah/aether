@@ -1,0 +1,56 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// P6.7 witness — Vec<i64> + String heap primitives.
+//   * push 0..10 onto a Vec<i64>, sum them via vec_get → expect 45
+//   * round-trip "Hi" through a String, verify length=2 + chars
+//   * 45 (vec sum) + 'H' (72) + 'i' (105) - 80 - 100 = 42
+use runtime;
+
+fn main() -> i32 {
+    // Vec<i64>: push 0..10, capacity-doubling growth (cap 0→4→8→16).
+    let v: i64 = aether_vec_i64_new();
+    if v < 0 { return 1; }
+
+    let mut i: i64 = 0;
+    while i < 10 {
+        if aether_vec_i64_push(v, i) != 0 { return 2; }
+        i = i + 1;
+    }
+
+    if aether_vec_i64_len(v) != 10 { return 3; }
+
+    // Sum elements via vec_get.
+    let mut sum: i64 = 0;
+    let mut k: i64 = 0;
+    while k < 10 {
+        sum = sum + aether_vec_i64_get(v, k);
+        k = k + 1;
+    }
+    if sum != 45 { return 4; }
+
+    // Test set + get round-trip.
+    if aether_vec_i64_set(v, 3, 999) != 0 { return 5; }
+    if aether_vec_i64_get(v, 3) != 999 { return 6; }
+
+    if aether_vec_i64_free(v) != 0 { return 7; }
+
+    // String: build "Hi", verify byte-for-byte.
+    let s: i64 = aether_string_new();
+    if s < 0 { return 8; }
+
+    if aether_string_push_byte(s, 72) != 0 { return 9; }   // 'H'
+    if aether_string_push_byte(s, 105) != 0 { return 10; } // 'i'
+
+    if aether_string_len(s) != 2 { return 11; }
+    let h: i64 = aether_string_byte_at(s, 0);
+    let ii: i64 = aether_string_byte_at(s, 1);
+    if h != 72 { return 12; }
+    if ii != 105 { return 13; }
+
+    if aether_string_free(s) != 0 { return 14; }
+
+    // 45 + 72 + 105 - 180 = 42
+    let result: i64 = sum + h + ii - 180;
+    return result as i32;
+}

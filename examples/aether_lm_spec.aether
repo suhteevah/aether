@@ -1,0 +1,140 @@
+// AetherLM-Tiny - byte-level decoder transformer in pure Aether.
+//
+// Targets:
+//   train -> single RTX 3070 Ti  (8 GB, bf16 + AMP, batch 32, seq 256)
+//   serve -> same card, paged KV cache
+//
+// Spec:
+//   vocab     = 256          (raw bytes, no tokenizer)
+//   d_model   = 320
+//   n_layers  = 6
+//   n_heads   = 5            (head_dim 64)
+//   d_ff      = 1280
+//   seq_len   = 256
+//   params   ~= 7.46 M
+//
+// Every op is a forward decl into libaether_rt (aether::ops::*). Phase 0
+// stubs return without computing; Phase 1 routes the same symbols to
+// cuBLAS / cuDNN. The Aether source never changes.
+
+module models::aether_lm;
+
+use core::tensor::Tensor;
+use aether::nn::Linear;
+use aether::nn::Embedding;
+use aether::nn::LayerNorm;
+use aether::ops::cross_entropy_f32;
+use aether::ops::scaled_dot_product_attention_f32;
+use aether::ops::gelu_f32;
+use aether::ops::softmax_f32;
+use aether::optim::adamw_step_f32;
+
+const VOCAB: i64 = 256;
+const D_MODEL: i64 = 320;
+const N_LAYERS: i64 = 6;
+const N_HEADS: i64 = 5;
+const HEAD_DIM: i64 = 64;
+const D_FF: i64 = 1280;
+const SEQ_LEN: i64 = 256;
+
+// --- attention ---------------------------------------------------------
+
+#[autodiff]
+fn causal_attention(
+    q: &Tensor<f32, [B, H, S, D]>,
+    k: &Tensor<f32, [B, H, S, D]>,
+    v: &Tensor<f32, [B, H, S, D]>,
+) -> Tensor<f32, [B, H, S, D]> {
+    let scale = 0.125;
+    let scores = q.matmul(k.transpose());
+    let masked = scores.causal_mask().scale(scale);
+    let attn = masked.softmax();
+    attn.matmul(v)
+}
+
+// --- feed-forward ------------------------------------------------------
+
+#[autodiff]
+fn ffn(x: &Tensor<f32, [B, S, D]>, w1: &Tensor<f32, [D, F]>, w2: &Tensor<f32, [F, D]>)
+    -> Tensor<f32, [B, S, D]>
+{
+    let h = x.matmul(w1).gelu();
+    h.matmul(w2)
+}
+
+// --- transformer block -------------------------------------------------
+
+pub struct Block {
+    ln1: LayerNorm<D_MODEL>,
+    qkv: Linear<D_MODEL, 960>,    // 3 * d_model
+    out: Linear<D_MODEL, D_MODEL>,
+    ln2: LayerNorm<D_MODEL>,
+    fc1: Linear<D_MODEL, D_FF>,
+    fc2: Linear<D_FF, D_MODEL>,
+}
+
+#[autodiff]
+fn block_forward(self: &Block, x: &Tensor<f32, [B, S, D]>)
+    -> Tensor<f32, [B, S, D]>
+{
+    let h1 = self.ln1.forward(x);
+    let qkv = self.qkv.forward(h1);
+    let attn = causal_attention(qkv.q(), qkv.k(), qkv.v());
+    let post_attn = self.out.forward(attn).add(x);
+    let h2 = self.ln2.forward(post_attn);
+    let mlp = ffn(h2, self.fc1.w, self.fc2.w);
+    mlp.add(post_attn)
+}
+
+// --- whole model -------------------------------------------------------
+
+pub struct AetherLm {
+    tok_emb: Embedding<VOCAB, D_MODEL>,
+    pos_emb: Embedding<SEQ_LEN, D_MODEL>,
+    blocks: Block,
+    ln_f: LayerNorm<D_MODEL>,
+}
+
+#[autodiff]
+fn forward(self: &AetherLm, idx: &Tensor<i32, [B, S]>) -> Tensor<f32, [B, S, V]> {
+    let pos = idx.arange_like();
+    let x = self.tok_emb.forward(idx).add(self.pos_emb.forward(pos));
+    let h = self.blocks.forward(x);
+    let z = self.ln_f.forward(h);
+    z.tied_lm_head(self.tok_emb.w)
+}
+
+// --- training ----------------------------------------------------------
+
+pub struct Batch {
+    input_ids: Tensor<i32, [B, S]>,
+    labels: Tensor<i32, [B, S]>,
+}
+
+#[autodiff]
+fn train_step(model: &mut AetherLm, batch: &Batch, optim_state: &mut OptimState) {
+    let logits = model.forward(&batch.input_ids);
+    let loss = logits.cross_entropy(&batch.labels);
+    loss.backward();
+    optim_state.adamw_step(&model);
+}
+
+// Multi-GPU variant. Exact same body, one extra attribute. Aetherc inserts
+// a ring all_reduce on `grads` at MIR before the optimiser step.
+#[autodiff]
+#[distributed(world_size=3, backend="nccl", algorithm="ring")]
+fn train_step_ddp(model: &mut AetherLm, batch: &Batch, optim_state: &mut OptimState) {
+    let logits = model.forward(&batch.input_ids);
+    let loss = logits.cross_entropy(&batch.labels);
+    loss.backward();
+    optim_state.adamw_step(&model);
+}
+
+// --- generation --------------------------------------------------------
+
+#[server(port=8080, continuous_batching=true, paged_attention=true)]
+fn serve(prompt: &Tensor<u8, [N]>) -> Tensor<u8, [M]> {
+    let model = AetherLm::load("checkpoints/aether_lm_tiny.safetensors");
+    let cache = PagedKVCache::new(2048, 64);
+    model.generate(prompt, cache, 256)
+}

@@ -1,0 +1,64 @@
+// roadmap: P10.7
+// expect: exit=0
+//
+// P10.7 PGO instrumentation surface witness. Verifies:
+//   1. aether_pgo_reset clears state.
+//   2. aether_pgo_record_branch accumulates (taken, total) per site_id.
+//   3. aether_pgo_branch_freq returns taken/total, 0.0 if total=0.
+//   4. aether_pgo_record_call accumulates per callsite_id.
+//   5. aether_pgo_call_count returns the count, 0 for unknown sites.
+//
+// Counts use ratios exact in f32 (0.5, 1.0, 0.0).
+// Exit codes localise where a stat went wrong (1..20).
+use runtime;
+
+fn main() -> i32 {
+    aether_pgo_reset();
+
+    // Empty state.
+    if aether_pgo_call_count(1) != 0 { return 1; }
+    let f0: f32 = aether_pgo_branch_freq(1);
+    if f0 != 0.0 { return 2; }
+
+    // Site 1: 3 taken of 6 = 0.5
+    aether_pgo_record_branch(1, 1);
+    aether_pgo_record_branch(1, 0);
+    aether_pgo_record_branch(1, 1);
+    aether_pgo_record_branch(1, 0);
+    aether_pgo_record_branch(1, 1);
+    aether_pgo_record_branch(1, 0);
+
+    // Site 2: 4 taken of 4 = 1.0
+    aether_pgo_record_branch(2, 1);
+    aether_pgo_record_branch(2, 1);
+    aether_pgo_record_branch(2, 1);
+    aether_pgo_record_branch(2, 1);
+
+    let f1: f32 = aether_pgo_branch_freq(1);
+    if f1 != 0.5 { return 3; }
+
+    let f2: f32 = aether_pgo_branch_freq(2);
+    if f2 != 1.0 { return 4; }
+
+    // Unknown site → 0.0
+    let f3: f32 = aether_pgo_branch_freq(99);
+    if f3 != 0.0 { return 5; }
+
+    // Callsite 10: 3 calls. Callsite 20: 1 call.
+    aether_pgo_record_call(10);
+    aether_pgo_record_call(10);
+    aether_pgo_record_call(10);
+    aether_pgo_record_call(20);
+
+    if aether_pgo_call_count(10) != 3 { return 6; }
+    if aether_pgo_call_count(20) != 1 { return 7; }
+    if aether_pgo_call_count(999) != 0 { return 8; }
+
+    // Reset clears everything.
+    aether_pgo_reset();
+    if aether_pgo_call_count(10) != 0 { return 9; }
+    let f4: f32 = aether_pgo_branch_freq(1);
+    if f4 != 0.0 { return 10; }
+
+    0
+}

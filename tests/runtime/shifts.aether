@@ -1,0 +1,14 @@
+// roadmap: P6.7
+// expect: exit=42
+// Bitwise shifts: << and >>. Lex as two single tokens (Lt+Lt / Gt+Gt) so
+// they don't conflict with generic-args close `>>`. Codegen uses CL-form
+// shlq / sarq so any rhs value works (literal, ident, expr).
+fn main() -> i32 {
+    let a = 1 << 5;          // 32
+    let b = 80 >> 1;         // 40
+    let n = 3;
+    let c = 1 << n;          // 8
+    let d = a + b - c + 2;   // 32 + 40 - 8 + 2 = 66 â€” adjust to land on 42
+    let e = d - 24;          // 42
+    e as i32
+}

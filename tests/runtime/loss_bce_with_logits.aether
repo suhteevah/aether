@@ -1,0 +1,41 @@
+// roadmap: P7.6
+// expect: exit=0
+// BCEWithLogits: stable BCE on raw logits. Backward = (sigmoid(z) - t) / n.
+use runtime;
+
+fn main() -> i32 {
+    let n: i32 = 4;
+    let pred:   i64 = aether_alloc_f32(n);
+    let target: i64 = aether_alloc_f32(n);
+    let dpred:  i64 = aether_alloc_f32(n);
+    if pred == 0 { return 1; }
+
+    aether_store_f32(pred, 0, 0.5);
+    aether_store_f32(pred, 1, 1.5);
+    aether_store_f32(pred, 2, 2.0);
+    aether_store_f32(pred, 3, 0.25);
+
+    aether_store_f32(target, 0, 0.0);
+    aether_store_f32(target, 1, 1.0);
+    aether_store_f32(target, 2, 0.0);
+    aether_store_f32(target, 3, 1.0);
+
+    aether_op_bce_with_logits_backward_f32(pred, target, dpred, n);
+
+    let eps: f32 = 0.001;
+    let tol: f32 = 0.001;
+    let mut i: i32 = 0;
+    while i < n {
+        let saved: f32 = aether_load_f32(pred, i);
+        aether_store_f32(pred, i, saved + eps);
+        let lp: f32 = aether_op_bce_with_logits_f32(pred, target, n);
+        aether_store_f32(pred, i, saved - eps);
+        let lm: f32 = aether_op_bce_with_logits_f32(pred, target, n);
+        aether_store_f32(pred, i, saved);
+        let num: f32 = (lp - lm) / (2.0 * eps);
+        let ana: f32 = aether_load_f32(dpred, i);
+        if aether_abs_f32(num - ana) > tol { return 2 + i; }
+        i = i + 1;
+    }
+    0
+}

@@ -1,0 +1,43 @@
+// expect: exit=0
+// requires: cuda
+//
+// MIR fusion pass detects `x.matmul(...); h.gelu(...)` and rewrites to
+// `x.matmul_gelu(...)` — one fewer ABI round-trip per layer. Runs the
+// same forward as cuda_train_mlp's first half but without backward —
+// the audit just checks the fused build runs and exits 0; the perf win
+// shows up under the bench harness.
+//
+// You can verify fusion fired with `aetherc <file> --emit=asm` and
+// looking for `aether_op_matmul_gelu_f32_cuda` in the .s output.
+use runtime;
+
+const BSZ: i32 = 16;
+const KK:  i32 = 64;
+const HH:  i32 = 128;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:  i64 = aether_alloc_f32(1024);
+    let h_w1: i64 = aether_alloc_f32(8192);
+    aether_init_normal_f32(h_x,  1024, 1.0, 1);
+    aether_init_normal_f32(h_w1, 8192, 0.1, 7);
+
+    let x:     Tensor<f32, [BSZ, KK]>;
+    let w1:    Tensor<f32, [KK, HH]>;
+    let h_pre: Tensor<f32, [BSZ, HH]>;
+    let h_act: Tensor<f32, [BSZ, HH]>;
+
+    aether_dev_h2d_f32(h_x,  x,  1024);
+    aether_dev_h2d_f32(h_w1, w1, 8192);
+
+    // The fusion pass detects this exact pattern and rewrites to one call.
+    x.matmul(&w1, &mut h_pre);
+    h_pre.gelu(&mut h_pre);
+    let _ = h_act;     // silence unused warning
+
+    aether_dev_sync();
+    aether_free_f32(h_x, 1024);
+    aether_free_f32(h_w1, 8192);
+    0
+}

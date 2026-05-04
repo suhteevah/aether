@@ -1,0 +1,14 @@
+// expect: exit=42
+// Scalar helpers in stdlib: abs / min / max / sqrt for i64 + f32. Plain
+// extern fns (Aether doesn't have method-on-scalar dispatch yet).
+use runtime;
+
+fn main() -> i32 {
+    let a = aether_abs_i64(-5);              // 5
+    let b = aether_min_i64(20, 7);           // 7
+    let c = aether_max_i64(15, 30);          // 30
+    let d = aether_sqrt_f32(4.0) as i64;     // 2
+    // 5 + 7 + 30 + 2 = 44; subtract 2 = 42
+    let total = a + b + c + d - 2;
+    total as i32
+}

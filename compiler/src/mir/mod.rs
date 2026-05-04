@@ -17,6 +17,10 @@
 use crate::ast::*;
 
 pub mod adgraph;
+pub mod fuse;
+pub mod closures;
+pub mod spec;
+pub mod test_harness;
 
 #[derive(Debug, Clone)]
 pub struct MirProgram {
@@ -128,6 +132,9 @@ fn lower_stmt(s: &Stmt, autodiff: bool, out: &mut Vec<MirStmt>) {
         Stmt::Let { name, value: None, .. } => {
             out.push(MirStmt::Source(format!("let {}: <uninit>", name)));
         }
+        Stmt::LetTuple { names, value } => {
+            out.push(MirStmt::Source(format!("let ({}) = {}", names.join(", "), render_expr(value))));
+        }
         Stmt::Expr(e) => lower_expr_stmt(e, autodiff, out),
         Stmt::Return(Some(e)) => out.push(MirStmt::Source(format!("return {}", render_expr(e)))),
         Stmt::Return(None) => out.push(MirStmt::Source("return".into())),
@@ -203,6 +210,15 @@ fn render_expr(e: &Expr) -> String {
         }
         Expr::Cast { expr, ty } => format!("({} as {})", render_expr(expr), ty),
         Expr::Index { recv, idx } => format!("{}[{}]", render_expr(recv), render_expr(idx)),
+        Expr::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(render_expr).collect();
+            format!("({})", parts.join(", "))
+        }
+        Expr::Closure { params, body } => {
+            let plist: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+            format!("|{}| {}", plist.join(", "), render_expr(body))
+        }
+        Expr::Try(inner) => format!("{}?", render_expr(inner)),
     }
 }
 
@@ -213,6 +229,7 @@ fn bin_op_str(op: BinOp) -> &'static str {
         BinOp::Gt => ">", BinOp::Le => "<=", BinOp::Ge => ">=", BinOp::And => "&&",
         BinOp::Or => "||", BinOp::Assign => "=",
         BinOp::BitAnd => "&", BinOp::BitOr => "|", BinOp::BitXor => "^",
+        BinOp::Shl => "<<", BinOp::Shr => ">>",
     }
 }
 

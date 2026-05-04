@@ -1,0 +1,36 @@
+// expect: exit=0
+// expect: stdout contains ALL PASSED
+// roadmap: P6.14
+// build-mode: aether-bin-test
+//
+// Roadmap P6.14 — `#[test]` attribute + minimal runner harness.
+//
+// Each `#[test] fn` returns i32: 0 = pass, nonzero = fail. aetherc's
+// `--test` mode synthesises a `main` that calls every #[test] fn in
+// source order, prints PASS/FAIL per test + a summary, and exits 0
+// iff all tests passed. Substitutes for `assert_eq!`/`assert!` macros
+// (those are blocked on P6.11 macro support) — the convention is
+// "return 0 if your invariants held, return nonzero if not".
+
+#[test]
+fn test_basic_arith() -> i32 {
+    let a: i32 = 2 + 3;
+    if a == 5 { 0 } else { 1 }
+}
+
+#[test]
+fn test_branching() -> i32 {
+    let x: i32 = 10;
+    let y: i32 = if x > 5 { 7 } else { 99 };
+    if y == 7 { 0 } else { 1 }
+}
+
+#[test]
+fn test_loop_sum() -> i32 {
+    let mut acc: i32 = 0;
+    for i in 0..5 {
+        acc = acc + i;
+    }
+    // 0+1+2+3+4 = 10
+    if acc == 10 { 0 } else { 1 }
+}

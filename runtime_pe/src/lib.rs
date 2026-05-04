@@ -346,6 +346,78 @@ fn write_f32(buf: &mut [u8], v: f32, decimals: u32) -> usize {
     i
 }
 
+// ----- byte-buffer helpers (P9.4) -----
+//
+// Mirror the full `aether_rt` API for the byte-buffer / printing surface
+// the self-hosted bootstrap stages (`aetherc_self_*.aether`) lean on. All
+// allocations route through `HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY)`
+// — no Rust `Vec`, no allocator init paths, so the slim cdylib's DllMain
+// stays clean. With these in place the pe-bin path covers byte I/O +
+// formatted i64 prints without pulling in msvcrt.
+
+/// Allocate `n` zero-initialised bytes. Returns ptr as i64; 0 on `n <= 0`.
+/// Matches the contract of `aether_rt::aether_alloc_bytes` so .aether
+/// programs that compile under both --emit=aether-bin and --emit=pe-bin
+/// stay identical at the source level.
+#[no_mangle] pub unsafe extern "C" fn aether_alloc_bytes(n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    alloc_zeroed(n as usize) as i64
+}
+
+/// Free a buffer previously returned by `aether_alloc_bytes`. The `_n`
+/// arg is accepted for ABI parity with the full runtime (which uses it to
+/// reconstruct a Box slice); HeapFree doesn't need the size.
+#[no_mangle] pub unsafe extern "C" fn aether_free_bytes(p: i64, _n: i64) -> CInt {
+    if p != 0 { free(p as *mut u8); }
+    0
+}
+
+/// Load a single byte; returns 0..=255 widened to i64. -1 on null ptr.
+#[no_mangle] pub unsafe extern "C" fn aether_byte_at(p: i64, i: i64) -> i64 {
+    if p == 0 || i < 0 { return -1; }
+    *(p as *const u8).add(i as usize) as i64
+}
+
+/// Store the low 8 bits of `v` at offset `i`.
+#[no_mangle] pub unsafe extern "C" fn aether_byte_set(p: i64, i: i64, v: i64) -> CInt {
+    if p == 0 || i < 0 { return 0; }
+    *(p as *mut u8).add(i as usize) = (v & 0xFF) as u8;
+    0
+}
+
+/// Write `n` bytes from buffer `p` to stdout via kernel32!WriteFile.
+/// No buffering, no msvcrt; same surface as `aether_rt::aether_print_bytes`.
+#[no_mangle] pub unsafe extern "C" fn aether_print_bytes(p: i64, n: i64) -> CInt {
+    if p == 0 || n <= 0 { return 0; }
+    let h = GetStdHandle(STD_OUTPUT_HANDLE);
+    let mut written: u32 = 0;
+    WriteFile(h, p as *const c_void, n as u32,
+              &mut written, core::ptr::null_mut());
+    0
+}
+
+/// Print `<label>: <value>\n` to stdout. `label` is a NUL-terminated C
+/// string (typically interned in `.rdata` by aetherc); pass null to
+/// print just the value. kernel32!WriteFile only — no msvcrt printf.
+#[no_mangle] pub unsafe extern "C" fn aether_print_kv_i64(label: *const u8, value: i64) -> CInt {
+    let mut buf = [0u8; 96];
+    let mut i = 0usize;
+    if !label.is_null() {
+        let mut n = 0usize;
+        while *label.add(n) != 0 && n < 64 { n += 1; }
+        let mut k = 0usize;
+        while k < n && i < buf.len() { buf[i] = *label.add(k); i += 1; k += 1; }
+        if i + 1 < buf.len() { buf[i] = b':'; i += 1; buf[i] = b' '; i += 1; }
+    }
+    i += write_int(&mut buf[i..], value);
+    if i < buf.len() { buf[i] = b'\n'; i += 1; }
+    let h = GetStdHandle(STD_OUTPUT_HANDLE);
+    let mut written: u32 = 0;
+    WriteFile(h, buf.as_ptr() as *const c_void, i as u32,
+              &mut written, core::ptr::null_mut());
+    0
+}
+
 // ----- test exports -----
 #[no_mangle] pub extern "C" fn aether_test_log_f32(x: f32) -> f32 { libm::logf(x.max(1e-30)) }
 

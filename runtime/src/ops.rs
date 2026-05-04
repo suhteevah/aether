@@ -16,6 +16,47 @@ unsafe fn sm<'a>(p: *mut f32, n: usize) -> &'a mut [f32] { slice::from_raw_parts
 
 // ---------------------------------------------------------------- matmul
 
+/// Blocked matmul (cache-tile-friendly). Same shape contract as `matmul_f32`
+/// but uses 32x32 register-resident tiles to improve L1 reuse on bigger
+/// shapes. Identical numerical output to the naive version (modulo
+/// fp-summation order differences, which are below the audit's float
+/// tolerance for the witness shape).
+pub unsafe fn matmul_blocked_f32(
+    a: *const f32, b: *const f32, out: *mut f32,
+    m: usize, k: usize, n: usize,
+) {
+    const BS: usize = 32;
+    let a = s(a, m * k);
+    let b = s(b, k * n);
+    let out = sm(out, m * n);
+    for v in out.iter_mut() { *v = 0.0; }
+    let mut i0 = 0;
+    while i0 < m {
+        let i_end = (i0 + BS).min(m);
+        let mut j0 = 0;
+        while j0 < n {
+            let j_end = (j0 + BS).min(n);
+            let mut k0 = 0;
+            while k0 < k {
+                let k_end = (k0 + BS).min(k);
+                for i in i0..i_end {
+                    for kk in k0..k_end {
+                        let av = a[i * k + kk];
+                        for j in j0..j_end {
+                            out[i * n + j] += av * b[kk * n + j];
+                        }
+                    }
+                }
+                k0 += BS;
+            }
+            j0 += BS;
+        }
+        i0 += BS;
+    }
+}
+
+// ---------------------------------------------------------------- matmul
+
 /// `out[i, j] = sum_k a[i, k] * b[k, j]` — row-major.
 pub unsafe fn matmul_f32(
     a: *const f32, b: *const f32, out: *mut f32,
@@ -449,6 +490,311 @@ pub unsafe fn cross_entropy_backward_f32(
         for j in 0..v { dlogits[off + j] = probs[off + j] * inv_b; }
         let lab = labels[i] as usize;
         dlogits[off + lab] -= inv_b;
+    }
+}
+
+// ---------------------------------------------------------------- losses (P7.6)
+
+/// Mean-squared error: scalar = mean_i (pred[i] - target[i])^2.
+pub unsafe fn mse_f32(pred: *const f32, target: *const f32, n: usize) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let d = pred[i] - target[i];
+        acc += (d * d) as f64;
+    }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = 2 * (pred[i] - target[i]) / n. Matches mean reduction.
+pub unsafe fn mse_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let scale = 2.0 / n as f32;
+    for i in 0..n {
+        dpred[i] = (pred[i] - target[i]) * scale;
+    }
+}
+
+/// Mean absolute error: scalar = mean_i |pred[i] - target[i]|.
+pub unsafe fn mae_f32(pred: *const f32, target: *const f32, n: usize) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n { acc += (pred[i] - target[i]).abs() as f64; }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = sign(pred[i] - target[i]) / n. Subgradient at zero is 0.
+pub unsafe fn mae_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let inv_n = 1.0 / n as f32;
+    for i in 0..n {
+        let d = pred[i] - target[i];
+        dpred[i] = if d > 0.0 { inv_n } else if d < 0.0 { -inv_n } else { 0.0 };
+    }
+}
+
+/// Binary cross-entropy with logits (numerically stable). Per-elem:
+///   loss[i] = max(z, 0) - z*t + log(1 + exp(-|z|))
+/// where z = pred[i] (logit), t = target[i] (in [0,1]). Reduce by mean.
+pub unsafe fn bce_with_logits_f32(
+    pred: *const f32, target: *const f32, n: usize,
+) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let z = pred[i];
+        let t = target[i];
+        let max_zero = if z > 0.0 { z } else { 0.0 };
+        let l = max_zero - z * t + (1.0 + (-z.abs()).exp()).ln();
+        acc += l as f64;
+    }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = (sigmoid(pred[i]) - target[i]) / n.
+pub unsafe fn bce_with_logits_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let inv_n = 1.0 / n as f32;
+    for i in 0..n {
+        let z = pred[i];
+        let sigmoid = 1.0 / (1.0 + (-z).exp());
+        dpred[i] = (sigmoid - target[i]) * inv_n;
+    }
+}
+
+/// Binary cross-entropy on probabilities (clamps for numerical safety):
+///   loss[i] = -(t*log(p) + (1-t)*log(1-p)). Reduce by mean.
+pub unsafe fn bce_f32(pred: *const f32, target: *const f32, n: usize) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let p = pred[i].clamp(1e-7, 1.0 - 1e-7);
+        let t = target[i];
+        acc += -((t * p.ln() + (1.0 - t) * (1.0 - p).ln()) as f64);
+    }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = (p - t) / (p*(1-p)) / n. Clamps mirror the forward.
+pub unsafe fn bce_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let inv_n = 1.0 / n as f32;
+    for i in 0..n {
+        let p = pred[i].clamp(1e-7, 1.0 - 1e-7);
+        dpred[i] = (p - target[i]) / (p * (1.0 - p)) * inv_n;
+    }
+}
+
+/// KL divergence KL(target || pred) on probability distributions:
+///   loss = sum_i target[i] * (log(target[i]) - log(pred[i])) / n.
+/// `pred` and `target` must be valid probability vectors (>0 entries).
+pub unsafe fn kl_div_f32(pred: *const f32, target: *const f32, n: usize) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let p = pred[i].max(1e-12);
+        let t = target[i].max(1e-12);
+        acc += (target[i] * (t.ln() - p.ln())) as f64;
+    }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = -target[i] / pred[i] / n. (gradient wrt pred only)
+pub unsafe fn kl_div_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let inv_n = 1.0 / n as f32;
+    for i in 0..n {
+        let p = pred[i].max(1e-12);
+        dpred[i] = -target[i] / p * inv_n;
+    }
+}
+
+/// Huber loss with parameter `delta`:
+///   loss[i] = 0.5 * d^2                  if |d| <= delta
+///           = delta * (|d| - 0.5*delta)  otherwise
+/// where d = pred[i] - target[i]. Reduce by mean.
+pub unsafe fn huber_f32(
+    pred: *const f32, target: *const f32, n: usize, delta: f32,
+) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let d = pred[i] - target[i];
+        let ad = d.abs();
+        let l = if ad <= delta { 0.5 * d * d } else { delta * (ad - 0.5 * delta) };
+        acc += l as f64;
+    }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = d if |d|<=delta else delta*sign(d), divided by n.
+pub unsafe fn huber_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize, delta: f32,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let inv_n = 1.0 / n as f32;
+    for i in 0..n {
+        let d = pred[i] - target[i];
+        let g = if d.abs() <= delta { d } else if d > 0.0 { delta } else { -delta };
+        dpred[i] = g * inv_n;
+    }
+}
+
+/// Smooth-L1 (Huber with delta=1, beta-form):
+///   loss[i] = 0.5 * d^2 / beta  if |d| < beta
+///           = |d| - 0.5 * beta  otherwise
+/// where d = pred - target. Reduce by mean.
+pub unsafe fn smooth_l1_f32(
+    pred: *const f32, target: *const f32, n: usize, beta: f32,
+) -> f32 {
+    if n == 0 { return 0.0; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let mut acc = 0.0f64;
+    for i in 0..n {
+        let d = pred[i] - target[i];
+        let ad = d.abs();
+        let l = if ad < beta { 0.5 * d * d / beta } else { ad - 0.5 * beta };
+        acc += l as f64;
+    }
+    (acc / n as f64) as f32
+}
+
+/// dpred[i] = d/beta if |d|<beta else sign(d), divided by n.
+pub unsafe fn smooth_l1_backward_f32(
+    pred: *const f32, target: *const f32, dpred: *mut f32, n: usize, beta: f32,
+) {
+    if n == 0 { return; }
+    let pred = s(pred, n);
+    let target = s(target, n);
+    let dpred = sm(dpred, n);
+    let inv_n = 1.0 / n as f32;
+    for i in 0..n {
+        let d = pred[i] - target[i];
+        let g = if d.abs() < beta { d / beta } else if d > 0.0 { 1.0 } else { -1.0 };
+        dpred[i] = g * inv_n;
+    }
+}
+
+/// Triplet margin loss (single triplet, dim-d vectors):
+///   loss = max(0, ||a-p||^2 - ||a-n||^2 + margin)
+pub unsafe fn triplet_f32(
+    anchor: *const f32, positive: *const f32, negative: *const f32,
+    d: usize, margin: f32,
+) -> f32 {
+    let a = s(anchor, d);
+    let p = s(positive, d);
+    let nn = s(negative, d);
+    let mut dap = 0.0f32;
+    let mut dan = 0.0f32;
+    for i in 0..d {
+        let u = a[i] - p[i]; dap += u * u;
+        let v = a[i] - nn[i]; dan += v * v;
+    }
+    let raw = dap - dan + margin;
+    if raw > 0.0 { raw } else { 0.0 }
+}
+
+/// Backward wrt anchor: 2*(a-p) - 2*(a-n) when active, else 0. Caller can
+/// derive d_positive / d_negative from -2*(a-p) and 2*(a-n) symmetrically.
+pub unsafe fn triplet_backward_f32(
+    anchor: *const f32, positive: *const f32, negative: *const f32,
+    d_anchor: *mut f32, d: usize, margin: f32,
+) {
+    let a = s(anchor, d);
+    let p = s(positive, d);
+    let nn = s(negative, d);
+    let da = sm(d_anchor, d);
+    let mut dap = 0.0f32;
+    let mut dan = 0.0f32;
+    for i in 0..d {
+        let u = a[i] - p[i]; dap += u * u;
+        let v = a[i] - nn[i]; dan += v * v;
+    }
+    let active = dap - dan + margin > 0.0;
+    if active {
+        for i in 0..d { da[i] = 2.0 * (nn[i] - p[i]); }
+    } else {
+        for i in 0..d { da[i] = 0.0; }
+    }
+}
+
+/// Contrastive loss (Hadsell et al.) on a single pair, dim-d vectors:
+///   d2 = ||x1 - x2||^2
+///   loss = y * d2 + (1-y) * max(0, margin - sqrt(d2))^2
+/// y == 1 means "similar"; y == 0 means "dissimilar".
+pub unsafe fn contrastive_f32(
+    x1: *const f32, x2: *const f32, y: f32, d: usize, margin: f32,
+) -> f32 {
+    let a = s(x1, d);
+    let b = s(x2, d);
+    let mut d2 = 0.0f32;
+    for i in 0..d { let u = a[i] - b[i]; d2 += u * u; }
+    let dist = d2.sqrt();
+    let neg_part = (margin - dist).max(0.0);
+    y * d2 + (1.0 - y) * neg_part * neg_part
+}
+
+/// dx1[i]: 2*y*(x1-x2)[i] for similar pair; for dissimilar, when margin>dist,
+/// dx1[i] = -2*(margin - dist)*(x1-x2)[i] / dist (else 0).
+pub unsafe fn contrastive_backward_f32(
+    x1: *const f32, x2: *const f32, dx1: *mut f32,
+    y: f32, d: usize, margin: f32,
+) {
+    let a = s(x1, d);
+    let b = s(x2, d);
+    let dx = sm(dx1, d);
+    let mut d2 = 0.0f32;
+    for i in 0..d { let u = a[i] - b[i]; d2 += u * u; }
+    let dist = d2.sqrt().max(1e-12);
+    let neg_active = margin - dist > 0.0;
+    for i in 0..d {
+        let diff = a[i] - b[i];
+        let g_pos = 2.0 * y * diff;
+        let g_neg = if neg_active {
+            -2.0 * (margin - dist) * diff / dist * (1.0 - y)
+        } else { 0.0 };
+        dx[i] = g_pos + g_neg;
     }
 }
 

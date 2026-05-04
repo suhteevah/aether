@@ -1,0 +1,51 @@
+// roadmap: P8.7
+// expect: exit=0
+//
+// Mixed-precision (autocast-style) matmul witness.
+//   - Random f32 a, b (small magnitude so bf16 truncation doesn't bite).
+//   - Reference: full f32 matmul.
+//   - Test: pack a, b to bf16 buffers, run matmul_bf16_f32_out (bf16
+//     inputs, f32 accumulation, f32 output).
+//   - Compare results: must agree within bf16 truncation noise.
+use runtime;
+
+fn main() -> i32 {
+    let m: i32 = 8;
+    let nm_a: i32 = m * m;
+    let nm_b: i32 = m * m;
+    let nm_o: i32 = m * m;
+
+    let a_f32: i64 = aether_alloc_f32(nm_a);
+    let b_f32: i64 = aether_alloc_f32(nm_b);
+    let out_ref: i64 = aether_alloc_f32(nm_o);
+    let out_mp:  i64 = aether_alloc_f32(nm_o);
+    let a_bf16: i64 = aether_alloc_i32(nm_a);
+    let b_bf16: i64 = aether_alloc_i32(nm_b);
+    if a_f32 == 0 { return 1; }
+
+    aether_init_normal_f32(a_f32, nm_a, 0.2, 11);
+    aether_init_normal_f32(b_f32, nm_b, 0.2, 13);
+
+    aether_op_matmul_f32(a_f32, b_f32, out_ref, m, m, m);
+
+    aether_pack_f32_to_bf16(a_f32, a_bf16, nm_a);
+    aether_pack_f32_to_bf16(b_f32, b_bf16, nm_b);
+    aether_op_matmul_bf16_f32_out(a_bf16, b_bf16, out_mp, m, m, m);
+
+    let mut i: i32 = 0;
+    while i < nm_o {
+        let r: f32 = aether_load_f32(out_ref, i);
+        let p: f32 = aether_load_f32(out_mp, i);
+        // bf16 has ~8-bit mantissa; expect O(1e-2) absolute slop on small outputs.
+        if aether_abs_f32(r - p) > 0.02 { return 2 + i; }
+        i = i + 1;
+    }
+
+    aether_free_f32(a_f32, nm_a);
+    aether_free_f32(b_f32, nm_b);
+    aether_free_f32(out_ref, nm_o);
+    aether_free_f32(out_mp, nm_o);
+    aether_free_i32(a_bf16, nm_a);
+    aether_free_i32(b_bf16, nm_b);
+    0
+}

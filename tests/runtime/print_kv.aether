@@ -1,0 +1,11 @@
+// expect: stdout contains step: 7
+// `aether_print_kv_i64("label", value)` debug helper. String literals are
+// pointers to interned `.rdata`; the runtime fn formats `<label>: <value>`.
+use runtime;
+
+fn main() -> i32 {
+    let label = "step";
+    aether_print_kv_i64(label, 7);
+    aether_print_kv_f32("loss", 0.125);
+    0
+}

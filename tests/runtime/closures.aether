@@ -1,0 +1,17 @@
+// roadmap: P6.6
+// expect: exit=42
+// Closures (no captures yet). Lifted to synthetic top-level fns by
+// the closure-lifting pass; the closure expression becomes a function
+// pointer the rest of the code can pass around and call.
+fn apply(op: i64, x: i64, y: i64) -> i64 { op(x, y) }
+
+fn main() -> i32 {
+    let add = |a: i64, b: i64| a + b;
+    let sub = |a: i64, b: i64| a - b;
+    let mul = |a: i64, b: i64| a * b;
+
+    let a = apply(add, 10, 5);   // 15
+    let b = apply(sub, 30, 8);   // 22
+    let c = apply(mul, 5, 1);    // 5
+    (a + b + c) as i32           // 42
+}

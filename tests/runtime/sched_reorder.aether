@@ -1,0 +1,22 @@
+// expect: exit=42
+// roadmap: P10.5
+// Witness: P10.5 instruction scheduler (load-store reorder).
+//
+// Each `let b = a;` lowers to a (load a → rax) + (store rax → b) pair.
+// Five sequential `let`-aliasing pairs give the scheduler several
+// (load,store)(load,store) windows where the load/store reorder applies.
+// The total `t1+t2+t3+t4+t5` must still equal 42 — the reorder must not
+// change semantics.
+fn main() -> i32 {
+    let a1 = 2;
+    let a2 = 4;
+    let a3 = 6;
+    let a4 = 12;
+    let a5 = 18;
+    let t1 = a1;
+    let t2 = a2;
+    let t3 = a3;
+    let t4 = a4;
+    let t5 = a5;
+    t1 + t2 + t3 + t4 + t5
+}

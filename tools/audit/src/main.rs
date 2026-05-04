@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 mod conformance;
 mod golden;
+mod roadmap;
 mod runtime_check;
 mod scan;
 mod sloc;
@@ -282,6 +283,29 @@ fn main() {
     });
     runtime_json.push(']');
 
+    // ---- 7. Roadmap progress ----
+    let mut roadmap_json = String::from("{");
+    section!("roadmap", {
+        writeln_human("\n[7/7] Roadmap v2 progress".into());
+        let r = roadmap::run(&root);
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = roadmap::report_text(&r, &mut buf);
+        for line in String::from_utf8_lossy(&buf).lines() {
+            writeln_human(line.to_string());
+        }
+        let total: usize = r.phase_progress.values().map(|(t, _)| t).sum();
+        let done:  usize = r.phase_progress.values().map(|(_, d)| d).sum();
+        roadmap_json.push_str(&format!("\"total\":{},\"witnessed\":{},\"phases\":[", total, done));
+        let mut first = true;
+        for (phase, (t, d)) in &r.phase_progress {
+            if !first { roadmap_json.push(','); }
+            first = false;
+            roadmap_json.push_str(&format!("{{\"phase\":{},\"total\":{},\"witnessed\":{}}}", phase, t, d));
+        }
+        roadmap_json.push(']');
+    });
+    roadmap_json.push('}');
+
     // ---- summary ----
     writeln_human("\n=== summary ===".into());
     writeln_human(format!("  errors: {}", errors.len()));
@@ -289,10 +313,10 @@ fn main() {
 
     if json {
         let body = format!(
-            "{{\"sloc\":{},\"scan\":{},\"tests\":{},\"golden\":{},\"conformance\":{},\"runtime\":{},\"errors\":{}}}",
+            "{{\"sloc\":{},\"scan\":{},\"tests\":{},\"golden\":{},\"conformance\":{},\"runtime\":{},\"roadmap\":{},\"errors\":{}}}",
             sloc_json, scan_json,
             test_json.trim_start_matches('[').trim_end_matches(']'),
-            golden_json, conf_json, runtime_json,
+            golden_json, conf_json, runtime_json, roadmap_json,
             errors.len(),
         );
         let _ = std::io::stdout().write_all(body.as_bytes());

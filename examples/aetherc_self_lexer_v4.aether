@@ -1,0 +1,188 @@
+// Self-hosting bootstrap step 5 — STRUCTURED token stream in Aether.
+//
+// Step 4 only counted tokens; step 5 EMITS a structured stream into a
+// pre-allocated buffer. Each token is 3 i64s: (kind, start, len). The
+// parser-side stages (also-to-be-written-in-Aether) consume this layout.
+//
+// Token kinds:
+//   0 = none / EOF
+//   1 = ident
+//   2 = keyword
+//   3 = number
+//   4 = string-literal
+//   5 = punct (1 byte)
+//   6 = punct (2 bytes)
+//
+// At end: dump the first 20 tokens as `<kind>:<start>:<len>` triples.
+use runtime;
+
+const TOK_FIELDS:    i64 = 3;        // kind, start, len
+const MAX_TOKENS:    i64 = 4096;     // pre-alloc ceiling
+const TOKEN_BUF_BYTES: i64 = 98304;  // 3 * 4096 * 8
+
+fn is_id_cont(b: i64) -> i64 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 { return 1; }
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+
+fn match_kw(buf: i64, start: i64, len: i64, kw_lit: i64, kw_len: i64) -> i64 {
+    if len != kw_len { return 0; }
+    if aether_bytes_eq(buf + start, kw_lit, kw_len) == 1 { return 1; }
+    return 0;
+}
+
+fn is_keyword(buf: i64, start: i64, len: i64) -> i64 {
+    if match_kw(buf, start, len, "fn", 2) == 1 { return 1; }
+    if match_kw(buf, start, len, "if", 2) == 1 { return 1; }
+    if match_kw(buf, start, len, "in", 2) == 1 { return 1; }
+    if match_kw(buf, start, len, "let", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "mut", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "use", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "for", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "pub", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "else", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "enum", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "impl", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "self", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "while", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "const", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "match", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "break", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "return", 6) == 1 { return 1; }
+    if match_kw(buf, start, len, "struct", 6) == 1 { return 1; }
+    if match_kw(buf, start, len, "extern", 6) == 1 { return 1; }
+    if match_kw(buf, start, len, "continue", 8) == 1 { return 1; }
+    return 0;
+}
+
+fn two_punct(a: i64, b: i64) -> i64 {
+    if a == 61 && b == 61 { return 1; }
+    if a == 33 && b == 61 { return 1; }
+    if a == 60 && b == 61 { return 1; }
+    if a == 62 && b == 61 { return 1; }
+    if a == 38 && b == 38 { return 1; }
+    if a == 124 && b == 124 { return 1; }
+    if a == 43 && b == 61 { return 1; }
+    if a == 45 && b == 61 { return 1; }
+    if a == 42 && b == 61 { return 1; }
+    if a == 47 && b == 61 { return 1; }
+    if a == 45 && b == 62 { return 1; }
+    if a == 58 && b == 58 { return 1; }
+    if a == 46 && b == 46 { return 1; }
+    if a == 60 && b == 60 { return 1; }
+    if a == 62 && b == 62 { return 1; }
+    return 0;
+}
+
+// Each token = 3 consecutive i64s in `tok_buf`. Field offsets = 0/8/16
+// from the token's base byte offset (token_idx * 24).
+fn tok_set(tok_buf: i64, idx: i64, kind: i64, start: i64, len: i64) {
+    let base = idx * 24;
+    // Pack each i64 as 8 little-endian bytes via byte_set.
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(tok_buf, base + k,      (kind  >> (k * 8)) & 255);
+        aether_byte_set(tok_buf, base + 8  + k, (start >> (k * 8)) & 255);
+        aether_byte_set(tok_buf, base + 16 + k, (len   >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+
+fn tok_get(tok_buf: i64, idx: i64, field: i64) -> i64 {
+    // field: 0=kind, 1=start, 2=len
+    let base = idx * 24 + field * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(tok_buf, base + k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    let path    = "examples/aetherc_self_lexer_v4.aether";
+    let buf     = aether_read_file(path);
+    if buf == 0 { return 1; }
+    let n       = aether_file_size_last();
+    let tok_buf = aether_alloc_bytes(TOKEN_BUF_BYTES);
+    aether_print_kv_i64("source bytes", n);
+
+    let mut i: i64 = 0;
+    let mut tn: i64 = 0;     // token count
+
+    while i < n {
+        let b = aether_byte_at(buf, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if b == 47 && i + 1 < n && aether_byte_at(buf, i + 1) == 47 {
+            i += 2;
+            while i < n && aether_byte_at(buf, i) != 10 { i += 1; }
+            continue;
+        }
+        if b == 34 {
+            let start = i;
+            i += 1;
+            while i < n && aether_byte_at(buf, i) != 34 { i += 1; }
+            if i < n { i += 1; }
+            tok_set(tok_buf, tn, 4, start, i - start);
+            tn += 1;
+            continue;
+        }
+        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 {
+            let start = i;
+            i += 1;
+            while i < n && is_id_cont(aether_byte_at(buf, i)) == 1 { i += 1; }
+            let kind = if is_keyword(buf, start, i - start) == 1 { 2 } else { 1 };
+            tok_set(tok_buf, tn, kind, start, i - start);
+            tn += 1;
+            continue;
+        }
+        if b >= 48 && b <= 57 {
+            let start = i;
+            i += 1;
+            while i < n && aether_byte_at(buf, i) >= 48 && aether_byte_at(buf, i) <= 57 {
+                i += 1;
+            }
+            tok_set(tok_buf, tn, 3, start, i - start);
+            tn += 1;
+            continue;
+        }
+        // Punct.
+        if i + 1 < n {
+            let b2 = aether_byte_at(buf, i + 1);
+            if two_punct(b, b2) == 1 {
+                tok_set(tok_buf, tn, 6, i, 2);
+                tn += 1;
+                i += 2;
+                continue;
+            }
+        }
+        tok_set(tok_buf, tn, 5, i, 1);
+        tn += 1;
+        i += 1;
+    }
+
+    aether_print_kv_i64("token count", tn);
+
+    // Dump first 20 tokens — demonstrates round-trip read of structured buffer.
+    let mut idx = 0;
+    while idx < 20 && idx < tn {
+        let kind  = tok_get(tok_buf, idx, 0);
+        let start = tok_get(tok_buf, idx, 1);
+        let len   = tok_get(tok_buf, idx, 2);
+        aether_print_kv_i64("kind", kind);
+        aether_print_kv_i64(" start", start);
+        aether_print_kv_i64(" len", len);
+        aether_print_bytes(buf + start, len);
+        let nl = aether_alloc_bytes(1);
+        aether_byte_set(nl, 0, 10);
+        aether_print_bytes(nl, 1);
+        aether_free_bytes(nl, 1);
+        idx += 1;
+    }
+
+    aether_free_bytes(buf, n);
+    aether_free_bytes(tok_buf, TOKEN_BUF_BYTES);
+    0
+}

@@ -1,0 +1,13 @@
+// roadmap: P6.7
+// expect: exit=42
+// Tuple literals + numeric field access. `let pair = (a, b);` allocates
+// two synthetic slots `pair.0` and `pair.1`; `.0` / `.1` read them back.
+// Mixed types (int + float) â€” verifies per-element type inference at let.
+fn main() -> i32 {
+    let pair = (10, 4.0);
+    let pt:   (i64, i64, i64) = (1, 2, 3);
+    let sum  = pair.0 + pt.0 + pt.1 + pt.2;     // 10 + 1 + 2 + 3 = 16
+    let half = pair.1;                           // 4.0
+    let bonus = half as i64 + 22;                // 4 + 22 = 26
+    (sum + bonus) as i32                         // 42
+}

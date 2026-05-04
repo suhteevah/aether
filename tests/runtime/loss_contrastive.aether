@@ -1,0 +1,46 @@
+// roadmap: P7.6
+// expect: exit=0
+// Contrastive loss on a single dim-4 pair. Tests both regimes:
+//   y=1 (similar): loss = ||x1-x2||^2,  dx1 = 2*(x1-x2)
+//   y=0 (dissimilar, margin>dist): hinge active.
+// This test uses y=1 so only the squared-distance branch matters.
+use runtime;
+
+fn main() -> i32 {
+    let d: i32 = 4;
+    let x1:  i64 = aether_alloc_f32(d);
+    let x2:  i64 = aether_alloc_f32(d);
+    let dx1: i64 = aether_alloc_f32(d);
+    if x1 == 0 { return 1; }
+    let margin: f32 = 1.0;
+    let y:      f32 = 1.0;
+
+    aether_store_f32(x1, 0, 1.5);
+    aether_store_f32(x1, 1, 2.5);
+    aether_store_f32(x1, 2, 0.5);
+    aether_store_f32(x1, 3, 4.0);
+
+    aether_store_f32(x2, 0, 1.0);
+    aether_store_f32(x2, 1, 2.0);
+    aether_store_f32(x2, 2, 1.0);
+    aether_store_f32(x2, 3, 3.5);
+
+    aether_op_contrastive_backward_f32(x1, x2, dx1, y, d, margin);
+
+    let eps: f32 = 0.001;
+    let tol: f32 = 0.005;
+    let mut i: i32 = 0;
+    while i < d {
+        let saved: f32 = aether_load_f32(x1, i);
+        aether_store_f32(x1, i, saved + eps);
+        let lp: f32 = aether_op_contrastive_f32(x1, x2, y, d, margin);
+        aether_store_f32(x1, i, saved - eps);
+        let lm: f32 = aether_op_contrastive_f32(x1, x2, y, d, margin);
+        aether_store_f32(x1, i, saved);
+        let num: f32 = (lp - lm) / (2.0 * eps);
+        let ana: f32 = aether_load_f32(dx1, i);
+        if aether_abs_f32(num - ana) > tol { return 2 + i; }
+        i = i + 1;
+    }
+    0
+}

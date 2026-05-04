@@ -1,0 +1,54 @@
+// roadmap: P8.6
+// expect: exit=0
+//
+// P8.6 profiling smoke. Verifies:
+//   1. Allocator stats (total/live/peak) move correctly across a
+//      sequence of alloc + free.
+//   2. Stopwatch (timer_start + timer_elapsed_us) returns a sane
+//      non-negative duration after a real op runs.
+//
+// Exit codes localise where a stat went wrong (1..15).
+use runtime;
+
+fn main() -> i32 {
+    aether_prof_reset();
+    if aether_prof_alloc_total() != 0 { return 1; }
+    if aether_prof_alloc_live()  != 0 { return 2; }
+    if aether_prof_alloc_peak()  != 0 { return 3; }
+
+    let a: i64 = aether_alloc_bytes(1024);
+    if aether_prof_alloc_total() != 1024 { return 4; }
+    if aether_prof_alloc_live()  != 1024 { return 5; }
+    if aether_prof_alloc_peak()  != 1024 { return 6; }
+
+    let b: i64 = aether_alloc_bytes(2048);
+    if aether_prof_alloc_total() != 3072 { return 7; }
+    if aether_prof_alloc_live()  != 3072 { return 8; }
+    if aether_prof_alloc_peak()  != 3072 { return 9; }
+
+    aether_free_bytes(a, 1024);
+    if aether_prof_alloc_total() != 3072 { return 10; }   // total never decreases
+    if aether_prof_alloc_live()  != 2048 { return 11; }
+    if aether_prof_alloc_peak()  != 3072 { return 12; }   // peak retained
+
+    aether_free_bytes(b, 2048);
+    if aether_prof_alloc_live() != 0 { return 13; }
+
+    // Stopwatch: time a CPU matmul. Should be non-negative.
+    let m: i32 = 32;
+    let pa: i64 = aether_alloc_f32(m * m);
+    let pb: i64 = aether_alloc_f32(m * m);
+    let pc: i64 = aether_alloc_f32(m * m);
+    aether_init_normal_f32(pa, m * m, 0.1, 1);
+    aether_init_normal_f32(pb, m * m, 0.1, 2);
+
+    let t0: i64 = aether_timer_start();
+    aether_op_matmul_f32(pa, pb, pc, m, m, m);
+    let dt: i64 = aether_timer_elapsed_us(t0);
+    if dt < 0 { return 14; }
+
+    aether_free_f32(pa, m * m);
+    aether_free_f32(pb, m * m);
+    aether_free_f32(pc, m * m);
+    0
+}

@@ -1,0 +1,61 @@
+// roadmap: P7.3
+// expect: exit=0
+// requires: cuda
+//
+// Single-head scaled-dot-product attention forward, on GPU, end-to-end
+// from .aether source. Demonstrates that we now have every primitive
+// needed to build a transformer block:
+//   Q = x @ Wq;  K = x @ Wk;  V = x @ Wv         (3 matmuls)
+//   scores = Q @ K^T                              (matmul_t)
+//   scores *= 1/sqrt(d_k)                         (scale)
+//   attn = softmax(scores)                        (softmax)
+//   out  = attn @ V                               (matmul)
+use runtime;
+
+const SS: i32 = 8;    // sequence length
+const DM: i32 = 16;   // model dim
+const DK: i32 = 16;   // head dim (equal here for simplicity)
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:  i64 = aether_alloc_f32(128);   // SS*DM
+    let h_wq: i64 = aether_alloc_f32(256);   // DM*DK
+    let h_wk: i64 = aether_alloc_f32(256);
+    let h_wv: i64 = aether_alloc_f32(256);
+    aether_init_normal_f32(h_x,  128, 1.0, 1);
+    aether_init_normal_f32(h_wq, 256, 0.1, 7);
+    aether_init_normal_f32(h_wk, 256, 0.1, 11);
+    aether_init_normal_f32(h_wv, 256, 0.1, 13);
+
+    let x:      Tensor<f32, [SS, DM]>;
+    let wq:     Tensor<f32, [DM, DK]>;
+    let wk:     Tensor<f32, [DM, DK]>;
+    let wv:     Tensor<f32, [DM, DK]>;
+    let q:      Tensor<f32, [SS, DK]>;
+    let k:      Tensor<f32, [SS, DK]>;
+    let v:      Tensor<f32, [SS, DK]>;
+    let scores: Tensor<f32, [SS, SS]>;
+    let attn:   Tensor<f32, [SS, SS]>;
+    let out:    Tensor<f32, [SS, DK]>;
+
+    aether_dev_h2d_f32(h_x,  x,  128);
+    aether_dev_h2d_f32(h_wq, wq, 256);
+    aether_dev_h2d_f32(h_wk, wk, 256);
+    aether_dev_h2d_f32(h_wv, wv, 256);
+
+    x.matmul(&wq, &mut q);
+    x.matmul(&wk, &mut k);
+    x.matmul(&wv, &mut v);
+    q.matmul_t(&k, &mut scores);     // scores[s, s] = q @ k^T
+    scores.scale(0.25);              // 1/sqrt(16)
+    scores.softmax(&mut attn);
+    attn.matmul(&v, &mut out);
+
+    aether_dev_sync();
+    aether_free_f32(h_x,  128);
+    aether_free_f32(h_wq, 256);
+    aether_free_f32(h_wk, 256);
+    aether_free_f32(h_wv, 256);
+    0
+}

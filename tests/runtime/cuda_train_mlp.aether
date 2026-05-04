@@ -1,0 +1,89 @@
+// roadmap: P7.7
+// expect: exit=0
+// requires: cuda
+//
+// Real 2-layer MLP trained end-to-end on GPU through .aether source.
+// Forward:  h = gelu(x @ w1);  logits = h @ w2;  loss = ce(logits, labels)
+// Backward: dlogits â†’ dh, dw2 â†’ dh_pre = gelu_bwd(dh), dw1
+// Optim:    AdamW on w1 and w2
+//
+// Exit 0 iff final loss < initial loss (proves real GPU training of a
+// non-trivial graph end to end via the new gelu + matmul_backward_lhs
+// kernels in cuda.rs).
+use runtime;
+
+const BSZ: i32 = 8;
+const KK:  i32 = 16;
+const HH:  i32 = 32;
+const NN:  i32 = 4;
+const KH:  i32 = 512;  // KK * HH
+const HN:  i32 = 128;  // HH * NN
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    // Host init.
+    let h_x:  i64 = aether_alloc_f32(128);   // BSZ*KK
+    let h_w1: i64 = aether_alloc_f32(512);   // KK*HH
+    let h_w2: i64 = aether_alloc_f32(128);   // HH*NN
+    let h_lab: i64 = aether_alloc_i32(8);
+    aether_init_normal_f32(h_x, 128, 1.0, 1);
+    aether_init_normal_f32(h_w1, 512, 0.1, 7);
+    aether_init_normal_f32(h_w2, 128, 0.1, 11);
+    aether_fill_labels_i32(h_lab, 8, 4, 19);
+
+    // Device tensors with multi-dim shapes â€” one declaration per buffer.
+    let x:       Tensor<f32, [BSZ, KK]>;
+    let w1:      Tensor<f32, [KK, HH]>;
+    let w2:      Tensor<f32, [HH, NN]>;
+    let h_pre:   Tensor<f32, [BSZ, HH]>;
+    let h_act:   Tensor<f32, [BSZ, HH]>;
+    let logits:  Tensor<f32, [BSZ, NN]>;
+    let probs:   Tensor<f32, [BSZ, NN]>;
+    let dlogits: Tensor<f32, [BSZ, NN]>;
+    let dh_act:  Tensor<f32, [BSZ, HH]>;
+    let dh_pre:  Tensor<f32, [BSZ, HH]>;
+    let dw1:     Tensor<f32, [KK, HH]>;
+    let dw2:     Tensor<f32, [HH, NN]>;
+    let m_w1:    Tensor<f32, [KH]>;
+    let v_w1:    Tensor<f32, [KH]>;
+    let m_w2:    Tensor<f32, [HN]>;
+    let v_w2:    Tensor<f32, [HN]>;
+    let labels:  Tensor<i32, [BSZ]>;
+
+    aether_dev_h2d_f32(h_x,  x,  128);
+    aether_dev_h2d_f32(h_w1, w1, 512);
+    aether_dev_h2d_f32(h_w2, w2, 128);
+    aether_dev_h2d_i32(h_lab, labels, 8);
+
+    let mut step: i64 = 1;
+    let mut initial_loss: f32 = 0.0;
+    let mut final_loss: f32 = 0.0;
+    while step <= 80 {
+        // Forward.
+        x.matmul(&w1, &mut h_pre);
+        h_pre.gelu(&mut h_act);
+        h_act.matmul(&w2, &mut logits);
+        let loss: f32 = logits.cross_entropy(&labels, &mut probs);
+        if step == 1 { initial_loss = loss; }
+        final_loss = loss;
+        // Backward.
+        probs.cross_entropy_backward(&labels, &mut dlogits);
+        h_act.matmul_backward_rhs(&dlogits, &mut dw2);
+        dlogits.matmul_backward_lhs(&w2, &mut dh_act);
+        h_pre.gelu_backward(&dh_act, &mut dh_pre);
+        x.matmul_backward_rhs(&dh_pre, &mut dw1);
+        // Optim â€” AdamW on both weight matrices.
+        w1.adamw_step(&dw1, &mut m_w1, &mut v_w1, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        w2.adamw_step(&dw2, &mut m_w2, &mut v_w2, 0.05, 0.9, 0.999, 0.00000001, 0.0, step);
+        step = step + 1;
+    }
+    aether_dev_sync();
+
+    aether_free_f32(h_x, 128);
+    aether_free_f32(h_w1, 512);
+    aether_free_f32(h_w2, 128);
+    aether_free_i32(h_lab, 8);
+
+    if final_loss < initial_loss { 0 } else { 1 }
+}

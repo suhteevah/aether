@@ -1,0 +1,234 @@
+// Self-hosting bootstrap step 7 — JIT in Aether.
+//
+// The Aether-source program below:
+//   1. Parses an arithmetic expression `5 + 18 * 2 + 1` from a hardcoded
+//      source string (lex + parse identical to step 6).
+//   2. Walks the parse, but instead of EVALUATING, emits raw x86-64
+//      machine code into a VirtualAlloc'd executable buffer:
+//         movq $K, %rax         48 B8 imm64
+//         movq %rax, -8(%rbp)   48 89 45 F8        (spill lhs)
+//         movq $K, %rax         48 B8 imm64
+//         movq -8(%rbp), %r10   4C 8B 55 F8
+//         addq %r10, %rax       4C 01 D0
+//         (factor*factor)       imulq instead of add
+//         retq                  C3
+//   3. JIT-calls the buffer via `aether_call_jit_i64`.
+//   4. Prints the result.
+//
+// Compile-and-run loop ENTIRELY in .aether source, no Rust on the
+// codegen path. The runtime ABI just provides VirtualAlloc + a fn-ptr cast.
+//
+// Today: hardcoded constants only (no env / no `let`). Same expression
+// the step-6 interpreter evaluates, so we can cross-check: both routes
+// produce 42 — one by walking the AST, one by JIT-compiling and calling.
+use runtime;
+
+const TOK_NUM:    i64 = 1;
+const TOK_PLUS:   i64 = 6;
+const TOK_MINUS:  i64 = 7;
+const TOK_STAR:   i64 = 8;
+const TOK_EOF:    i64 = 0;
+
+fn is_digit(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+
+fn write_tok(buf: i64, idx: i64, kind: i64, val: i64) {
+    let base = idx * 16;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(buf, base + k,     (kind >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 8 + k, (val  >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+fn read_tok(buf: i64, idx: i64, field: i64) -> i64 {
+    let base = idx * 16 + field * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(buf, base + k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+
+fn lex(src: i64, n: i64, toks: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut tn: i64 = 0;
+    while i < n {
+        let b = aether_byte_at(src, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if is_digit(b) == 1 {
+            let mut acc: i64 = 0;
+            while i < n && is_digit(aether_byte_at(src, i)) == 1 {
+                acc = acc * 10 + (aether_byte_at(src, i) - 48);
+                i += 1;
+            }
+            write_tok(toks, tn, TOK_NUM, acc);
+            tn += 1;
+            continue;
+        }
+        let kind = if b == 43 { TOK_PLUS }
+                   else if b == 45 { TOK_MINUS }
+                   else if b == 42 { TOK_STAR }
+                   else { 0 };
+        if kind == 0 { i += 1; continue; }
+        write_tok(toks, tn, kind, 0);
+        tn += 1;
+        i += 1;
+    }
+    write_tok(toks, tn, TOK_EOF, 0);
+    return tn;
+}
+
+// --- Codegen: emit machine code byte-by-byte into a code buffer ------
+
+// Cursor into the code buffer is held in the same write_tok format
+// (single i64 in slot 0, field 0).
+fn cg_pos(c: i64) -> i64 { return read_tok(c, 0, 0); }
+fn cg_set(c: i64, v: i64) { write_tok(c, 0, v, 0); }
+
+fn emit_byte(code: i64, cur_p: i64, b: i64) {
+    let p = cg_pos(cur_p);
+    aether_byte_set(code, p, b);
+    cg_set(cur_p, p + 1);
+}
+fn emit_imm64(code: i64, cur_p: i64, v: i64) {
+    let mut k = 0;
+    while k < 8 {
+        emit_byte(code, cur_p, (v >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+
+// Emit `movq $imm, %rax` — 10 bytes (REX.W + B8+rax + imm64)
+fn emit_mov_rax_imm(code: i64, cur_p: i64, v: i64) {
+    emit_byte(code, cur_p, 72);   // 0x48 REX.W
+    emit_byte(code, cur_p, 184);  // 0xB8 mov rax, imm64
+    emit_imm64(code, cur_p, v);
+}
+// Emit `pushq %rax` — 0x50
+fn emit_push_rax(code: i64, cur_p: i64) { emit_byte(code, cur_p, 80); }
+// Emit `popq %r10` — 0x41 0x5A
+fn emit_pop_r10(code: i64, cur_p: i64) { emit_byte(code, cur_p, 65); emit_byte(code, cur_p, 90); }
+// Emit `xchgq %rax, %r10` so swap LHS/RHS — REX.W + 87 /r ; modrm: 11 010 000 = 0xD0
+fn emit_xchg_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 76);   // 0x4C REX.W + REX.R for r10 in src
+    emit_byte(code, cur_p, 135);  // 0x87
+    emit_byte(code, cur_p, 208);  // 0xD0 = 11 010 000
+}
+// Emit `addq %r10, %rax` — REX.W + 01 /r ; modrm 11 010 000 = 0xD0
+fn emit_add_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 76);   // 0x4C REX.W + REX.R (src=r10 ext)
+    emit_byte(code, cur_p, 1);
+    emit_byte(code, cur_p, 208);
+}
+// Emit `subq %r10, %rax` — REX.W + 29 /r ; same modrm
+fn emit_sub_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 76);
+    emit_byte(code, cur_p, 41);
+    emit_byte(code, cur_p, 208);
+}
+// Emit `imulq %r10, %rax` — REX.W + 0F AF /r ; modrm 11 dst=rax src=r10
+//   modrm: 11 000 010 = 0xC2  (dst.lo3=0=rax in reg field, src.lo3=2=r10 in r/m)
+fn emit_imul_rax_r10(code: i64, cur_p: i64) {
+    emit_byte(code, cur_p, 73);   // 0x49 REX.W + REX.B for r10
+    emit_byte(code, cur_p, 15);
+    emit_byte(code, cur_p, 175);
+    emit_byte(code, cur_p, 194);  // 0xC2
+}
+fn emit_ret(code: i64, cur_p: i64) { emit_byte(code, cur_p, 195); }
+
+// --- Pratt parser that EMITS code instead of evaluating --------------
+fn pos_get(p: i64) -> i64 { return read_tok(p, 0, 0); }
+fn pos_set(p: i64, v: i64) { write_tok(p, 0, v, 0); }
+fn peek_kind(toks: i64, pos_p: i64) -> i64 { return read_tok(toks, pos_get(pos_p), 0); }
+
+// Each parse_* call leaves the result in %rax at runtime. To compose
+// sub-expressions we push %rax before the rhs and pop into %r10 after.
+
+fn cg_factor(toks: i64, pos_p: i64, code: i64, cur_p: i64) {
+    let p = pos_get(pos_p);
+    let k = read_tok(toks, p, 0);
+    let v = read_tok(toks, p, 1);
+    pos_set(pos_p, p + 1);
+    if k == TOK_NUM {
+        emit_mov_rax_imm(code, cur_p, v);
+        return;
+    }
+    aether_print_kv_i64("CG bad factor", k);
+}
+
+fn cg_term(toks: i64, pos_p: i64, code: i64, cur_p: i64) {
+    cg_factor(toks, pos_p, code, cur_p);
+    while peek_kind(toks, pos_p) == TOK_STAR {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        emit_push_rax(code, cur_p);
+        cg_factor(toks, pos_p, code, cur_p);
+        emit_pop_r10(code, cur_p);
+        // Now: rax=rhs, r10=lhs. imulq is commutative so order doesn't matter.
+        emit_imul_rax_r10(code, cur_p);
+    }
+}
+
+fn cg_expr(toks: i64, pos_p: i64, code: i64, cur_p: i64) {
+    cg_term(toks, pos_p, code, cur_p);
+    while peek_kind(toks, pos_p) == TOK_PLUS || peek_kind(toks, pos_p) == TOK_MINUS {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        emit_push_rax(code, cur_p);
+        cg_term(toks, pos_p, code, cur_p);
+        emit_pop_r10(code, cur_p);
+        // After pop: rax=rhs, r10=lhs. For non-commutative ops we need
+        // lhs OP rhs in rax — swap, then sub gives rax = lhs - rhs.
+        if op == TOK_PLUS {
+            // commutative, no swap needed
+            emit_add_rax_r10(code, cur_p);
+        } else {
+            // Want rax = lhs - rhs. Currently rax=rhs, r10=lhs. Swap then sub.
+            emit_xchg_rax_r10(code, cur_p);
+            emit_sub_rax_r10(code, cur_p);
+        }
+    }
+}
+
+fn main() -> i32 {
+    let src = "5 + 18 * 2 + 1";
+    let n = aether_str_len(src);
+    aether_print_kv_i64("source bytes", n);
+
+    let toks = aether_alloc_bytes(256 * 16);
+    let tn = lex(src, n, toks);
+    aether_print_kv_i64("token count", tn);
+
+    // Allocate executable code buffer.
+    let code_cap: i64 = 4096;
+    let code = aether_alloc_executable(code_cap);
+    if code == 0 {
+        aether_print_kv_i64("VirtualAlloc fail", 0);
+        return 1;
+    }
+    let cur_p = aether_alloc_bytes(16);
+    cg_set(cur_p, 0);
+
+    // Walk tokens emitting machine code.
+    let pos_p = aether_alloc_bytes(16);
+    pos_set(pos_p, 0);
+    cg_expr(toks, pos_p, code, cur_p);
+    emit_ret(code, cur_p);
+
+    let code_len = cg_pos(cur_p);
+    aether_print_kv_i64("emitted bytes", code_len);
+
+    // JIT-call the buffer.
+    let result = aether_call_jit_i64(code);
+    aether_print_kv_i64("JIT result", result);
+
+    aether_free_bytes(toks, 256 * 16);
+    aether_free_bytes(cur_p, 16);
+    aether_free_bytes(pos_p, 16);
+    aether_free_executable(code, code_cap);
+    result as i32
+}

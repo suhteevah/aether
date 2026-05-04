@@ -1,0 +1,28 @@
+// expect: exit=42
+// Compound assignment desugars to `x = x <op> rhs`. Works for any lvalue:
+// bare ident, struct field, array index.
+struct Counter {
+    n: i64,
+}
+
+fn main() -> i32 {
+    let mut acc = 10;
+    acc += 5;          // 15
+    acc *= 3;          // 45
+    acc -= 2;          // 43
+    acc /= 1;          // 43
+
+    let mut c: Counter;
+    c.n = 0;
+    c.n += 7;          // 7
+    c.n *= 2;          // 14
+
+    let buf: [i64; 4];
+    buf[0] = 1;
+    buf[0] += 4;       // 5
+    buf[0] *= 3;       // 15
+
+    // 43 + 14 + 15 = 72; subtract 30 = 42
+    let total = acc + c.n + buf[0] - 30;
+    total as i32
+}

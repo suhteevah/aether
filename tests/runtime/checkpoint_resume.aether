@@ -1,0 +1,69 @@
+// roadmap: P8.8
+// expect: exit=0
+//
+// Checkpoint round-trip witness. Save model params + AdamW optimizer
+// state (m moment) to two atomically-written SafeTensors files, then
+// load both back into fresh buffers and verify bit-equal recovery.
+//
+// Path-naming: under target/audit-tmp/ which exists at audit time.
+//
+// Exit codes:
+//   0 ok
+//   1 alloc
+//   2 save params failed
+//   3 save optim m failed
+//   4 load params failed
+//   5 load optim m failed
+//   6 params mismatch element i (returns 6+i, i in 0..3)
+//   12 optim m mismatch start
+use runtime;
+
+fn main() -> i32 {
+    let n: i32 = 4;
+    let params:    i64 = aether_alloc_f32(n);
+    let optim_m:   i64 = aether_alloc_f32(n);
+    let restored_p: i64 = aether_alloc_f32(n);
+    let restored_m: i64 = aether_alloc_f32(n);
+    if params == 0 { return 1; }
+    if optim_m == 0 { return 1; }
+    if restored_p == 0 { return 1; }
+    if restored_m == 0 { return 1; }
+
+    aether_store_f32(params, 0, 0.125);
+    aether_store_f32(params, 1, 0.5);
+    aether_store_f32(params, 2, 0.875);
+    aether_store_f32(params, 3, 1.25);
+
+    aether_store_f32(optim_m, 0, 0.001);
+    aether_store_f32(optim_m, 1, 0.002);
+    aether_store_f32(optim_m, 2, 0.004);
+    aether_store_f32(optim_m, 3, 0.008);
+
+    let n64: i64 = 4;
+    if safetensors_save_f32("target/audit-tmp/_ckpt_params.safetensors", params,  n64) != 0 { return 2; }
+    if safetensors_save_f32("target/audit-tmp/_ckpt_optim.safetensors",  optim_m, n64) != 0 { return 3; }
+
+    if safetensors_load_f32("target/audit-tmp/_ckpt_params.safetensors", restored_p, n64) != 0 { return 4; }
+    if safetensors_load_f32("target/audit-tmp/_ckpt_optim.safetensors",  restored_m, n64) != 0 { return 5; }
+
+    let mut i: i32 = 0;
+    while i < n {
+        let a: f32 = aether_load_f32(params, i);
+        let b: f32 = aether_load_f32(restored_p, i);
+        if a != b { return 6 + i; }
+        i = i + 1;
+    }
+    let mut j: i32 = 0;
+    while j < n {
+        let a: f32 = aether_load_f32(optim_m, j);
+        let b: f32 = aether_load_f32(restored_m, j);
+        if a != b { return 12 + j; }
+        j = j + 1;
+    }
+
+    aether_free_f32(params,     n);
+    aether_free_f32(optim_m,    n);
+    aether_free_f32(restored_p, n);
+    aether_free_f32(restored_m, n);
+    0
+}

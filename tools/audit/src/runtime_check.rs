@@ -44,6 +44,11 @@ pub fn cases(root: &Path) -> Vec<RuntimeCase> {
     for e in entries.flatten() {
         let p = e.path();
         if p.extension().and_then(|x| x.to_str()) != Some("aether") { continue; }
+        // Files starting with `_` are helper modules — skipped here, but
+        // available to other tests via `use _name;`.
+        if p.file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with('_')) {
+            continue;
+        }
         let Ok(src) = std::fs::read_to_string(&p) else { continue; };
         let mut expected_exit: i32 = 0;
         let mut expected_stdout: Option<String> = None;
@@ -100,10 +105,20 @@ pub fn run_case(root: &Path, case: &RuntimeCase) -> RuntimeResult {
     let stem = case.input.file_stem().and_then(|s| s.to_str()).unwrap_or("case");
     let exe_path = out_dir.join(format!("{stem}.exe"));
 
-    let emit_flag = format!("--emit={}", case.build_mode);
-    let build = Command::new(&aetherc)
-        .arg(&case.input).arg(&emit_flag)
-        .arg("-o").arg(&exe_path).output();
+    // P6.14 — `aether-bin-test` is `aether-bin` plus aetherc's `--test`
+    // flag, which synthesises a main calling every `#[test]` fn. The
+    // produced exe links libaether_rt the same way as the plain
+    // aether-bin path; we just pass `--test` ahead of the emit flag.
+    let (emit_value, test_flag) = if case.build_mode == "aether-bin-test" {
+        ("aether-bin", true)
+    } else {
+        (case.build_mode.as_str(), false)
+    };
+    let emit_flag = format!("--emit={}", emit_value);
+    let mut build_cmd = Command::new(&aetherc);
+    build_cmd.arg(&case.input).arg(&emit_flag);
+    if test_flag { build_cmd.arg("--test"); }
+    let build = build_cmd.arg("-o").arg(&exe_path).output();
     let build = match build {
         Ok(o) => o,
         Err(e) => return RuntimeResult::SpawnError(format!("aetherc spawn: {}", e)),

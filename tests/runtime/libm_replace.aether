@@ -1,0 +1,44 @@
+// roadmap: P9.6
+// expect: exit=0
+//
+// Hand-rolled sin/cos/exp/log (no platform libm). Witness:
+//   sin(0)=0, cos(0)=1, exp(0)=1, log(1)=0
+//   sin²+cos² == 1 at five sample points
+//   exp(log(x)) == x at five sample points
+use runtime;
+
+fn check_pythag(x: f32, tol: f32) -> i32 {
+    let s: f32 = aether_sin_f32(x);
+    let c: f32 = aether_cos_f32(x);
+    let p: f32 = s * s + c * c;
+    if aether_abs_f32(p - 1.0) > tol { 1 } else { 0 }
+}
+
+fn check_explog(y: f32, rel_tol: f32) -> i32 {
+    let r: f32 = aether_exp_f32(aether_log_f32(y));
+    if aether_abs_f32(r - y) / y > rel_tol { 1 } else { 0 }
+}
+
+fn main() -> i32 {
+    let tol: f32 = 0.001;
+    let rt:  f32 = 0.001;
+
+    if aether_abs_f32(aether_sin_f32(0.0))         > tol { return 1; }
+    if aether_abs_f32(aether_cos_f32(0.0) - 1.0)   > tol { return 2; }
+    if aether_abs_f32(aether_exp_f32(0.0) - 1.0)   > tol { return 3; }
+    if aether_abs_f32(aether_log_f32(1.0))         > tol { return 4; }
+
+    if check_pythag(0.5, tol) != 0 { return 5; }
+    if check_pythag(1.0, tol) != 0 { return 6; }
+    if check_pythag(1.5, tol) != 0 { return 7; }
+    if check_pythag(2.0, tol) != 0 { return 8; }
+    if check_pythag(3.0, tol) != 0 { return 9; }
+
+    if check_explog(0.5, rt)  != 0 { return 11; }
+    if check_explog(1.0, rt)  != 0 { return 12; }
+    if check_explog(2.5, rt)  != 0 { return 13; }
+    if check_explog(7.0, rt)  != 0 { return 14; }
+    if check_explog(50.0, rt) != 0 { return 15; }
+
+    0
+}

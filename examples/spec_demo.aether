@@ -1,0 +1,21 @@
+// Roadmap item #28 demo: spec-mode synthesis. The `add_two` fn is
+// declared with `#[spec(intent="…")]` and an EMPTY body. On the first
+// `aetherc` run, the spec pass writes `add_two.spec` describing what
+// needs to be implemented (intent + signature + path to drop the body)
+// AND falls back to the empty body (which would return 0).
+//
+// On the SECOND run — once you've created `examples/add_two.spec.aether`
+// containing the impl — the spec pass splices that body in, and the
+// program runs normally.
+//
+// We ship `examples/add_two.spec.aether` pre-filled with the impl, so
+// the round-trip works on the first audit pass: aetherc finds the body
+// file, splices `a + b` into `add_two`, the program returns 42.
+
+#[spec(intent="add two i64s and return their sum")]
+fn add_two(a: i64, b: i64) -> i64 { 0 }
+
+fn main() -> i32 {
+    let total = add_two(20, 22);     // 42 once the spec body splices in
+    total as i32
+}

@@ -1,0 +1,45 @@
+// roadmap: P6.13
+// expect: exit=0
+//
+// Filesystem-primitive smoke test (P6.13 standard I/O):
+//   create_dir_all, path_exists, is_dir, write_file, file_size,
+//   copy_file, rename, read_dir_count, remove_file.
+// Each step returns a unique exit code on failure so the audit can
+// localise. All paths live under target/audit-tmp/_fs_smoke/.
+use runtime;
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_fs_smoke") != 0 { return 1; }
+    if aether_path_exists("target/audit-tmp/_fs_smoke") == 0 { return 2; }
+    if aether_is_dir("target/audit-tmp/_fs_smoke") != 1 { return 3; }
+
+    // Write 5 bytes "hello" to file a.
+    let buf: i64 = aether_alloc_bytes(5);
+    if buf == 0 { return 4; }
+    aether_byte_set(buf, 0, 104);
+    aether_byte_set(buf, 1, 101);
+    aether_byte_set(buf, 2, 108);
+    aether_byte_set(buf, 3, 108);
+    aether_byte_set(buf, 4, 111);
+    if aether_write_file("target/audit-tmp/_fs_smoke/a.bin", buf, 5) != 0 { return 5; }
+    if aether_file_size("target/audit-tmp/_fs_smoke/a.bin") != 5 { return 6; }
+
+    // Copy a → b, then rename b → c. c should exist, b should not.
+    if aether_copy_file("target/audit-tmp/_fs_smoke/a.bin",
+                       "target/audit-tmp/_fs_smoke/b.bin") != 5 { return 7; }
+    if aether_rename("target/audit-tmp/_fs_smoke/b.bin",
+                    "target/audit-tmp/_fs_smoke/c.bin") != 0 { return 8; }
+    if aether_path_exists("target/audit-tmp/_fs_smoke/b.bin") != 0 { return 9; }
+    if aether_path_exists("target/audit-tmp/_fs_smoke/c.bin") == 0 { return 10; }
+
+    // Directory has 2 entries (a.bin, c.bin).
+    if aether_read_dir_count("target/audit-tmp/_fs_smoke") != 2 { return 11; }
+
+    // Cleanup: remove both files.
+    if aether_remove_file("target/audit-tmp/_fs_smoke/a.bin") != 0 { return 12; }
+    if aether_remove_file("target/audit-tmp/_fs_smoke/c.bin") != 0 { return 13; }
+    if aether_read_dir_count("target/audit-tmp/_fs_smoke") != 0 { return 14; }
+
+    aether_free_bytes(buf, 5);
+    0
+}

@@ -1,0 +1,29 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// Data-carrying enum variant. `Box::Full(i64)` carries a payload;
+// `Box::Empty` is tag-only. Test constructs both, matches them, and
+// returns 42 on success. This exercises the full P6.4 surface:
+//   - parse `enum Box { Empty, Full(i64) }` with one payload variant
+//   - parse `Box::Full(40)` constructor expression
+//   - 2-slot codegen layout (`b.tag` + `b.val`)
+//   - parse `Box::Full(x) =>` binding pattern
+//   - copy `b.val` into the bound local before the arm body runs
+enum Box { Empty, Full(i64) }
+
+fn main() -> i32 {
+    let full = Box::Full(40);
+    let empty = Box::Empty;
+
+    let from_full: i64 = match full {
+        Box::Empty   => 0,
+        Box::Full(x) => x + 1,    // 41
+    };
+
+    let from_empty: i64 = match empty {
+        Box::Empty   => 1,        // 1
+        Box::Full(y) => y,
+    };
+
+    (from_full + from_empty) as i32   // 42
+}

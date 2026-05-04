@@ -18,12 +18,12 @@ pub enum Item {
     /// then desugars to `Foo__bar(obj, x)` when `obj` is of struct
     /// type `Foo`.
     Impl { type_name: String, methods: Vec<FnDecl> },
-    /// `enum Color { Red, Green, Blue }` — discriminant-only enums for
-    /// now. Each variant gets a sequential i32 tag (Red=0, Green=1, ...).
-    /// `Color::Red` desugars to `IntLit(0)`. `match` dispatches on the
-    /// scrutinee's tag value via cmp+jmp. Data-carrying variants are
-    /// future work.
-    Enum { name: String, variants: Vec<String> },
+    /// `enum Color { Red, Green, Blue }` — discriminant tags. Each variant
+    /// gets a sequential i32 tag (Red=0, Green=1, ...). For variants with
+    /// a payload (`Box::Full(i64)`), `payloads[i]` is `Some(Ty)`. Enums
+    /// where any variant has a payload use a 2-slot layout (tag + val);
+    /// payload-less enums stay as bare i64 tag values.
+    Enum { name: String, variants: Vec<String>, payloads: Vec<Option<Ty>> },
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +121,10 @@ pub enum Ty {
     /// N consecutive slots reserved on the local frame; `buf[i]` indexes
     /// via `(base + i*8)` addressing.
     Array { elem: Box<Ty>, n: usize },
+    /// Tuple type `(T1, T2, ...)`. Zero-cost — lowered to N synthetic field
+    /// slots `<name>.0`, `<name>.1`, etc., and accessed via `.0`/`.1` field
+    /// syntax. Reuses the struct machinery wholesale.
+    Tuple(Vec<Ty>),
     Unit,
 }
 
@@ -142,6 +146,10 @@ pub enum Stmt {
     /// stack-allocated declaration — currently only used for struct locals,
     /// which want per-field assignment after declaration.
     Let { name: String, mutable: bool, ty: Option<Ty>, value: Option<Expr> },
+    /// `let (a, b, ...) = expr;` — tuple destructuring binding. Each name
+    /// becomes its own top-level local; the rhs MUST be a tuple literal of
+    /// matching arity (more general fn-returning-tuple awaits sret ABI).
+    LetTuple { names: Vec<String>, value: Expr },
     Expr(Expr),
     Return(Option<Expr>),
 }
@@ -185,6 +193,26 @@ pub enum Expr {
     /// read (`x = buf[i]`) and write (`buf[i] = x`) lower through this; the
     /// asm backend disambiguates by where the Index sits in a Bin::Assign.
     Index { recv: Box<Expr>, idx: Box<Expr> },
+    /// `(e1, e2, ...)` tuple literal. Used exclusively as the rhs of a
+    /// `let pair = (...)` style binding; the asm backend lowers it the same
+    /// way as a struct literal — N synthetic per-element slots.
+    Tuple(Vec<Expr>),
+    /// `|x, y| expr` closure expression. Today this is a NO-CAPTURE
+    /// closure — a `mir/closures.rs` pre-codegen pass lifts every Closure
+    /// into a synthetic top-level `__closure_<n>` fn and rewrites the
+    /// expression to `Expr::Ident("__closure_<n>")` (which the asm backend
+    /// loads as a function pointer via `leaq aether_<name>(%rip), %rax`).
+    /// Closures-with-captures need an env-struct allocation + indirect-call
+    /// ABI — future work; the lifted fn becomes a method on the env then.
+    Closure { params: Vec<(String, Option<Ty>)>, body: Box<Expr> },
+    /// `expr?` — try-operator. Lowered by the asm backend to:
+    ///   match expr { Ok(v) => v, Err(e) => return Err(e) }
+    /// `expr` MUST be a `Call` to a fn whose return type is a payload-enum
+    /// declared in the current program (concretely `Result`-shaped: variant 0
+    /// is "Ok" carrying a payload, variant 1 is "Err" carrying a payload).
+    /// The enclosing fn's return type must be the same payload-enum so the
+    /// early-return path can propagate the error variant unchanged.
+    Try(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +221,10 @@ pub enum MatchPat {
     /// `Color::Red` — a path of length 2; the asm backend resolves it
     /// to the variant's i32 tag at codegen time.
     EnumVariant(Vec<String>),
+    /// `Box::Full(x)` — payload-carrying variant pattern. After tag-cmp
+    /// matches, the payload slot is copied into a freshly-introduced
+    /// local named `bind` for use in the arm's body.
+    EnumVariantBind(Vec<String>, String),
     Wildcard,
 }
 
@@ -200,7 +232,7 @@ pub enum MatchPat {
 pub enum RegionKind { Warp, Block, AiRegion }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Gt, Le, Ge, And, Or, BitAnd, BitOr, BitXor, Assign }
+pub enum BinOp { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Gt, Le, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr, Assign }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp { Neg, Not }

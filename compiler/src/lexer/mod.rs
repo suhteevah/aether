@@ -65,6 +65,10 @@ pub enum Tok {
     Pipe,
     PipePipe,
     Caret,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
     Dot,
     DotDot,
     Hash,         // #
@@ -310,16 +314,18 @@ impl<'a> Lexer<'a> {
             b',' => Tok::Comma,
             b';' => Tok::Semi,
             b':' => if two(b':', b':', self) { Tok::ColonColon } else { Tok::Colon },
-            b'-' => if two(b'-', b'>', self) { Tok::Arrow } else { Tok::Minus },
+            b'-' => if two(b'-', b'>', self) { Tok::Arrow }
+                    else if two(b'-', b'=', self) { Tok::MinusEq }
+                    else { Tok::Minus },
             b'=' => if two(b'=', b'>', self) { Tok::FatArrow }
                     else if two(b'=', b'=', self) { Tok::EqEq }
                     else { Tok::Eq },
             b'!' => if two(b'!', b'=', self) { Tok::BangEq } else { Tok::Bang },
             b'<' => if two(b'<', b'=', self) { Tok::LtEq } else { Tok::Lt },
             b'>' => if two(b'>', b'=', self) { Tok::GtEq } else { Tok::Gt },
-            b'+' => Tok::Plus,
-            b'*' => Tok::Star,
-            b'/' => Tok::Slash, // comments handled above
+            b'+' => if two(b'+', b'=', self) { Tok::PlusEq } else { Tok::Plus },
+            b'*' => if two(b'*', b'=', self) { Tok::StarEq } else { Tok::Star },
+            b'/' => if two(b'/', b'=', self) { Tok::SlashEq } else { Tok::Slash }, // comments handled above
             b'%' => Tok::Percent,
             b'&' => if two(b'&', b'&', self) { Tok::AmpAmp } else { Tok::Amp },
             b'|' => if two(b'|', b'|', self) { Tok::PipePipe } else { Tok::Pipe },

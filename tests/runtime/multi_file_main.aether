@@ -1,0 +1,10 @@
+// expect: exit=42
+// Multi-file project — `use _helper_multi;` resolves to the sibling
+// .aether file in the same directory (audit skips `_`-prefixed files).
+use _helper_multi;
+
+fn main() -> i32 {
+    let a = double(15);   // 30
+    let b = triple(4);    // 12
+    (a + b) as i32        // 42
+}

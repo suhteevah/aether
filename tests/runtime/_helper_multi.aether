@@ -1,0 +1,5 @@
+// Helper module imported by tests/runtime/multi_file_main.aether.
+// Demonstrates that `use <name>;` looks in the source's own directory
+// before the bundled stdlib.
+fn double(x: i64) -> i64 { x * 2 }
+fn triple(x: i64) -> i64 { x * 3 }

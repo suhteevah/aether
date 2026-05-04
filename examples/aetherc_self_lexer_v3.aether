@@ -1,0 +1,107 @@
+// Self-hosting bootstrap step 4 — lexer v3 with KEYWORD recognition.
+// Inlines the keyword check via a compact match-by-length-and-first-byte
+// table in a small helper, sidestepping the large-frame issue v2's first
+// draft hit (every `let s = "kw"` would reserve a slot).
+use runtime;
+
+fn is_id_cont(b: i64) -> i64 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 { return 1; }
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+
+// Returns 1 if buf[start..start+len] matches the C-string `kw_lit`. The
+// caller passes the literal directly so each invocation only needs ONE
+// frame slot for `kw_lit` + the bytes_eq result.
+fn match_kw(buf: i64, start: i64, len: i64, kw_lit: i64, kw_len: i64) -> i64 {
+    if len != kw_len { return 0; }
+    if aether_bytes_eq(buf + start, kw_lit, kw_len) == 1 { return 1; }
+    return 0;
+}
+
+fn is_keyword(buf: i64, start: i64, len: i64) -> i64 {
+    // Length-2 keywords.
+    if match_kw(buf, start, len, "fn", 2) == 1 { return 1; }
+    if match_kw(buf, start, len, "if", 2) == 1 { return 1; }
+    if match_kw(buf, start, len, "in", 2) == 1 { return 1; }
+    // Length-3.
+    if match_kw(buf, start, len, "let", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "mut", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "use", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "for", 3) == 1 { return 1; }
+    if match_kw(buf, start, len, "pub", 3) == 1 { return 1; }
+    // Length-4.
+    if match_kw(buf, start, len, "else", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "enum", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "impl", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "self", 4) == 1 { return 1; }
+    if match_kw(buf, start, len, "true", 4) == 1 { return 1; }
+    // Length-5.
+    if match_kw(buf, start, len, "while", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "const", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "match", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "break", 5) == 1 { return 1; }
+    if match_kw(buf, start, len, "false", 5) == 1 { return 1; }
+    // Length-6.
+    if match_kw(buf, start, len, "return", 6) == 1 { return 1; }
+    if match_kw(buf, start, len, "struct", 6) == 1 { return 1; }
+    if match_kw(buf, start, len, "extern", 6) == 1 { return 1; }
+    // Length-8.
+    if match_kw(buf, start, len, "continue", 8) == 1 { return 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    let path = "examples/aetherc_self_lexer_v3.aether";
+    let buf  = aether_read_file(path);
+    if buf == 0 { return 1; }
+    let n    = aether_file_size_last();
+    aether_print_kv_i64("source bytes", n);
+
+    let mut i: i64 = 0;
+    let mut idents:   i64 = 0;
+    let mut keywords: i64 = 0;
+
+    while i < n {
+        let b = aether_byte_at(buf, i);
+
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if b == 47 && i + 1 < n && aether_byte_at(buf, i + 1) == 47 {
+            i += 2;
+            while i < n && aether_byte_at(buf, i) != 10 { i += 1; }
+            continue;
+        }
+        if b == 34 {
+            i += 1;
+            while i < n && aether_byte_at(buf, i) != 34 { i += 1; }
+            if i < n { i += 1; }
+            continue;
+        }
+
+        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 {
+            let start = i;
+            i += 1;
+            while i < n && is_id_cont(aether_byte_at(buf, i)) == 1 { i += 1; }
+            if is_keyword(buf, start, i - start) == 1 {
+                keywords += 1;
+            } else {
+                idents += 1;
+            }
+            continue;
+        }
+        if b >= 48 && b <= 57 {
+            i += 1;
+            while i < n && aether_byte_at(buf, i) >= 48 && aether_byte_at(buf, i) <= 57 {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    aether_print_kv_i64("idents",   idents);
+    aether_print_kv_i64("keywords", keywords);
+
+    aether_free_bytes(buf, n);
+    0
+}

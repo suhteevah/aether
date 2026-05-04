@@ -1,0 +1,44 @@
+// expect: exit=0
+// requires: cuda
+//
+// softmax + softmax_backward + matmul_tn round-trip. Just exercises the
+// new kernels at runtime. Quantitative correctness is checked by the
+// runtime crate's CPU + GPU bit-equivalence suite separately.
+use runtime;
+
+const BSZ: i32 = 4;
+const DD:  i32 = 8;
+
+fn main() -> i32 {
+    aether_dev_init();
+
+    let h_x:  i64 = aether_alloc_f32(32);
+    let h_dy: i64 = aether_alloc_f32(32);
+    aether_init_normal_f32(h_x, 32, 1.0, 5);
+    aether_init_normal_f32(h_dy, 32, 0.5, 9);
+
+    let x:    Tensor<f32, [BSZ, DD]>;
+    let y:    Tensor<f32, [BSZ, DD]>;
+    let dy:   Tensor<f32, [BSZ, DD]>;
+    let dx:   Tensor<f32, [BSZ, DD]>;
+    aether_dev_h2d_f32(h_x, x, 32);
+    aether_dev_h2d_f32(h_dy, dy, 32);
+
+    x.softmax(&mut y);
+    y.softmax_backward(&dy, &mut dx);
+
+    // matmul_tn quick sanity: a:[K,M], b:[K,N] → out:[M,N]. Pick K=BSZ, M=DD,
+    // N=DD so we can reuse y as both a (treated [BSZ,DD] interpreted as
+    // [K,M]=[4,8]) and b (interpreted [K,N]=[4,8]). out:[8,8].
+    let a:   Tensor<f32, [BSZ, DD]>;
+    let b:   Tensor<f32, [BSZ, DD]>;
+    let out: Tensor<f32, [DD, DD]>;
+    aether_dev_h2d_f32(h_x,  a, 32);
+    aether_dev_h2d_f32(h_dy, b, 32);
+    a.matmul_tn(&b, &mut out);
+
+    aether_dev_sync();
+    aether_free_f32(h_x, 32);
+    aether_free_f32(h_dy, 32);
+    0
+}

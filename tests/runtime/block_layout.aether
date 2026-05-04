@@ -1,0 +1,27 @@
+// expect: exit=42
+// roadmap: P10.8
+// Witness for hot/cold block layout. `#[cold] fn rare_path` is moved by
+// the asm backend into a `.section .text.cold,"x"` block so the loader
+// keeps it off the hot I-cache. `hot_path` stays in the default `.text`
+// section. `main` calls only `hot_path`, so the program exit verifies
+// behaviour parity (the cold fn is still reachable, just relocated).
+// Verification of the section directive itself is a separate aetherc
+// unit test (compiler/src/codegen/asm — block_layout fn).
+fn hot_path() -> i64 {
+    42
+}
+
+#[cold]
+fn rare_path() -> i64 {
+    99
+}
+
+fn main() -> i32 {
+    let h = hot_path();
+    // Touch rare_path through a never-taken branch so the fn is kept
+    // alive without affecting the exit code.
+    if h == 0 {
+        let _r = rare_path();
+    }
+    h as i32
+}

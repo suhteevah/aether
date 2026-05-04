@@ -1,3 +1,4 @@
+// roadmap: P6.7
 // expect: exit=42
 // Stack array `[T; N]`: declare a fixed-size buffer on the frame, write
 // to elements via `buf[i] = v`, read back via `buf[i]`. Sum a few entries

@@ -1,0 +1,297 @@
+// Self-hosting bootstrap step 10 — Aether-source compiler that emits
+// AT&T x86-64 ASSEMBLY TEXT (not just JIT bytes) for the mini-language,
+// then writes it to a `.s` file via `aether_write_file`. The existing
+// aether-asm crate can then consume the .s file and produce a .obj — a
+// real `.miniaether → .s → .obj` pipeline driven by .aether source.
+//
+// Reads:  examples/_mini_program.miniaether
+// Writes: scratch/_mini_emit.s
+//
+// Same source as step 9 — `let a = 7; let b = 6; let c = 100; c - a*b + a - b - 17`.
+// Expected result when the .s is assembled and linked: 42.
+use runtime;
+
+const TOK_NUM: i64 = 1; const TOK_IDENT: i64 = 2; const TOK_LET: i64 = 3;
+const TOK_EQ: i64 = 4;  const TOK_SEMI:  i64 = 5; const TOK_PLUS: i64 = 6;
+const TOK_MINUS: i64 = 7; const TOK_STAR: i64 = 8; const TOK_EOF: i64 = 0;
+const MAX_TOKENS: i64 = 256;
+const ENV_CAP:    i64 = 32;
+
+fn is_digit(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+fn is_alpha(b: i64) -> i64 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 { return 1; }
+    return 0;
+}
+fn write_tok(buf: i64, idx: i64, kind: i64, start: i64, len: i64) {
+    let base = idx * 24;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(buf, base + k,      (kind  >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 8  + k, (start >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 16 + k, (len   >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+fn read_tok(buf: i64, idx: i64, field: i64) -> i64 {
+    let base = idx * 24 + field * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(buf, base + k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+fn cur_get(p: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 { acc = acc | (aether_byte_at(p, k) << (k * 8)); k += 1; }
+    return acc;
+}
+fn cur_set(p: i64, v: i64) {
+    let mut k = 0;
+    while k < 8 { aether_byte_set(p, k, (v >> (k * 8)) & 255); k += 1; }
+}
+
+fn lex(src: i64, n: i64, toks: i64) -> i64 {
+    let mut i: i64 = 0; let mut tn: i64 = 0;
+    while i < n {
+        let b = aether_byte_at(src, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if is_digit(b) == 1 {
+            let start = i;
+            while i < n && is_digit(aether_byte_at(src, i)) == 1 { i += 1; }
+            write_tok(toks, tn, TOK_NUM, start, i - start);
+            tn += 1; continue;
+        }
+        if is_alpha(b) == 1 {
+            let start = i; i += 1;
+            while i < n && (is_alpha(aether_byte_at(src, i)) == 1 || is_digit(aether_byte_at(src, i)) == 1) {
+                i += 1;
+            }
+            if (i - start) == 3 && aether_bytes_eq(src + start, "let", 3) == 1 {
+                write_tok(toks, tn, TOK_LET, start, 3);
+            } else {
+                write_tok(toks, tn, TOK_IDENT, start, i - start);
+            }
+            tn += 1; continue;
+        }
+        let kind = if b == 61 { TOK_EQ } else if b == 59 { TOK_SEMI }
+                   else if b == 43 { TOK_PLUS } else if b == 45 { TOK_MINUS }
+                   else if b == 42 { TOK_STAR } else { 0 };
+        if kind == 0 { i += 1; continue; }
+        write_tok(toks, tn, kind, i, 1);
+        tn += 1; i += 1;
+    }
+    write_tok(toks, tn, TOK_EOF, 0, 0);
+    return tn;
+}
+
+// --- Asm text writer: appends ASCII into a buffer ---------------------
+
+fn put_byte(out: i64, cur_p: i64, b: i64) {
+    let p = cur_get(cur_p);
+    aether_byte_set(out, p, b);
+    cur_set(cur_p, p + 1);
+}
+fn put_str(out: i64, cur_p: i64, s: i64) {
+    let n = aether_str_len(s);
+    let mut i = 0;
+    while i < n { put_byte(out, cur_p, aether_byte_at(s, i)); i += 1; }
+}
+fn put_int(out: i64, cur_p: i64, v_in: i64) {
+    let mut v = v_in;
+    if v < 0 { put_byte(out, cur_p, 45); v = 0 - v; }   // '-'
+    if v == 0 { put_byte(out, cur_p, 48); return; }
+    // Pack digits into a 20-byte scratch in reverse, then emit.
+    let scratch = aether_alloc_bytes(32);
+    let mut nd = 0;
+    while v > 0 {
+        aether_byte_set(scratch, nd, 48 + (v - (v / 10) * 10));
+        v = v / 10;
+        nd += 1;
+    }
+    let mut i = nd - 1;
+    while i >= 0 {
+        put_byte(out, cur_p, aether_byte_at(scratch, i));
+        i -= 1;
+    }
+    aether_free_bytes(scratch, 32);
+}
+fn put_nl(out: i64, cur_p: i64) { put_byte(out, cur_p, 10); }
+
+// --- Env (slot lookup, same as JIT v2/v3) ----------------------------
+
+fn env_lookup_slot(names: i64, src: i64, count: i64,
+                   name_start: i64, name_len: i64) -> i64 {
+    let mut i = 0;
+    while i < count {
+        let nb = i * 16;
+        let mut s: i64 = 0; let mut l: i64 = 0;
+        let mut k = 0;
+        while k < 8 {
+            s = s | (aether_byte_at(names, nb + k)     << (k * 8));
+            l = l | (aether_byte_at(names, nb + 8 + k) << (k * 8));
+            k += 1;
+        }
+        if l == name_len && aether_bytes_eq(src + s, src + name_start, name_len) == 1 {
+            return i + 1;
+        }
+        i += 1;
+    }
+    return 0;
+}
+fn env_define(names: i64, count_p: i64, name_start: i64, name_len: i64) -> i64 {
+    let count = cur_get(count_p);
+    let nb = count * 16;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(names, nb + k,     (name_start >> (k * 8)) & 255);
+        aether_byte_set(names, nb + 8 + k, (name_len   >> (k * 8)) & 255);
+        k += 1;
+    }
+    cur_set(count_p, count + 1);
+    return count + 1;
+}
+
+// --- Pratt → asm-text emitter ---------------------------------------
+
+fn pos_get(p: i64) -> i64 { return cur_get(p); }
+fn pos_set(p: i64, v: i64) { cur_set(p, v); }
+fn peek_kind(toks: i64, pos_p: i64) -> i64 { return read_tok(toks, pos_get(pos_p), 0); }
+
+fn emit_factor(toks: i64, pos_p: i64, out: i64, cur_p: i64,
+               names: i64, env_count_p: i64, src: i64) {
+    let p = pos_get(pos_p);
+    let k = read_tok(toks, p, 0);
+    let s = read_tok(toks, p, 1);
+    let l = read_tok(toks, p, 2);
+    pos_set(pos_p, p + 1);
+    if k == TOK_NUM {
+        let mut acc: i64 = 0;
+        let mut i = 0;
+        while i < l {
+            acc = acc * 10 + (aether_byte_at(src, s + i) - 48);
+            i += 1;
+        }
+        put_str(out, cur_p, "    movq $");
+        put_int(out, cur_p, acc);
+        put_str(out, cur_p, ", %rax");
+        put_nl(out, cur_p);
+        return;
+    }
+    if k == TOK_IDENT {
+        let slot = env_lookup_slot(names, src, cur_get(env_count_p), s, l);
+        put_str(out, cur_p, "    movq -");
+        put_int(out, cur_p, slot * 8);
+        put_str(out, cur_p, "(%rbp), %rax");
+        put_nl(out, cur_p);
+        return;
+    }
+}
+
+fn emit_term(toks: i64, pos_p: i64, out: i64, cur_p: i64,
+             names: i64, env_count_p: i64, src: i64) {
+    emit_factor(toks, pos_p, out, cur_p, names, env_count_p, src);
+    while peek_kind(toks, pos_p) == TOK_STAR {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        put_str(out, cur_p, "    pushq %rax\n");
+        emit_factor(toks, pos_p, out, cur_p, names, env_count_p, src);
+        put_str(out, cur_p, "    popq %r10\n");
+        put_str(out, cur_p, "    imulq %r10, %rax\n");
+    }
+}
+
+fn emit_expr(toks: i64, pos_p: i64, out: i64, cur_p: i64,
+             names: i64, env_count_p: i64, src: i64) {
+    emit_term(toks, pos_p, out, cur_p, names, env_count_p, src);
+    while peek_kind(toks, pos_p) == TOK_PLUS || peek_kind(toks, pos_p) == TOK_MINUS {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        put_str(out, cur_p, "    pushq %rax\n");
+        emit_term(toks, pos_p, out, cur_p, names, env_count_p, src);
+        put_str(out, cur_p, "    popq %r10\n");
+        if op == TOK_PLUS {
+            put_str(out, cur_p, "    addq %r10, %rax\n");
+        } else {
+            put_str(out, cur_p, "    xchgq %rax, %r10\n");
+            put_str(out, cur_p, "    subq %r10, %rax\n");
+        }
+    }
+}
+
+fn emit_program(toks: i64, out: i64, cur_p: i64,
+                names: i64, env_count_p: i64, src: i64) {
+    let pos_p = aether_alloc_bytes(8);
+    pos_set(pos_p, 0);
+    while peek_kind(toks, pos_p) != TOK_EOF {
+        if peek_kind(toks, pos_p) == TOK_LET {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            let p = pos_get(pos_p);
+            let name_s = read_tok(toks, p, 1);
+            let name_l = read_tok(toks, p, 2);
+            pos_set(pos_p, p + 1);
+            pos_set(pos_p, pos_get(pos_p) + 1);   // =
+            emit_expr(toks, pos_p, out, cur_p, names, env_count_p, src);
+            pos_set(pos_p, pos_get(pos_p) + 1);   // ;
+            let slot = env_define(names, env_count_p, name_s, name_l);
+            put_str(out, cur_p, "    movq %rax, -");
+            put_int(out, cur_p, slot * 8);
+            put_str(out, cur_p, "(%rbp)\n");
+            continue;
+        }
+        emit_expr(toks, pos_p, out, cur_p, names, env_count_p, src);
+    }
+    aether_free_bytes(pos_p, 8);
+}
+
+fn main() -> i32 {
+    let path = "examples/_mini_program.miniaether";
+    let src  = aether_read_file(path);
+    if src == 0 { return 1; }
+    let n    = aether_file_size_last();
+
+    let toks = aether_alloc_bytes(MAX_TOKENS * 24);
+    let tn   = lex(src, n, toks);
+    aether_print_kv_i64("token count", tn);
+
+    let out_cap: i64 = 65536;
+    let out      = aether_alloc_bytes(out_cap);
+    let cur_p    = aether_alloc_bytes(8);
+    cur_set(cur_p, 0);
+    let names    = aether_alloc_bytes(ENV_CAP * 16);
+    let ec_p     = aether_alloc_bytes(8);
+    cur_set(ec_p, 0);
+
+    // Asm header + main prologue.
+    put_str(out, cur_p, "# AETHER mini-compiler emit (in Aether)\n");
+    put_str(out, cur_p, ".section .text\n");
+    put_str(out, cur_p, ".globl main\n");
+    put_str(out, cur_p, "main:\n");
+    put_str(out, cur_p, "    pushq %rbp\n");
+    put_str(out, cur_p, "    movq %rsp, %rbp\n");
+    put_str(out, cur_p, "    subq $256, %rsp\n");
+
+    emit_program(toks, out, cur_p, names, ec_p, src);
+
+    put_str(out, cur_p, "    movq %rbp, %rsp\n");
+    put_str(out, cur_p, "    popq %rbp\n");
+    put_str(out, cur_p, "    retq\n");
+
+    let asm_len = cur_get(cur_p);
+    aether_print_kv_i64("asm bytes", asm_len);
+
+    let rc = aether_write_file("scratch/_mini_emit.s", out, asm_len);
+    aether_print_kv_i64("write rc", rc as i64);
+
+    aether_free_bytes(src, n);
+    aether_free_bytes(toks, MAX_TOKENS * 24);
+    aether_free_bytes(out, out_cap);
+    aether_free_bytes(cur_p, 8);
+    aether_free_bytes(names, ENV_CAP * 16);
+    aether_free_bytes(ec_p, 8);
+    rc
+}
