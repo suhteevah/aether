@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P6.12
+// roadmap: P6.12, P16.10
 //
 // P6.12 witness — Aether.toml manifest write/read + minimal build cache.
 //

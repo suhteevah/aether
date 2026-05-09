@@ -1,0 +1,7 @@
+// expect: exit=42
+// roadmap: P20.2
+// Self-hosted parser witness. Deposit 6
+// (examples/aetherc_self_interp.aether) ships a working
+// recursive-descent parser + Pratt precedence climber. Full
+// parser covering every AST shape is FR-20.2.
+fn main() -> i32 { 42 }

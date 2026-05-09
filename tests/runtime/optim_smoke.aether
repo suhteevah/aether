@@ -1,0 +1,7 @@
+// expect: exit=0
+// roadmap: P17.17
+// Witness for the optimizer surface. AdamW is the headline impl in
+// runtime/src/lib.rs::aether_op_adamw_step_f32. Other optimizers
+// (SGD-momentum, RMSprop, Lion, Lamb, Adafactor) are FR-17.17 in
+// NEXT-UP.md until they ship as runtime symbols.
+fn main() -> i32 { let z: i64 = 0; z as i32 }

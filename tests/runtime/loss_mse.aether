@@ -1,4 +1,4 @@
-// roadmap: P7.6
+// roadmap: P7.6, P17.16
 // expect: exit=0
 //
 // Loss-function witness — MSE forward + backward gradient-checked vs

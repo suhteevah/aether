@@ -10,13 +10,21 @@ use crate::ast::{Expr, Item, Program, Stmt, Block};
 use super::lto::{CrateUnit, FnSummary, LtoGraph};
 
 pub fn drive(prog: &Program, crate_name: &str) -> (usize, usize) {
+    let (live, dead, _) = drive_with_live(prog, crate_name);
+    (live, dead)
+}
+
+/// Same as `drive` but also returns the set of live unqualified fn names so
+/// the caller can filter `prog.items` before codegen (P15.9).
+pub fn drive_with_live(prog: &Program, crate_name: &str)
+    -> (usize, usize, std::collections::HashSet<String>)
+{
     let mut fns = Vec::new();
     for it in &prog.items {
         if let Item::Fn(f) = it {
             let mut callees = Vec::new();
             if let Some(body) = &f.body { collect_callees(body, &mut callees); }
             let exported = f.is_pub || f.is_extern || f.name == "main";
-            // Prefix unqualified callees with the crate name.
             let callees: Vec<String> = callees.into_iter()
                 .map(|c| if c.contains("::") { c } else { format!("{}::{}", crate_name, c) })
                 .collect();
@@ -28,7 +36,11 @@ pub fn drive(prog: &Program, crate_name: &str) -> (usize, usize) {
     g.add(CrateUnit { name: crate_name.into(), fns });
     let reachable = g.reachable();
     let dead = total.saturating_sub(reachable.len());
-    (reachable.len(), dead)
+    let prefix = format!("{}::", crate_name);
+    let live_unqualified: std::collections::HashSet<String> = reachable.iter()
+        .filter_map(|fqn| fqn.strip_prefix(&prefix).map(String::from))
+        .collect();
+    (reachable.len(), dead, live_unqualified)
 }
 
 fn collect_callees(b: &Block, out: &mut Vec<String>) {

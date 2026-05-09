@@ -37,6 +37,10 @@ struct Args {
     /// `--lto`: cross-crate reachability DCE — drops unused pub fns from the
     /// final .obj. Implies opt_level >= 1.
     lto: bool,
+    /// `--target=<triple>` — today only the default
+    /// (`x86_64-pc-windows-msvc`) emits a runnable artefact. Other triples
+    /// are recorded + an FR-21.{1,2,3} message reported.
+    target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +55,7 @@ fn parse_args() -> Result<Args, String> {
     let mut test_mode = false;
     let mut opt_level: u8 = 0;
     let mut lto = false;
+    let mut target: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -70,6 +75,14 @@ fn parse_args() -> Result<Args, String> {
             "--O1" => opt_level = 1,
             "--O2" => { opt_level = 2; lto = true; }
             "--lto" => { lto = true; if opt_level == 0 { opt_level = 1; } }
+            // P21.10 — accept `--target=<triple>`. Today only the default
+            // (x86_64-pc-windows-msvc) actually emits; other triples are
+            // recorded + reported, then aetherc errors out cleanly. Real
+            // ELF / Mach-O / ARM64 emit lives behind FR-21.{1,2,3}.
+            x if x.starts_with("--target=") => {
+                let t = x.trim_start_matches("--target=");
+                target = Some(t.to_string());
+            }
             "-h" | "--help" => { print_help(); std::process::exit(0); }
             "--version" => { println!("aetherc 0.1.0 (Phase 0/0.5)"); std::process::exit(0); }
             other if !other.starts_with('-') => input = Some(PathBuf::from(other)),
@@ -88,7 +101,7 @@ fn parse_args() -> Result<Args, String> {
         }
         p
     });
-    Ok(Args { input, output, emit, check_only, json_errors, test_mode, opt_level, lto })
+    Ok(Args { input, output, emit, check_only, json_errors, test_mode, opt_level, lto, target })
 }
 
 fn print_help() {
@@ -179,6 +192,19 @@ fn main() {
         Ok(a) => a,
         Err(e) => { eprintln!("aetherc: {}", e); std::process::exit(2); }
     };
+
+    // P21.10 — friendly --target check. Only x86_64-pc-windows-msvc ships an
+    // emit path today; everything else is recorded as the requested target
+    // and an FR pointer printed to stderr.
+    if let Some(t) = &args.target {
+        let supported = ["x86_64-pc-windows-msvc", "native"];
+        if !supported.contains(&t.as_str()) && !args.json_errors {
+            eprintln!("[aetherc] --target={} not yet supported — see NEXT-UP.md FR-21.{{1,2,3,9}}", t);
+            std::process::exit(2);
+        } else if !args.json_errors {
+            eprintln!("[aetherc] --target={}", t);
+        }
+    }
 
     let file_str = args.input.to_string_lossy().to_string();
     let mut sink = DiagSink::default();
@@ -292,8 +318,24 @@ fn main() {
     if args.lto {
         let crate_name = args.input.file_stem()
             .and_then(|s| s.to_str()).unwrap_or("main").to_string();
-        let (live, dead) = mir::lto_drive::drive(&prog, &crate_name);
-        if !args.json_errors {
+        let (live, dead, live_set) = mir::lto_drive::drive_with_live(&prog, &crate_name);
+        // P15.9 — actually drop unreachable fn items from the program before
+        // codegen. Stdlib externs + structs + traits + uses stay; only
+        // `Item::Fn` entries get filtered against the live set. Methods
+        // inside `Item::Impl` get flattened later by the asm backend; the
+        // filter runs before that, so today we keep all impl blocks.
+        if dead > 0 {
+            let before = prog.items.len();
+            prog.items.retain(|it| match it {
+                ast::Item::Fn(f) => f.is_extern || live_set.contains(&f.name),
+                _ => true,
+            });
+            let dropped = before - prog.items.len();
+            if !args.json_errors {
+                eprintln!("[aetherc] --lto reachability: {} live / {} dead fn(s); dropped {} from emit",
+                          live, dead, dropped);
+            }
+        } else if !args.json_errors {
             eprintln!("[aetherc] --lto reachability: {} live / {} dead fn(s)", live, dead);
         }
     }

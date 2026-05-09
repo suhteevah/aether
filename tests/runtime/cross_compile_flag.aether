@@ -1,0 +1,6 @@
+// expect: exit=42
+// roadmap: P21.10
+// The aetherc CLI accepts --target=<triple> (default
+// x86_64-pc-windows-msvc). Other triples (linux/x86_64,
+// linux/aarch64, macos/aarch64) are FR-21.{1,2,3}.
+fn main() -> i32 { 42 }

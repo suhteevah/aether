@@ -1,4 +1,4 @@
-// roadmap: P6.6
+// roadmap: P6.6, P16.4
 // expect: exit=42
 // Closures (no captures yet). Lifted to synthetic top-level fns by
 // the closure-lifting pass; the closure expression becomes a function

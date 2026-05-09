@@ -1,6 +1,6 @@
 // expect: exit=0
 // expect: stdout contains ALL PASSED
-// roadmap: P6.14
+// roadmap: P6.14, P16.17
 // build-mode: aether-bin-test
 //
 // Roadmap P6.14 — `#[test]` attribute + minimal runner harness.

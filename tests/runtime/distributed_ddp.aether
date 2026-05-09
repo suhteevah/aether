@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P7.9
+// roadmap: P7.9, P18.3
 //
 // P7.9 witness — DDP gradient all-reduce simulation.
 //

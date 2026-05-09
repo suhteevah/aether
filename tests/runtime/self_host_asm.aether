@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P9.2
+// roadmap: P9.2, P20.4
 //
 // P9.2 witness — self-hosted assembler primitives.
 //

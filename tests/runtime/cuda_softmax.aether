@@ -1,4 +1,4 @@
-// roadmap: P7.3
+// roadmap: P7.3, P17.6
 // expect: exit=0
 // requires: cuda
 //

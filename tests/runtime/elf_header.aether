@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P8.10
+// roadmap: P8.10, P21.1
 //
 // P8.10 witness — ELF64 header build + parse round-trip.
 //

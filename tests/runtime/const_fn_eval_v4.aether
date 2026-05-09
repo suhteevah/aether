@@ -1,0 +1,10 @@
+// expect: exit=42
+// roadmap: P16.18
+// const-arithmetic; --O1 ast-opt folds this to a literal at compile time.
+const TWO: i64 = 2;
+const THREE: i64 = 3;
+const SEVEN: i64 = 7;
+fn main() -> i32 {
+    let x: i64 = TWO * THREE * SEVEN;
+    x as i32
+}

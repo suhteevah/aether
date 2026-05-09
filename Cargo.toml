@@ -1,5 +1,5 @@
 [workspace]
-members = ["compiler", "runtime", "runtime_pe", "trainer", "aether_asm", "tools/audit"]
+members = ["compiler", "runtime", "runtime_pe", "trainer", "aether_asm", "tools/audit", "tools/witness-stamper"]
 resolver = "2"
 
 [profile.dev]

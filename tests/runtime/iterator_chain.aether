@@ -1,4 +1,4 @@
-// roadmap: P6.8
+// roadmap: P6.8, P16.6
 // expect: exit=42
 //
 // P6.8 witness — Iterator adapter chains over Vec<i64>.

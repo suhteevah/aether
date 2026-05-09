@@ -1,4 +1,4 @@
-// roadmap: P7.4
+// roadmap: P7.4, P17.14
 // expect: exit=0
 //
 // GGUF header parser witness. Hand-builds the first 24 bytes of a GGUF

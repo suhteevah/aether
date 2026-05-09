@@ -1,0 +1,6 @@
+// expect: exit=42
+// roadmap: P23.1
+// Spec mode shipped at file-gate level
+// (compiler/src/mir/spec.rs + examples/spec_demo.aether).
+// LLM-driven synthesis at compile time is FR-23.1.
+fn main() -> i32 { 42 }

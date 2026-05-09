@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P6.10
+// roadmap: P6.10, P16.22
 //
 // P6.10 witness — manual state-machine + single-threaded executor.
 //

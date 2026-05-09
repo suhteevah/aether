@@ -1,4 +1,4 @@
-// roadmap: P9.6
+// roadmap: P9.6, P17.7
 // expect: exit=0
 //
 // Hand-rolled sin/cos/exp/log (no platform libm). Witness:

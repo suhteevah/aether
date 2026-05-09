@@ -1,0 +1,11 @@
+// expect: exit=42
+// roadmap: P16.13
+// Operator-shaped dispatch via free fns over struct fields.
+// Real op-trait resolution (Add/Sub/Mul) is FR-16.13 in NEXT-UP.md.
+struct V3 { x: i64, y: i64, z: i64 }
+fn v3_sum(a: i64, b: i64, c: i64) -> i64 { a + b + c }
+fn main() -> i32 {
+    let v: V3 = V3 { x: 10, y: 20, z: 12 };
+    let s: i64 = v3_sum(v.x, v.y, v.z);
+    s as i32
+}

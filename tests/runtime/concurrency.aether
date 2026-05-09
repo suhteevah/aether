@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P6.9
+// roadmap: P6.9, P16.23
 //
 // P6.9 witness — atomic primitives.
 //

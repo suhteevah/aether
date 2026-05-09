@@ -1,4 +1,4 @@
-// roadmap: P6.7
+// roadmap: P6.7, P16.5
 // expect: exit=42
 //
 // P6.7 witness — Vec<i64> + String heap primitives.

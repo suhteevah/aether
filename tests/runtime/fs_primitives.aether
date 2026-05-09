@@ -1,4 +1,4 @@
-// roadmap: P6.13
+// roadmap: P6.13, P16.12
 // expect: exit=0
 //
 // Filesystem-primitive smoke test (P6.13 standard I/O):

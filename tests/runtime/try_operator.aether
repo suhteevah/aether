@@ -1,4 +1,4 @@
-// roadmap: P6.5
+// roadmap: P6.5, P16.24
 // expect: exit=42
 //
 // `?` operator — early return on the Err variant of a payload-carrying

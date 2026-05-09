@@ -1,4 +1,4 @@
-// roadmap: P7.1
+// roadmap: P7.1, P17.1
 // expect: exit=0
 //
 // Half-precision dtype round-trip witness. Verifies:

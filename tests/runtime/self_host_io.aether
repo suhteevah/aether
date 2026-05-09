@@ -1,4 +1,4 @@
-// roadmap: P9.1
+// roadmap: P9.1, P20.1
 // expect: stdout contains Hello, Aether!
 // requires: cuda
 // (cuda gate: forces the audit to use the libaether_rt.a built with cuda

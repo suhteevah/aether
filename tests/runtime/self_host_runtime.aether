@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P9.3
+// roadmap: P9.3, P20.5
 //
 // P9.3 witness — self-hosted runtime op kernels (CPU subset).
 //

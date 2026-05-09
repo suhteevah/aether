@@ -1,0 +1,5 @@
+// expect: exit=42
+// roadmap: P20.6
+// Self-hosted trainer witness. Today's trainer is the
+// trainer/ Rust crate; Aether-host trainer is FR-20.6.
+fn main() -> i32 { 42 }

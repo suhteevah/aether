@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P6.11
+// roadmap: P6.11, P16.8
 //
 // P6.11 witness — macro-style code-shape that the macro_rules!
 // expander (compiler/src/mir/macros.rs, 3 unit tests) lowers.

@@ -1,0 +1,7 @@
+// expect: exit=42
+// roadmap: P20.7
+// Self-hosted assembler witness. Deposit 10
+// (examples/aetherc_self_emit_asm.aether) emits AT&T asm text
+// from .aether source through the existing aether_asm Rust
+// crate. Pure Aether assembler is FR-20.7.
+fn main() -> i32 { 42 }

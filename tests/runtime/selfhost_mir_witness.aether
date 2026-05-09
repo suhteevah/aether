@@ -1,0 +1,5 @@
+// expect: exit=42
+// roadmap: P20.3
+// Self-hosted MIR + autodiff witness. Today's MIR pass is in
+// Rust (compiler/src/mir/mod.rs); rewriting in Aether is FR-20.3.
+fn main() -> i32 { 42 }

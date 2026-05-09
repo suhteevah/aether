@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P7.8
+// roadmap: P7.8, P17.18
 //
 // P7.8 witness — layer modules + initializers (CPU shape).
 //

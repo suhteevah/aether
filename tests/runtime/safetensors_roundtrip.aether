@@ -1,4 +1,4 @@
-// roadmap: P7.5
+// roadmap: P7.5, P17.15
 // expect: exit=0
 //
 // SafeTensors round-trip witness. Hand-builds a minimal SafeTensors blob

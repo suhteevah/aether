@@ -1,5 +1,5 @@
 // expect: exit=42
-// roadmap: P11.4
+// roadmap: P11.4, P15.9
 // Two unused fns (never called) are dead at LTO; main is reachable. The
 // stderr `--lto reachability: N live / M dead` line proves the module is
 // on the compile path.
