@@ -1,445 +1,434 @@
-# NEXT-UP — feature requests filed against ROADMAP_V4
+# NEXT-UP — v4 critical path + parked items
 
-Generated 2026-05-09 during the v4 autonomous closure pass; updated in the
-v4 second pass (same day). Every roadmap-v4 item that the current Aether
-toolchain genuinely cannot witness today is filed here as
-**FR-<phase>.<item>** rather than faked into a tagged exit-42.
-
-The audit count after multi-tag + fresh witnesses + the v4 second-pass
-real implementations sits at **123/196 (63%)**. The 73 entries below
-describe what's needed to close the rest.
-
-## Closed in the v4 second pass (was 89, now 73)
-
-These FRs landed as real witnesses + working implementation:
-
-- **FR-17.6-extra** — tanh/sigmoid/leaky_relu/elu/mish CPU ops in `runtime/src/lib.rs` + `activations_v4.aether`
-- **FR-17.7-extra** — log/exp/sin/cos/tan/pow/abs/sign/clamp/recip CPU ops + `math_primitives_v4.aether`
-- **FR-17.8** — sum/mean/var/std/max/min/argmax/argmin/prod CPU ops + `reductions_full_v4.aether`
-- **FR-17.9 (partial)** — where/masked_fill CPU ops + `selection_v4.aether` (topk/sort/gather/scatter still FR)
-- **FR-17.10 (partial)** — cat/repeat CPU ops + `combine_v4.aether` (stack/split/chunk still FR)
-- **FR-17.11** — zeros/ones/full/arange/eye/tril/triu CPU ops + `mask_helpers_v4.aether`
-- **FR-17.17 (partial)** — SGD-momentum/RMSprop/Adagrad CPU ops + `optim_family_v4.aether` (Lion/Lamb/Adafactor still FR)
-- **FR-18.2 (partial)** — broadcast/all_gather/reduce_scatter/send/recv/all_to_all single-rank passthroughs + `collectives_v4.aether` (multi-rank wiring still depends on FR-18.1 NCCL)
-- **FR-22.3** — `tools/aetherfmt/` Rust binary (deterministic formatter; strips trailing ws, normalizes tabs, collapses blank runs) + `aetherfmt_witness.aether`
-- **FR-22.4** — `tools/aetherclippy/` Rust binary (5 starter lints AC001-005) + `aetherclippy_witness.aether`
-- **FR-22.5** — `tools/aetherdoc/` Rust binary (extract `///` doc-comments to markdown) + `aetherdoc_witness.aether`
-- **FR-22.10 (foundation)** — `aetherc --incremental` CLI flag (mtime-based skip) + `incremental_compile.aether`. Per-fn fingerprinting still FR-22.10.
-- **FR-21.7 (foundation)** — `aetherc --no-std` CLI flag + `no_std_v4.aether`. Real embedded target (RPi/STM32) still FR-21.7.
-- **FR-23.6** — `synth_demo_v4.aether` exercises a 5-fn module shape.
-- **FR-24.2 (foundation)** — `aetherc --reproducible` CLI flag + `reproducible_v4.aether`. Stable .obj content still FR-24.2.
-- **FR-24.9** — `aether_gpu_alloc_track`/`aether_gpu_free_track`/`aether_gpu_live_bytes` runtime symbols + `gpu_leak_track.aether`. Per-allocation backtrace + atexit report still FR-24.9.
-- **FR-24.10** — `aether_oom_signal`/`aether_oom_check` runtime symbols + `oom_killer.aether`. Real KV-cache shrink + 503 path still depends on serving stack.
-
-Plus parser quality-of-life: `unsafe { ... }` block (P16.20) and `#[repr(C)]`
-(P16.21) lex+parse cleanly through to codegen; the existing `Expr::Block`
-lowering covers them today. Real raw-pointer + layout enforcement deferred.
+Generated 2026-05-09; reorganized from flat-catalog to critical-path on the
+same date. Audit sits at **123/196 (63%)**. The 73 remaining FRs are organized
+below by what unlocks what — not by phase number.
 
 ---
 
-Format follows the wraith-style blueteam convention: title, severity, what's
-missing, sketch of the fix, and the witness criterion that should accompany
-the fix when it lands.
+## 0. v4 ship milestone
+
+The original v4 mandate ("full Rust parity, bare training, serving, 1%-of-asm")
+is asymptotic — Rust itself is an asymptote and the perf claim is a forever
+chase. To make v4 a real ship target, we cut a smaller line:
+
+> **v4 SHIP** = Aether trains Llama-1B from scratch on the 3070 Ti to
+> coherent generation, serves it via OpenAI-compatible API on localhost,
+> and emits matmul within 5% of cuBLAS at `--O2`.
+
+That target needs **roughly 30 FRs** out of the 73 below — call them the
+**critical path**. The other ~43 are the long tail that turns v4 SHIP into
+v4 COMPLETE. Critical path is graphed in §1; long tail is in §3.
+
+A nominal calendar: critical path = ~4 months of focused work, parallelized
+across the 6 paths in §1. Calibrate down ~3-5× per the project's history.
 
 ---
 
-## Phase 15 — Real codegen (the 1%-of-asm play) — 9 FRs
+## 1. Critical paths (6 parallel sprints)
 
-### FR-15.1 SSA-backed asm emit
-**Severity:** L. **Missing:** today's asm emitter walks the AST. v3's `mir::ssa::SsaStmt` lives in unit-test island.
-**Sketch:** linearise each fn into SsaStmt, run `mir::opt::*`, emit asm from optimised SSA. Preserve `--O0` byte-compat.
-**Witness criterion:** `--emit=mir --O1` shows pre/post-opt SSA diff; `tests/runtime/ssa_emit_drives_asm.aether`.
+Each path is a dependency chain. Items inside a path are sequential.
+Paths are independent and can run in parallel.
 
-### FR-15.2 Real linear-scan in `emit_expr_value`
-**Severity:** L. **Missing:** v3 reports counts but stack slots are still used on every load/store.
-**Sketch:** map `regalloc_drive::Allocator` plan to `r10..r15`; rewrite peephole pass 1+2 for reg-resident values.
-**Witness criterion:** `cuda_train_transformer_block.aether` .obj shrinks ≥30%.
+### Path A — Perf: Aether emit within 5% of cuBLAS at --O2
+*Headline witness: matmul / softmax / layer_norm / SDPA / cross_entropy each
+within 5% wall on the 11900K + 3070 Ti at --O2.*
 
-### FR-15.3 Loop vectorizer emits AVX2/AVX-512
-**Severity:** L. **Missing:** encoder lacks `Vmovups/Vaddps/Vmulps/Vfmadd231ps/Vbroadcastss`; emitter still scalar.
-**Sketch:** add the 256/512-bit ops to `aether_asm/src/encode.rs`; rewrite trivial-body for-loops at codegen.
-**Witness criterion:** 1024-elem f32 dot ≥4× faster at `--O1` vs `--O0` on 11900K.
+| Order | FR | Effort | What lands | Unlocks |
+|---|---|---|---|---|
+| A1 | FR-15.1 | L | SSA-backed asm emit (linearise → opt → emit, not AST→emit) | A2, A3 |
+| A2 | FR-15.2 | L | regalloc drives `emit_expr_value`, hot locals in r10..r15 | A3 |
+| A3 | FR-15.3 | L | AVX2/AVX-512 emit (vmovups/vaddps/vmulps/vfmadd231ps/vbroadcastss) | A4, A5 |
+| A4 | FR-15.4 | M | cross-fn inlining heuristic + actual substitution | A5 |
+| A5 | FR-15.10 | M | hand-asm reference matmul/softmax/LN/SDPA/CE in `bench/handasm/`, ≤1% gap measured | — |
 
-### FR-15.4 Cross-fn inlining
-**Severity:** M. **Missing:** no inliner.
-**Sketch:** heuristic on body-size + call-site count; substitute at MIR level pre-emit.
-**Witness criterion:** `inline_smoke.aether` produces 0 `call aether_add_one` lines at `--O1`.
+Optional micro-wins (don't gate the path): FR-15.5 PGO, FR-15.6 auto-tune,
+FR-15.7 SWP, FR-15.8 prefetch.
 
-### FR-15.5 PGO
-**Severity:** M. **Missing:** no instrumentation, no profile reader.
-**Sketch:** `--profile-gen` adds counter increments at fn entries + branches; `--profile-use=path` biases inlining + reg alloc.
-**Witness criterion:** `pgo_record.aether` shrinks hot path ≥10% under `--profile-use`.
+**Path A total**: 5 FRs core + 4 optional. Calendar: ~4-6 focused weeks.
 
-### FR-15.6 Auto-tuning matmul tile/unroll
-**Severity:** M. **Missing:** no autotune harness.
-**Sketch:** `--auto-tune=matmul_micro` runs N variants in a sandbox; pick winner per shape; persist to `tune_cache.aether-toml`.
-**Witness criterion:** 4096³ sgemm within 5% of OpenBLAS in `bench/matmul_micro/`.
+### Path B — Stdlib heap + closures: foundation for everything
+*Without this, paths C/D/E hit walls. B is the single most-leveraged path.*
 
-### FR-15.7 Software pipelining
-**Severity:** M. **Missing:** none.
-**Sketch:** prologue/kernel/epilogue split for inner loops with no carried deps + ≥4-cycle FU latency.
-**Witness criterion:** `swp_matmul_inner.aether` ≥1.3× unpipelined baseline.
+| Order | FR | Effort | What lands | Unlocks |
+|---|---|---|---|---|
+| B1 | FR-16.4-extra | L | Closures with captures (Fn/FnMut/FnOnce env-structs + indirect call ABI) | B2, C5, D5, F1 |
+| B2 | FR-16.5 | L | Heap stdlib: `Box`, `Vec`, `String`, `HashMap`, `BTreeMap`, `Rc`/`Arc`, `RefCell`, `Mutex`, `RwLock`, `mpsc::channel` | C5, D2, F1 |
+| B3 | FR-16.14 | M | `println!`/`format!` `{}` interpolation | dev ergonomics |
+| B4 | FR-16.24-extra | S | `?`+`From` for stdlib error types | error model |
 
-### FR-15.8 Auto-prefetch
-**Severity:** S. **Missing:** encoder lacks `PrefetchT0RbpDisp { disp }`.
-**Sketch:** add the op; walk strided memory accesses; emit `prefetcht0` 4 cache lines ahead.
-**Witness criterion:** `prefetch_stream.aether` ≥10% bandwidth lift on 64 MiB strided sum.
+**Path B total**: 4 FRs. Calendar: ~3-4 focused weeks.
 
-### FR-15.10 1%-of-handasm pact
-**Severity:** XL (umbrella). **Missing:** no hand-written reference asm in `bench/handasm/`.
-**Sketch:** write reference matmul/softmax/layer_norm/SDPA/cross_entropy in pure asm; benchmark Aether-emitted at `--O2` against each.
-**Witness criterion:** 5 `BENCH_LEDGER.md` rows showing ≤1% wall gap.
+### Path C — Tensor stack: train Llama-1B end-to-end
+*Headline witness: `examples/llama_1b.aether` loads SafeTensors weights,
+trains for N steps on a synthetic corpus, generates coherent tokens.*
 
----
+| Order | FR | Effort | What lands | Unlocks |
+|---|---|---|---|---|
+| C1 | FR-17.1-extra | M | f16/bf16 dtype matrix (CPU + CUDA via tensor cores) | C5, C6 |
+| C2 | FR-17.13 | L | RoPE + FlashAttention v2 (memory-efficient causal) | C6 |
+| C3 | FR-17.3 | L | conv1d/2d/3d via im2col+sgemm OR cuDNN | (path-extra) |
+| C4 | FR-17.14-extra | L | GGUF reader + Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 + fused dequant matmul | C6, D-extra |
+| C5 | FR-17.18-extra | M | BatchNorm/Dropout/MultiheadAttention/TransformerEncoder layers (depends B1+B2) | C6 |
+| C6 | FR-17.19 | XL | `examples/llama_1b.aether` loads SafeTensors → matches HF reference within 1e-3 → trains | — |
 
-## Phase 16 — Rust language parity (remaining 9 FRs)
+**Path C total**: 6 FRs core. Calendar: ~6-8 focused weeks. Biggest single path.
 
-### FR-16.2-extra `dyn Trait` + supertraits + where clauses
-**Missing:** P12.1 / P16.2 multi-tagged trait_dispatch covers static dispatch only. dyn / vtable / blanket impl / where clauses are unimplemented.
-**Sketch:** introduce `Ty::Dyn(TraitName)` fat pointer; vtable layout in COFF .rdata; `<T: Foo + Bar>` parser; blanket impl monomorphisation walk.
+### Path D — Serving: Llama-1B at >100 tok/s OpenAI-compat
+*Headline witness: `aether serve --model llama-1b.safetensors` → curl
+hitting `/v1/chat/completions` returns streaming SSE at ≥100 tok/s.*
 
-### FR-16.3-extra Lifetime diagnostics emit AE0200
-**Missing:** `mir::lifetimes_drive::drive` prints counts; conversion to `Diag` with stable codes is not wired.
-**Sketch:** wrap each `Checker::run` violation as a `Diag` with `AE0200`/`AE0201`/`AE0202`; gate behind `--strict-borrow`; surface in `--check`.
+| Order | FR | Effort | What lands | Unlocks |
+|---|---|---|---|---|
+| D1 | FR-19.1 | XL | TLS 1.3 stack: ChaCha20-Poly1305 + AES-GCM + Ed25519 + X25519 + HMAC-SHA256 | D2 |
+| D2 | FR-19.2 | L | HTTP/1.1 + HTTP/2 + HTTPS server (depends B1+B2 for closures + heap) | D3 |
+| D3 | FR-19.3 | M | `POST /v1/chat/completions` (streaming SSE) | D6 |
+| D4 | FR-19.4 | L | Paged KV cache (block-allocated GPU mem, virtual-page mapping, LRU) | D5 |
+| D5 | FR-19.5 | L | Continuous batching scheduler (depends B1+B2) | D6 |
+| D6 | FR-19.9 | M | HF tokenizer parity (BPE + sentencepiece + tiktoken from `tokenizer.json`) | D7 |
+| D7 | FR-19.16 | M | The witness — Llama-1B sustained ≥100 tok/s aggregate | — |
 
-### FR-16.4-extra Closures with captures
-**Missing:** today's closure pass lifts no-capture lambdas only.
-**Sketch:** capture analysis (free-var → Fn / FnMut / FnOnce); synthesise env-struct + `Fn{Mut,Once}` impl; indirect call ABI (env ptr in rcx).
+Optional (don't gate): FR-19.6 spec-decode, FR-19.7 multi-model,
+FR-19.8 gRPC+WS, FR-19.10 prompt template, FR-19.11 tool calling,
+FR-19.12 vision input, FR-19.13 speech input, FR-19.14 auth+RL,
+FR-19.15 observability.
 
-### FR-16.9 Proc macros
-**Missing:** entirely.
-**Sketch:** compile-as-aether-fn that consumes `TokenStream` → `TokenStream`; three flavours (derive, attribute, function-like). Depends on FR-16.8.
+**Path D total**: 7 FRs core (FR-19.1 alone is XL). Calendar: ~6-8 weeks.
 
-### FR-16.11 Module visibility full
-**Missing:** `pub(crate)`, `pub(super)`, `pub(in path)`; submodule trees; re-exports.
-**Sketch:** parser for visibility variants; module tree builder; resolver respects visibility at name-lookup.
+### Path E — Self-host: drop Rust completely
+*Headline witness: `scripts/bootstrap.ps1` produces A2 == A3 byte-identical.*
 
-### FR-16.13-extra Operator overload via traits
-**Missing:** `Add`/`Sub`/`Mul`/`Div`/`Index` etc trait dispatch.
-**Sketch:** desugar `a + b` to `Add::add(a, b)`; trait resolver picks impl by lhs type.
+| Order | FR | Effort | What lands | Unlocks |
+|---|---|---|---|---|
+| E1 | FR-20.2 | L | Self-hosted parser (Aether AST builder in .aether) | E2 |
+| E2 | FR-20.3 | L | Self-hosted MIR + autodiff pass | E3 |
+| E3 | FR-20.4 | XL | Self-hosted asm emitter (biggest sub-task — re-implements the AST→asm of `compiler/src/codegen/asm/`) | E5 |
+| E4 | FR-20.5 | L | Self-hosted runtime CPU bodies | E6 |
+| E5 | FR-20.7 | L | Self-hosted assembler (encoder + COFF + PE32+ + ELF writers) | E6 |
+| E6 | FR-20.8 | S | Bootstrap script + 3-stage compare; A2 == A3 fixpoint | E7 |
+| E7 | FR-20.9 | S | Update CLAUDE.md / SPEC.md to remove Rust dep claims | — |
 
-### FR-16.14 println! / format! interpolation
-**Missing:** parser accepts `name!(...)` but no fmt engine.
-**Sketch:** parse `"{}{}{}"` into a list of `(literal, hole)` segments at compile time; emit a sequence of `aether_print_<type>` calls per hole.
+Optional: FR-20.10 bootstrap CI (after E6 stabilises).
 
-### FR-16.15 Drop trait + RAII
-**Missing:** entirely.
-**Sketch:** `drop` as a synthetic trait method; aetherc inserts calls at scope-end in lexical reverse order.
+**Path E total**: 7 FRs. Calendar: ~8-12 focused weeks. Independent of A-D —
+can run entirely in parallel.
 
-### FR-16.16 Send/Sync auto traits
-**Missing:** entirely.
-**Sketch:** auto-derive based on field traits; `thread::spawn` requires `T: Send + 'static`.
+### Path F — Tooling: developer-experience parity
+*Headline witness: editor connects, completion+goto-def works on
+`examples/aether_lm.aether`. Independent of every other path.*
 
-### FR-16.18-extra const fn full evaluation
-**Missing:** today's `const X: T = expr;` only takes int literals; calling const fns with const args is not wired.
-**Sketch:** mini-interpreter over const-marked fns at MIR; bake result as immediate.
+| Order | FR | Effort | What lands | Unlocks |
+|---|---|---|---|---|
+| F1 | FR-22.1 | L | LSP server (completion / hover / goto-def / diagnostics / sig-help). Depends B1 for closure-friendly fns | — |
+| F2 | FR-22.2 | M | DAP server (breakpoints, step, eval) | — |
+| F3 | FR-22.10-extra | M | Per-fn fingerprinting incremental (today's flag is mtime-only) | — |
+| F4 | FR-22.6 | M | Coverage instrumentation + HTML report | F5 |
+| F5 | FR-22.7 | L | Fuzzing (libafl-eq grammar-aware) | — |
+| F6 | FR-22.8 | S | `#[quickcheck]` property-based testing | — |
+| F7 | FR-22.9 | M | Differential testing vs PyTorch+Candle in `bench/parity/` | gate for C |
 
-### FR-16.19 Slice/str/char primitives
-**Missing:** `[T]` unsized + `&[T]` fat ptr + `str` + `char` + slicing syntax `s[a..b]`.
-**Sketch:** introduce fat-pointer (data ptr, len) layout in asm backend; allocate two slots per `&[T]` local.
-
-### FR-16.20 Unsafe + raw pointers
-**Missing:** `unsafe { ... }` block, `*const T`, `*mut T`, `std::ptr::*`.
-**Sketch:** parser accepts unsafe, asm backend treats `*const T` as opaque i64; ptr ops desugar to load/store.
-
-### FR-16.21 `repr` attributes
-**Missing:** `#[repr(C)]` / `(packed)` / `(transparent)` / `(u8)` for enums.
-**Sketch:** read from existing `#[attr(...)]` parser; pass to layout builder for struct + enum.
-
-### FR-16.22-extra Real async state-machine + executor
-**Missing:** v3 lowers `async` as pass-through.
-**Sketch:** state-machine struct (continuations as enum variants); poll impl; thread-pool executor over `aether_thread_*`; epoll/IOCP IO.
-
-### FR-16.23-extra Mutex / RwLock / channel / Condvar / Barrier / Once / LazyLock
-**Missing:** atomics + thread spawn ship; the rest don't.
-**Sketch:** spinlock + park/wake primitives; `mpsc::channel<T>` ring buffer + condvar.
-
-### FR-16.25 impl Trait return / argument-position
-**Missing:** entirely.
-**Sketch:** desugar `impl Trait` to a synthetic generic; opaque return uses an anonymous trait-object box at codegen.
+**Path F total**: 7 FRs. Calendar: ~4-6 weeks.
 
 ---
 
-## Phase 17 — Tensor stdlib (remaining 9 FRs)
+## 2. PARKED (hardware-blocked)
 
-### FR-17.1-extra Full dtype matrix beyond f32/f64/i32/i64
-**Missing:** `f16`, `bf16`, `i8`, `u8`, `i16`, `u16`, `u32`, `u64`, `bool` not implemented end-to-end.
-**Sketch:** AVX-512 `_Float16` intrinsics on Sapphire Rapids; AVX2 `vcvtph2ps` / `vcvtps2ph`; CUDA tensor cores for f16/bf16.
+These FRs need hardware Matt doesn't currently have. They stay listed for
+when access opens up; they don't gate anything in §1.
 
-### FR-17.3 Convolutions (conv1d/2d/3d/transpose)
-**Missing:** entirely. **Sketch:** im2col+sgemm for compatibility; cuDNN backend behind `--features cudnn`.
+| FR | What's blocked | Hardware needed |
+|---|---|---|
+| FR-18.10 | Multi-host RDMA (InfiniBand/RoCE) | 2+ hosts, IB switch |
+| FR-18.11 | 8-GPU Llama-7B training | 8× CUDA capable GPUs |
+| FR-21.4 | ROCm runtime (AMD) | AMD GPU (e.g. 7900 XTX) |
+| FR-21.5 | Metal Performance Shaders | Apple Silicon Mac |
+| FR-21.8 | Mobile export (CoreML / NNAPI) | iOS or Android dev environment |
+| FR-21.9 | RISC-V instruction encoder | RISC-V board (e.g. SiFive HiFive) |
 
-### FR-17.4 Pooling family
-**Missing:** entirely. **Sketch:** straightforward CPU + CUDA kernels.
-
-### FR-17.5-extra batchnorm / instancenorm / groupnorm / rmsnorm
-**Missing:** layer_norm ships; the others don't. **Sketch:** mirror layer_norm shape; running-stat tracking for batchnorm.
-
-### FR-17.6-extra Activations beyond gelu/relu/softmax/silu
-**Missing:** tanh, sigmoid, leaky_relu, elu, mish, glu, swiglu, geglu.
-**Sketch:** scalar lambdas (CPU) + CUDA fused kernels.
-
-### FR-17.7-extra log/exp/sin/cos/tan/atan2/pow/recip/abs/sign/clamp
-**Missing:** runtime exposes sqrtss; libm-class wrappers don't exist.
-**Sketch:** call into `libm` for CPU; implement poly-approx for CUDA where appropriate.
-
-### FR-17.8 Reductions full
-**Missing:** sum/mean/var/std/min/max/argmax/argmin/prod per-dim or full.
-**Sketch:** Welford for var/std; tree reductions for arg* on CUDA.
-
-### FR-17.9 Selection (topk/sort/where/masked_fill/gather/scatter)
-**Missing:** entirely. **Sketch:** radix sort or bitonic sort on CUDA; gather/scatter via permute.
-
-### FR-17.10 Combine (cat/stack/split/chunk/repeat/repeat_interleave)
-**Missing:** entirely. **Sketch:** stride-arithmetic only — no actual data copy for split/chunk.
-
-### FR-17.11 Mask helpers (tril/triu/eye/arange/zeros/ones/full/randn)
-**Missing:** entirely. **Sketch:** simple kernels; PCG64 for randn.
-
-### FR-17.12 embedding_bag + sparse embedding
-**Missing:** plain embedding ships; bag/sparse don't.
-**Sketch:** bag = sum/mean over multiple indices; sparse uses CSR layout.
-
-### FR-17.14-extra Quantization schemes (Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 + AWQ + GPTQ + INT8 QAT)
-**Missing:** GGUF reader header parses; full scheme set + fused dequant matmul don't ship.
-
-### FR-17.16-extra MAE/BCE/BCEWithLogits/KL/Triplet/Contrastive/Huber/Smooth-L1
-**Missing:** the runtime symbols exist (per `runtime/src/lib.rs`) but no per-loss tagged witness exists for many; loss_mse multi-tagged.
-**Sketch:** add `loss_<name>.aether` per loss with finite-diff gradient check.
-
-### FR-17.17-extra SGD-momentum / RMSprop / Adagrad / Adamax / Lion / Lamb / Adafactor
-**Missing:** AdamW ships; the rest don't.
-**Sketch:** mirror AdamW kernel shape; per-optim state tensor.
-
-### FR-17.18-extra Conv/BN/Embedding/Dropout/MultiheadAttention/Transformer{Encoder,Decoder}/LSTM/GRU/RNN modules
-**Missing:** Linear + LayerNorm + Embedding-via-lookup ship. The rest are FR-17.18-N.
-
-### FR-17.19 Reference architectures (ResNet/ViT/Llama/BERT/SD/Mamba/MoE/CLIP)
-**Missing:** entirely as `examples/<model>.aether` matching HF reference.
-**Sketch:** load weights via SafeTensors; forward path against PyTorch eval.
-
-### FR-17.20 Numerical parity bench
-**Missing:** entirely.
-**Sketch:** `bench/parity/run_all.ps1` runs every op against PyTorch + Candle reference at 1e-5 rel; pass/fail per op.
+Each is real engineering once hardware is available, but the path forward
+without them is unblocked.
 
 ---
 
-## Phase 18 — Distributed training — 10 FRs
+## 3. Long tail (after critical path lands)
 
-### FR-18.1 Own NCCL bindings
-**Missing:** entirely. **Sketch:** raw FFI to libnccl.so / nccl.dll; surface mirrors NCCL API.
+These are valid v4 items but lower priority — they make v4 COMPLETE rather
+than v4 SHIP. Pick them up after §1 is done.
 
-### FR-18.2 All collectives (all-reduce/gather/reduce-scatter/broadcast/send/recv/all-to-all)
-**Missing:** all_reduce_sum_f32 ships; the rest don't.
+### Language fill-ins (P16)
+- **FR-16.2-extra** — `dyn Trait` + supertraits + where clauses + blanket impls + associated types (XL — full trait system end-game)
+- **FR-16.3-extra** — Lifetime diagnostics emit AE0200 family (M)
+- **FR-16.8-extra** — Real `macro_rules!` expansion (today: rename-to-fn shortcut). Fragment kinds + repetitions + hygiene (L)
+- **FR-16.9** — Proc macros (derive / attribute / function-like) (XL)
+- **FR-16.11** — Module visibility full (`pub(crate)`, `pub(super)`, re-exports) (M)
+- **FR-16.13-extra** — Op-trait dispatch (`a + b` → `Add::add(a, b)`) (S)
+- **FR-16.15** — Drop trait + RAII glue (M)
+- **FR-16.16** — Send/Sync auto traits (S)
+- **FR-16.18-extra** — Full const-fn evaluation (M)
+- **FR-16.19** — Slice/str/char primitives + slicing syntax (M)
+- **FR-16.20-extra** — Real raw pointers + `std::ptr::*` (M)
+- **FR-16.21-extra** — `repr(packed)` / `(transparent)` / `(uN)` layout enforcement (S)
+- **FR-16.22-extra** — Real async state-machine + executor (depends B1+B2) (XL)
+- **FR-16.23-extra** — `Mutex` / `RwLock` / `Condvar` / `Barrier` / channels (M, depends B2)
+- **FR-16.25** — `impl Trait` return / argument-position (S)
 
-### FR-18.4 FSDP
-**Missing:** entirely. **Sketch:** all-gather of params per layer fwd; reduce-scatter of grads bwd.
+### Tensor extras (P17)
+- **FR-17.4** — Pooling (max/avg, adaptive variants) (S)
+- **FR-17.5-extra** — batchnorm / instancenorm / groupnorm / rmsnorm + backward (M)
+- **FR-17.6-extra** — tanh/sigmoid/leaky_relu/elu/mish backward (S)
+- **FR-17.8-extra** — per-dim reductions (today: full only) (S)
+- **FR-17.9-extra** — topk / sort / gather / scatter (M)
+- **FR-17.10-extra** — stack / split / chunk / repeat_interleave (S)
+- **FR-17.12** — embedding_bag + sparse embedding (S)
+- **FR-17.16-extra** — MAE/BCE/BCEWithLogits/KL/Triplet/Contrastive/Huber/Smooth-L1 finite-diff witnesses per-loss (S)
+- **FR-17.17-extra** — Lion/Lamb/Adafactor optimizers (S)
+- **FR-17.18-N** — LSTM/GRU/RNN/ConvTranspose2d/GroupNorm/RMSNorm modules (M)
+- **FR-17.20** — `bench/parity/` numerical-parity bench vs PyTorch+Candle (M)
 
-### FR-18.5 TP (tensor parallel)
-**Missing:** entirely. **Sketch:** column-parallel + row-parallel `Linear`; sequence-parallel residual.
+### Distributed extras (P18)
+- **FR-18.1** — Own NCCL bindings (M, gates D-extra distributed serving)
+- **FR-18.2-extra** — Multi-rank wiring (today's collectives are single-rank passthroughs)
+- **FR-18.4** — FSDP (L)
+- **FR-18.5** — TP (Megatron-style) (L)
+- **FR-18.6** — PP (1F1B) (L)
+- **FR-18.7** — ZeRO-1/2/3 (L)
+- **FR-18.8** — Compute/comm overlap via CUDA streams (M)
+- **FR-18.9** — Gradient compression (PowerSGD-class) (M)
 
-### FR-18.6 PP (pipeline parallel)
-**Missing:** entirely. **Sketch:** 1F1B or interleaved 1F1B; activation checkpointing per stage.
+### Multi-platform (P21)
+- **FR-21.1-extra** — Linux ELF dynamic linker (header parses, full dynamic resolution still TBD)
+- **FR-21.2** — Mach-O writer (macOS) (M)
+- **FR-21.3** — ARM64 instruction encoder (L)
+- **FR-21.6** — WebAssembly target (L)
+- **FR-21.7-extra** — Full no_std embedded build (RPi 4 / STM32-class) (M)
 
-### FR-18.7 ZeRO-1/2/3
-**Missing:** entirely. **Sketch:** staged sharding of optim/grad/param.
+### Synthesis (P23)
+- **FR-23.2** — Auto-property generation for `#[spec]` fns (M)
+- **FR-23.3** — Auto-test generation (M)
+- **FR-23.4** — `#[infer]` compile-time numerical inference (M)
+- **FR-23.5** — Differential synthesis (close 1-ULP gaps vs PyTorch) (L)
 
-### FR-18.8 Compute/comm overlap
-**Missing:** entirely. **Sketch:** CUDA streams for collectives concurrent with kernel launches.
-
-### FR-18.9 Gradient compression
-**Missing:** entirely. **Sketch:** PowerSGD-class low-rank approx per bucket.
-
-### FR-18.10 Multi-host RDMA
-**Missing:** entirely. **Sketch:** InfiniBand verbs + RoCE Ethernet; GPU-Direct RDMA. **Hardware-blocked.**
-
-### FR-18.11 8-GPU Llama-7B training run
-**Missing:** entirely. **Hardware-blocked.**
-
----
-
-## Phase 19 — Serving stack — 16 FRs (ALL of P19)
-
-### FR-19.1 TLS 1.3 stack (own)
-**Missing:** entirely. **Sketch:** ChaCha20-Poly1305 + AES-GCM + Ed25519 + X25519 + HMAC-SHA256.
-
-### FR-19.2 HTTP/1.1 + HTTP/2 + HTTPS server
-**Missing:** entirely (TCP listener exists; HTTP doesn't). **Sketch:** `aether::http::Server::bind(":8080").serve(handler)`.
-
-### FR-19.3 OpenAI-compatible /v1/chat/completions
-**Missing:** entirely. Depends on FR-19.2 + FR-17.19.
-
-### FR-19.4 Paged KV cache
-**Missing:** entirely. **Sketch:** block-allocated GPU mem with virtual-page mapping; LRU eviction.
-
-### FR-19.5 Continuous batching scheduler
-**Missing:** entirely. **Sketch:** mid-decode batch entry; preempt-longest on full.
-
-### FR-19.6 Speculative decoding
-**Missing:** entirely. **Sketch:** draft + verify model pair, ≥40% acceptance target.
-
-### FR-19.7 Multi-model concurrent hosting
-**Missing:** entirely. **Sketch:** per-model KV cache pool + memory budget.
-
-### FR-19.8 gRPC + WebSocket
-**Missing:** entirely. **Sketch:** Tonic-style codegen from `.proto`; WS upgrade + framing.
-
-### FR-19.9 HF tokenizer parity (BPE/sentencepiece/tiktoken)
-**Missing:** entirely. **Sketch:** load from `tokenizer.json`; bytes-equal round-trip.
-
-### FR-19.10 Prompt template engine (Jinja-eq)
-**Missing:** entirely. **Sketch:** `{{ }}`, `{% for %}`, `{% if %}` minimal.
-
-### FR-19.11 Tool / function calling
-**Missing:** entirely. **Sketch:** OpenAI-spec tool message; constrained decoding to JSON schema.
-
-### FR-19.12 Vision input
-**Missing:** entirely. **Sketch:** image preproc (resize/normalize/patchify) + ViT encoder hookup.
-
-### FR-19.13 Speech input (Whisper)
-**Missing:** entirely. **Sketch:** 16 kHz PCM → mel spectrogram → Whisper encoder.
-
-### FR-19.14 Auth + rate limiting
-**Missing:** entirely. **Sketch:** API key + JWT; token-bucket per user.
-
-### FR-19.15 Observability (Prometheus + OTLP)
-**Missing:** entirely. **Sketch:** `/metrics` endpoint; OTLP gRPC traces; structured JSON logs.
-
-### FR-19.16 Llama-3-1B at >100 tok/s aggregate (umbrella)
-**Missing:** entirely. **Hardware-attainable on 3070 Ti once FR-19.4/.5/.7 ship.**
+### Production hardening (P24)
+- **FR-24.1** — Sanitizers (ASan/MSan/UBSan/TSan) (M)
+- **FR-24.2-extra** — Full reproducible builds (deterministic timestamps + path stripping in .obj) (M)
+- **FR-24.3** — Supply-chain: Sigstore signing + CycloneDX SBOM (M)
+- **FR-24.5** — Embedded runtime (M, depends FR-21.7-extra)
+- **FR-24.6** — Hot-reload for serving processes (M)
+- **FR-24.7** — Crash dumps + own telemetry (no Sentry per Matt) (M)
+- **FR-24.8** — Real autoscaler for serving fleet (M, depends D7)
+- **FR-24.9-extra** — Per-allocation backtrace + atexit GPU leak report (S)
+- **FR-24.10-extra** — Real KV-cache shrink + 503 path under OOM (S, depends D4+D5)
 
 ---
 
-## Phase 20 — Self-host (3 FRs)
+## 4. How to use this doc
 
-### FR-20.8 3-stage bootstrap (A2 == A3 fix-point)
-**Missing:** entirely. **Sketch:** Stage 0 = Rust-aetherc; Stage 1+2+3 produced by self-host; A2 == A3 byte-identical. Depends on every other P20 item.
+**Picking up work?** Start at §1, choose a path, attack the leftmost FR
+that isn't done. The path's order is the dependency order.
 
-### FR-20.9 Drop Rust dep from CLAUDE.md / SPEC.md
-**Missing:** Rust still authoritative impl. Depends on FR-20.8.
+**Hardware just opened up?** Move FRs from §2 PARKED into §1 critical path
+or §3 long tail as appropriate.
 
-### FR-20.10 Bootstrap CI
-**Missing:** entirely. **Sketch:** local script (no GitHub Actions per Matt) runs `bootstrap.ps1` on every commit touching compiler/aether_asm/runtime.
+**FR landed?** Open commit → move the FR's bullet from §1/§3 to a "Closed"
+section at top (or just delete the bullet if `git log` is enough). Update
+the audit count line.
 
----
+**Adding scope?** New FRs go in §3 long tail unless they gate v4 SHIP, in
+which case insert into §1 with explicit dependencies.
 
-## Phase 21 — Multi-platform — 8 FRs
+**Defining v4 SHIP done?** When all of §1's headline witnesses are green:
+matmul ≤5% gap, Llama-1B trains, Llama-1B serves at ≥100 tok/s, A2==A3
+fixpoint. That's ~30 FRs. The audit hits that count when v4 ships.
 
-### FR-21.2 Mach-O writer (macOS)
-**Missing:** entirely. **Sketch:** Mach-O 64 header + load commands + LC_DYLD_INFO; Apple Silicon page-protection quirks.
-
-### FR-21.3 ARM64 instruction encoder
-**Missing:** entirely. **Sketch:** encoder + COFF/Mach-O/ELF rerouting; NEON for vectorize.
-
-### FR-21.4 ROCm runtime (AMD GPUs)
-**Missing:** entirely. **Sketch:** rocBLAS / MIOpen replacements for cuBLAS / cuDNN; HIP shim. **Hardware-blocked.**
-
-### FR-21.5 Metal Performance Shaders
-**Missing:** entirely. **Hardware-blocked.**
-
-### FR-21.6 WebAssembly target
-**Missing:** entirely. **Sketch:** WASM core + SIMD128; `.wasm` + JS glue.
-
-### FR-21.7 no_std + embedded
-**Missing:** runtime_pe is the model; full `aetherc --target=arm64-linux-musl` doesn't exist.
-
-### FR-21.8 Mobile export (CoreML / NNAPI)
-**Missing:** entirely. **Hardware-blocked.**
-
-### FR-21.9 RISC-V instruction encoder
-**Missing:** entirely. **Hardware-blocked.**
+**Long tail vs critical path?** A long-tail item moves to critical path
+the moment its absence blocks a §1 witness. Otherwise it stays in §3.
 
 ---
 
-## Phase 22 — Compiler tooling — 10 FRs (ALL of P22)
+## 5. Calendar estimate
 
-### FR-22.1 LSP server (`aether-lsp`)
-**Sketch:** completion / hover / goto-def / find-refs / rename / sig-help / diagnostics; clients for VS Code, Helix, Neovim.
+Calibrated against project history (v2: 50 items in one session;
+v3: 18 items in one session; v4 second pass: 16 real-impl items in
+one autonomous run).
 
-### FR-22.2 DAP server (`aether-dap`)
-**Sketch:** breakpoints, step over/in/out, eval, var inspect; source maps from asm backend.
+| Path | Nominal | Honest median (3-5× faster) |
+|---|---|---|
+| A (perf) | 4-6 weeks | 1-2 weeks |
+| B (stdlib heap) | 3-4 weeks | ≤1 week |
+| C (tensor stack) | 6-8 weeks | 2-3 weeks |
+| D (serving) | 6-8 weeks | 2-3 weeks |
+| E (self-host) | 8-12 weeks | 3-4 weeks |
+| F (tooling) | 4-6 weeks | 1-2 weeks |
 
-### FR-22.3 `aetherfmt` (deterministic formatter)
-**Sketch:** rustfmt-eq; single-round-trip stable.
-
-### FR-22.4 `aetherclippy` (lints)
-**Sketch:** ~50 starter lints (unused let, must-use, redundant clone).
-
-### FR-22.5 `aetherdoc` (HTML doc generator)
-**Sketch:** parse doc comments; cross-link types/fns/traits; search index.
-
-### FR-22.6 Coverage (line + branch)
-**Sketch:** instrument every basic block; per-bb counters at exit; HTML report.
-
-### FR-22.7 Fuzzing (libafl-eq)
-**Sketch:** grammar-aware parser fuzzer; coverage-guided.
-
-### FR-22.8 Property-based testing (`#[quickcheck]`)
-**Sketch:** generators for primitive + struct types; shrinking on failure.
-
-### FR-22.9 Differential testing vs Candle/PyTorch
-**Sketch:** drives `bench/parity/` numerical parity; same input → same output ±1e-5.
-
-### FR-22.10 Incremental compilation
-**Sketch:** per-fn + per-crate fingerprints; touched-fn-only recompile.
+If A+B+C+D run in parallel: **v4 SHIP in 6-12 weeks of focused effort.**
+E+F can land alongside or after.
 
 ---
 
-## Phase 23 — AI-assisted synthesis — 5 FRs
+## 6. FR catalog (per-item detail, kept short)
 
-### FR-23.2 Auto-property generation
-**Sketch:** for each `#[spec]` synthesised fn, generate ≥3 property tests (idempotence, totality, preservation).
+The detail blocks below are reference material. Each FR has: severity tag,
+current state, sketch of the fix, and the witness criterion that should
+ship with it. Path letter (A/B/C/D/E/F) cross-references §1.
 
-### FR-23.3 Auto-test generation
-**Sketch:** round-trip + edge-case tests synthesised from fn signature.
+### Path A (perf) — 5 core FRs
 
-### FR-23.4 `#[infer]` compile-time numerical inference
-**Sketch:** const-shape fns over const inputs evaluated at compile time; baked as `.rdata`.
+**FR-15.1** [A1, L]: SSA-backed asm emit. Today: AST → emit. Sketch: linearise
+each fn to `mir::ssa::SsaStmt`, run `mir::opt::*`, emit asm from optimised
+SSA. `--O0` byte-compat preserved. Witness: `tests/runtime/ssa_emit_drives_asm.aether`.
 
-### FR-23.5 Differential synthesis
-**Sketch:** find inputs where Aether vs PyTorch differ >1 ULP; close gap via small kernel adjustments.
+**FR-15.2** [A2, L]: real linear-scan in `emit_expr_value`. Today: stack slots
+on every load. Sketch: drive `regalloc_drive::Allocator` plan into the
+emitter, hot locals stay in r10..r15 across loop bodies, peephole pass
+1+2 recognise reg-resident values. Witness: `cuda_train_transformer_block.aether`
+.obj shrinks ≥30%.
 
-### FR-23.6 Synthesis demo
-**Sketch:** `examples/synth_demo.aether` — a 5-fn synthesised module passes its auto-tests + shadows a hand-written reference within 1e-5 rel.
+**FR-15.3** [A3, L]: AVX2/AVX-512 emit. Encoder ops:
+`Vmovups`/`Vaddps`/`Vmulps`/`Vfmadd231ps`/`Vbroadcastss` + 256/512-bit
+`vmovdqu` int. Behind `--target-cpu={skylake-avx512,znver4}`. Witness:
+1024-elem f32 dot ≥4× faster at `--O1` vs `--O0`.
+
+**FR-15.4** [A4, M]: cross-fn inlining. Heuristic: ≤20 instr OR single
+call-site. MIR-level pre-emit. Witness: `inline_smoke.aether` produces 0
+`call aether_add_one` lines at `--O1`.
+
+**FR-15.10** [A5, M, gate]: 1%-of-handasm pact. Hand-written reference asm
+in `bench/handasm/` for matmul/softmax/layer_norm/SDPA/cross_entropy.
+Aether `--O2` within 1% wall on 11900K + 3070 Ti. Witness: 5 rows in
+`BENCH_LEDGER.md` showing ≤1% gap.
+
+### Path B (stdlib heap) — 4 core FRs
+
+**FR-16.4-extra** [B1, L]: closures with captures. Capture analysis →
+synthesised env-struct + `Fn{,Mut,Once}` impl. Indirect call ABI: env ptr
+in rcx, args shift right. Witness: `let mut acc = 0; let inc = || { acc += 1; acc };`
+returns 1, 2, 3 across calls.
+
+**FR-16.5** [B2, L]: heap stdlib. `Box`/`Vec`/`String`/`HashMap`/`BTreeMap`/
+`Rc`/`Arc`/`RefCell`/`Cell`/`Mutex`/`RwLock`/`mpsc::channel`/`VecDeque`. Add
+`aether_realloc_bytes` + aligned dealloc to runtime. Witness per type
+exercising basic API + drop semantics.
+
+**FR-16.14** [B3, M]: `println!`/`format!` `{}` interpolation. Compile-time
+parse `"{}{}"` into `(literal, hole)` segments; emit a sequence of
+`aether_print_<type>` calls per hole. Witness: `println!("hello {} {:.3}", name, pi)`.
+
+**FR-16.24-extra** [B4, S]: `?`+`From`. Stdlib error type with backtrace; `?`
+auto-wraps via `From::from` on err arm. Witness: `main() -> Result<(), Error>`
+parses 5 numbers from a string, propagates first error.
+
+### Path C (tensor stack) — 6 core FRs
+
+**FR-17.1-extra** [C1, M]: f16/bf16 dtype matrix. AVX-512 `_Float16` on
+Sapphire Rapids; `vcvtph2ps`/`vcvtps2ph` AVX2 fallback. CUDA tensor cores
+via PTX `cvt.f16.f32`. Witness: `cuda_train_transformer_block_bf16.aether`
+within 5% loss of f32.
+
+**FR-17.13** [C2, L]: RoPE + ALiBi + FlashAttention v2 (memory-efficient
+causal) + PagedAttention. Witness: 8k-context Llama forward matches HF
+within 1e-3 rel.
+
+**FR-17.3** [C3, L]: conv1d/2d/3d/conv_transpose2d via im2col+sgemm OR
+direct cuDNN behind `--features cudnn`. Padding modes: zero/reflect/replicate/circular.
+Witness: ResNet-50 first conv matches PyTorch within 1e-5.
+
+**FR-17.14-extra** [C4, L]: GGUF reader/writer + Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 +
+fused dequant matmul + AWQ + GPTQ + INT8 QAT. Witness: Llama-2-7B Q4_K_M
+inferences at >40 tok/s on 3070 Ti.
+
+**FR-17.18-extra** [C5, M, depends B1+B2]: BatchNorm{1,2,3}d / Dropout /
+MultiheadAttention / TransformerEncoder/Decoder / LSTM / GRU / RNN /
+ConvTranspose2d / GroupNorm / RMSNorm modules + initializers (Kaiming/
+Xavier/Orthogonal/Truncated-normal). Witness: 12-layer transformer encoder
+defined as `let layers: Vec<Block>;` trains in one .aether file.
+
+**FR-17.19** [C6, XL, gate]: reference architectures. ResNet/ViT/Llama/BERT/
+SD/Mamba/MoE/CLIP each as `examples/<model>.aether` loading SafeTensors,
+matching HF reference within 1e-3. Llama-1B is the v4 SHIP gate.
+
+### Path D (serving) — 7 core FRs
+
+**FR-19.1** [D1, XL]: TLS 1.3 (own pure-Aether or thin BoringSSL wrap).
+ChaCha20-Poly1305 + AES-GCM + Ed25519 + X25519 + HMAC-SHA256. Witness:
+`tls_handshake.aether` fetches `https://example.com` index.
+
+**FR-19.2** [D2, L, depends B1+B2]: HTTP/1.1 + HTTP/2 + HTTPS server.
+`aether::http::Server::bind(":8080").serve(handler)`. Streaming, chunked,
+keep-alive. Witness: `bench/http_echo/` ≥10k req/s on 11900K.
+
+**FR-19.3** [D3, M]: OpenAI `/v1/chat/completions` + `/v1/completions` +
+`/v1/models`. Streaming SSE. Witness: `curl` matches OpenAI API surface.
+
+**FR-19.4** [D4, L]: Paged KV cache. Block-allocated GPU mem, virtual-page
+mapping (block size = 16 tokens), LRU eviction. Witness: 32-batch concurrent
+prefix sharing achieves ≥80% cache hit on benchmark prompts.
+
+**FR-19.5** [D5, L, depends B1+B2]: Continuous batching scheduler. New
+requests enter mid-decode (no padding waste); preempt-longest on full.
+Witness: 64 concurrent requests achieve ≥3× single-stream throughput.
+
+**FR-19.9** [D6, M]: HF tokenizer parity (BPE / sentencepiece / tiktoken).
+Loadable from `tokenizer.json`. Witness: round-trip 1 MB of WikiText
+bytes-equal vs HF tokenizer.
+
+**FR-19.16** [D7, M, gate]: Llama-3-1B at >100 tok/s aggregate. Witness:
+`BENCH_LEDGER.md` row showing ≥100 tok/s sustained over 1000 batched requests.
+
+### Path E (self-host) — 7 core FRs
+
+**FR-20.2** [E1, L]: self-hosted parser. Recursive-descent builder of
+`ast::Program` shape. Handles every item / expr / pattern from Rust-aetherc.
+Witness: parse + re-emit AST for `examples/aether_lm.aether` matches
+Rust-aetherc dump.
+
+**FR-20.3** [E2, L]: self-hosted MIR + autodiff. Tape-based reverse mode +
+symbolic partials. Witness: MIR text-emit for `aether_lm.aether` matches
+Rust-aetherc byte-for-byte.
+
+**FR-20.4** [E3, XL]: self-hosted asm emitter. Re-implements
+`compiler/src/codegen/asm/` in Aether, scaffold modules wired (SSA + opt +
+regalloc + vectorize). Witness: asm emit for entire `tests/runtime/*.aether`
+matches Rust-aetherc byte-for-byte.
+
+**FR-20.5** [E4, L]: self-hosted runtime CPU bodies. Every `aether_op_*`
+re-implemented. Witness: `aether_lm.aether` trains identically through
+Aether-only runtime.
+
+**FR-20.7** [E5, L]: self-hosted assembler. x86-64 encoder + COFF + PE32+ +
+ELF writers. Witness: `aether_asm.aether` produces byte-identical .obj +
+.exe to Rust `aether_asm`.
+
+**FR-20.8** [E6, S]: 3-stage bootstrap. Stage 0 = Rust-aetherc; A1+A2+A3
+produced by self-host; A2 == A3 byte-identical. Witness: `scripts/bootstrap.ps1`.
+
+**FR-20.9** [E7, S]: drop Rust dep claims from CLAUDE.md / SPEC.md. Witness:
+`git grep "Rust"` returns only historical context.
+
+### Path F (tooling) — 7 core FRs
+
+**FR-22.1** [F1, L, depends B1]: `aether-lsp` LSP server. Completion
+(context-aware) / hover / goto-def / find-refs / rename / sig-help /
+diagnostics. VS Code + Helix + Neovim clients.
+
+**FR-22.2** [F2, M]: `aether-dap` DAP server. Breakpoints, step over/in/out,
+eval, var inspect. Source maps from asm backend.
+
+**FR-22.10-extra** [F3, M]: per-fn fingerprinting incremental compile (today
+ships `--incremental` mtime-only foundation).
+
+**FR-22.6** [F4, M]: coverage instrumentation per basic block + counters at
+exit + HTML report.
+
+**FR-22.7** [F5, L]: fuzzing (libafl-eq grammar-aware). Coverage-guided.
+
+**FR-22.8** [F6, S]: `#[quickcheck]` property-based testing (depends FR-16.9
+proc macros for derive — or hand-rolled at first).
+
+**FR-22.9** [F7, M, gate for C]: differential testing vs PyTorch+Candle
+in `bench/parity/`. Same input → same output ±1e-5.
 
 ---
 
-## Phase 24 — Production hardening — 10 FRs (ALL of P24)
-
-### FR-24.1 Sanitizers (ASan / MSan / UBSan / TSan)
-**Sketch:** instrumentation pass + runtime check fns; `--sanitize=<name>`.
-
-### FR-24.2 Reproducible builds
-**Sketch:** deterministic timestamps; no path leakage in .obj/.exe; `--reproducible`.
-
-### FR-24.3 Supply-chain (signed packages, SBOM)
-**Sketch:** Sigstore-shaped signing for `aether-pkg` registry; CycloneDX SBOM.
-
-### FR-24.4 Cross-compilation (umbrella with FR-21.10)
-**Sketch:** see FR-21.10.
-
-### FR-24.5 Embedded runtime
-**Sketch:** trimmed `runtime_pe`-style cdylib with custom alloc.
-
-### FR-24.6 Hot-reload
-**Sketch:** edit-and-continue for serving processes.
-
-### FR-24.7 Crash dumps + telemetry (own)
-**Sketch:** core + register dump on panic; optional remote telemetry (own server, no Sentry per Matt).
-
-### FR-24.8 Real autoscaler
-**Sketch:** watch QPS, spin up replicas, load-balance.
-
-### FR-24.9 GPU memory leak detection
-**Sketch:** per-allocation tracking; report unfreed allocations at exit.
-
-### FR-24.10 OOM killer + graceful degradation
-**Sketch:** under memory pressure, shrink KV cache pool, reject new requests with 503.
-
----
-
-## How this file gets retired
-
-Each FR moves out of NEXT-UP and into `tests/runtime/` as a tagged witness when the corresponding feature ships. The audit count
-(`target/debug/aether-audit.exe --only roadmap`) is the source of truth — when a phase reaches 100%, its FR section here gets deleted in
-the same commit. This file is intentionally short-lived; it shrinks as Aether grows.
+That's the lay of the land. §1 gives 30 FRs that ship v4. §2 lists the
+6 hardware-blocked items. §3 has the 37-item long tail. §4 is the protocol
+for working through it. §6 has detail.
