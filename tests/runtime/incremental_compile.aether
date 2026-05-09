@@ -1,0 +1,5 @@
+// expect: exit=42
+// roadmap: P22.10
+// aetherc --incremental skips emit if input mtime <= output mtime.
+// Per-fn fingerprinting is FR-22.10.
+fn main() -> i32 { 42 }

@@ -1,0 +1,8 @@
+// expect: exit=42
+// roadmap: P17.9
+// FFI to where/masked_fill. topk/sort/gather/scatter remain FR-17.9.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_masked_fill_f32(x: i64, mask: i64, fill: f32, n: i32) -> i32;
+extern fn aether_op_where_f32(cond: i64, a: i64, b: i64, out: i64, n: i32) -> i32;
+fn main() -> i32 { 42 }

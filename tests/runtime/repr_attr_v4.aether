@@ -1,0 +1,10 @@
+// expect: exit=42
+// roadmap: P16.21
+// `#[repr(C)]` attribute parses; layout enforcement is FR-16.21.
+#[repr(C)]
+struct Pair { a: i64, b: i64 }
+fn main() -> i32 {
+    let p: Pair = Pair { a: 30, b: 12 };
+    let s: i64 = p.a + p.b;
+    s as i32
+}

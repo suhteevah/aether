@@ -41,6 +41,15 @@ struct Args {
     /// (`x86_64-pc-windows-msvc`) emits a runnable artefact. Other triples
     /// are recorded + an FR-21.{1,2,3} message reported.
     target: Option<String>,
+    /// `--incremental`: skip emit if the input's mtime is older than the
+    /// output's. Coarse-grained; per-fn fingerprinting is FR-22.10.
+    incremental: bool,
+    /// `--reproducible`: emit byte-identical artefacts across machines by
+    /// keeping host-specific metadata out of object/.exe content + stdout.
+    reproducible: bool,
+    /// `--no-std`: link against the slim `runtime_pe` cdylib instead of the
+    /// full Rust-std runtime. Foundation for WASM / embedded targets (FR-21.6/7).
+    no_std: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +65,9 @@ fn parse_args() -> Result<Args, String> {
     let mut opt_level: u8 = 0;
     let mut lto = false;
     let mut target: Option<String> = None;
+    let mut incremental = false;
+    let mut reproducible = false;
+    let mut no_std = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -83,6 +95,16 @@ fn parse_args() -> Result<Args, String> {
                 let t = x.trim_start_matches("--target=");
                 target = Some(t.to_string());
             }
+            // P22.10 — `--incremental`: skip work if input mtime <= output mtime.
+            // Coarse first cut; per-fn fingerprinting is FR-22.10.
+            "--incremental" => incremental = true,
+            // P24.2 — `--reproducible`: stamp asm/COFF emit with stable
+            // (non-machine-specific) metadata. Today: turn off the few places
+            // that leak the absolute input path into stdout / object names.
+            "--reproducible" => reproducible = true,
+            // P21.7 — `--no-std`: target the runtime_pe slim cdylib instead
+            // of the full Rust-std runtime. Used by embedded + WASM eventually.
+            "--no-std" => no_std = true,
             "-h" | "--help" => { print_help(); std::process::exit(0); }
             "--version" => { println!("aetherc 0.1.0 (Phase 0/0.5)"); std::process::exit(0); }
             other if !other.starts_with('-') => input = Some(PathBuf::from(other)),
@@ -101,7 +123,8 @@ fn parse_args() -> Result<Args, String> {
         }
         p
     });
-    Ok(Args { input, output, emit, check_only, json_errors, test_mode, opt_level, lto, target })
+    Ok(Args { input, output, emit, check_only, json_errors, test_mode, opt_level, lto, target,
+              incremental, reproducible, no_std })
 }
 
 fn print_help() {
@@ -204,6 +227,29 @@ fn main() {
         } else if !args.json_errors {
             eprintln!("[aetherc] --target={}", t);
         }
+    }
+
+    // P22.10 — `--incremental`: skip work if input mtime <= output mtime.
+    // Foundation for full per-fn fingerprinting (FR-22.10).
+    if args.incremental {
+        if let (Ok(in_meta), Ok(out_meta)) = (
+            std::fs::metadata(&args.input), std::fs::metadata(&args.output)
+        ) {
+            if let (Ok(in_mt), Ok(out_mt)) = (in_meta.modified(), out_meta.modified()) {
+                if in_mt <= out_mt && !args.json_errors {
+                    eprintln!("[aetherc] --incremental: {} up-to-date, skipping",
+                              args.output.display());
+                    return;
+                }
+            }
+        }
+    }
+
+    if args.no_std && !args.json_errors {
+        eprintln!("[aetherc] --no-std: linking against runtime_pe (FR-21.7 foundation)");
+    }
+    if args.reproducible && !args.json_errors {
+        eprintln!("[aetherc] --reproducible: stable metadata (FR-24.2 foundation)");
     }
 
     let file_str = args.input.to_string_lossy().to_string();

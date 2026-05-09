@@ -1,0 +1,11 @@
+// expect: exit=42
+// roadmap: P18.2
+// FFI to collective ops. Single-rank passthroughs today; real NCCL
+// bindings are FR-18.1.
+extern fn aether_op_broadcast_f32(buf: i64, n: i32, root: i32) -> i32;
+extern fn aether_op_all_gather_f32(src: i64, dst: i64, n: i32, world: i32) -> i32;
+extern fn aether_op_reduce_scatter_f32(src: i64, dst: i64, n: i32, world: i32) -> i32;
+extern fn aether_op_send_f32(buf: i64, n: i32, dst_rank: i32) -> i32;
+extern fn aether_op_recv_f32(buf: i64, n: i32, src_rank: i32) -> i32;
+extern fn aether_op_all_to_all_f32(src: i64, dst: i64, n: i32, world: i32) -> i32;
+fn main() -> i32 { 42 }

@@ -1,0 +1,16 @@
+// expect: exit=42
+// roadmap: P17.11
+// FFI to mask helpers: zeros/ones/full/arange/eye/tril/triu.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_zeros_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_ones_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_arange_f32(x: i64, start: f32, step: f32, n: i32) -> i32;
+extern fn aether_op_eye_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_tril_f32(x: i64, rows: i32, cols: i32) -> i32;
+extern fn aether_op_triu_f32(x: i64, rows: i32, cols: i32) -> i32;
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(36);
+    aether_free_bytes(buf);
+    42
+}

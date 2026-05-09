@@ -1,0 +1,14 @@
+// expect: exit=42
+// roadmap: P17.6
+// FFI to extended activations: tanh/sigmoid/leaky_relu/elu/mish.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_tanh_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_sigmoid_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_leaky_relu_f32(x: i64, slope: f32, n: i32) -> i32;
+extern fn aether_op_mish_f32(x: i64, n: i32) -> i32;
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(4);
+    aether_free_bytes(buf);
+    42
+}

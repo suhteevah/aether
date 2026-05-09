@@ -1,0 +1,8 @@
+[package]
+name = "aetherfmt"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aetherfmt"
+path = "src/main.rs"

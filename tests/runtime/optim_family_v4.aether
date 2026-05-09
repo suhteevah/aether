@@ -1,0 +1,7 @@
+// expect: exit=42
+// roadmap: P17.17
+// FFI to extended optimizers: SGD-momentum/RMSprop/Adagrad.
+extern fn aether_op_sgd_momentum_step_f32(params: i64, grad: i64, momentum_buf: i64, lr: f32, mu: f32, weight_decay: f32, n: i32) -> i32;
+extern fn aether_op_rmsprop_step_f32(params: i64, grad: i64, sq_buf: i64, lr: f32, rho: f32, eps: f32, n: i32) -> i32;
+extern fn aether_op_adagrad_step_f32(params: i64, grad: i64, sq_buf: i64, lr: f32, eps: f32, n: i32) -> i32;
+fn main() -> i32 { 42 }

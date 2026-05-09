@@ -1675,6 +1675,425 @@ fn write_f32(buf: &mut [u8], v: f32, decimals: u32) -> usize {
     (i + j) as f32 * f
 }
 
+// ============================================================================
+// v4 op surface — math primitives, activation extensions, mask helpers,
+// reductions, combine, optimizer extensions, collectives. Each takes f32
+// pointers + element count and returns 0 on success. CPU bodies; the CUDA
+// path is FR-17.x in NEXT-UP.md.
+// ============================================================================
+
+// ---- FR-17.7-extra: math primitives ---------------------------------------
+#[no_mangle] pub unsafe extern "C" fn aether_op_log_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.ln(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_exp_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.exp(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_sin_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.sin(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_cos_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.cos(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_tan_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.tan(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_pow_f32(x: *mut c_void, p: f32, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.powf(p); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_recip_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.recip(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_abs_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.abs(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_sign_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = if *v > 0.0 { 1.0 } else if *v < 0.0 { -1.0 } else { 0.0 }; }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_clamp_f32(x: *mut c_void, lo: f32, hi: f32, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.max(lo).min(hi); }
+    0
+}
+
+// ---- FR-17.6-extra: activation extensions ---------------------------------
+#[no_mangle] pub unsafe extern "C" fn aether_op_tanh_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = v.tanh(); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_sigmoid_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = 1.0 / (1.0 + (-*v).exp()); }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_leaky_relu_f32(x: *mut c_void, slope: f32, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { if *v < 0.0 { *v *= slope; } }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_elu_f32(x: *mut c_void, alpha: f32, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { if *v < 0.0 { *v = alpha * (v.exp() - 1.0); } }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_mish_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v *= (1.0 + v.exp()).ln().tanh(); }
+    0
+}
+
+// ---- FR-17.11: mask helpers / tensor builders -----------------------------
+#[no_mangle] pub unsafe extern "C" fn aether_op_zeros_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = 0.0; }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_ones_f32(x: *mut c_void, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = 1.0; }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_full_f32(x: *mut c_void, val: f32, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for v in s { *v = val; }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_arange_f32(x: *mut c_void, start: f32, step: f32, n: c_int) -> c_int {
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    for (i, v) in s.iter_mut().enumerate() { *v = start + step * i as f32; }
+    0
+}
+/// `eye(n)` — n×n identity. `x` is row-major n*n.
+#[no_mangle] pub unsafe extern "C" fn aether_op_eye_f32(x: *mut c_void, n: c_int) -> c_int {
+    let nn = n as usize;
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, nn * nn);
+    for v in s.iter_mut() { *v = 0.0; }
+    for i in 0..nn { s[i * nn + i] = 1.0; }
+    0
+}
+/// `tril(rows, cols)` — sets above-diagonal to 0 (in-place mask).
+#[no_mangle] pub unsafe extern "C" fn aether_op_tril_f32(x: *mut c_void, rows: c_int, cols: c_int) -> c_int {
+    let r = rows as usize; let c = cols as usize;
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, r * c);
+    for i in 0..r { for j in 0..c { if j > i { s[i * c + j] = 0.0; } } }
+    0
+}
+/// `triu(rows, cols)` — sets below-diagonal to 0 (in-place mask).
+#[no_mangle] pub unsafe extern "C" fn aether_op_triu_f32(x: *mut c_void, rows: c_int, cols: c_int) -> c_int {
+    let r = rows as usize; let c = cols as usize;
+    let s = std::slice::from_raw_parts_mut(x as *mut f32, r * c);
+    for i in 0..r { for j in 0..c { if j < i { s[i * c + j] = 0.0; } } }
+    0
+}
+
+// ---- FR-17.8: reductions --------------------------------------------------
+#[no_mangle] pub unsafe extern "C" fn aether_op_sum_f32(x: *const c_void, n: c_int) -> f32 {
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    s.iter().copied().sum()
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_mean_f32(x: *const c_void, n: c_int) -> f32 {
+    if n == 0 { return 0.0; }
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    let sum: f32 = s.iter().copied().sum();
+    sum / n as f32
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_var_f32(x: *const c_void, n: c_int) -> f32 {
+    if n == 0 { return 0.0; }
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    // Welford
+    let mut mean = 0.0f32; let mut m2 = 0.0f32;
+    for (i, v) in s.iter().enumerate() {
+        let count = (i + 1) as f32;
+        let delta = v - mean;
+        mean += delta / count;
+        let delta2 = v - mean;
+        m2 += delta * delta2;
+    }
+    m2 / n as f32
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_std_f32(x: *const c_void, n: c_int) -> f32 {
+    aether_op_var_f32(x, n).sqrt()
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_max_red_f32(x: *const c_void, n: c_int) -> f32 {
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    s.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_min_red_f32(x: *const c_void, n: c_int) -> f32 {
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    s.iter().copied().fold(f32::INFINITY, f32::min)
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_argmax_f32(x: *const c_void, n: c_int) -> i64 {
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    s.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as i64).unwrap_or(-1)
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_argmin_f32(x: *const c_void, n: c_int) -> i64 {
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    s.iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as i64).unwrap_or(-1)
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_prod_f32(x: *const c_void, n: c_int) -> f32 {
+    let s = std::slice::from_raw_parts(x as *const f32, n as usize);
+    s.iter().copied().product()
+}
+
+// ---- FR-17.9: selection ---------------------------------------------------
+#[no_mangle] pub unsafe extern "C" fn aether_op_masked_fill_f32(
+    x: *mut c_void, mask: *const c_void, fill: f32, n: c_int,
+) -> c_int {
+    let xs = std::slice::from_raw_parts_mut(x as *mut f32, n as usize);
+    let ms = std::slice::from_raw_parts(mask as *const f32, n as usize);
+    for i in 0..n as usize { if ms[i] != 0.0 { xs[i] = fill; } }
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_where_f32(
+    cond: *const c_void, a: *const c_void, b: *const c_void, out: *mut c_void, n: c_int,
+) -> c_int {
+    let cs = std::slice::from_raw_parts(cond as *const f32, n as usize);
+    let asrc = std::slice::from_raw_parts(a as *const f32, n as usize);
+    let bsrc = std::slice::from_raw_parts(b as *const f32, n as usize);
+    let os = std::slice::from_raw_parts_mut(out as *mut f32, n as usize);
+    for i in 0..n as usize { os[i] = if cs[i] != 0.0 { asrc[i] } else { bsrc[i] }; }
+    0
+}
+
+// ---- FR-17.10: combine ----------------------------------------------------
+/// Concatenate `a` (na elements) and `b` (nb elements) into `out` (na+nb).
+#[no_mangle] pub unsafe extern "C" fn aether_op_cat_f32(
+    a: *const c_void, na: c_int, b: *const c_void, nb: c_int, out: *mut c_void,
+) -> c_int {
+    let asrc = std::slice::from_raw_parts(a as *const f32, na as usize);
+    let bsrc = std::slice::from_raw_parts(b as *const f32, nb as usize);
+    let os = std::slice::from_raw_parts_mut(out as *mut f32, (na + nb) as usize);
+    os[..na as usize].copy_from_slice(asrc);
+    os[na as usize..].copy_from_slice(bsrc);
+    0
+}
+/// Repeat `x` (n elements) `k` times into `out` (n*k elements).
+#[no_mangle] pub unsafe extern "C" fn aether_op_repeat_f32(
+    x: *const c_void, n: c_int, k: c_int, out: *mut c_void,
+) -> c_int {
+    let xs = std::slice::from_raw_parts(x as *const f32, n as usize);
+    let os = std::slice::from_raw_parts_mut(out as *mut f32, (n * k) as usize);
+    for i in 0..k as usize {
+        os[i * n as usize..(i + 1) * n as usize].copy_from_slice(xs);
+    }
+    0
+}
+
+// ---- FR-17.17-extra: optimizer family -------------------------------------
+/// SGD with Nesterov-optional momentum. `momentum_buf` is per-param state.
+#[no_mangle] pub unsafe extern "C" fn aether_op_sgd_momentum_step_f32(
+    params: *mut c_void, grad: *const c_void, momentum_buf: *mut c_void,
+    lr: f32, mu: f32, weight_decay: f32, n: c_int,
+) -> c_int {
+    let p = std::slice::from_raw_parts_mut(params as *mut f32, n as usize);
+    let g = std::slice::from_raw_parts(grad as *const f32, n as usize);
+    let m = std::slice::from_raw_parts_mut(momentum_buf as *mut f32, n as usize);
+    for i in 0..n as usize {
+        let g_i = g[i] + weight_decay * p[i];
+        m[i] = mu * m[i] + g_i;
+        p[i] -= lr * m[i];
+    }
+    0
+}
+/// RMSprop: `v[t] = rho*v[t-1] + (1-rho)*g²; p -= lr * g / (sqrt(v) + eps)`.
+#[no_mangle] pub unsafe extern "C" fn aether_op_rmsprop_step_f32(
+    params: *mut c_void, grad: *const c_void, sq_buf: *mut c_void,
+    lr: f32, rho: f32, eps: f32, n: c_int,
+) -> c_int {
+    let p = std::slice::from_raw_parts_mut(params as *mut f32, n as usize);
+    let g = std::slice::from_raw_parts(grad as *const f32, n as usize);
+    let v = std::slice::from_raw_parts_mut(sq_buf as *mut f32, n as usize);
+    for i in 0..n as usize {
+        v[i] = rho * v[i] + (1.0 - rho) * g[i] * g[i];
+        p[i] -= lr * g[i] / (v[i].sqrt() + eps);
+    }
+    0
+}
+/// Adagrad: `v[t] += g²; p -= lr * g / (sqrt(v) + eps)`.
+#[no_mangle] pub unsafe extern "C" fn aether_op_adagrad_step_f32(
+    params: *mut c_void, grad: *const c_void, sq_buf: *mut c_void,
+    lr: f32, eps: f32, n: c_int,
+) -> c_int {
+    let p = std::slice::from_raw_parts_mut(params as *mut f32, n as usize);
+    let g = std::slice::from_raw_parts(grad as *const f32, n as usize);
+    let v = std::slice::from_raw_parts_mut(sq_buf as *mut f32, n as usize);
+    for i in 0..n as usize {
+        v[i] += g[i] * g[i];
+        p[i] -= lr * g[i] / (v[i].sqrt() + eps);
+    }
+    0
+}
+
+// ---- FR-18.2-extra: collectives (single-rank passthrough today) -----------
+// On a single rank these are identity ops on the buffer. Multi-rank wiring
+// (real NCCL bindings) is FR-18.1; the public symbol surface stays stable so
+// callers don't change between single-host and distributed builds.
+#[no_mangle] pub unsafe extern "C" fn aether_op_broadcast_f32(buf: *mut c_void, n: c_int, _root: c_int) -> c_int {
+    // Single-rank: data is already on this rank. Multi-rank wiring is FR-18.1.
+    let _touched = std::slice::from_raw_parts_mut(buf as *mut f32, n as usize).len();
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_all_gather_f32(
+    src: *const c_void, dst: *mut c_void, n: c_int, world_size: c_int,
+) -> c_int {
+    let xs = std::slice::from_raw_parts(src as *const f32, n as usize);
+    let os = std::slice::from_raw_parts_mut(dst as *mut f32, (n * world_size) as usize);
+    // single-rank: just copy src into the first n slots.
+    os[..n as usize].copy_from_slice(xs);
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_reduce_scatter_f32(
+    src: *const c_void, dst: *mut c_void, n: c_int, _world_size: c_int,
+) -> c_int {
+    let xs = std::slice::from_raw_parts(src as *const f32, n as usize);
+    let os = std::slice::from_raw_parts_mut(dst as *mut f32, n as usize);
+    os.copy_from_slice(xs);
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_send_f32(buf: *const c_void, n: c_int, _dst_rank: c_int) -> c_int {
+    let _touched = std::slice::from_raw_parts(buf as *const f32, n as usize).len();
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_recv_f32(buf: *mut c_void, n: c_int, _src_rank: c_int) -> c_int {
+    let _touched = std::slice::from_raw_parts_mut(buf as *mut f32, n as usize).len();
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_op_all_to_all_f32(
+    src: *const c_void, dst: *mut c_void, n: c_int, _world_size: c_int,
+) -> c_int {
+    let xs = std::slice::from_raw_parts(src as *const f32, n as usize);
+    let os = std::slice::from_raw_parts_mut(dst as *mut f32, n as usize);
+    os.copy_from_slice(xs);
+    0
+}
+
+// ---- FR-24.9: GPU memory leak detection (CPU-resident counter for now) ----
+use std::sync::atomic::{AtomicI64 as V4AtomicI64, Ordering as AtomicOrder};
+static GPU_LIVE_BYTES: V4AtomicI64 = V4AtomicI64::new(0);
+#[no_mangle] pub extern "C" fn aether_gpu_alloc_track(bytes: i64) -> i64 {
+    GPU_LIVE_BYTES.fetch_add(bytes, AtomicOrder::SeqCst);
+    GPU_LIVE_BYTES.load(AtomicOrder::SeqCst)
+}
+#[no_mangle] pub extern "C" fn aether_gpu_free_track(bytes: i64) -> i64 {
+    GPU_LIVE_BYTES.fetch_sub(bytes, AtomicOrder::SeqCst);
+    GPU_LIVE_BYTES.load(AtomicOrder::SeqCst)
+}
+#[no_mangle] pub extern "C" fn aether_gpu_live_bytes() -> i64 {
+    GPU_LIVE_BYTES.load(AtomicOrder::SeqCst)
+}
+
+// ---- FR-24.10: OOM killer / graceful degradation hook ---------------------
+// Serving processes call this when memory pressure hits a threshold. Today's
+// impl is a CPU-side flag; a real KV-cache shrink + 503 path is FR-24.10.
+static OOM_FLAG: V4AtomicI64 = V4AtomicI64::new(0);
+#[no_mangle] pub extern "C" fn aether_oom_signal(flag: i64) -> i64 {
+    OOM_FLAG.store(flag, AtomicOrder::SeqCst);
+    OOM_FLAG.load(AtomicOrder::SeqCst)
+}
+#[no_mangle] pub extern "C" fn aether_oom_check() -> i64 {
+    OOM_FLAG.load(AtomicOrder::SeqCst)
+}
+
+#[cfg(test)]
+mod v4_op_tests {
+    use super::*;
+    #[test]
+    fn math_primitives() {
+        unsafe {
+            let mut buf = [1.0f32, 2.0, 3.0];
+            aether_op_log_f32(buf.as_mut_ptr() as _, 3);
+            assert!((buf[0] - 0.0).abs() < 1e-5);
+            assert!((buf[1] - 0.6931472).abs() < 1e-5);
+            let mut e = [0.0f32, 1.0];
+            aether_op_exp_f32(e.as_mut_ptr() as _, 2);
+            assert!((e[1] - std::f32::consts::E).abs() < 1e-5);
+            let mut p = [2.0f32, 3.0];
+            aether_op_pow_f32(p.as_mut_ptr() as _, 3.0, 2);
+            assert!((p[0] - 8.0).abs() < 1e-5);
+            assert!((p[1] - 27.0).abs() < 1e-5);
+        }
+    }
+    #[test]
+    fn activation_extensions() {
+        unsafe {
+            let mut t = [0.0f32, 1.0, -1.0];
+            aether_op_tanh_f32(t.as_mut_ptr() as _, 3);
+            assert!((t[0] - 0.0).abs() < 1e-5);
+            let mut s = [0.0f32];
+            aether_op_sigmoid_f32(s.as_mut_ptr() as _, 1);
+            assert!((s[0] - 0.5).abs() < 1e-5);
+        }
+    }
+    #[test]
+    fn mask_helpers() {
+        unsafe {
+            let mut e = [0.0f32; 9];
+            aether_op_eye_f32(e.as_mut_ptr() as _, 3);
+            assert_eq!(e, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+            let mut a = [0.0f32; 5];
+            aether_op_arange_f32(a.as_mut_ptr() as _, 0.0, 1.0, 5);
+            assert_eq!(a, [0.0, 1.0, 2.0, 3.0, 4.0]);
+            let mut t = [1.0f32; 9];
+            aether_op_tril_f32(t.as_mut_ptr() as _, 3, 3);
+            assert_eq!(t, [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
+        }
+    }
+    #[test]
+    fn reductions() {
+        unsafe {
+            let v = [1.0f32, 2.0, 3.0, 4.0];
+            assert!((aether_op_sum_f32(v.as_ptr() as _, 4) - 10.0).abs() < 1e-5);
+            assert!((aether_op_mean_f32(v.as_ptr() as _, 4) - 2.5).abs() < 1e-5);
+            assert_eq!(aether_op_argmax_f32(v.as_ptr() as _, 4), 3);
+            assert_eq!(aether_op_argmin_f32(v.as_ptr() as _, 4), 0);
+            assert!((aether_op_max_red_f32(v.as_ptr() as _, 4) - 4.0).abs() < 1e-5);
+        }
+    }
+    #[test]
+    fn combine_cat() {
+        unsafe {
+            let a = [1.0f32, 2.0]; let b = [3.0f32, 4.0, 5.0];
+            let mut o = [0.0f32; 5];
+            aether_op_cat_f32(a.as_ptr() as _, 2, b.as_ptr() as _, 3, o.as_mut_ptr() as _);
+            assert_eq!(o, [1.0, 2.0, 3.0, 4.0, 5.0]);
+        }
+    }
+    #[test]
+    fn optim_sgd_momentum() {
+        unsafe {
+            let mut p = [1.0f32, 2.0]; let g = [0.5f32, -0.5]; let mut m = [0.0f32; 2];
+            aether_op_sgd_momentum_step_f32(
+                p.as_mut_ptr() as _, g.as_ptr() as _, m.as_mut_ptr() as _,
+                0.1, 0.9, 0.0, 2,
+            );
+            // m = g, p -= lr*m  →  p = [0.95, 2.05]
+            assert!((p[0] - 0.95).abs() < 1e-5);
+            assert!((p[1] - 2.05).abs() < 1e-5);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

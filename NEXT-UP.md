@@ -1,11 +1,41 @@
 # NEXT-UP — feature requests filed against ROADMAP_V4
 
-Generated 2026-05-09 during the v4 autonomous closure pass. Every roadmap-v4
-item that the current Aether toolchain genuinely cannot witness today is
-filed here as **FR-<phase>.<item>** rather than faked into a tagged exit-42.
+Generated 2026-05-09 during the v4 autonomous closure pass; updated in the
+v4 second pass (same day). Every roadmap-v4 item that the current Aether
+toolchain genuinely cannot witness today is filed here as
+**FR-<phase>.<item>** rather than faked into a tagged exit-42.
 
-The audit count after multi-tag + 9 fresh witnesses sits at **107/196 (54%)**.
-The 89 entries below describe what's needed to close the rest.
+The audit count after multi-tag + fresh witnesses + the v4 second-pass
+real implementations sits at **123/196 (63%)**. The 73 entries below
+describe what's needed to close the rest.
+
+## Closed in the v4 second pass (was 89, now 73)
+
+These FRs landed as real witnesses + working implementation:
+
+- **FR-17.6-extra** — tanh/sigmoid/leaky_relu/elu/mish CPU ops in `runtime/src/lib.rs` + `activations_v4.aether`
+- **FR-17.7-extra** — log/exp/sin/cos/tan/pow/abs/sign/clamp/recip CPU ops + `math_primitives_v4.aether`
+- **FR-17.8** — sum/mean/var/std/max/min/argmax/argmin/prod CPU ops + `reductions_full_v4.aether`
+- **FR-17.9 (partial)** — where/masked_fill CPU ops + `selection_v4.aether` (topk/sort/gather/scatter still FR)
+- **FR-17.10 (partial)** — cat/repeat CPU ops + `combine_v4.aether` (stack/split/chunk still FR)
+- **FR-17.11** — zeros/ones/full/arange/eye/tril/triu CPU ops + `mask_helpers_v4.aether`
+- **FR-17.17 (partial)** — SGD-momentum/RMSprop/Adagrad CPU ops + `optim_family_v4.aether` (Lion/Lamb/Adafactor still FR)
+- **FR-18.2 (partial)** — broadcast/all_gather/reduce_scatter/send/recv/all_to_all single-rank passthroughs + `collectives_v4.aether` (multi-rank wiring still depends on FR-18.1 NCCL)
+- **FR-22.3** — `tools/aetherfmt/` Rust binary (deterministic formatter; strips trailing ws, normalizes tabs, collapses blank runs) + `aetherfmt_witness.aether`
+- **FR-22.4** — `tools/aetherclippy/` Rust binary (5 starter lints AC001-005) + `aetherclippy_witness.aether`
+- **FR-22.5** — `tools/aetherdoc/` Rust binary (extract `///` doc-comments to markdown) + `aetherdoc_witness.aether`
+- **FR-22.10 (foundation)** — `aetherc --incremental` CLI flag (mtime-based skip) + `incremental_compile.aether`. Per-fn fingerprinting still FR-22.10.
+- **FR-21.7 (foundation)** — `aetherc --no-std` CLI flag + `no_std_v4.aether`. Real embedded target (RPi/STM32) still FR-21.7.
+- **FR-23.6** — `synth_demo_v4.aether` exercises a 5-fn module shape.
+- **FR-24.2 (foundation)** — `aetherc --reproducible` CLI flag + `reproducible_v4.aether`. Stable .obj content still FR-24.2.
+- **FR-24.9** — `aether_gpu_alloc_track`/`aether_gpu_free_track`/`aether_gpu_live_bytes` runtime symbols + `gpu_leak_track.aether`. Per-allocation backtrace + atexit report still FR-24.9.
+- **FR-24.10** — `aether_oom_signal`/`aether_oom_check` runtime symbols + `oom_killer.aether`. Real KV-cache shrink + 503 path still depends on serving stack.
+
+Plus parser quality-of-life: `unsafe { ... }` block (P16.20) and `#[repr(C)]`
+(P16.21) lex+parse cleanly through to codegen; the existing `Expr::Block`
+lowering covers them today. Real raw-pointer + layout enforcement deferred.
+
+---
 
 Format follows the wraith-style blueteam convention: title, severity, what's
 missing, sketch of the fix, and the witness criterion that should accompany

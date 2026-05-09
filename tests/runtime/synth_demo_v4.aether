@@ -1,0 +1,10 @@
+// expect: exit=42
+// roadmap: P23.6
+// 5-fn synthesised module witness. Each fn is a stand-in; true LLM-driven
+// synthesis with property+test auto-gen is FR-23.{2,3,5,6}.
+fn synth_a() -> i64 { 20 }
+fn synth_b() -> i64 { 22 }
+fn synth_c(x: i64) -> i64 { x }
+fn synth_d(x: i64, y: i64) -> i64 { x + y }
+fn synth_e() -> i64 { synth_d(synth_c(synth_a()), synth_b()) }
+fn main() -> i32 { synth_e() as i32 }

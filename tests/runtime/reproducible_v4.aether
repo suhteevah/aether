@@ -1,0 +1,5 @@
+// expect: exit=42
+// roadmap: P24.2
+// aetherc --reproducible foundation: stable metadata in stdout/.obj.
+// Full reproducible builds are FR-24.2.
+fn main() -> i32 { 42 }

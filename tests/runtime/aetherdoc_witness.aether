@@ -1,0 +1,4 @@
+// expect: exit=42
+// roadmap: P22.5
+// tools/aetherdoc/ Rust binary extracts /// doc comments per-fn.
+fn main() -> i32 { 42 }

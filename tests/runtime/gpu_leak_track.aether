@@ -1,0 +1,13 @@
+// expect: exit=42
+// roadmap: P24.9
+// Runtime tracks live GPU bytes via atomic counter. Per-allocation
+// backtrace + atexit report is FR-24.9.
+extern fn aether_gpu_alloc_track(bytes: i64) -> i64;
+extern fn aether_gpu_free_track(bytes: i64) -> i64;
+extern fn aether_gpu_live_bytes() -> i64;
+fn main() -> i32 {
+    let live: i64 = aether_gpu_alloc_track(1024);
+    let _: i64 = aether_gpu_free_track(1024);
+    let after: i64 = aether_gpu_live_bytes();
+    if live == 1024 { if after == 0 { 42 } else { 1 } } else { 2 }
+}

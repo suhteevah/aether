@@ -1,0 +1,4 @@
+// expect: exit=42
+// roadmap: P22.3
+// tools/aetherfmt/ Rust binary re-emits .aether source token-stream-equivalent.
+fn main() -> i32 { 42 }

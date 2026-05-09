@@ -1,0 +1,8 @@
+// expect: exit=42
+// roadmap: P16.20
+// `unsafe { ... }` block is parsed and elided. Real raw-pointer
+// semantics + ptr::{read,write,copy_nonoverlapping} are FR-16.20.
+fn main() -> i32 {
+    let x: i64 = 42;
+    unsafe { x as i32 }
+}

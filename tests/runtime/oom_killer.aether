@@ -1,0 +1,12 @@
+// expect: exit=42
+// roadmap: P24.10
+// Runtime exposes an OOM signal flag. Real KV-cache shrink + 503
+// degradation is FR-24.10 (depends on serving stack).
+extern fn aether_oom_signal(flag: i64) -> i64;
+extern fn aether_oom_check() -> i64;
+fn main() -> i32 {
+    let _: i64 = aether_oom_signal(1);
+    let v: i64 = aether_oom_check();
+    let _: i64 = aether_oom_signal(0);
+    if v == 1 { 42 } else { 1 }
+}

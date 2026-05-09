@@ -886,6 +886,13 @@ impl Parser {
                 Ok(first)
             }
             Tok::LBrace => Ok(Expr::Block(self.parse_block()?)),
+            // P16.20 — `unsafe { ... }` is parsed and elided. The block runs
+            // exactly as a normal block today; real raw-pointer semantics
+            // (`*const T`, `*mut T`, `std::ptr::{read,write,copy}`) are FR-16.20.
+            Tok::Unsafe => {
+                self.bump();
+                Ok(Expr::Block(self.parse_block()?))
+            }
             Tok::If => {
                 self.bump();
                 let cond = self.with_struct_lit_disabled(|p| p.parse_expr())?;

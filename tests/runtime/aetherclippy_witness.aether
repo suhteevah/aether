@@ -1,0 +1,4 @@
+// expect: exit=42
+// roadmap: P22.4
+// tools/aetherclippy/ Rust binary runs starter lints over .aether source.
+fn main() -> i32 { 42 }

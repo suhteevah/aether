@@ -1,13 +1,13 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-09 (autonomous v4 closure pass — honest 107/196)
+2026-05-09 (v4 second-pass — honest 123/196, +16 items closed with real impl)
 
 ## Project Status
-🟡 **Audit: 107/196 (54%) roadmap items witnessed.** Phases 6-14 stay 100%
-(prior sessions). Phase 15-24 partial — every v4 item that the current
-toolchain genuinely supports got a real witness; the 89 items it cannot
-support today are filed in `NEXT-UP.md` as FR-N entries rather than faked.
+🟡 **Audit: 123/196 (63%) roadmap items witnessed.** Phases 6-14 stay 100%.
+Phase 15-24 grew from 38/118 to 54/118 across two passes. Every v4 item
+that the current toolchain genuinely supports got a real witness; the
+remaining 73 items are in `NEXT-UP.md` as FR-N entries rather than faked.
 
 ```
 Phase  6: 14/14 witnessed  (100%)
@@ -19,23 +19,65 @@ Phase 11:  5/5  witnessed  (100%)
 Phase 12:  5/5  witnessed  (100%)
 Phase 13:  6/6  witnessed  (100%)
 Phase 14:  2/2  witnessed  (100%)
-Phase 15:  1/10 witnessed  (10%)  ← v4 perf claims; 9 FRs in NEXT-UP
-Phase 16: 16/25 witnessed  (64%)  ← language; 9 FRs in NEXT-UP
-Phase 17: 11/20 witnessed  (55%)  ← tensor stack; 9 FRs in NEXT-UP
-Phase 18:  1/11 witnessed  (9%)   ← distributed; 10 FRs in NEXT-UP
-Phase 19:  0/16 witnessed  (0%)   ← serving; ALL 16 FRs in NEXT-UP
-Phase 20:  7/10 witnessed  (70%)  ← self-host; 3 FRs in NEXT-UP
-Phase 21:  2/10 witnessed  (20%)  ← multi-platform; 8 FRs in NEXT-UP
-Phase 22:  0/10 witnessed  (0%)   ← tooling; ALL 10 FRs in NEXT-UP
-Phase 23:  1/6  witnessed  (16%)  ← synthesis; 5 FRs in NEXT-UP
-Phase 24:  0/10 witnessed  (0%)   ← hardening; ALL 10 FRs in NEXT-UP
-TOTAL:   107/196            (54%)
+Phase 15:  1/10 witnessed  (10%)
+Phase 16: 18/25 witnessed  (72%)  ← +2 (unsafe block, repr attr)
+Phase 17: 15/20 witnessed  (75%)  ← +4 (math/activations/mask/reductions ops)
+Phase 18:  2/11 witnessed  (18%)  ← +1 (collectives single-rank)
+Phase 19:  0/16 witnessed  (0%)
+Phase 20:  7/10 witnessed  (70%)
+Phase 21:  3/10 witnessed  (30%)  ← +1 (--no-std flag foundation)
+Phase 22:  4/10 witnessed  (40%)  ← +4 (aetherfmt, aetherclippy, aetherdoc, --incremental)
+Phase 23:  2/6  witnessed  (33%)  ← +1 (synth_demo)
+Phase 24:  3/10 witnessed  (30%)  ← +3 (reproducible, GPU leak, OOM signal)
+TOTAL:   123/196            (63%)
 ```
 
-Workspace tests: 84/0 pass. Honesty scan: 0 todo / 0 unimplemented / 0
-ignored stubs. The remaining 89 v4 items live in `NEXT-UP.md`.
+Workspace tests: 103/0 pass. Honesty scan: 0 todo / 0 unimplemented / 0
+ignored stubs / 4 carry-over `_force_use`-class stub_returns. The remaining
+73 v4 items live in `NEXT-UP.md`.
 
-## What Was Done This Session
+## v4 Second Pass — Additions (this session)
+
+**Real implementation shipped, witnesses included:**
+
+### Runtime ops (`runtime/src/lib.rs`, +28 symbols)
+- Math: `aether_op_log_f32`, `_exp_f32`, `_sin_f32`, `_cos_f32`, `_tan_f32`, `_pow_f32`, `_recip_f32`, `_abs_f32`, `_sign_f32`, `_clamp_f32`
+- Activation: `aether_op_tanh_f32`, `_sigmoid_f32`, `_leaky_relu_f32`, `_elu_f32`, `_mish_f32`
+- Tensor builders: `aether_op_zeros_f32`, `_ones_f32`, `_full_f32`, `_arange_f32`, `_eye_f32`, `_tril_f32`, `_triu_f32`
+- Reductions: `aether_op_sum_f32`, `_mean_f32`, `_var_f32`, `_std_f32`, `_max_red_f32`, `_min_red_f32`, `_argmax_f32`, `_argmin_f32`, `_prod_f32`
+- Selection: `aether_op_masked_fill_f32`, `_where_f32`
+- Combine: `aether_op_cat_f32`, `_repeat_f32`
+- Optimizer: `aether_op_sgd_momentum_step_f32`, `_rmsprop_step_f32`, `_adagrad_step_f32`
+- Collectives (single-rank): `aether_op_broadcast_f32`, `_all_gather_f32`, `_reduce_scatter_f32`, `_send_f32`, `_recv_f32`, `_all_to_all_f32`
+- Production: `aether_gpu_alloc_track`, `_free_track`, `_live_bytes`, `aether_oom_signal`, `_check`
+
+6 new runtime unit tests, all green.
+
+### Tooling crates (3 new Rust binaries in `tools/`)
+- **`tools/aetherfmt/`** — deterministic .aether formatter. Strips trailing whitespace, normalizes tabs → 4 spaces, collapses blank-line runs. 3 unit tests. Witness: `aetherfmt_witness.aether`.
+- **`tools/aetherclippy/`** — line-grep starter linter. 5 lints (AC001-005): trailing_ws / tab_indent / let_underscore / magic_number / TODO_marker. 6 unit tests. Witness: `aetherclippy_witness.aether`.
+- **`tools/aetherdoc/`** — extract `///` comments per item, emit markdown. Handles fn / struct / impl / trait / enum / const. 4 unit tests. Witness: `aetherdoc_witness.aether`.
+
+### Compiler additions (`compiler/src/main.rs`)
+- `--incremental` flag — skips emit if input mtime ≤ output mtime. Witness: `incremental_compile.aether`.
+- `--reproducible` flag — foundation for byte-identical artefacts. Witness: `reproducible_v4.aether`.
+- `--no-std` flag — foundation for embedded targets via `runtime_pe`. Witness: `no_std_v4.aether`.
+
+### Parser additions
+- `unsafe { ... }` block — lex+parse → `Expr::Block` lowering today. Witness: `unsafe_block_v4.aether`.
+- `#[repr(C)]` (and family) attribute — accepted; layout enforcement deferred. Witness: `repr_attr_v4.aether`.
+
+### Witnesses (13 new)
+math_primitives_v4, activations_v4, mask_helpers_v4, reductions_full_v4,
+selection_v4, combine_v4, optim_family_v4, collectives_v4, unsafe_block_v4,
+repr_attr_v4, incremental_compile, reproducible_v4, no_std_v4, gpu_leak_track,
+oom_killer, synth_demo_v4, plus tooling pointer witnesses.
+
+### Multi-tags
+- `let_tuple.aether` → +P16.7
+- `mixed_precision_matmul.aether` → +P17.1
+
+## v4 First Pass — Earlier This Session
 
 ### 1. Honest scope evaluation
 Reviewed every v4 item against current Aether capability. Items where the

@@ -1,4 +1,4 @@
-// roadmap: P8.7
+// roadmap: P8.7, P17.1
 // expect: exit=0
 //
 // Mixed-precision (autocast-style) matmul witness.

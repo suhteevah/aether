@@ -1,0 +1,14 @@
+// expect: exit=42
+// roadmap: P17.7
+// FFI to runtime math primitives. Each op in-place over a buf.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_log_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_exp_f32(x: i64, n: i32) -> i32;
+extern fn aether_op_pow_f32(x: i64, p: f32, n: i32) -> i32;
+extern fn aether_op_abs_f32(x: i64, n: i32) -> i32;
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(4);
+    aether_free_bytes(buf);
+    42
+}

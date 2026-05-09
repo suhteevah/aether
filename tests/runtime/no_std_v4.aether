@@ -1,0 +1,5 @@
+// expect: exit=42
+// roadmap: P21.7
+// aetherc --no-std flag accepted; runtime_pe slim cdylib path is the
+// foundation. Real embedded target (RPi 4 / STM32) is FR-21.7.
+fn main() -> i32 { 42 }

@@ -1,0 +1,16 @@
+// expect: exit=42
+// roadmap: P17.8
+// FFI to reductions: sum/mean/var/std/max/min/argmax/argmin/prod.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_sum_f32(x: i64, n: i32) -> f32;
+extern fn aether_op_mean_f32(x: i64, n: i32) -> f32;
+extern fn aether_op_max_red_f32(x: i64, n: i32) -> f32;
+extern fn aether_op_min_red_f32(x: i64, n: i32) -> f32;
+extern fn aether_op_argmax_f32(x: i64, n: i32) -> i64;
+extern fn aether_op_argmin_f32(x: i64, n: i32) -> i64;
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(16);
+    aether_free_bytes(buf);
+    42
+}

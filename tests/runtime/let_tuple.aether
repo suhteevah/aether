@@ -1,4 +1,4 @@
-// roadmap: P6.4
+// roadmap: P6.4, P16.7
 // expect: exit=42
 // Tuple destructuring: `let (a, b, c) = (e1, e2, e3);` binds 3 separate
 // top-level locals.
