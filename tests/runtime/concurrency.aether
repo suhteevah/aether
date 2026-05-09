@@ -1,0 +1,52 @@
+// expect: exit=42
+// roadmap: P6.9
+//
+// P6.9 witness — atomic primitives.
+//
+// Allocates 16 bytes of 8-aligned storage, zero-initialises, runs a
+// loop of `aether_atomic_fetch_add_i64` calls (1000 increments of +1
+// followed by 958 decrements of -1, leaving 42), then verifies the
+// load. CAS path is exercised once to swap 42 → 100, then 100 → 42.
+//
+// Thread-spawn path (`aether_thread_spawn` / `aether_thread_join`) is
+// available via the same runtime ABI; the multi-threaded variant is
+// blocked on fn-pointer call expressions in the asm backend.
+use runtime;
+
+fn main() -> i32 {
+    let storage: i64 = aether_alloc_bytes(16);
+    if storage == 0 { return 1; }
+    let mut i: i64 = 0;
+    while i < 16 {
+        aether_byte_set(storage, i, 0);
+        i = i + 1;
+    }
+
+    aether_atomic_store_i64(storage, 0);
+
+    let mut k: i64 = 0;
+    while k < 1000 {
+        let _ = aether_atomic_fetch_add_i64(storage, 1);
+        k = k + 1;
+    }
+
+    let mut j: i64 = 0;
+    while j < 958 {
+        let _ = aether_atomic_fetch_add_i64(storage, -1);
+        j = j + 1;
+    }
+
+    let v: i64 = aether_atomic_load_i64(storage);
+    if v != 42 { return 2; }
+
+    // CAS round-trip.
+    let prev: i64 = aether_atomic_cas_i64(storage, 42, 100);
+    if prev != 42 { return 3; }
+    if aether_atomic_load_i64(storage) != 100 { return 4; }
+    let _ = aether_atomic_cas_i64(storage, 100, 42);
+    if aether_atomic_load_i64(storage) != 42 { return 5; }
+
+    let final_val: i64 = aether_atomic_load_i64(storage);
+    aether_free_bytes(storage, 16);
+    final_val as i32
+}

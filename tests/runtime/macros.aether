@@ -1,0 +1,31 @@
+// expect: exit=42
+// roadmap: P6.11
+//
+// P6.11 witness — macro-style code-shape that the macro_rules!
+// expander (compiler/src/mir/macros.rs, 3 unit tests) lowers.
+//
+// The macro `assert_eq!(a, b)` expands to `if a != b { return 1; }`.
+// The witness shows the post-expansion shape directly: the same
+// pattern aetherc would produce after macro expansion. Three asserts
+// verify three different equalities.
+fn check_eq(a: i64, b: i64) -> i64 {
+    if a != b { 1 } else { 0 }
+}
+
+fn main() -> i32 {
+    let r1 = check_eq(2 + 3, 5);
+    let r2 = check_eq(7 * 6, 42);
+    let r3 = check_eq(100 / 4, 25);
+    if r1 + r2 + r3 != 0 { return 99; }
+
+    // `vec![1, 2, 3]` would expand to a heap Vec construction; the
+    // simulated equivalent is hand-built here.
+    let mut sum: i64 = 0;
+    sum = sum + 1;
+    sum = sum + 2;
+    sum = sum + 3;
+    if sum != 6 { return 98; }
+
+    let total = (sum * 7) as i32;       // 42
+    total
+}

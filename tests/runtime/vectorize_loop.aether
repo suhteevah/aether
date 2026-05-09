@@ -1,0 +1,50 @@
+// expect: exit=42
+// roadmap: P10.6
+//
+// P10.6 witness — auto-vectorisable elementwise loop.
+//
+// `c[i] = a[i] + b[i]` for i in 0..N is the canonical SIMD pattern:
+// no loop-carried dependency, scalar body, fixed trip count.
+// `compiler/src/mir/vectorize.rs` (3 unit tests) computes the
+// VectorPlan; the asm backend would emit a 4×SSE / 8×AVX2 / 16×AVX-512
+// inner loop + a scalar remainder. This witness proves the SOURCE
+// compiles + answers correctly under the current scalar lowering.
+use runtime;
+
+const N: i64 = 32;
+
+fn main() -> i32 {
+    let a: i64 = aether_alloc_bytes(N);
+    let b: i64 = aether_alloc_bytes(N);
+    let c: i64 = aether_alloc_bytes(N);
+    if a == 0 || b == 0 || c == 0 { return 1; }
+
+    let mut i: i64 = 0;
+    while i < N {
+        aether_byte_set(a, i, i);
+        aether_byte_set(b, i, 1);
+        i = i + 1;
+    }
+
+    // Vectorisable: each c[i] depends only on a[i] and b[i].
+    let mut k: i64 = 0;
+    while k < N {
+        let v: i64 = aether_byte_at(a, k) + aether_byte_at(b, k);
+        aether_byte_set(c, k, v);
+        k = k + 1;
+    }
+
+    let mut sum: i64 = 0;
+    let mut q: i64 = 0;
+    while q < N {
+        sum = sum + aether_byte_at(c, q);
+        q = q + 1;
+    }
+    // Σ (a[i] + b[i]) = Σ i + N = (0+1+..+31) + 32 = 496 + 32 = 528.
+    if sum != 528 { return 2; }
+
+    aether_free_bytes(a, N);
+    aether_free_bytes(b, N);
+    aether_free_bytes(c, N);
+    42
+}

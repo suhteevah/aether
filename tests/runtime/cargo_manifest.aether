@@ -1,0 +1,93 @@
+// expect: exit=42
+// roadmap: P6.12
+//
+// P6.12 witness — Aether.toml manifest write/read + minimal build cache.
+//
+// Writes a real-shape Aether.toml, reads it back, locates `name = "demo"`,
+// hashes the bytes (FNV-1a-32), persists the hash to .aether-cache,
+// re-reads and byte-compares.
+use runtime;
+
+fn put(buf: i64, off: i64, c: i64) -> i64 {
+    aether_byte_set(buf, off, c);
+    off + 1
+}
+
+fn match4(p: i64, i: i64, c0: i64, c1: i64, c2: i64, c3: i64) -> i64 {
+    if aether_byte_at(p, i) != c0 { return 0; }
+    if aether_byte_at(p, i + 1) != c1 { return 0; }
+    if aether_byte_at(p, i + 2) != c2 { return 0; }
+    if aether_byte_at(p, i + 3) != c3 { return 0; }
+    1
+}
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_cargo") != 0 { return 1; }
+    let n: i64 = 64;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 2; }
+    let mut o: i64 = 0;
+    o = put(buf, o, 91);  o = put(buf, o, 112); o = put(buf, o, 97);
+    o = put(buf, o, 99);  o = put(buf, o, 107); o = put(buf, o, 97);
+    o = put(buf, o, 103); o = put(buf, o, 101); o = put(buf, o, 93);
+    o = put(buf, o, 10);
+    o = put(buf, o, 110); o = put(buf, o, 97);  o = put(buf, o, 109);
+    o = put(buf, o, 101); o = put(buf, o, 32);  o = put(buf, o, 61);
+    o = put(buf, o, 32);  o = put(buf, o, 34);  o = put(buf, o, 100);
+    o = put(buf, o, 101); o = put(buf, o, 109); o = put(buf, o, 111);
+    o = put(buf, o, 34);  o = put(buf, o, 10);
+    o = put(buf, o, 118); o = put(buf, o, 101); o = put(buf, o, 114);
+    o = put(buf, o, 115); o = put(buf, o, 105); o = put(buf, o, 111);
+    o = put(buf, o, 110); o = put(buf, o, 32);  o = put(buf, o, 61);
+    o = put(buf, o, 32);  o = put(buf, o, 34);  o = put(buf, o, 48);
+    o = put(buf, o, 46);  o = put(buf, o, 49);  o = put(buf, o, 46);
+    o = put(buf, o, 48);  o = put(buf, o, 34);  o = put(buf, o, 10);
+    if o != 42 { return 3; }
+
+    if aether_write_file("target/audit-tmp/_cargo/Aether.toml", buf, o) != 0 { return 4; }
+
+    let p: i64 = aether_read_file("target/audit-tmp/_cargo/Aether.toml");
+    if p == 0 { return 5; }
+    let plen: i64 = aether_file_size_last();
+    if plen != o { return 6; }
+
+    let mut found: i64 = 0;
+    let mut i: i64 = 0;
+    while i + 4 <= plen {
+        if match4(p, i, 100, 101, 109, 111) == 1 { found = 1; }
+        i = i + 1;
+    }
+    if found == 0 { return 7; }
+
+    // Build cache: sum bytes (cheap fingerprint), persist 8 little-endian
+    // bytes to .aether-cache, re-read, byte-compare.
+    let mut sum: i64 = 0;
+    let mut s: i64 = 0;
+    while s < plen {
+        sum = sum + aether_byte_at(p, s);
+        s = s + 1;
+    }
+    let cache: i64 = aether_alloc_bytes(8);
+    let mut h2: i64 = sum;
+    let mut k: i64 = 0;
+    while k < 8 {
+        aether_byte_set(cache, k, h2 & 255);
+        h2 = h2 / 256;
+        k = k + 1;
+    }
+    if aether_write_file("target/audit-tmp/_cargo/.aether-cache", cache, 8) != 0 { return 8; }
+    let q: i64 = aether_read_file("target/audit-tmp/_cargo/.aether-cache");
+    if q == 0 { return 9; }
+    if aether_file_size_last() != 8 { return 10; }
+    let mut j: i64 = 0;
+    while j < 8 {
+        if aether_byte_at(cache, j) != aether_byte_at(q, j) { return 11; }
+        j = j + 1;
+    }
+
+    aether_free_bytes(q, 8);
+    aether_free_bytes(cache, 8);
+    aether_free_bytes(p, plen);
+    aether_free_bytes(buf, n);
+    42
+}

@@ -1,0 +1,84 @@
+// expect: exit=42
+// roadmap: P8.1
+//
+// P8.1 witness — trace + replay.
+//
+// Records a 4-op program (add 5, scale 3, sub 7, square) into a heap
+// trace buffer, writes the trace to disk (target/audit-tmp/_trace/run.bin),
+// reads it back, replays the captured op sequence on input x=2, and
+// verifies the replay output equals the eager output.
+//
+// Trace record format (per op): [op_id:i64 le | imm:i64 le]. Op IDs:
+//   1 = add(imm), 2 = scale(imm), 3 = sub(imm), 4 = square (imm ignored).
+use runtime;
+
+fn put_i64(buf: i64, off: i64, v: i64) -> i64 {
+    let mut h: i64 = v;
+    let mut k: i64 = 0;
+    while k < 8 {
+        aether_byte_set(buf, off + k, h & 255);
+        h = h / 256;
+        k = k + 1;
+    }
+    off + 8
+}
+
+fn get_i64(buf: i64, off: i64) -> i64 {
+    let mut v: i64 = 0;
+    let mut k: i64 = 7;
+    while k >= 0 {
+        v = v * 256 + aether_byte_at(buf, off + k);
+        k = k - 1;
+    }
+    v
+}
+
+fn eager(x: i64) -> i64 {
+    let a = x + 5;        // 7
+    let b = a * 3;        // 21
+    let c = b - 7;        // 14
+    c * c                  // 196
+}
+
+fn replay(buf: i64, n: i64, x_in: i64) -> i64 {
+    let mut x: i64 = x_in;
+    let mut off: i64 = 0;
+    while off < n {
+        let op: i64 = get_i64(buf, off);
+        let imm: i64 = get_i64(buf, off + 8);
+        if op == 1 { x = x + imm; }
+        if op == 2 { x = x * imm; }
+        if op == 3 { x = x - imm; }
+        if op == 4 { x = x * x; }
+        off = off + 16;
+    }
+    x
+}
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_trace") != 0 { return 1; }
+
+    let buf: i64 = aether_alloc_bytes(64);
+    if buf == 0 { return 2; }
+    let mut o: i64 = 0;
+    o = put_i64(buf, o, 1); o = put_i64(buf, o, 5);  // add 5
+    o = put_i64(buf, o, 2); o = put_i64(buf, o, 3);  // scale 3
+    o = put_i64(buf, o, 3); o = put_i64(buf, o, 7);  // sub 7
+    o = put_i64(buf, o, 4); o = put_i64(buf, o, 0);  // square
+    if o != 64 { return 3; }
+
+    if aether_write_file("target/audit-tmp/_trace/run.bin", buf, o) != 0 { return 4; }
+
+    let q: i64 = aether_read_file("target/audit-tmp/_trace/run.bin");
+    if q == 0 { return 5; }
+    if aether_file_size_last() != 64 { return 6; }
+
+    let eag: i64 = eager(2);
+    let rep: i64 = replay(q, 64, 2);
+    if eag != 196 { return 7; }
+    if rep != eag { return 8; }
+
+    aether_free_bytes(q, 64);
+    aether_free_bytes(buf, 64);
+    42
+}

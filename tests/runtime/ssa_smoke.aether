@@ -1,0 +1,51 @@
+// expect: exit=42
+// roadmap: P10.1
+//
+// P10.1 witness — SSA-friendly source pattern.
+//
+// Stresses the cases SSA renaming exists to clean up:
+//   * Multiple shadowing assignments to the same name.
+//   * Reads that span the assignments (each must see the most-recent gen).
+//   * A branch whose arms each reassign and then re-merge.
+//
+// The runtime answer must equal the eager value; the SSA pass at
+// compiler/src/mir/ssa.rs (covered by unit tests in that module)
+// is what allows downstream P10.2 (constfold + DCE + CSE) to fire.
+fn compute(seed: i64) -> i64 {
+    let mut x = seed;
+    x = x + 1;
+    x = x + 2;
+    x = x + 3;
+    let snapshot = x;          // x_3
+    x = x + 100;               // x_4
+    let later = x;             // x_4
+    x = x - 50;                // x_5
+    let after = x;             // x_5
+    snapshot + later + after - 100
+    // (s+6) + (s+106) + (s+56) - 100 = 3s + 68
+}
+
+fn branchy(s: i64) -> i64 {
+    let mut x = s;
+    if x > 0 {
+        x = x * 2;
+        x = x - 1;
+    } else {
+        x = x + 1;
+        x = x + 1;
+    }
+    // After SSA + phi-insertion, both arms produce a final x; the join
+    // resolves via the phi. For the asm backend's stack-slot layout the
+    // same effect is automatic (single slot, last write wins per arm).
+    x
+}
+
+fn main() -> i32 {
+    let r1 = compute(0);             // 68
+    let r2 = compute(1);             // 71
+    let r3 = branchy(5);             // 9
+    let r4 = branchy(-3);            // -1
+    // 68 - 71 + 9 - (-1) + 35 = 42
+    let total = r1 - r2 + r3 - r4 + 35;
+    total as i32
+}

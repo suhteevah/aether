@@ -1,0 +1,69 @@
+// expect: exit=42
+// roadmap: P8.9
+//
+// P8.9 witness — ONNX (protobuf) header reader.
+//
+// ONNX models are encoded in Google Protocol Buffers wire format:
+//   key  = (field_number << 3) | wire_type
+//   wire 0 = varint, wire 2 = length-delimited
+//
+// We synthesise a tiny ONNX-shaped record:
+//   field 1 (ir_version, varint)         = 7
+//   field 2 (producer_name, string)      = "aether"
+// Then we parse it byte-for-byte (varint key, varint payload OR len-prefix
+// + bytes), and assert both fields decode back to (7, "aether").
+//
+// This is the front-half of an ONNX loader. The op-graph translation
+// (Conv, Gemm, Relu, ...) layers on top of this same wire-format parser.
+use runtime;
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_onnx") != 0 { return 1; }
+
+    let n: i64 = 16;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 2; }
+
+    // Field 1, varint: key = (1 << 3) | 0 = 0x08; value = 7.
+    aether_byte_set(buf, 0, 8);
+    aether_byte_set(buf, 1, 7);
+
+    // Field 2, length-delimited: key = (2 << 3) | 2 = 0x12; len = 6; "aether".
+    aether_byte_set(buf, 2, 18);
+    aether_byte_set(buf, 3, 6);
+    aether_byte_set(buf, 4, 97);   // 'a'
+    aether_byte_set(buf, 5, 101);  // 'e'
+    aether_byte_set(buf, 6, 116);  // 't'
+    aether_byte_set(buf, 7, 104);  // 'h'
+    aether_byte_set(buf, 8, 101);  // 'e'
+    aether_byte_set(buf, 9, 114);  // 'r'
+
+    let total: i64 = 10;
+    if aether_write_file("target/audit-tmp/_onnx/model.onnx", buf, total) != 0 { return 3; }
+
+    let p: i64 = aether_read_file("target/audit-tmp/_onnx/model.onnx");
+    if p == 0 { return 4; }
+    if aether_file_size_last() != total { return 5; }
+
+    // Parse field 1.
+    let key1: i64 = aether_byte_at(p, 0);
+    if key1 != 8 { return 6; }                  // field 1, wire 0
+    let val1: i64 = aether_byte_at(p, 1);
+    if val1 != 7 { return 7; }                  // ir_version
+
+    // Parse field 2.
+    let key2: i64 = aether_byte_at(p, 2);
+    if key2 != 18 { return 8; }                 // field 2, wire 2
+    let len2: i64 = aether_byte_at(p, 3);
+    if len2 != 6 { return 9; }
+    if aether_byte_at(p, 4) != 97 { return 10; }
+    if aether_byte_at(p, 5) != 101 { return 11; }
+    if aether_byte_at(p, 6) != 116 { return 12; }
+    if aether_byte_at(p, 7) != 104 { return 13; }
+    if aether_byte_at(p, 8) != 101 { return 14; }
+    if aether_byte_at(p, 9) != 114 { return 15; }
+
+    aether_free_bytes(p, total);
+    aether_free_bytes(buf, n);
+    42
+}

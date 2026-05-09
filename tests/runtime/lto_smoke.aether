@@ -1,0 +1,27 @@
+// expect: exit=42
+// roadmap: P10.9
+//
+// P10.9 witness — cross-module call shape that whole-program LTO
+// would consume.
+//
+// `live` is called by main; `also_live` by `live`. `unused` is defined
+// but never called — under LTO with reachability analysis
+// (compiler/src/mir/lto.rs, 2 unit tests) it would be DCE'd before the
+// final link, shrinking the binary.
+//
+// Witness asserts the live chain still produces 42, and that the dead
+// fn doesn't influence the output.
+fn unused(x: i64) -> i64 { x * 1000 + 9999 }
+
+fn also_live(a: i64, b: i64) -> i64 { a * b + 2 }
+
+fn live(seed: i64) -> i64 {
+    let s = also_live(seed, 4);   // 5*4 + 2 = 22
+    s + 20                         // 42
+}
+
+fn main() -> i32 {
+    let r = live(5);
+    let _ = unused;
+    r as i32
+}

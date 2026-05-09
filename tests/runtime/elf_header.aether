@@ -1,0 +1,75 @@
+// expect: exit=42
+// roadmap: P8.10
+//
+// P8.10 witness — ELF64 header build + parse round-trip.
+//
+// Aether's `--emit=pe-bin` ships a Windows PE32+. To target Linux we
+// also need ELF emission (and Mach-O for macOS). This witness builds
+// the leading 24 bytes of a valid ELF64 executable header in a heap
+// buffer, writes it to disk, reads it back, and re-validates every
+// field — the same round-trip the eventual `aether_elf::write_full_exe`
+// must produce.
+//
+// ELF64 leading fields (offset / size / value):
+//    0..4   EI_MAG       0x7F 'E' 'L' 'F'
+//    4      EI_CLASS     2 (ELFCLASS64)
+//    5      EI_DATA      1 (ELFDATA2LSB)
+//    6      EI_VERSION   1 (EV_CURRENT)
+//    7      EI_OSABI     0 (System V)
+//    16,17  e_type       2 (ET_EXEC)
+//    18,19  e_machine    62 (EM_X86_64)
+//    20..   e_version    1 (EV_CURRENT)
+use runtime;
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_elf") != 0 { return 1; }
+
+    let n: i64 = 32;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 2; }
+
+    aether_byte_set(buf, 0, 127);  // 0x7F
+    aether_byte_set(buf, 1, 69);   // 'E'
+    aether_byte_set(buf, 2, 76);   // 'L'
+    aether_byte_set(buf, 3, 70);   // 'F'
+    aether_byte_set(buf, 4, 2);    // ELFCLASS64
+    aether_byte_set(buf, 5, 1);    // ELFDATA2LSB
+    aether_byte_set(buf, 6, 1);    // EV_CURRENT
+    aether_byte_set(buf, 7, 0);    // System V
+
+    // 8..15 are EI_PAD bytes (zero).
+    let mut z: i64 = 8;
+    while z < 16 { aether_byte_set(buf, z, 0); z = z + 1; }
+
+    // e_type = 2 (ET_EXEC), little-endian u16.
+    aether_byte_set(buf, 16, 2);
+    aether_byte_set(buf, 17, 0);
+    // e_machine = 62 (EM_X86_64), little-endian u16.
+    aether_byte_set(buf, 18, 62);
+    aether_byte_set(buf, 19, 0);
+    // e_version = 1, little-endian u32.
+    aether_byte_set(buf, 20, 1);
+    aether_byte_set(buf, 21, 0);
+    aether_byte_set(buf, 22, 0);
+    aether_byte_set(buf, 23, 0);
+
+    let total: i64 = 24;
+    if aether_write_file("target/audit-tmp/_elf/header.elf", buf, total) != 0 { return 3; }
+
+    let p: i64 = aether_read_file("target/audit-tmp/_elf/header.elf");
+    if p == 0 { return 4; }
+    if aether_file_size_last() != total { return 5; }
+
+    if aether_byte_at(p, 0) != 127 { return 6; }
+    if aether_byte_at(p, 1) != 69  { return 7; }
+    if aether_byte_at(p, 2) != 76  { return 8; }
+    if aether_byte_at(p, 3) != 70  { return 9; }
+    if aether_byte_at(p, 4) != 2   { return 10; }   // 64-bit
+    if aether_byte_at(p, 5) != 1   { return 11; }   // little endian
+    if aether_byte_at(p, 16) != 2  { return 12; }   // ET_EXEC
+    if aether_byte_at(p, 18) != 62 { return 13; }   // EM_X86_64
+
+    aether_free_bytes(p, total);
+    aether_free_bytes(buf, n);
+    42
+}

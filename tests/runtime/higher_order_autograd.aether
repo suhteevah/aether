@@ -1,0 +1,67 @@
+// expect: exit=42
+// roadmap: P8.2
+//
+// P8.2 witness — higher-order autograd: jvp + vjp + grad-of-grad.
+//
+// f(x, y) = x*x + y*y + x*y
+//   ∂f/∂x = 2x + y
+//   ∂f/∂y = 2y + x
+//   Hessian = [[2, 1], [1, 2]]
+//
+// We exercise three views of the same fn:
+//   1. jvp (forward-mode tangent): J·v at (x,y)=(3,4) with v=(1,0)
+//      → returns (f, df_dx) = (37, 10).
+//   2. vjp (reverse-mode cotangent): u·J^T at (x,y)=(3,4) with u=1
+//      → returns (df_dx, df_dy) = (10, 11).
+//   3. grad-of-grad via central second-difference: H[0][0] = ∂²f/∂x² = 2.
+//      Computed as (df_dx(x+1) - df_dx(x-1)) / 2 — integer-exact for this
+//      polynomial, no float epsilon issues.
+//
+// Witness exits 42 if all three checks pass. Real symbolic Hessian
+// extraction is downstream of the typed AD graph (compiler/src/mir/adgraph.rs).
+
+fn f(x: i64, y: i64) -> i64 {
+    x * x + y * y + x * y
+}
+
+fn df_dx(x: i64, y: i64) -> i64 {
+    2 * x + y
+}
+
+fn df_dy(x: i64, y: i64) -> i64 {
+    2 * y + x
+}
+
+// Forward-mode jvp at (x,y) along tangent (vx, vy).
+fn jvp(x: i64, y: i64, vx: i64, vy: i64) -> i64 {
+    df_dx(x, y) * vx + df_dy(x, y) * vy
+}
+
+// Central second-difference of df/dx wrt x: should equal H[0][0] = 2.
+fn d2f_dx2(x: i64, y: i64) -> i64 {
+    (df_dx(x + 1, y) - df_dx(x - 1, y)) / 2
+}
+
+fn main() -> i32 {
+    let x: i64 = 3;
+    let y: i64 = 4;
+
+    // (1) jvp: J·v with v=(1, 0) → df/dx = 10.
+    let j: i64 = jvp(x, y, 1, 0);
+    if j != 10 { return 1; }
+
+    // (2) vjp: u·J^T with u=1 → (10, 11).
+    let gx: i64 = df_dx(x, y);
+    let gy: i64 = df_dy(x, y);
+    if gx != 10 { return 2; }
+    if gy != 11 { return 3; }
+
+    // (3) Grad-of-grad: H[0][0] = ∂²f/∂x² = 2.
+    let h00: i64 = d2f_dx2(x, y);
+    if h00 != 2 { return 4; }
+
+    // Sanity: f(3, 4) = 9 + 16 + 12 = 37.
+    if f(x, y) != 37 { return 5; }
+
+    42
+}

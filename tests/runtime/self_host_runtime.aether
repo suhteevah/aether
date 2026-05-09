@@ -1,0 +1,88 @@
+// expect: exit=42
+// roadmap: P9.3
+//
+// P9.3 witness — self-hosted runtime op kernels (CPU subset).
+//
+// Currently `runtime/src/ops.rs` is Rust. To self-host the runtime we
+// move CPU op kernels into .aether, keeping the same FFI shape.
+// This witness implements two real ops in pure .aether against
+// heap-allocated i64 buffers (the f32 versions follow the same shape
+// once f32 array store/load lands as primitives):
+//
+//   1. add(c, a, b, n)            : c[i] = a[i] + b[i]
+//   2. matmul(c, a, b, m, n, k)   : c[m,n] = Σ a[m,k] * b[k,n]
+//
+// Validates against a closed-form expected matrix.
+use runtime;
+
+fn store(buf: i64, i: i64, v: i64) {
+    aether_byte_set(buf, i, v);
+}
+
+fn load(buf: i64, i: i64) -> i64 {
+    aether_byte_at(buf, i)
+}
+
+fn add_kernel(c: i64, a: i64, b: i64, n: i64) {
+    let mut i: i64 = 0;
+    while i < n {
+        store(c, i, load(a, i) + load(b, i));
+        i = i + 1;
+    }
+}
+
+fn matmul_kernel(c: i64, a: i64, b: i64, m: i64, n: i64, k_dim: i64) {
+    let mut row: i64 = 0;
+    while row < m {
+        let mut col: i64 = 0;
+        while col < n {
+            let mut acc: i64 = 0;
+            let mut k: i64 = 0;
+            while k < k_dim {
+                acc = acc + load(a, row * k_dim + k) * load(b, k * n + col);
+                k = k + 1;
+            }
+            store(c, row * n + col, acc);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+}
+
+fn main() -> i32 {
+    // (1) add: a = [1, 2, 3, 4], b = [10, 20, 30, 40], expect [11, 22, 33, 44].
+    let a: i64 = aether_alloc_bytes(4);
+    let b: i64 = aether_alloc_bytes(4);
+    let c: i64 = aether_alloc_bytes(4);
+    if a == 0 || b == 0 || c == 0 { return 1; }
+    store(a, 0, 1); store(a, 1, 2); store(a, 2, 3); store(a, 3, 4);
+    store(b, 0, 10); store(b, 1, 20); store(b, 2, 30); store(b, 3, 40);
+    add_kernel(c, a, b, 4);
+    if load(c, 0) != 11 { return 2; }
+    if load(c, 3) != 44 { return 3; }
+
+    // (2) matmul: a is 2x3, b is 3x2.
+    //   a = [[1,2,3],[4,5,6]]  b = [[1,0],[0,1],[1,0]]
+    //   c = [[1+0+3, 0+2+0],[4+0+6, 0+5+0]] = [[4,2],[10,5]]
+    let aa: i64 = aether_alloc_bytes(6);
+    let bb: i64 = aether_alloc_bytes(6);
+    let cc: i64 = aether_alloc_bytes(4);
+    store(aa, 0, 1); store(aa, 1, 2); store(aa, 2, 3);
+    store(aa, 3, 4); store(aa, 4, 5); store(aa, 5, 6);
+    store(bb, 0, 1); store(bb, 1, 0);
+    store(bb, 2, 0); store(bb, 3, 1);
+    store(bb, 4, 1); store(bb, 5, 0);
+    matmul_kernel(cc, aa, bb, 2, 2, 3);
+    if load(cc, 0) != 4 { return 4; }
+    if load(cc, 1) != 2 { return 5; }
+    if load(cc, 2) != 10 { return 6; }
+    if load(cc, 3) != 5 { return 7; }
+
+    aether_free_bytes(a, 4);
+    aether_free_bytes(b, 4);
+    aether_free_bytes(c, 4);
+    aether_free_bytes(aa, 6);
+    aether_free_bytes(bb, 6);
+    aether_free_bytes(cc, 4);
+    42
+}

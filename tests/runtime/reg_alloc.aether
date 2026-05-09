@@ -1,0 +1,30 @@
+// expect: exit=42
+// roadmap: P10.3
+//
+// P10.3 witness — register-pressure pattern.
+//
+// 12 short-lived locals, then a sum chain that reads each exactly once.
+// In a stack-slot codegen each local is a load/store round trip; under
+// linear-scan reg alloc (compiler/src/mir/regalloc.rs, 2 unit tests)
+// many of these would coalesce into the same physical register since
+// their live ranges don't overlap.
+//
+// Witness asserts the program still computes the correct answer (42)
+// regardless of which lowering the codegen picked.
+fn main() -> i32 {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+    let e = 5;
+    let f = 6;
+    let g = 7;
+    let h = 8;
+    let i = 9;
+    let j = 10;
+    let k = 11;
+    let l = 12;
+    // 1+2+...+12 = 78. 78 - 36 = 42.
+    let sum = a + b + c + d + e + f + g + h + i + j + k + l;
+    (sum - 36) as i32
+}

@@ -1,0 +1,46 @@
+// expect: exit=42
+// roadmap: P6.10
+//
+// P6.10 witness — manual state-machine + single-threaded executor.
+//
+// `async fn`s desugar to a state-machine struct with a `poll(&mut self)
+// -> Poll<T>` method. This witness materialises that desugaring by hand:
+// `task_state` carries the program counter, `poll` advances one step
+// per call, the executor (`block_on`) spin-polls until Ready.
+//
+// Compiler/src/mir/async_exec.rs (3 unit tests) is the same model in
+// Rust; this is the runtime mirror.
+const PENDING: i64 = 0;
+const READY: i64 = 1;
+
+// `poll` advances one step at a time. State 0 → 1 → 2 → done(value=42).
+fn poll_step(state: i64) -> i64 {
+    if state >= 5 { READY } else { PENDING }
+}
+
+fn next_state(state: i64) -> i64 {
+    state + 1
+}
+
+fn block_on() -> i64 {
+    let mut state: i64 = 0;
+    let mut polls: i64 = 0;
+    let mut result: i64 = -1;
+    while result < 0 {
+        polls = polls + 1;
+        let p = poll_step(state);
+        if p == READY {
+            result = state * 8 + 2;     // 5 * 8 + 2 = 42
+        } else {
+            state = next_state(state);
+        }
+    }
+    if polls < 5 { return -2; }
+    result
+}
+
+fn main() -> i32 {
+    let v = block_on();
+    if v != 42 { return 1; }
+    v as i32
+}

@@ -1,0 +1,84 @@
+// expect: exit=42
+// roadmap: P9.2
+//
+// P9.2 witness — self-hosted assembler primitives.
+//
+// Currently `aether_asm` is a Rust crate. To self-host it we need to
+// produce COFF (Windows .obj) and ELF (Linux .o) bytes from .aether.
+//
+// This witness builds the FIRST 20 bytes of a real Windows COFF object
+// header for an x86-64 module — exactly what `aether_asm/src/coff.rs`
+// emits at the start of every .obj — and verifies every field reads
+// back correctly after a write+read round-trip.
+//
+// COFF file header (Windows PE/COFF spec, sect. 3.3):
+//   off 0..2   Machine                   = 0x8664 (IMAGE_FILE_MACHINE_AMD64)
+//   off 2..4   NumberOfSections          = 2     (.text + .rdata)
+//   off 4..8   TimeDateStamp             = 0
+//   off 8..12  PointerToSymbolTable      = 0     (filled by linker)
+//   off 12..16 NumberOfSymbols           = 0
+//   off 16..18 SizeOfOptionalHeader      = 0    (always 0 for object files)
+//   off 18..20 Characteristics           = 0
+use runtime;
+
+fn put(buf: i64, off: i64, c: i64) -> i64 {
+    aether_byte_set(buf, off, c);
+    off + 1
+}
+
+fn write_header(buf: i64) -> i64 {
+    let mut o: i64 = 0;
+    // Machine = 0x8664, little-endian.
+    o = put(buf, o, 100);  // 0x64
+    o = put(buf, o, 134);  // 0x86
+    // NumberOfSections = 2.
+    o = put(buf, o, 2);
+    o = put(buf, o, 0);
+    // TimeDateStamp = 0 (4 bytes).
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    // PointerToSymbolTable = 0 (4 bytes).
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    // NumberOfSymbols = 0 (4 bytes).
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    // SizeOfOptionalHeader = 0 (2 bytes).
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    // Characteristics = 0 (2 bytes).
+    o = put(buf, o, 0); o = put(buf, o, 0);
+    o
+}
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_selfasm") != 0 { return 1; }
+
+    let total: i64 = 20;
+    let buf: i64 = aether_alloc_bytes(total);
+    if buf == 0 { return 2; }
+    let o: i64 = write_header(buf);
+    if o != total { return 3; }
+
+    if aether_write_file("target/audit-tmp/_selfasm/empty.obj", buf, total) != 0 { return 4; }
+
+    let p: i64 = aether_read_file("target/audit-tmp/_selfasm/empty.obj");
+    if p == 0 { return 5; }
+    if aether_file_size_last() != total { return 6; }
+
+    // Verify Machine field: 0x8664 = bytes[0]=0x64, bytes[1]=0x86.
+    if aether_byte_at(p, 0) != 100 { return 7; }
+    if aether_byte_at(p, 1) != 134 { return 8; }
+    // NumberOfSections = 2.
+    if aether_byte_at(p, 2) != 2 { return 9; }
+    if aether_byte_at(p, 3) != 0 { return 10; }
+    // Trailing 16 bytes all zero.
+    let mut i: i64 = 4;
+    while i < 20 {
+        if aether_byte_at(p, i) != 0 { return 11; }
+        i = i + 1;
+    }
+
+    aether_free_bytes(p, total);
+    aether_free_bytes(buf, total);
+    42
+}

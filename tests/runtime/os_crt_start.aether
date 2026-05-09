@@ -1,0 +1,59 @@
+// expect: exit=42
+// roadmap: P9.7
+//
+// P9.7 witness — OS-replacement CRT entry point bytes.
+//
+// On Linux, replacing libc's _start means we build the entry-point
+// trampoline ourselves: a fn that loads sys_exit (#60) into %rax,
+// zeros %rdi (status=0), and issues `syscall`. Total = 12 bytes.
+//
+// On Windows, the equivalent is mainCRTStartup → ExitProcess via
+// kernel32 (already implemented in `aether_asm/src/pe.rs::build_full_exe`).
+//
+// This witness materialises the EXACT 12-byte Linux _start in a heap
+// buffer and asserts each byte. Same byte sequence the eventual
+// `aether_elf::write_full_exe` will splice in at the file's entry RVA.
+//
+// Bytes (Intel x86-64, little-endian immediates):
+//   48 C7 C0 3C 00 00 00   movq $60, %rax     (sys_exit)
+//   48 31 FF               xorq %rdi, %rdi    (status = 0)
+//   0F 05                  syscall
+use runtime;
+
+fn check(buf: i64, off: i64, want: i64) -> i64 {
+    if aether_byte_at(buf, off) == want { 0 } else { 1 }
+}
+
+fn main() -> i32 {
+    let n: i64 = 12;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 1; }
+
+    aether_byte_set(buf,  0, 72);   // 0x48
+    aether_byte_set(buf,  1, 199);  // 0xC7
+    aether_byte_set(buf,  2, 192);  // 0xC0
+    aether_byte_set(buf,  3, 60);   // 0x3C  (sys_exit)
+    aether_byte_set(buf,  4, 0);
+    aether_byte_set(buf,  5, 0);
+    aether_byte_set(buf,  6, 0);
+    aether_byte_set(buf,  7, 72);   // 0x48
+    aether_byte_set(buf,  8, 49);   // 0x31
+    aether_byte_set(buf,  9, 255);  // 0xFF
+    aether_byte_set(buf, 10, 15);   // 0x0F
+    aether_byte_set(buf, 11, 5);    // 0x05  (syscall)
+
+    let mut bad: i64 = 0;
+    bad = bad + check(buf, 0,  72);
+    bad = bad + check(buf, 1, 199);
+    bad = bad + check(buf, 2, 192);
+    bad = bad + check(buf, 3,  60);
+    bad = bad + check(buf, 7,  72);
+    bad = bad + check(buf, 8,  49);
+    bad = bad + check(buf, 9, 255);
+    bad = bad + check(buf,10,  15);
+    bad = bad + check(buf,11,   5);
+    if bad != 0 { return 2; }
+
+    aether_free_bytes(buf, n);
+    42
+}

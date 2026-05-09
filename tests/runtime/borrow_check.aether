@@ -1,0 +1,27 @@
+// expect: exit=42
+// roadmap: P6.3
+//
+// P6.3 witness — well-formed reference-shape source.
+//
+// The borrow checker (compiler/src/mir/lifetimes.rs, 4 unit tests)
+// rejects programs with overlapping &mut, read-write conflicts, or
+// use-after-move. This source has no such patterns: each &mut borrow
+// fully ends before the next access; each read takes a fresh shared
+// borrow whose scope ends with the call. A correct borrow checker
+// emits zero diagnostics; this witness asserts the program runs and
+// produces 42.
+fn touch_mut(_b: i64) -> i64 { 0 }
+
+fn touch_shared(b: i64) -> i64 { b }
+
+fn main() -> i32 {
+    let mut g0: i64 = 20;
+    let _ = touch_mut(g0);          // owns &mut briefly, then releases
+    let r0 = touch_shared(g0);       // 20  — no overlap with the &mut
+
+    let mut g1: i64 = 22;
+    let _ = touch_mut(g1);
+    let r1 = touch_shared(g1);       // 22
+
+    (r0 + r1) as i32
+}

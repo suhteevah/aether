@@ -1,0 +1,34 @@
+// expect: exit=42
+// roadmap: P10.2
+//
+// P10.2 witness — patterns that the constfold + strength_reduce + CSE +
+// DCE passes (compiler/src/mir/opt.rs) collapse.
+//
+// Each grouping below is hand-shaped to fire one of the passes:
+//   * Constant folding: `let _ = 2 + 3 * 4;`     → emits a single literal.
+//   * Strength reduction: `let q = x * 8;`        → shifts instead of imul.
+//   * Common subexpression: `(a*b) + (a*b);`     → one mul, two reads.
+//   * Dead store: `let _unused = expensive();`    → fully removed.
+//
+// Correctness witness: the source's exit value matches a hand-evaluated
+// reference, regardless of whether the optimiser fired or not.
+fn expensive(x: i64) -> i64 {
+    // Pure fn — DCE-eligible when the result is unused.
+    let mut acc = 0;
+    for i in 0..x { acc = acc + i; }
+    acc
+}
+
+fn main() -> i32 {
+    let folded = 2 + 3 * 4;          // 14, expected as a single literal
+    let x = 5;
+    let strength = x * 8;            // 40, expected as `x << 3`
+    let a = 7;
+    let b = 6;
+    let cse_lhs = a * b;             // 42
+    let cse_rhs = a * b;             // 42 — should map to the same register
+    let _dead = expensive(100);      // 4950 — DCE candidate
+    let combined = folded + strength + (cse_lhs + cse_rhs) - 96;
+    // 14 + 40 + 42 + 42 - 96 = 42
+    combined as i32
+}

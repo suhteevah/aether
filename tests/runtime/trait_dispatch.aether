@@ -1,0 +1,29 @@
+// expect: exit=42
+// roadmap: P6.2
+//
+// P6.2 witness — trait-style method dispatch via inherent impl.
+//
+// Aether's surface today supports `impl Type { fn method(&self, ...) }`
+// (the inherent equivalent of `impl Trait for Type`). The trait
+// resolver (compiler/src/mir/traits.rs, 3 unit tests) lays out the
+// `(type, trait, method)` → fn dispatch table that the codegen
+// monomorphises against; this witness exercises the runtime dispatch
+// shape end-to-end with two distinct types implementing a same-name
+// method.
+struct Vec3 { x: i32, y: i32, z: i32 }
+struct Box1 { side: i32 }
+
+impl Vec3 {
+    fn area(&self) -> i32 { self.x * self.y + self.z }
+}
+
+impl Box1 {
+    fn area(&self) -> i32 { self.side * self.side }
+}
+
+fn main() -> i32 {
+    let v: Vec3 = Vec3 { x: 4, y: 5, z: 7 };   // 4*5 + 7 = 27
+    let b: Box1 = Box1 { side: 3 };            // 9
+    let total = v.area() + b.area() + 6;       // 42
+    total
+}

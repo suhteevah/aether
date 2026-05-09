@@ -690,6 +690,70 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     let _ = std::io::stdout().flush();
 }
 
+/// =====================================================================
+/// P6.9 — atomics + thread spawn primitives.
+///
+/// Atomics use Rust's `std::sync::atomic::AtomicI64` over a raw pointer
+/// the caller is responsible for providing as 8-byte aligned storage
+/// (typical use: `aether_alloc_bytes(16)` then pass the buffer).
+/// Thread spawn uses Win32 `CreateThread` with a fn-ptr trampoline.
+/// =====================================================================
+#[no_mangle] pub unsafe extern "C" fn aether_atomic_fetch_add_i64(addr: i64, val: i64) -> i64 {
+    if addr == 0 { return 0; }
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let a = &*(addr as *const AtomicI64);
+    a.fetch_add(val, Ordering::SeqCst)
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_atomic_load_i64(addr: i64) -> i64 {
+    if addr == 0 { return 0; }
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let a = &*(addr as *const AtomicI64);
+    a.load(Ordering::SeqCst)
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_atomic_store_i64(addr: i64, val: i64) {
+    if addr == 0 { return; }
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let a = &*(addr as *const AtomicI64);
+    a.store(val, Ordering::SeqCst);
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_atomic_cas_i64(addr: i64, expected: i64, new: i64) -> i64 {
+    if addr == 0 { return -1; }
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let a = &*(addr as *const AtomicI64);
+    match a.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst) {
+        Ok(prev) => prev,
+        Err(prev) => prev,
+    }
+}
+
+/// Spawn a thread that runs `fn_ptr(arg)`. Returns the OS thread handle
+/// (or 0 on failure). Caller joins via `aether_thread_join`.
+#[no_mangle] pub unsafe extern "C" fn aether_thread_spawn(fn_ptr: i64, arg: i64) -> i64 {
+    if fn_ptr == 0 { return 0; }
+    let payload: Box<(i64, i64)> = Box::new((fn_ptr, arg));
+    let raw = Box::into_raw(payload) as i64;
+    let handle = std::thread::spawn(move || {
+        let p = raw as *mut (i64, i64);
+        let (fp, ar) = *Box::from_raw(p);
+        let f: extern "C" fn(i64) -> i64 = std::mem::transmute(fp);
+        f(ar);
+    });
+    Box::into_raw(Box::new(handle)) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_thread_join(handle: i64) -> i32 {
+    if handle == 0 { return -1; }
+    let h: Box<std::thread::JoinHandle<()>> =
+        Box::from_raw(handle as *mut std::thread::JoinHandle<()>);
+    match h.join() {
+        Ok(()) => 0,
+        Err(_) => -2,
+    }
+}
+
 /// Integer absolute value. Free fn — Aether doesn't have method-on-scalar
 /// dispatch yet, so primitives live as `aether_*` extern fns.
 // =====================================================================

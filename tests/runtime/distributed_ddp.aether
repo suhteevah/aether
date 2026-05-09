@@ -1,0 +1,86 @@
+// expect: exit=42
+// roadmap: P7.9
+//
+// P7.9 witness — DDP gradient all-reduce simulation.
+//
+// Models 2 ranks training the same model on different data. Each rank
+// produces a local gradient buffer of length 8 (i64 elements). DDP's
+// gradient sync is "sum across ranks, then divide by world_size" —
+// after the sync, every rank holds the SAME averaged gradient.
+//
+// This witness simulates the all-reduce in-process (no NCCL needed)
+// and asserts:
+//   1. Both ranks' local grads were initially distinct.
+//   2. After all-reduce + averaging, both rank buffers byte-equal.
+//   3. The averaged value on element 0 == (rank0_g + rank1_g) / 2.
+//
+// The runtime symbol `aether_op_all_reduce_sum_f32` is the eventual
+// NCCL hook; this witness exercises the DDP control flow shape that
+// the NCCL backend must preserve.
+use runtime;
+
+const N: i64 = 8;
+
+fn main() -> i32 {
+    let g0: i64 = aether_alloc_bytes(N * 8);
+    let g1: i64 = aether_alloc_bytes(N * 8);
+    if g0 == 0 { return 1; }
+    if g1 == 0 { return 2; }
+
+    // rank 0: grads = [10, 20, 30, ..., 80].
+    // rank 1: grads = [12, 22, 32, ..., 82].
+    let mut i: i64 = 0;
+    while i < N {
+        let v0: i64 = (i + 1) * 10;
+        let v1: i64 = v0 + 2;
+        let off: i64 = i * 8;
+        // Single-byte stores into the low byte are sufficient since
+        // values fit in u8.
+        aether_byte_set(g0, off, v0);
+        aether_byte_set(g1, off, v1);
+        i = i + 1;
+    }
+
+    // Pre-condition: rank buffers differ at every slot.
+    let mut diff: i64 = 0;
+    let mut k: i64 = 0;
+    while k < N {
+        if aether_byte_at(g0, k * 8) != aether_byte_at(g1, k * 8) {
+            diff = diff + 1;
+        }
+        k = k + 1;
+    }
+    if diff != N { return 3; }
+
+    // All-reduce SUM (in-process simulation): both buffers get the sum.
+    // Then divide by world_size=2 for the mean.
+    let mut j: i64 = 0;
+    while j < N {
+        let off: i64 = j * 8;
+        let sum: i64 = aether_byte_at(g0, off) + aether_byte_at(g1, off);
+        let avg: i64 = sum / 2;
+        aether_byte_set(g0, off, avg);
+        aether_byte_set(g1, off, avg);
+        j = j + 1;
+    }
+
+    // Post-condition 1: both ranks identical.
+    let mut same: i64 = 0;
+    let mut q: i64 = 0;
+    while q < N {
+        if aether_byte_at(g0, q * 8) == aether_byte_at(g1, q * 8) {
+            same = same + 1;
+        }
+        q = q + 1;
+    }
+    if same != N { return 4; }
+
+    // Post-condition 2: element 0 averaged correctly. (10 + 12) / 2 = 11.
+    if aether_byte_at(g0, 0) != 11 { return 5; }
+    // Element 7: (80 + 82) / 2 = 81.
+    if aether_byte_at(g0, 7 * 8) != 81 { return 6; }
+
+    aether_free_bytes(g0, N * 8);
+    aether_free_bytes(g1, N * 8);
+    42
+}

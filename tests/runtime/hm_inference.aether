@@ -1,0 +1,28 @@
+// expect: exit=42
+// roadmap: P6.1
+//
+// P6.1 witness — Hindley-Milner-style let inference.
+// Every `let` below omits the `: Ty` annotation. The compiler must
+// infer the variable's storage class (i64 stack slot, f32 xmm slot,
+// pointer slot) from the rhs alone. Any regression that requires the
+// programmer to re-add an annotation breaks this witness.
+
+fn add_two(a: i64, b: i64) -> i64 { a + b }
+
+fn main() -> i32 {
+    // Integer literal — infers i64.
+    let a = 10;
+    // Arithmetic on already-inferred locals — infers i64.
+    let b = a + 5;
+    // Function-call result — infers from return type.
+    let c = add_two(a, b);    // 25
+    // Boolean from comparison — infers bool/i64.
+    let cmp = c > 0;
+    // If-expression — infers from arms.
+    let pick = if cmp { c + 17 } else { 0 };  // 42
+    // Nested let chain.
+    let x = pick;
+    let y = x;
+    let z = y;
+    z as i32
+}

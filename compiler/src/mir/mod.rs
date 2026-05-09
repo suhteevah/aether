@@ -20,6 +20,15 @@ pub mod adgraph;
 pub mod fuse;
 pub mod closures;
 pub mod spec;
+pub mod ssa;
+pub mod opt;
+pub mod regalloc;
+pub mod vectorize;
+pub mod lto;
+pub mod traits;
+pub mod lifetimes;
+pub mod async_exec;
+pub mod macros;
 pub mod test_harness;
 
 #[derive(Debug, Clone)]
