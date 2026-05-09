@@ -161,6 +161,8 @@ impl Parser {
                 }
             }
             first_param = false;
+            // Allow `mut` on params (P13.1) — informational only; codegen treats every param slot writable.
+            if matches!(self.peek(0), Tok::Mut) { self.bump(); }
             let pname = if matches!(self.peek(0), Tok::SelfLower) {
                 self.bump(); "self".to_string()
             } else {
