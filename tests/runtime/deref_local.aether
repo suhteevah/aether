@@ -1,0 +1,9 @@
+// expect: exit=42
+// roadmap: P12.5
+// `*ref` reads through a pointer to a local i64.
+fn main() -> i32 {
+    let x: i64 = 42;
+    let r: i64 = &x;
+    let v: i64 = *r;
+    v as i32
+}

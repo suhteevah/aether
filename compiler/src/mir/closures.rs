@@ -20,7 +20,7 @@ pub fn run(prog: &mut Program) -> usize {
     for item in prog.items.iter_mut() {
         match item {
             Item::Fn(f) => lift_fn(f, &mut ctx),
-            Item::Impl { methods, .. } => {
+            Item::Impl { methods, .. } | Item::ImplTrait { methods, .. } => {
                 for m in methods.iter_mut() { lift_fn(m, &mut ctx); }
             }
             _ => {}

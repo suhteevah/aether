@@ -1,0 +1,18 @@
+// expect: exit=42
+// roadmap: P13.5
+// 64-bit imul + bitwise mask must not segfault.
+fn hash_loop(n: i64) -> i64 {
+    let mut h: i64 = 2166136261;
+    let mut i: i64 = 0;
+    while i < n {
+        // multiply (overflow-allowed) then mask — exercises imulq + andq.
+        h = (h * 16777619) & 9223372036854775807;
+        i = i + 1;
+    }
+    h
+}
+
+fn main() -> i32 {
+    let h: i64 = hash_loop(4);
+    if h != 0 { 42 } else { 1 }
+}

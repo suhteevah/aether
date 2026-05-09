@@ -34,8 +34,8 @@ pub struct RoadmapReport {
 }
 
 pub fn run(root: &Path) -> RoadmapReport {
-    let roadmap_md = root.join("docs").join("ROADMAP_V2.md");
-    let items = parse_roadmap(&roadmap_md);
+    let mut items = parse_roadmap(&root.join("docs").join("ROADMAP_V2.md"));
+    items.extend(parse_roadmap(&root.join("docs").join("ROADMAP_V3.md")));
     let witnesses = scan_witnesses(root);
 
     let mut phase_progress: BTreeMap<u32, (usize, usize)> = BTreeMap::new();

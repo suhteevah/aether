@@ -1,0 +1,14 @@
+// expect: exit=42
+// roadmap: P12.2
+// Explicit lifetime annotations parse cleanly and don't change semantics.
+fn first<'a>(x: &'a i64) -> i64 {
+    let v: i64 = *x;
+    v
+}
+
+fn main() -> i32 {
+    let n: i64 = 42;
+    let r: i64 = &n;
+    let v: i64 = first(r);
+    v as i32
+}

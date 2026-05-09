@@ -1,0 +1,18 @@
+// expect: exit=42
+// roadmap: P12.4
+// `macro_rules! …` parses; the body is silently dropped today (real
+// hygienic expansion is downstream). Call sites with `name!(...)` desugar
+// to `name(...)` — letting the witness exercise the surface syntax via
+// a hand-written `forty_two` fn that takes the macro's place.
+macro_rules! forty_two {
+    () => { 42 };
+}
+
+fn forty_two() -> i64 {
+    42
+}
+
+fn main() -> i32 {
+    let v: i64 = forty_two!();
+    v as i32
+}

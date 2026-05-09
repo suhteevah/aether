@@ -463,6 +463,19 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
                     }
                     let _: Option<FnDecl> = None;
                 }
+                // P12.1 — `impl Trait for Type` flattens the same way as inherent
+                // impl. The trait_name is currently informational; mir::traits
+                // resolves dispatch.
+                Item::ImplTrait { type_name, methods, .. } => {
+                    for mut m in methods {
+                        m.name = format!("{}__{}", type_name, m.name);
+                        new_items.push(Item::Fn(m));
+                    }
+                }
+                // Trait declarations don't emit code — they declare an
+                // interface. Bodies (default methods) live in the
+                // `ImplTrait` blocks that satisfy them.
+                Item::Trait { .. } => {}
                 other => new_items.push(other),
             }
         }
@@ -1019,7 +1032,24 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     out.push_str(&format!("{name}:\n"));
     out.push_str("    pushq %rbp\n");
     out.push_str("    movq %rsp, %rbp\n");
-    out.push_str(&format!("    subq ${}, %rsp\n", frame));
+    // P13.4: when the frame would skip past a stack guard page (>4 KiB on
+    // Windows), probe each page as we decrement rsp. Inline equivalent of the
+    // MSVC `__chkstk` helper — keeps us free of an external linkage.
+    if frame > 4096 {
+        out.push_str(&format!("    movq ${}, %r11\n", frame));   // remaining
+        out.push_str("    movq $4096, %r10\n");                  // page size
+        out.push_str(&format!(".Lchkstk_loop_{}:\n", name));
+        out.push_str("    cmpq %r10, %r11\n");                   // r11 - 4096
+        out.push_str(&format!("    jbe .Lchkstk_done_{}\n", name));
+        out.push_str("    subq $4096, %rsp\n");
+        out.push_str("    movq %r10, (%rsp)\n");                 // touch page
+        out.push_str("    subq $4096, %r11\n");
+        out.push_str(&format!("    jmp .Lchkstk_loop_{}\n", name));
+        out.push_str(&format!(".Lchkstk_done_{}:\n", name));
+        out.push_str("    subq %r11, %rsp\n");
+    } else {
+        out.push_str(&format!("    subq ${}, %rsp\n", frame));
+    }
 
     // Spill incoming param regs into their stack slots and record type info.
     // MS x64: positional. Slot i picks {rcx,rdx,r8,r9} (int) or xmm{i} (float).
@@ -1964,17 +1994,39 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
         }
         Expr::Unary { op, expr } => {
             let kind = emit_expr_value(expr, out, data, locals)?;
-            if kind != TyKind::Int {
-                return Err(AsmError::UnsupportedExpr("unary op on non-int (f32 unary not yet wired)"));
-            }
-            match op {
-                UnOp::Neg => out.push_str("    negq %rax\n"),
-                UnOp::Not => {
+            match (kind, op) {
+                (TyKind::Int, UnOp::Neg) => { out.push_str("    negq %rax\n"); Ok(TyKind::Int) }
+                (TyKind::Int, UnOp::Not) => {
                     out.push_str("    testq %rax, %rax\n");
                     out.push_str("    sete %al\n");
                     out.push_str("    movzbl %al, %eax\n");
+                    Ok(TyKind::Int)
                 }
+                // P13.3: f32/f64 unary negate via `0 - x`. Loads 0.0 into xmm1
+                // (sub-from), subtracts xmm0, copies result back. Uses only
+                // existing encoder ops (movss/subss/{movsd/subsd}).
+                (TyKind::F32, UnOp::Neg) => {
+                    let zero = locals.intern_f32(0.0);
+                    out.push_str(&format!("    movss {}(%rip), %xmm1\n", zero));
+                    out.push_str("    subss %xmm0, %xmm1\n");
+                    out.push_str("    movss %xmm1, %xmm0\n");
+                    Ok(TyKind::F32)
+                }
+                (TyKind::F64, UnOp::Neg) => {
+                    let zero = locals.intern_f64(0.0);
+                    out.push_str(&format!("    movsd {}(%rip), %xmm1\n", zero));
+                    out.push_str("    subsd %xmm0, %xmm1\n");
+                    out.push_str("    movsd %xmm1, %xmm0\n");
+                    Ok(TyKind::F64)
+                }
+                _ => Err(AsmError::UnsupportedExpr("unary op on this type")),
             }
+        }
+        // P12.5: `*expr` — load through a reference. The inner expression
+        // should evaluate to an address in rax; we follow it.
+        Expr::Deref(inner) => {
+            let _ = emit_expr_value(inner, out, data, locals)?;
+            out.push_str("    movq (%rax), %rax\n");
             Ok(TyKind::Int)
         }
         Expr::Ref { expr, .. } => {

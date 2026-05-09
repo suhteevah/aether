@@ -1,0 +1,11 @@
+// expect: exit=42
+// roadmap: P11.5
+// At --check the lifetimes driver runs a borrow check over the synthetic
+// MIR borrow CFG and reports `0 violation(s)` for clean code. The witness
+// also runs end-to-end (exits 42) to keep the audit happy.
+fn main() -> i32 {
+    let x: i64 = 42;
+    let r: i64 = &x;
+    let v: i64 = *r;
+    v as i32
+}

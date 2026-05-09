@@ -1,0 +1,10 @@
+// expect: exit=42
+// roadmap: P14.1
+// Sentinel for the new bench harnesses (bench/optfx, bench/conv2d,
+// bench/attention). The actual measurements live in the .ps1 scripts;
+// this witness keeps the audit aware that the harness directory exists
+// and the build still produces a runnable binary at --O1.
+fn main() -> i32 {
+    let n: i64 = 6 * 7;   // constfolded by --O1 (P11.1)
+    n as i32
+}

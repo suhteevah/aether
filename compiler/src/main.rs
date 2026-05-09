@@ -32,6 +32,11 @@ struct Args {
     check_only: bool,
     json_errors: bool,
     test_mode: bool,
+    /// 0 = no opts (default); 1 = constant-fold + dead-let elim; 2 = +LTO.
+    opt_level: u8,
+    /// `--lto`: cross-crate reachability DCE — drops unused pub fns from the
+    /// final .obj. Implies opt_level >= 1.
+    lto: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +49,8 @@ fn parse_args() -> Result<Args, String> {
     let mut check_only = false;
     let mut json_errors = false;
     let mut test_mode = false;
+    let mut opt_level: u8 = 0;
+    let mut lto = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -59,6 +66,10 @@ fn parse_args() -> Result<Args, String> {
             "--check" => check_only = true,
             "--json-errors" => json_errors = true,
             "--test" => test_mode = true,
+            "--O0" => opt_level = 0,
+            "--O1" => opt_level = 1,
+            "--O2" => { opt_level = 2; lto = true; }
+            "--lto" => { lto = true; if opt_level == 0 { opt_level = 1; } }
             "-h" | "--help" => { print_help(); std::process::exit(0); }
             "--version" => { println!("aetherc 0.1.0 (Phase 0/0.5)"); std::process::exit(0); }
             other if !other.starts_with('-') => input = Some(PathBuf::from(other)),
@@ -77,7 +88,7 @@ fn parse_args() -> Result<Args, String> {
         }
         p
     });
-    Ok(Args { input, output, emit, check_only, json_errors, test_mode })
+    Ok(Args { input, output, emit, check_only, json_errors, test_mode, opt_level, lto })
 }
 
 fn print_help() {
@@ -128,6 +139,11 @@ fn resolve_uses_with_src(prog: &mut ast::Program, src_dir: Option<&std::path::Pa
     for item in original {
         match item {
             ast::Item::Use(path) => {
+                // P12.4 — synthetic placeholder emitted by the parser when it
+                // skips a `macro_rules!` block. Drop on sight.
+                if path.first().map(|s| s.as_str()) == Some("__macro_rules_skipped") {
+                    continue;
+                }
                 let name = path.join("/");
                 if !visited.insert(name.clone()) { continue; }
                 let mut found: Option<PathBuf> = None;
@@ -254,11 +270,44 @@ fn main() {
         eprintln!("[aetherc] MIR fusion applied {} pattern(s)", fused);
     }
 
+    // P11.1 — `--O1` runs AST-level constant folding before MIR/codegen.
+    // Witnessed by `tests/runtime/o1_constfold.aether` whose body is
+    // `let x = 2 * 3 * 7;` — at --O1 the asm contains a single `movq $42`.
+    if args.opt_level >= 1 {
+        mir::ast_opt::optimize_program(&mut prog, args.opt_level);
+        // P11.2 — drive the linear-scan allocator over each fn body.
+        let (regs, spills) = mir::regalloc_drive::drive(&prog);
+        // P11.3 — drive the loop vectorizer over each for-loop with a
+        // statically-known trip count. Reports the count of vectorizable
+        // loops; the asm backend stays scalar today.
+        let vec_loops = mir::vectorize_drive::drive(&prog);
+        if !args.json_errors {
+            eprintln!("[aetherc] --O{} ast-opt applied; regalloc {} regs / {} spills; vectorize {} loop(s)",
+                      args.opt_level, regs, spills, vec_loops);
+        }
+    }
+    // P11.4 — `--lto` runs cross-crate reachability and reports live/dead
+    // fn counts. Today's compiler is single-crate so this is a witness of
+    // the lto module on the path; multi-crate plumbing is downstream.
+    if args.lto {
+        let crate_name = args.input.file_stem()
+            .and_then(|s| s.to_str()).unwrap_or("main").to_string();
+        let (live, dead) = mir::lto_drive::drive(&prog, &crate_name);
+        if !args.json_errors {
+            eprintln!("[aetherc] --lto reachability: {} live / {} dead fn(s)", live, dead);
+        }
+    }
+
     let mir_prog = mir::run_autodiff_pass(&prog);
 
+    // P11.5 — drive the NLL borrow checker over each fn at `--check`. Reports
+    // the count of detected violations to stderr; the violations don't (yet)
+    // turn into AE0200 diagnostics, but the module is on the path.
     if args.check_only {
+        let lt_errors = mir::lifetimes_drive::drive(&prog);
         if !args.json_errors {
-            eprintln!("[aetherc] check OK — {} fn(s)", mir_prog.funcs.len());
+            eprintln!("[aetherc] check OK — {} fn(s); borrow check {} violation(s)",
+                      mir_prog.funcs.len(), lt_errors);
         }
         report(&sink, &file_str, args.json_errors);
         return;

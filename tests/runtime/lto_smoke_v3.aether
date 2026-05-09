@@ -1,0 +1,14 @@
+// expect: exit=42
+// roadmap: P11.4
+// Two unused fns (never called) are dead at LTO; main is reachable. The
+// stderr `--lto reachability: N live / M dead` line proves the module is
+// on the compile path.
+fn dead_one() -> i64 { 1 }
+fn dead_two() -> i64 { 2 }
+
+fn live_helper() -> i64 { 42 }
+
+fn main() -> i32 {
+    let r: i64 = live_helper();
+    r as i32
+}

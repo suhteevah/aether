@@ -1,0 +1,29 @@
+// expect: exit=42
+// roadmap: P12.1
+// `trait Animal { fn sound() -> i64; }` — two impls, dispatch picks the
+// right body. Today this is monomorphic static dispatch (no `dyn Trait`
+// vtables); the trait declaration drives signature checking.
+trait Animal {
+    fn sound() -> i64 { 0 }
+}
+
+struct Dog {
+    age: i64,
+}
+struct Cat {
+    name: i64,
+}
+
+impl Animal for Dog {
+    fn sound() -> i64 { 18 }
+}
+
+impl Animal for Cat {
+    fn sound() -> i64 { 24 }
+}
+
+fn main() -> i32 {
+    let d: i64 = Dog__sound();
+    let c: i64 = Cat__sound();
+    (d + c) as i32   // 42
+}

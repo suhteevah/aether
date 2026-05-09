@@ -1,0 +1,8 @@
+// expect: exit=43
+// roadmap: P13.2
+// Store negative i32, reload, add 50 → 43.
+fn main() -> i32 {
+    let x: i32 = -7;
+    let y: i32 = x + 50;
+    y
+}

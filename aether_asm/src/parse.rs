@@ -639,6 +639,10 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "jg"         => Instr::JccRel32 { cc: CondCode::G,  sym: rest.to_string() },
         "jle"        => Instr::JccRel32 { cc: CondCode::Le, sym: rest.to_string() },
         "jge"        => Instr::JccRel32 { cc: CondCode::Ge, sym: rest.to_string() },
+        "jbe"        => Instr::JccRel32 { cc: CondCode::Be, sym: rest.to_string() },
+        "ja"         => Instr::JccRel32 { cc: CondCode::A,  sym: rest.to_string() },
+        "jb"         => Instr::JccRel32 { cc: CondCode::B,  sym: rest.to_string() },
+        "jae"        => Instr::JccRel32 { cc: CondCode::Ae, sym: rest.to_string() },
         "jmp"        => Instr::JmpRel32 { sym: rest.to_string() },
         // Some forms emitted by aetherc — fold into known mnems.
         "movl"  if rest.starts_with('$') => {

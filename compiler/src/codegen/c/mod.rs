@@ -186,5 +186,6 @@ fn emit_expr(e: &Expr) -> String {
         Expr::Tuple(_) => "/* tuple unimplemented in c-fallback */ 0".into(),
         Expr::Closure { .. } => "/* closure unimplemented in c-fallback */ 0".into(),
         Expr::Try(inner) => format!("/* try */ {}", emit_expr(inner)),
+        Expr::Deref(inner) => format!("*({})", emit_expr(inner)),
     }
 }

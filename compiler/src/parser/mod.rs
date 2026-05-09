@@ -69,6 +69,34 @@ impl Parser {
             true
         } else { false };
 
+        // P12.3 — `async fn …` parses; today the body runs synchronously
+        // (state-machine lowering is a deeper rewrite). The marker is
+        // consumed so the rest of the parser sees a normal fn decl.
+        if matches!(self.peek(0), Tok::Async) { self.bump(); }
+
+        // P12.4 — `macro_rules! name { … }` item. We parse the shape (name
+        // + balanced braces) and silently drop it. Call-site expansion is
+        // handled in `parse_postfix` by treating `name!(...)` as `name(...)`.
+        if matches!(self.peek(0), Tok::Ident(s) if s == "macro_rules")
+            && matches!(self.peek(1), Tok::Bang)
+        {
+            self.bump(); // macro_rules
+            self.bump(); // !
+            let _name = self.expect_ident()?;
+            self.expect(Tok::LBrace)?;
+            let mut depth = 1u32;
+            while depth > 0 {
+                match self.peek(0).clone() {
+                    Tok::LBrace => { depth += 1; self.bump(); }
+                    Tok::RBrace => { depth -= 1; self.bump(); }
+                    Tok::Eof => return Err("unterminated macro_rules! body".into()),
+                    _ => { self.bump(); }
+                }
+            }
+            // Synthesize a no-op item the rest of the pipeline ignores.
+            return Ok(Item::Use(vec!["__macro_rules_skipped".to_string()]));
+        }
+
         match self.peek(0) {
             Tok::Module => {
                 self.bump();
@@ -85,6 +113,7 @@ impl Parser {
             Tok::Const => self.parse_const_item(false),
             Tok::Struct => self.parse_struct_item(false),
             Tok::Impl => self.parse_impl_item(),
+            Tok::Trait => self.parse_trait_item(),
             Tok::Enum => self.parse_enum_item(),
             Tok::Pub if matches!(self.peek(1), Tok::Const) => {
                 self.bump(); self.parse_const_item(true)
@@ -127,8 +156,13 @@ impl Parser {
         if matches!(self.peek(0), Tok::Lt) {
             self.bump();
             while !matches!(self.peek(0), Tok::Gt) {
-                let p = self.expect_ident()?;
-                const_params.push(p);
+                // P12.2 — accept lifetime params (`<'a, T>`); we don't record
+                // them in the AST yet, just consume to keep parsing intact.
+                if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
+                else {
+                    let p = self.expect_ident()?;
+                    const_params.push(p);
+                }
                 if matches!(self.peek(0), Tok::Comma) { self.bump(); }
             }
             self.expect(Tok::Gt)?;
@@ -192,7 +226,13 @@ impl Parser {
 
     fn parse_impl_item(&mut self) -> PResult<Item> {
         self.expect(Tok::Impl)?;
-        let type_name = self.expect_ident()?;
+        let first = self.expect_ident()?;
+        // `impl Foo for Bar { ... }` → ImplTrait. `impl Bar { ... }` → Impl.
+        let (trait_name, type_name) = if matches!(self.peek(0), Tok::For) {
+            self.bump();
+            let bar = self.expect_ident()?;
+            (Some(first), bar)
+        } else { (None, first) };
         self.expect(Tok::LBrace)?;
         let mut methods = Vec::new();
         while !matches!(self.peek(0), Tok::RBrace) {
@@ -202,7 +242,28 @@ impl Parser {
             methods.push(m);
         }
         self.expect(Tok::RBrace)?;
-        Ok(Item::Impl { type_name, methods })
+        if let Some(tr) = trait_name {
+            Ok(Item::ImplTrait { trait_name: tr, type_name, methods })
+        } else {
+            Ok(Item::Impl { type_name, methods })
+        }
+    }
+
+    /// `trait Foo { fn bar(&self) -> i32; fn baz() -> i64 { 0 } }`.
+    /// Method bodies are optional (signature-only is fine).
+    fn parse_trait_item(&mut self) -> PResult<Item> {
+        self.expect(Tok::Trait)?;
+        let name = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut methods = Vec::new();
+        while !matches!(self.peek(0), Tok::RBrace) {
+            let attrs = self.parse_attrs()?;
+            let is_pub = if matches!(self.peek(0), Tok::Pub) { self.bump(); true } else { false };
+            let m = self.parse_fn_decl(attrs, is_pub, false, Some(&name))?;
+            methods.push(m);
+        }
+        self.expect(Tok::RBrace)?;
+        Ok(Item::Trait { name, methods })
     }
 
     fn parse_match_pat(&mut self) -> PResult<MatchPat> {
@@ -342,6 +403,11 @@ impl Parser {
     fn parse_ty(&mut self) -> PResult<Ty> {
         if matches!(self.peek(0), Tok::Amp) {
             self.bump();
+            // P12.2 — accept (and silently elide) explicit lifetime annotations:
+            // `&'a T` / `&'a mut T`. Today's borrow checker (mir::lifetimes)
+            // works on inferred regions; the lifetime name is recorded only in
+            // diagnostics, not in the Ty AST.
+            if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
             let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
             return Ok(Ty::Ref { mutable, inner: Box::new(self.parse_ty()?) });
         }
@@ -664,6 +730,8 @@ impl Parser {
         match self.peek(0) {
             Tok::Minus => { self.bump(); Ok(Expr::Unary { op: UnOp::Neg, expr: Box::new(self.parse_unary()?) }) }
             Tok::Bang => { self.bump(); Ok(Expr::Unary { op: UnOp::Not, expr: Box::new(self.parse_unary()?) }) }
+            // `*expr` deref (P12.5).
+            Tok::Star => { self.bump(); Ok(Expr::Deref(Box::new(self.parse_unary()?))) }
             Tok::Amp => {
                 self.bump();
                 let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
@@ -695,6 +763,19 @@ impl Parser {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut e = self.parse_atom()?;
         loop {
+            // P12.4 — `name!(...)` macro invocation. Today's expansion is a
+            // pass-through to a fn call: `name!(args)` desugars to `name(args)`.
+            // The macro_rules! item itself is skipped at item-parse time. Real
+            // hygienic expansion is downstream.
+            if matches!(self.peek(0), Tok::Bang) && matches!(self.peek(1), Tok::LParen) {
+                if let Expr::Ident(_) = &e {
+                    self.bump(); // !
+                    self.bump(); // (
+                    let args = self.parse_call_args()?;
+                    e = Expr::Call { callee: Box::new(e), args };
+                    continue;
+                }
+            }
             match self.peek(0) {
                 Tok::LParen => {
                     self.bump();
@@ -703,6 +784,13 @@ impl Parser {
                 }
                 Tok::Dot => {
                     self.bump();
+                    // P12.3 — `.await` postfix. Today's lowering is a
+                    // pass-through (the value is the future itself); a real
+                    // executor + state-machine transform is the deeper rewrite.
+                    if matches!(self.peek(0), Tok::Await) {
+                        self.bump();
+                        continue;
+                    }
                     // Tuple field syntax: `.0`, `.1`, etc. Numeric index is
                     // converted to the synthetic `<base>.<n>` slot key by the
                     // asm backend.

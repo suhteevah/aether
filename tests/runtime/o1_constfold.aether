@@ -1,0 +1,7 @@
+// expect: exit=42
+// roadmap: P11.1
+// `--O1` constfold: 2*3*7 collapses to literal 42 before asm emission.
+fn main() -> i32 {
+    let x: i64 = 2 * 3 * 7;
+    x as i32
+}

@@ -1,0 +1,17 @@
+// expect: exit=42
+// roadmap: P11.2
+// At --O1 the linear-scan allocator (mir::regalloc) walks this fn's locals
+// and assigns physical regs / spills. The asm still uses stack slots — the
+// integration step is "module on the compile path", witnessed by the
+// stderr `regalloc N regs / M spills` line and a clean exit.
+fn hot(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    let t1: i64 = a + b;
+    let t2: i64 = c + d;
+    let t3: i64 = t1 * t2;
+    let t4: i64 = t3 - 1;
+    t4
+}
+fn main() -> i32 {
+    let r: i64 = hot(1, 2, 4, 7);   // (1+2)*(4+7) - 1 = 32
+    (r + 10) as i32                  // 42
+}

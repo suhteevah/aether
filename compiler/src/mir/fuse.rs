@@ -38,7 +38,7 @@ pub fn run(prog: &mut Program) -> usize {
         // Methods inside `impl` blocks are flattened to `Item::Fn` AFTER this
         // pass by the asm backend (try_emit time), so we'd miss them here.
         // Walk them too.
-        if let Item::Impl { methods, .. } = item {
+        if let Item::Impl { methods, .. } | Item::ImplTrait { methods, .. } = item {
             for m in methods.iter_mut() {
                 if let Some(b) = m.body.as_mut() {
                     total += fuse_block(b);

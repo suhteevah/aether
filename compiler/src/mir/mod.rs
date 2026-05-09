@@ -28,6 +28,11 @@ pub mod lto;
 pub mod traits;
 pub mod lifetimes;
 pub mod async_exec;
+pub mod ast_opt;
+pub mod regalloc_drive;
+pub mod vectorize_drive;
+pub mod lto_drive;
+pub mod lifetimes_drive;
 pub mod macros;
 pub mod test_harness;
 
@@ -228,6 +233,7 @@ fn render_expr(e: &Expr) -> String {
             format!("|{}| {}", plist.join(", "), render_expr(body))
         }
         Expr::Try(inner) => format!("{}?", render_expr(inner)),
+        Expr::Deref(inner) => format!("*{}", render_expr(inner)),
     }
 }
 

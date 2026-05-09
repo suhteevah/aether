@@ -28,6 +28,10 @@ pub enum Tok {
     Const,
     Struct,
     Impl,
+    Trait,
+    Async,
+    Await,
+    MacroRules,
     Enum,
     Match,
     SelfLower,
@@ -79,6 +83,8 @@ pub enum Tok {
     IntLit(i64),
     FloatLit(f64),
     StrLit(String),
+    /// `'a`, `'static`, etc. Carries the lifetime name without the leading `'`.
+    Lifetime(String),
 
     Eof,
 }
@@ -214,6 +220,9 @@ impl<'a> Lexer<'a> {
                 "const" => Tok::Const,
                 "struct" => Tok::Struct,
                 "impl" => Tok::Impl,
+                "trait" => Tok::Trait,
+                "async" => Tok::Async,
+                "await" => Tok::Await,
                 "enum" => Tok::Enum,
                 "match" => Tok::Match,
                 "as" => Tok::As,
@@ -269,6 +278,19 @@ impl<'a> Lexer<'a> {
             } else {
                 Tok::IntLit(raw.parse().map_err(|e| format!("bad int: {e}"))?)
             });
+        }
+
+        // Lifetime / label: `'a`, `'_lt`. Lexer-side we just emit a Lifetime
+        // token; the parser silently consumes them after `&` or `&mut` in
+        // type positions (P12.2).
+        if b == b'\'' && self.peek(1).map_or(false, |c| c.is_ascii_alphabetic() || c == b'_') {
+            self.bump(); // '
+            let start = self.pos;
+            while let Some(c) = self.peek(0) {
+                if c.is_ascii_alphanumeric() || c == b'_' { self.bump(); } else { break; }
+            }
+            let s = std::str::from_utf8(&self.src[start..self.pos]).unwrap().to_string();
+            return Ok(Tok::Lifetime(s));
         }
 
         // String literal

@@ -1,0 +1,13 @@
+// expect: exit=42
+// roadmap: P11.3
+// At --O1 the vectorize driver inspects this 8-iter for-loop and the
+// stderr reports a vectorizable loop count >= 1. Asm stays scalar.
+fn main() -> i32 {
+    let mut s: i64 = 0;
+    for i in 0..8 {
+        s = s + i;
+    }
+    // 0+1+2+3+4+5+6+7 = 28; +14 = 42
+    let r: i64 = s + 14;
+    r as i32
+}

@@ -1,0 +1,18 @@
+// expect: exit=120
+// roadmap: P13.6
+// Sum 0..16 in a stack-allocated array.
+fn main() -> i32 {
+    let buf: [i64; 16];
+    let mut i: i64 = 0;
+    while i < 16 {
+        buf[i] = i;
+        i = i + 1;
+    }
+    let mut s: i64 = 0;
+    let mut j: i64 = 0;
+    while j < 16 {
+        s = s + buf[j];
+        j = j + 1;
+    }
+    s as i32
+}

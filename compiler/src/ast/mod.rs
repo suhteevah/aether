@@ -18,6 +18,15 @@ pub enum Item {
     /// then desugars to `Foo__bar(obj, x)` when `obj` is of struct
     /// type `Foo`.
     Impl { type_name: String, methods: Vec<FnDecl> },
+    /// `trait Foo { fn bar(&self) -> i32; }` — declares a trait with a list
+    /// of method signatures. Today only used by `mir::traits::Resolver` for
+    /// completeness checks; static dispatch still goes through `Item::Impl`'s
+    /// per-type method tables.
+    Trait { name: String, methods: Vec<FnDecl> },
+    /// `impl Foo for Bar { fn bar(&self) -> i32 { ... } }`. Lowered to the
+    /// same `<Bar>__bar` mangling as inherent `impl`. The `trait_name` is
+    /// recorded so the trait resolver can verify completeness.
+    ImplTrait { trait_name: String, type_name: String, methods: Vec<FnDecl> },
     /// `enum Color { Red, Green, Blue }` — discriminant tags. Each variant
     /// gets a sequential i32 tag (Red=0, Green=1, ...). For variants with
     /// a payload (`Box::Full(i64)`), `payloads[i]` is `Some(Ty)`. Enums
@@ -175,6 +184,9 @@ pub enum Expr {
     Range { lo: Box<Expr>, hi: Box<Expr>, step: Option<Box<Expr>> },
     Path(Vec<String>),
     Ref { mutable: bool, expr: Box<Expr> },
+    /// `*expr` — load through a reference. Codegen evaluates `expr` to rax
+    /// (which holds the address) then issues `movq (%rax), %rax`.
+    Deref(Box<Expr>),
     /// `warp { ... }` and `block { ... }` — GPU-shaped lexical scopes.
     Region { kind: RegionKind, body: Block },
     /// Struct literal: `Foo { a: 1, b: 2.0 }`. The parser disambiguates

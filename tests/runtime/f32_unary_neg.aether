@@ -1,0 +1,8 @@
+// expect: exit=42
+// roadmap: P13.3
+// f32 unary negate: -(-42.0) → 42.0 → cast to i32.
+fn main() -> i32 {
+    let x: f32 = -42.0;
+    let y: f32 = -x;
+    y as i32
+}

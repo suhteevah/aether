@@ -1,0 +1,8 @@
+// expect: exit=42
+// roadmap: P14.2
+// Sentinel for the coverage matrix snapshot at docs/COVERAGE_MATRIX.md.
+// The matrix itself is documentation; this witness proves the audit
+// records the snapshot and the build still produces a runnable binary.
+fn main() -> i32 {
+    42
+}
