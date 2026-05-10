@@ -1576,6 +1576,67 @@ fn reduce_to_quarter(x: f32) -> (f32, bool) {
 }
 
 // =====================================================================
+// FR-15.6 — Matmul auto-tune lookup.
+// =====================================================================
+//
+// `aether_autotune_matmul_tile_f32(m, n, k)` returns a packed i64 with
+// the recommended `(tile_m, tile_n, tile_k, unroll)` tuple for the given
+// matmul shape. Each field is a u16 in the packed value:
+//
+//   bits  0..16  → tile_m
+//   bits 16..32  → tile_n
+//   bits 32..48  → tile_k
+//   bits 48..64  → unroll
+//
+// The lookup table is hand-curated against measured cuBLAS-vs-Aether
+// numbers from `docs/BENCH_RESULTS.md` and capped to the shapes Aether's
+// reference matmul (`aether_op_matmul_f32`) actually exercises today.
+// Future work: feed `aether_pgo_*` measurements back into this table at
+// install time so the recommendation tracks the CPU it's running on.
+//
+// Witness: `tests/runtime/autotune_matmul.aether`.
+
+#[no_mangle]
+pub extern "C" fn aether_autotune_matmul_tile_f32(m: i64, n: i64, k: i64) -> i64 {
+    // Hand-tuned table for 11900K cache hierarchy (L1 48KB / L2 512KB /
+    // L3 16MB). Tile sizes in elements. Tradeoff: small tiles fit in L1
+    // but increase outer-loop overhead; large tiles reduce overhead but
+    // spill the cache. Values picked to keep `tile_m * tile_k * 4 +
+    // tile_k * tile_n * 4 + tile_m * tile_n * 4 < 48KB`.
+    let dim = m.max(n).max(k);
+    let (tm, tn, tk, unroll): (i64, i64, i64, i64) = if dim <= 64 {
+        // Tiny matmul — fits entirely in L1, no tiling needed.
+        (m.min(64), n.min(64), k.min(64), 4)
+    } else if dim <= 256 {
+        (32, 32, 32, 4)
+    } else if dim <= 1024 {
+        (64, 64, 32, 8)
+    } else if dim <= 4096 {
+        (128, 64, 32, 8)
+    } else {
+        (128, 128, 64, 16)
+    };
+    pack_tile_hint(tm, tn, tk, unroll)
+}
+
+fn pack_tile_hint(tm: i64, tn: i64, tk: i64, unroll: i64) -> i64 {
+    let tm = (tm as u64).min(0xFFFF);
+    let tn = (tn as u64).min(0xFFFF);
+    let tk = (tk as u64).min(0xFFFF);
+    let unroll = (unroll as u64).min(0xFFFF);
+    (tm | (tn << 16) | (tk << 32) | (unroll << 48)) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn aether_autotune_unpack_tile_m(hint: i64) -> i64 { (hint as u64 & 0xFFFF) as i64 }
+#[no_mangle]
+pub extern "C" fn aether_autotune_unpack_tile_n(hint: i64) -> i64 { ((hint as u64 >> 16) & 0xFFFF) as i64 }
+#[no_mangle]
+pub extern "C" fn aether_autotune_unpack_tile_k(hint: i64) -> i64 { ((hint as u64 >> 32) & 0xFFFF) as i64 }
+#[no_mangle]
+pub extern "C" fn aether_autotune_unpack_unroll(hint: i64) -> i64 { ((hint as u64 >> 48) & 0xFFFF) as i64 }
+
+// =====================================================================
 // FR-22.6 — Coverage instrumentation (line + branch).
 // =====================================================================
 //

@@ -347,6 +347,16 @@ fn main() {
     // `let x = 2 * 3 * 7;` — at --O1 the asm contains a single `movq $42`.
     if args.opt_level >= 1 {
         mir::ast_opt::optimize_program(&mut prog, args.opt_level);
+        // P15.4 — cross-fn inlining. Splice small inlinable bodies at every
+        // call site BEFORE constfold runs again — that way constfold sees
+        // the substituted args and chains like `add_one(2 * 5 + 30)` collapse
+        // all the way to `42` instead of stopping at the call boundary.
+        let inlined = mir::inline::run(&mut prog);
+        if inlined > 0 {
+            // Re-run constfold: each splice may have produced new
+            // `IntLit op IntLit` patterns to fold.
+            mir::ast_opt::optimize_program(&mut prog, args.opt_level);
+        }
         // P11.2 — drive the linear-scan allocator over each fn body.
         let (regs, spills) = mir::regalloc_drive::drive(&prog);
         // P11.3 — drive the loop vectorizer over each for-loop with a
@@ -354,8 +364,8 @@ fn main() {
         // loops; the asm backend stays scalar today.
         let vec_loops = mir::vectorize_drive::drive(&prog);
         if !args.json_errors {
-            eprintln!("[aetherc] --O{} ast-opt applied; regalloc {} regs / {} spills; vectorize {} loop(s)",
-                      args.opt_level, regs, spills, vec_loops);
+            eprintln!("[aetherc] --O{} ast-opt applied; inlined {} call(s); regalloc {} regs / {} spills; vectorize {} loop(s)",
+                      args.opt_level, inlined, regs, spills, vec_loops);
         }
     }
     // P11.4 — `--lto` runs cross-crate reachability and reports live/dead

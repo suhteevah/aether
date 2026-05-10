@@ -29,6 +29,7 @@ pub mod traits;
 pub mod lifetimes;
 pub mod async_exec;
 pub mod ast_opt;
+pub mod inline;
 pub mod regalloc_drive;
 pub mod vectorize_drive;
 pub mod lto_drive;

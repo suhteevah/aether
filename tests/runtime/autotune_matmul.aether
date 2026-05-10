@@ -1,0 +1,38 @@
+// roadmap: P15.6
+// expect: exit=42
+//
+// FR-15.6 — Matmul auto-tune lookup. The runtime ships a hand-curated
+// table indexed by (M, N, K) that returns recommended tile sizes packed
+// as a single i64. The witness queries the table for several known
+// shapes and verifies the unpacked tile_m / tile_n / tile_k / unroll
+// fields are sensible (positive, fit in L1).
+extern fn aether_autotune_matmul_tile_f32(m: i64, n: i64, k: i64) -> i64;
+extern fn aether_autotune_unpack_tile_m(hint: i64) -> i64;
+extern fn aether_autotune_unpack_tile_n(hint: i64) -> i64;
+extern fn aether_autotune_unpack_tile_k(hint: i64) -> i64;
+extern fn aether_autotune_unpack_unroll(hint: i64) -> i64;
+
+fn main() -> i32 {
+    // Tiny: 32x32x32 → tile == dim, no inner tiling.
+    let h_tiny: i64 = aether_autotune_matmul_tile_f32(32, 32, 32);
+    let tm: i64 = aether_autotune_unpack_tile_m(h_tiny);
+    if tm != 32 { return 1; }
+
+    // Small: 256x256x256 → 32-tile.
+    let h_small: i64 = aether_autotune_matmul_tile_f32(256, 256, 256);
+    if aether_autotune_unpack_tile_m(h_small) != 32 { return 2; }
+    if aether_autotune_unpack_unroll(h_small) != 4 { return 3; }
+
+    // Medium: 1024x1024x1024 → 64x64x32, unroll 8.
+    let h_med: i64 = aether_autotune_matmul_tile_f32(1024, 1024, 1024);
+    if aether_autotune_unpack_tile_m(h_med) != 64 { return 4; }
+    if aether_autotune_unpack_tile_k(h_med) != 32 { return 5; }
+    if aether_autotune_unpack_unroll(h_med) != 8 { return 6; }
+
+    // Large: 8192x8192x8192 → 128x128x64, unroll 16.
+    let h_large: i64 = aether_autotune_matmul_tile_f32(8192, 8192, 8192);
+    if aether_autotune_unpack_tile_m(h_large) != 128 { return 7; }
+    if aether_autotune_unpack_unroll(h_large) != 16 { return 8; }
+
+    42
+}

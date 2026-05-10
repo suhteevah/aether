@@ -1,0 +1,20 @@
+// roadmap: P15.4
+// expect: exit=42
+//
+// FR-15.4 — Cross-fn inlining. The inliner detects `add_one` as a
+// tail-only fn ≤ 5 stmts, no recursion, no Return, and splices its body
+// in place at every call site. After splicing, constfold runs again and
+// `add_one(41)` folds end-to-end to `42` — at --O1 the asm contains
+// zero `callq aether_add_one` lines and a single `movq $42` immediate.
+//
+// The companion witness `inline_smoke_no_o1.aether` (NOT yet committed)
+// would emit the call to confirm --O0 is unchanged.
+fn add_one(x: i64) -> i64 { x + 1 }
+fn double(x: i64) -> i64 { x * 2 }
+
+fn main() -> i32 {
+    // double(20) → 40 (inlined + folded), then add_one(40 + 1) → 42.
+    let a: i64 = double(20);
+    let b: i64 = add_one(a + 1);
+    b as i32
+}
