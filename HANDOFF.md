@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-09 (v4 second-pass — honest 123/196, +16 items closed with real impl)
+2026-05-09 (v4 second-pass + NEXT-UP critical-path reorg)
 
 ## Project Status
 🟡 **Audit: 123/196 (63%) roadmap items witnessed.** Phases 6-14 stay 100%.
@@ -35,6 +35,33 @@ TOTAL:   123/196            (63%)
 Workspace tests: 103/0 pass. Honesty scan: 0 todo / 0 unimplemented / 0
 ignored stubs / 4 carry-over `_force_use`-class stub_returns. The remaining
 73 v4 items live in `NEXT-UP.md`.
+
+## NEXT-UP critical-path reorg (commit 5e5ab0b)
+
+73 v4 FRs reorganised from flat phase-order catalog to navigable
+strategy-doc:
+
+- **§0 v4 SHIP milestone** — defines the smaller-than-196 line: Aether
+  trains Llama-1B + serves OpenAI-compat at ≥100 tok/s + matmul ≤5%
+  cuBLAS gap at --O2. ~30 FRs needed to hit that.
+- **§1 Six parallel critical paths** — A perf, B stdlib heap, C tensor,
+  D serving, E self-host, F tooling. Each FR in dependency order with
+  effort tag, what-it-unlocks, and the gate witness.
+  - Path B (closures + heap stdlib) is the most-leveraged: unlocks C5,
+    D2, D5, F1.
+  - Path D's FR-19.1 TLS 1.3 is XL on its own (~2-3 weeks).
+  - Path E's FR-20.4 self-hosted asm emitter is the biggest single
+    sub-task in self-host.
+- **§2 PARKED (hardware-blocked)** — 6 FRs with the gate documented:
+  FR-18.10 RDMA, FR-18.11 8-GPU, FR-21.4 ROCm, FR-21.5 Metal,
+  FR-21.8 mobile, FR-21.9 RISC-V.
+- **§3 Long tail** — 37 items that turn v4 SHIP into v4 COMPLETE.
+- **§4 Protocol** — picking up work, FR landing, hardware coming
+  online, scope creep, long-tail-to-critical promotion rule.
+- **§5 Calendar** — 6-12 honest weeks if A+B+C+D run in parallel.
+- **§6 Per-FR detail** — short reference indexed by path letter.
+
+Doc-only edit; audit count unchanged at 123/196.
 
 ## v4 Second Pass — Additions (this session)
 
@@ -195,25 +222,34 @@ All carry-overs / known-OK guard rails.
 
 ## What's Next
 
-The 89 FRs in `NEXT-UP.md` are the queue. Suggested first attack order:
+`NEXT-UP.md` is now the queue, organised by critical path (not phase
+number). Read §0+§1 for the v4 SHIP definition + the 6 parallel paths.
 
-1. **FR-15.2** real linear-scan in `emit_expr_value` — biggest bang per buck (.obj shrink + perf lift). Closes one of the major v4 perf claims.
-2. **FR-15.10** the 1%-of-handasm pact — write the reference asm in `bench/handasm/` even before the emitter matches; sets the gate.
-3. **FR-16.4-extra** closures with captures — unblocks Iterator + parallel-for + tokio-style executor.
-4. **FR-16.14** println! / format! interpolation — small parser+codegen lift, huge ergonomics win.
-5. **FR-17.3** conv2d kernels — cheapest path to ResNet/ViT/SD parity.
-6. **FR-19.1** TLS 1.3 stack — gating dependency for the entire serving stack.
+**Recommended attack order** (highest leverage first):
 
-Each FR-N comment block in `NEXT-UP.md` lists a witness criterion. When the
-feature ships, move the witness into `tests/runtime/<name>.aether` with the
-right `// roadmap: P<id>` tag and delete the corresponding FR section.
+1. **Path B** — FR-16.4-extra (closures with captures) → FR-16.5 (heap
+   stdlib) → FR-16.14 (println!/format!). Path B unlocks paths C/D/F.
+2. **Path A** — FR-15.1 SSA emit → FR-15.2 regalloc-in-emit → FR-15.3
+   AVX2 vectorize. Independent of B; can run in parallel.
+3. **Path E** — entirely independent of A-D; pick this up if you want
+   parallel headway on the self-host claim.
+4. **Path C** — gated by Path B's heap stdlib, so wait until B2 lands.
+5. **Path D** — FR-19.1 TLS 1.3 is the long pole; start it early
+   alongside other paths.
+6. **Path F** — entirely independent; pick this up for cheap wins.
+
+When an FR ships: move the witness into `tests/runtime/<name>.aether`
+with the right `// roadmap: P<id>` tag, run `witness-stamper` if it's
+a multi-tag, and delete the FR's bullet from §1/§3 of NEXT-UP.md.
 
 ## Notes for Next Session
 
 - **Honest scope is the rule.** Don't fake exit-42 witnesses for unimplemented features. File as FR-N in NEXT-UP.md instead.
-- **Don't use Python for tooling.** Rust binaries in `tools/` (like `witness-stamper`) or pure Aether are the on-mandate path.
-- **`witness-stamper` is idempotent.** `cargo run -p witness-stamper` won't double-tag; it's safe to re-run after edits.
-- **`--lto` is ON the compile path.** Use it on every fresh witness to keep the .obj small; verifies the LTO drop continues to fire.
+- **Don't use Python for tooling.** Rust binaries in `tools/` (witness-stamper, aetherfmt, aetherclippy, aetherdoc) or pure Aether are the on-mandate path.
+- **`witness-stamper` is idempotent.** `cargo run -p witness-stamper` won't double-tag; safe to re-run after edits.
+- **`--lto` is ON the compile path.** Use on every fresh witness to keep .obj small; verifies LTO drop continues to fire.
+- **NEXT-UP is critical-path-organised, not phase-organised.** When working through it, navigate §1's path letters (A-F), not phase numbers. Multiple paths can run in parallel.
+- **v4 SHIP < v4 COMPLETE.** ~30 FRs ship Aether; the other 43 are long-tail polish. Don't conflate the two when defining "done".
 
 ## Quick Reference
 
