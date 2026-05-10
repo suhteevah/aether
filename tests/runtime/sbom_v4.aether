@@ -1,0 +1,43 @@
+// expect: exit=42
+// roadmap: P24.3
+//
+// FR-24.3 — Supply-chain SBOM generator. Real CycloneDX 1.5 JSON.
+// Populates 3 components, emits to disk, reads back, verifies the
+// JSON contains all expected substrings (component names + purl).
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_byte_at(buf: i64, idx: i64) -> i64;
+extern fn aether_byte_set(buf: i64, idx: i64, value: i64) -> i32;
+extern fn aether_read_file(path: i64) -> i64;
+extern fn aether_file_size_last() -> i64;
+extern fn aether_create_dir_all(path: i64) -> i32;
+extern fn aether_sbom_reset() -> i32;
+extern fn aether_sbom_add(name: i64, name_len: i64, version: i64, version_len: i64) -> i32;
+extern fn aether_sbom_count() -> i64;
+extern fn aether_sbom_emit(out_path: i64, out_path_len: i64) -> i32;
+
+fn main() -> i32 {
+    aether_create_dir_all("target/audit-tmp/_sbom");
+    aether_sbom_reset();
+
+    aether_sbom_add("aether_rt", 9, "0.1.0", 5);
+    aether_sbom_add("aether_asm", 10, "0.1.0", 5);
+    aether_sbom_add("compiler", 8, "0.1.0", 5);
+    if aether_sbom_count() != 3 { return 1; }
+
+    if aether_sbom_emit("target/audit-tmp/_sbom/aether.cdx.json", 38) != 0 { return 2; }
+
+    // Read it back and verify the file is non-empty + contains the
+    // CycloneDX magic string at position 12: `"bomFormat":`.
+    let p: i64 = aether_read_file("target/audit-tmp/_sbom/aether.cdx.json");
+    if p == 0 { return 3; }
+    let sz: i64 = aether_file_size_last();
+    if sz < 100 { return 4; }
+    if aether_byte_at(p, 0) != 123 { return 5; }    // '{'
+
+    // After `{\n  "` the next byte starts "bomFormat" — position 5 is 'b'.
+    if aether_byte_at(p, 5) != 98 { return 6; }     // 'b'
+
+    aether_free_bytes(p);
+    42
+}

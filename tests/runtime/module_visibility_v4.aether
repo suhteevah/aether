@@ -1,0 +1,21 @@
+// roadmap: P16.11
+// expect: exit=42
+//
+// FR-16.11 — module visibility specifiers. The parser accepts the full
+// `pub(crate)` / `pub(super)` / `pub(self)` / `pub(in path::to)` family.
+// Single-crate semantics today treats them all as crate-public; multi-
+// crate enforcement is FR-16.11-extra in NEXT-UP.
+pub fn add_pub(a: i64, b: i64) -> i64 { a + b }
+pub(crate) fn add_pubcrate(a: i64, b: i64) -> i64 { a + b }
+pub(super) fn add_pubsuper(a: i64, b: i64) -> i64 { a + b }
+pub(self) fn add_pubself(a: i64, b: i64) -> i64 { a + b }
+pub(in some::nested::path) fn add_pubpath(a: i64, b: i64) -> i64 { a + b }
+
+fn main() -> i32 {
+    let s1: i64 = add_pub(10, 1);          // 11
+    let s2: i64 = add_pubcrate(s1, 1);     // 12
+    let s3: i64 = add_pubsuper(s2, -1);    // 11
+    let s4: i64 = add_pubself(s3, 5);      // 16
+    let s5: i64 = add_pubpath(s4, 26);     // 42
+    s5 as i32
+}

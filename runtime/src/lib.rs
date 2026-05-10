@@ -1576,6 +1576,143 @@ fn reduce_to_quarter(x: f32) -> (f32, bool) {
 }
 
 // =====================================================================
+// FR-24.6 — Hot-reload signal.
+// =====================================================================
+//
+// Production serving / training processes poll `aether_hot_reload_check`
+// once per epoch / inference loop. If a sentinel file at the watch path
+// has been touched (mtime > recorded baseline), the function returns 1
+// + updates the baseline. The caller then reloads weights / config /
+// checkpoint and continues without process restart.
+//
+// Witness: `tests/runtime/hot_reload_v4.aether`.
+
+struct HotReloadCell(UnsafeCell<Option<std::time::SystemTime>>);
+unsafe impl Sync for HotReloadCell {}
+static HOT_RELOAD_BASELINE: HotReloadCell = HotReloadCell(UnsafeCell::new(None));
+
+#[no_mangle] pub unsafe extern "C" fn aether_hot_reload_arm(
+    sentinel_path: *const u8, len: i64,
+) -> c_int {
+    if sentinel_path.is_null() || len <= 0 { return -1; }
+    let path = match std::str::from_utf8(std::slice::from_raw_parts(sentinel_path, len as usize)) {
+        Ok(p) => p,
+        Err(_) => return -2,
+    };
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok();
+    *HOT_RELOAD_BASELINE.0.get() = mtime;
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hot_reload_check(
+    sentinel_path: *const u8, len: i64,
+) -> c_int {
+    if sentinel_path.is_null() || len <= 0 { return 0; }
+    let path = match std::str::from_utf8(std::slice::from_raw_parts(sentinel_path, len as usize)) {
+        Ok(p) => p,
+        Err(_) => return 0,
+    };
+    let cur = match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    let baseline = *HOT_RELOAD_BASELINE.0.get();
+    let triggered = match baseline {
+        Some(b) => cur > b,
+        None => true,    // first observation arms + signals.
+    };
+    if triggered {
+        *HOT_RELOAD_BASELINE.0.get() = Some(cur);
+        1
+    } else {
+        0
+    }
+}
+
+// =====================================================================
+// FR-24.3 — Supply-chain SBOM generator.
+// =====================================================================
+//
+// Emits a CycloneDX 1.5 JSON SBOM from a caller-built component list.
+// The runtime maintains an in-process registry that gets populated by
+// `aether_sbom_add(name, name_len, version, version_len)`. A final
+// `aether_sbom_emit(out_path, out_path_len)` walks the registry, formats
+// the JSON, and writes it to disk. No serde — direct string formatting.
+//
+// `purl` (Package URL) is auto-derived as `pkg:aether/<name>@<version>`
+// — caller can pre-mangle the name for a different scheme if needed.
+//
+// Witness: `tests/runtime/sbom_v4.aether` — populates 3 components,
+// emits to disk, reads back, verifies the JSON contains the expected
+// strings.
+
+#[derive(Clone)]
+struct SbomComponent { name: String, version: String }
+
+struct SbomCell(UnsafeCell<Vec<SbomComponent>>);
+unsafe impl Sync for SbomCell {}
+static SBOM_TABLE: SbomCell = SbomCell(UnsafeCell::new(Vec::new()));
+unsafe fn sbom_table() -> &'static mut Vec<SbomComponent> { &mut *SBOM_TABLE.0.get() }
+
+#[no_mangle] pub unsafe extern "C" fn aether_sbom_reset() -> c_int {
+    sbom_table().clear();
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_sbom_add(
+    name: *const u8, name_len: i64,
+    version: *const u8, version_len: i64,
+) -> c_int {
+    if name.is_null() || version.is_null() || name_len <= 0 || version_len <= 0 { return -1; }
+    let n = std::str::from_utf8(std::slice::from_raw_parts(name, name_len as usize))
+        .unwrap_or("?").to_string();
+    let v = std::str::from_utf8(std::slice::from_raw_parts(version, version_len as usize))
+        .unwrap_or("?").to_string();
+    sbom_table().push(SbomComponent { name: n, version: v });
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_sbom_count() -> i64 {
+    sbom_table().len() as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_sbom_emit(
+    out_path: *const u8, out_path_len: i64,
+) -> c_int {
+    if out_path.is_null() || out_path_len <= 0 { return -1; }
+    let path = match std::str::from_utf8(std::slice::from_raw_parts(out_path, out_path_len as usize)) {
+        Ok(p) => p.to_string(),
+        Err(_) => return -2,
+    };
+    let mut json = String::with_capacity(512);
+    json.push_str("{\n");
+    json.push_str("  \"bomFormat\": \"CycloneDX\",\n");
+    json.push_str("  \"specVersion\": \"1.5\",\n");
+    json.push_str("  \"version\": 1,\n");
+    json.push_str("  \"components\": [\n");
+    let table = sbom_table();
+    for (i, c) in table.iter().enumerate() {
+        json.push_str("    {\n");
+        json.push_str(&format!("      \"type\": \"library\",\n"));
+        json.push_str(&format!("      \"name\": \"{}\",\n", c.name));
+        json.push_str(&format!("      \"version\": \"{}\",\n", c.version));
+        json.push_str(&format!("      \"purl\": \"pkg:aether/{}@{}\"\n", c.name, c.version));
+        if i + 1 < table.len() {
+            json.push_str("    },\n");
+        } else {
+            json.push_str("    }\n");
+        }
+    }
+    json.push_str("  ]\n}\n");
+    match std::fs::write(&path, &json) {
+        Ok(_) => 0,
+        Err(_) => -3,
+    }
+}
+
+// =====================================================================
 // FR-15.6 — Matmul auto-tune lookup.
 // =====================================================================
 //

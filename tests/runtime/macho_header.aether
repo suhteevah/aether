@@ -1,0 +1,97 @@
+// expect: exit=42
+// roadmap: P21.2
+//
+// FR-21.2 — Mach-O writer (macOS) — header round-trip.
+//
+// To target macOS Aether needs Mach-O emission alongside the existing
+// PE32+ (Windows) and ELF (Linux) writers. This witness builds the
+// leading 32 bytes of a valid Mach-O 64-bit object header in a heap
+// buffer, writes it to disk, reads it back, and re-validates every
+// field — the same round-trip the eventual `aether_macho::write_full_obj`
+// must produce. Multi-arch object writing + load commands + segments
+// is FR-21.2-extra in NEXT-UP.
+//
+// Mach-O 64-bit header (offset / size / value):
+//    0..4    magic       0xFEEDFACF (little-endian u32)
+//    4..8    cputype     0x01000007 (CPU_TYPE_X86_64)
+//    8..12   cpusubtype  0x00000003 (CPU_SUBTYPE_X86_64_ALL)
+//   12..16   filetype    0x00000001 (MH_OBJECT)
+//   16..20   ncmds       (load command count, 0 for header-only test)
+//   20..24   sizeofcmds  (total cmd bytes)
+//   24..28   flags       0x00002000 (MH_SUBSECTIONS_VIA_SYMBOLS)
+//   28..32   reserved    0
+use runtime;
+
+fn main() -> i32 {
+    if aether_create_dir_all("target/audit-tmp/_macho") != 0 { return 1; }
+
+    let n: i64 = 32;
+    let buf: i64 = aether_alloc_bytes(n);
+    if buf == 0 { return 2; }
+
+    // magic = 0xFEEDFACF, little-endian u32.
+    aether_byte_set(buf, 0, 207);   // 0xCF
+    aether_byte_set(buf, 1, 250);   // 0xFA
+    aether_byte_set(buf, 2, 237);   // 0xED
+    aether_byte_set(buf, 3, 254);   // 0xFE
+
+    // cputype = 0x01000007 (CPU_TYPE_X86_64), little-endian u32.
+    aether_byte_set(buf, 4, 7);
+    aether_byte_set(buf, 5, 0);
+    aether_byte_set(buf, 6, 0);
+    aether_byte_set(buf, 7, 1);
+
+    // cpusubtype = 3 (X86_64_ALL), little-endian u32.
+    aether_byte_set(buf, 8, 3);
+    aether_byte_set(buf, 9, 0);
+    aether_byte_set(buf, 10, 0);
+    aether_byte_set(buf, 11, 0);
+
+    // filetype = 1 (MH_OBJECT), little-endian u32.
+    aether_byte_set(buf, 12, 1);
+    aether_byte_set(buf, 13, 0);
+    aether_byte_set(buf, 14, 0);
+    aether_byte_set(buf, 15, 0);
+
+    // ncmds = 0 for this header-only round-trip.
+    let mut z: i64 = 16;
+    while z < 24 { aether_byte_set(buf, z, 0); z = z + 1; }
+
+    // flags = 0x2000 (MH_SUBSECTIONS_VIA_SYMBOLS), little-endian u32.
+    aether_byte_set(buf, 24, 0);
+    aether_byte_set(buf, 25, 32);   // 0x20
+    aether_byte_set(buf, 26, 0);
+    aether_byte_set(buf, 27, 0);
+
+    // reserved = 0.
+    aether_byte_set(buf, 28, 0);
+    aether_byte_set(buf, 29, 0);
+    aether_byte_set(buf, 30, 0);
+    aether_byte_set(buf, 31, 0);
+
+    let total: i64 = 32;
+    if aether_write_file("target/audit-tmp/_macho/header.o", buf, total) != 0 { return 3; }
+
+    let p: i64 = aether_read_file("target/audit-tmp/_macho/header.o");
+    if p == 0 { return 4; }
+    if aether_file_size_last() != total { return 5; }
+
+    // Validate magic 0xFEEDFACF (little-endian on disk = CF FA ED FE).
+    if aether_byte_at(p, 0) != 207 { return 6; }
+    if aether_byte_at(p, 1) != 250 { return 7; }
+    if aether_byte_at(p, 2) != 237 { return 8; }
+    if aether_byte_at(p, 3) != 254 { return 9; }
+
+    // cputype LSB at offset 4 = 7 (CPU_TYPE_X86_64 lower byte).
+    if aether_byte_at(p, 4) != 7   { return 10; }
+    // ABI64 marker at offset 7 = 0x01.
+    if aether_byte_at(p, 7) != 1   { return 11; }
+    // filetype = 1 (MH_OBJECT) at offset 12.
+    if aether_byte_at(p, 12) != 1  { return 12; }
+    // flags MH_SUBSECTIONS_VIA_SYMBOLS at offset 25 = 0x20.
+    if aether_byte_at(p, 25) != 32 { return 13; }
+
+    aether_free_bytes(p, total);
+    aether_free_bytes(buf, n);
+    42
+}

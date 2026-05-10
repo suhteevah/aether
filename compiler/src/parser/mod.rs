@@ -50,6 +50,27 @@ impl Parser {
         }
     }
 
+    /// P16.11 — consume an optional `(crate)` / `(super)` / `(self)` /
+    /// `(in path::to)` visibility specifier sitting after a `pub` token.
+    /// Returns silently with the cursor advanced past the closing `)` when
+    /// one is present; no-op when the next token isn't `(`. Multi-crate
+    /// enforcement is FR-16.11-extra; today's single-crate compiler treats
+    /// every visibility as crate-public.
+    fn eat_visibility_paren(&mut self) {
+        if !matches!(self.peek(0), Tok::LParen) { return; }
+        self.bump(); // (
+        // Burn tokens until balanced ).
+        let mut depth = 1u32;
+        while depth > 0 {
+            match self.bump() {
+                Tok::LParen => depth += 1,
+                Tok::RParen => depth -= 1,
+                Tok::Eof => return,
+                _ => {}
+            }
+        }
+    }
+
     pub fn parse_program(mut self) -> PResult<Program> {
         let mut items = Vec::new();
         while !matches!(self.peek(0), Tok::Eof) {
@@ -123,15 +144,29 @@ impl Parser {
             Tok::Impl => self.parse_impl_item(),
             Tok::Trait => self.parse_trait_item(),
             Tok::Enum => self.parse_enum_item(),
-            Tok::Pub if matches!(self.peek(1), Tok::Const) => {
-                self.bump(); self.parse_const_item(true)
+            Tok::Pub => {
+                self.bump();
+                // P16.11 — accept `pub(crate)` / `pub(super)` / `pub(self)` /
+                // `pub(in path::to)` visibility specifiers. The single-crate
+                // compiler treats them all as public-within-this-crate, which
+                // matches single-crate semantics 1:1. Multi-crate enforcement
+                // is FR-16.11-extra (depends real module system).
+                self.eat_visibility_paren();
+                match self.peek(0) {
+                    Tok::Const => self.parse_const_item(true),
+                    Tok::Struct => self.parse_struct_item(true),
+                    Tok::Fn => {
+                        let f = self.parse_fn_decl(attrs, true, is_extern, None)?;
+                        Ok(Item::Fn(f))
+                    }
+                    other => {
+                        let (l, c) = self.loc();
+                        Err(format!("{}:{}: expected item after `pub`, got {:?}", l, c, other))
+                    }
+                }
             }
-            Tok::Pub if matches!(self.peek(1), Tok::Struct) => {
-                self.bump(); self.parse_struct_item(true)
-            }
-            Tok::Pub | Tok::Fn => {
-                let is_pub = if matches!(self.peek(0), Tok::Pub) { self.bump(); true } else { false };
-                let f = self.parse_fn_decl(attrs, is_pub, is_extern, None)?;
+            Tok::Fn => {
+                let f = self.parse_fn_decl(attrs, false, is_extern, None)?;
                 Ok(Item::Fn(f))
             }
             other => {
