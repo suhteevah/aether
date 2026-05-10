@@ -1,0 +1,25 @@
+// roadmap: P16.25
+// expect: exit=42
+//
+// FR-16.25 — `impl Trait` syntax in argument and return position. The
+// type-checker treats `impl Trait` as a placeholder (Ty::Named
+// "__impl_<trait>") that doesn't enforce trait dispatch yet — that's
+// FR-16.25-extra in NEXT-UP — but the syntax must parse for libraries
+// that hide concrete return types behind a trait bound.
+//
+// `impl Display + Send` accepts the `+` bound separator.
+trait Adder { fn add(self, x: i64) -> i64; }
+
+fn make_adder(base: i64) -> impl Adder + Send {
+    base
+}
+
+fn use_adder(_a: impl Adder, x: i64) -> i64 {
+    x + 7
+}
+
+fn main() -> i32 {
+    let _a: i64 = make_adder(35);
+    let r: i64 = use_adder(0, 35);   // 35 + 7
+    r as i32
+}

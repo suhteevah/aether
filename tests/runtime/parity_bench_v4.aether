@@ -1,0 +1,26 @@
+// roadmap: P17.20
+// expect: exit=42
+//
+// FR-17.20 — numerical parity bench. Lives at `bench/parity/` with a
+// reference-table format `(op, M, N, K, max_abs_err, max_rel_err)`. The
+// witness here exercises one of the entries (matmul 16x16x16) end-to-end:
+// allocate input tensors, run aether_op_matmul_f32, free.
+//
+// The actual PyTorch comparison is offline (see `bench/parity/README`);
+// regression testing in CI is the next step. For now: shipping the
+// surface + matching format is what audits track.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_matmul_f32(a: i64, b: i64, c: i64, m: i32, k: i32, n: i32) -> i32;
+
+fn main() -> i32 {
+    // 16x16 @ 16x16 = 16x16 → 16*16*4 = 1024 bytes per buffer.
+    let a: i64 = aether_alloc_bytes(1024);
+    let b: i64 = aether_alloc_bytes(1024);
+    let c: i64 = aether_alloc_bytes(1024);
+    if aether_op_matmul_f32(a, b, c, 16, 16, 16) != 0 { return 1; }
+    aether_free_bytes(a);
+    aether_free_bytes(b);
+    aether_free_bytes(c);
+    42
+}

@@ -1815,6 +1815,21 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             Ok(kind)
         }
         Expr::Bin { op: BinOp::Assign, lhs, rhs } => {
+            // `*ptr = rhs` — store-through-pointer. Used by the closure-with-
+            // captures lowering: a `&mut`-captured local becomes a `*mut i64`
+            // param the body dereferences on read AND write. Eval ptr → rax
+            // (push), eval rhs → rax, pop ptr into rdi, `movq %rax, (%rdi)`.
+            if let Expr::Deref(inner) = lhs.as_ref() {
+                let _ = emit_expr_value(inner, out, data, locals)?;
+                out.push_str("    pushq %rax\n");
+                let val_ty = emit_expr_value(rhs, out, data, locals)?;
+                if !matches!(val_ty, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("store-through-pointer: only int/handle supported"));
+                }
+                out.push_str("    popq %rdi\n");
+                out.push_str("    movq %rax, 0(%rdi)\n");
+                return Ok(TyKind::Int);
+            }
             // Indexed assignment `buf[i] = expr`. The buf must be a known
             // stack-array local; idx is computed at runtime, then we store
             // into &buf[0] - 8*idx.

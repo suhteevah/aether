@@ -1,0 +1,35 @@
+// roadmap: P16.4
+// expect: exit=42
+// Closures with captures (FR-16.4-extra). Two captures exercised:
+//
+//   - `acc` is mutated inside the closure body → captured by &mut i64.
+//     Each invocation reads through the pointer, computes, and stores
+//     back. Across three calls of `inc`, acc steps 1, 2, 3.
+//
+//   - `base` is read but not written → captured by-value. Closure body
+//     uses `base` as a regular i64 param.
+//
+// The exit value 42 comes from:
+//     base = 10
+//     inc() // acc=1, returns base + acc = 11
+//     inc() // acc=2, returns 12
+//     inc() // acc=3, returns 13
+//     11 + 12 + 13 = 36
+//     36 + base*2 = 56  (just to keep base alive)
+//     ... rearranged so the program exits 42:
+//
+//     final = inc() + inc() + inc() + base + acc
+//           = 11    + 12    + 13    + 10   + 3   = 49 (oops)
+//
+// Actual arithmetic chosen for clean exit=42:
+//     inc reads acc, increments, returns acc (mutated value).
+//     1 + 2 + 3 = 6 plus 36 = 42 where 36 = (12 * 3).
+fn main() -> i32 {
+    let mut acc: i64 = 0;
+    let bonus: i64 = 12;
+    let inc = || { acc = acc + 1; acc + bonus };
+    let a = inc();   // acc = 1, returns 1 + 12 = 13
+    let b = inc();   // acc = 2, returns 2 + 12 = 14
+    let c = inc();   // acc = 3, returns 3 + 12 = 15
+    (a + b + c) as i32   // 13 + 14 + 15 = 42
+}

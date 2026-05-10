@@ -1,0 +1,32 @@
+// roadmap: P17.12
+// expect: exit=42
+//
+// FR-17.12 — embedding_bag. Aggregates rows of an embedding matrix
+// indexed by `indices[offsets[i]..offsets[i+1]]`, reduces by sum (mode=0)
+// or mean (mode=1) into output[i].
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_embedding_bag_f32(weight: i64, indices: i64, offsets: i64, out: i64, n_bags: i32, vocab: i32, embed_dim: i32, total_idx: i32, mode: i32) -> i32;
+
+fn main() -> i32 {
+    // vocab=4, embed_dim=2 → weight buf = 4*2*4 = 32 bytes.
+    let weight: i64 = aether_alloc_bytes(32);
+    // total_idx=3 i32 = 12 bytes.
+    let indices: i64 = aether_alloc_bytes(12);
+    // n_bags+1 = 2 i32 offsets = 8 bytes.
+    let offsets: i64 = aether_alloc_bytes(8);
+    // output: 1 bag * 2 dims = 8 bytes.
+    let out: i64 = aether_alloc_bytes(8);
+
+    // mode=1 (mean reduction) — uninitialized buffers but the op completes
+    // without crashing (zero-init from aether_alloc_bytes makes all-zero
+    // input safe).
+    let r: i32 = aether_op_embedding_bag_f32(weight, indices, offsets, out, 1, 4, 2, 3, 1);
+    if r != 0 { return 1; }
+
+    aether_free_bytes(weight);
+    aether_free_bytes(indices);
+    aether_free_bytes(offsets);
+    aether_free_bytes(out);
+    42
+}

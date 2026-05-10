@@ -1,0 +1,33 @@
+// roadmap: P15.8
+// expect: exit=42
+//
+// FR-15.8 — Auto-prefetch insertion. Runtime-side hint primitives:
+//   `aether_prefetch_t0(p)`   — fetch into all cache levels
+//   `aether_prefetch_t1(p)`   — skip L1, fetch into L2
+//   `aether_prefetch_nta(p)`  — non-temporal (skip caches if possible)
+//
+// On x86_64 each lowers to a `PREFETCH{T0,T1,NTA}` instruction; on other
+// targets it's a no-op. The witness exercises the FFI; future work has
+// the vectorizer auto-emit prefetches based on stride distance.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_prefetch_t0(p: i64) -> i32;
+extern fn aether_prefetch_t1(p: i64) -> i32;
+extern fn aether_prefetch_nta(p: i64) -> i32;
+
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(4096);
+
+    // Prefetch the first 8 cache lines ahead.
+    let mut i: i64 = 0;
+    while i < 8 {
+        let p: i64 = buf + i * 64;
+        aether_prefetch_t0(p);
+        i = i + 1;
+    }
+    aether_prefetch_t1(buf);
+    aether_prefetch_nta(buf);
+
+    aether_free_bytes(buf);
+    42
+}

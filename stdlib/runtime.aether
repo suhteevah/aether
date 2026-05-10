@@ -177,8 +177,9 @@ extern fn aether_pgo_call_count(callsite_id: i64) -> i64;
 extern fn aether_pgo_reset() -> i32;
 extern fn aether_pgo_dump() -> i32;
 
-// P6.7 — heap-allocated stdlib types (Vec<i64>, String, realloc).
-// Box<T> / HashMap / BTreeMap need generics (P6.1), still pending.
+// P6.7 / FR-16.5 — heap-allocated stdlib types.
+// Vec<i64>, String, Box<i64>, HashMap<i64,i64>, Rc<i64>, channel<i64>.
+// Concrete-i64 surface today; generic versions land with P6.1 type params.
 extern fn aether_realloc_bytes(p: i64, old_n: i64, new_n: i64) -> i64;
 extern fn aether_vec_i64_new() -> i64;
 extern fn aether_vec_i64_push(handle: i64, value: i64) -> i32;
@@ -191,6 +192,53 @@ extern fn aether_string_push_byte(handle: i64, b: i64) -> i32;
 extern fn aether_string_len(handle: i64) -> i64;
 extern fn aether_string_byte_at(handle: i64, idx: i64) -> i64;
 extern fn aether_string_free(handle: i64) -> i32;
+extern fn aether_box_i64_new(value: i64) -> i64;
+extern fn aether_box_i64_get(handle: i64) -> i64;
+extern fn aether_box_i64_set(handle: i64, value: i64) -> i32;
+extern fn aether_box_i64_free(handle: i64) -> i32;
+extern fn aether_hashmap_i64_new() -> i64;
+extern fn aether_hashmap_i64_insert(handle: i64, key: i64, value: i64) -> i32;
+extern fn aether_hashmap_i64_get(handle: i64, key: i64) -> i64;
+extern fn aether_hashmap_i64_contains(handle: i64, key: i64) -> i64;
+extern fn aether_hashmap_i64_remove(handle: i64, key: i64) -> i64;
+extern fn aether_hashmap_i64_len(handle: i64) -> i64;
+extern fn aether_hashmap_i64_free(handle: i64) -> i32;
+extern fn aether_rc_i64_new(value: i64) -> i64;
+extern fn aether_rc_i64_clone(handle: i64) -> i64;
+extern fn aether_rc_i64_get(handle: i64) -> i64;
+extern fn aether_rc_i64_strong_count(handle: i64) -> i64;
+extern fn aether_rc_i64_drop(handle: i64) -> i32;
+extern fn aether_chan_i64_new() -> i64;
+extern fn aether_chan_i64_send(handle: i64, value: i64) -> i32;
+extern fn aether_chan_i64_recv(handle: i64, out_ptr: i64) -> i32;
+extern fn aether_chan_i64_len(handle: i64) -> i64;
+extern fn aether_chan_i64_free(handle: i64) -> i32;
+
+// FR-17.4 — Pooling.
+extern fn aether_op_max_pool_2d_f32(x: i64, y: i64, n: i32, c: i32, h: i32, w: i32, kh: i32, kw: i32, sh: i32, sw: i32, ph: i32, pw: i32) -> i32;
+extern fn aether_op_avg_pool_2d_f32(x: i64, y: i64, n: i32, c: i32, h: i32, w: i32, kh: i32, kw: i32, sh: i32, sw: i32, ph: i32, pw: i32) -> i32;
+extern fn aether_op_adaptive_avg_pool_2d_f32(x: i64, y: i64, n: i32, c: i32, h: i32, w: i32, h_out: i32, w_out: i32) -> i32;
+
+// FR-17.12 — Embedding extras.
+extern fn aether_op_embedding_bag_f32(weight: i64, indices: i64, offsets: i64, out: i64, n_bags: i32, vocab: i32, embed_dim: i32, total_idx: i32, mode: i32) -> i32;
+
+// FR-17.6-extra — Activation backwards.
+extern fn aether_op_tanh_backward_f32(y: i64, grad: i64, n: i32) -> i32;
+extern fn aether_op_sigmoid_backward_f32(y: i64, grad: i64, n: i32) -> i32;
+extern fn aether_op_leaky_relu_backward_f32(x: i64, grad: i64, slope: f32, n: i32) -> i32;
+extern fn aether_op_elu_backward_f32(x: i64, grad: i64, alpha: f32, n: i32) -> i32;
+extern fn aether_op_mish_backward_f32(x: i64, grad: i64, n: i32) -> i32;
+
+// FR-17.17-extra — Lion / Lamb / Adafactor.
+extern fn aether_op_lion_step_f32(param: i64, grad: i64, m: i64, n: i32, lr: f32, beta1: f32, beta2: f32, weight_decay: f32) -> i32;
+extern fn aether_op_lamb_step_f32(param: i64, grad: i64, m: i64, v: i64, n: i32, lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, bias_correction1: f32, bias_correction2: f32) -> i32;
+extern fn aether_op_adafactor_step_f32(param: i64, grad: i64, row: i64, col: i64, n_rows: i32, n_cols: i32, lr: f32, eps: f32, decay_rate: f32) -> i32;
+
+// FR-16.14 — print primitives `println!`/`print!` lowers to.
+extern fn aether_print_i64(v: i64) -> i32;
+extern fn aether_print_f32_default(v: f32) -> i32;
+extern fn aether_print_str_n(p: i64, n: i64) -> i32;
+extern fn aether_print_newline() -> i32;
 
 // P6.8 — Iterator adapter primitives over Vec<i64>.
 extern fn aether_iter_vec_i64_new(vec_handle: i64) -> i64;

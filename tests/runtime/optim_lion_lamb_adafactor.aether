@@ -1,0 +1,33 @@
+// roadmap: P17.17
+// expect: exit=42
+//
+// FR-17.17-extra — Lion + LAMB + Adafactor optimizer steps. Witnessing
+// the FFI surface; numerical correctness lives in the runtime unit
+// tests we add alongside.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_lion_step_f32(param: i64, grad: i64, m: i64, n: i32, lr: f32, beta1: f32, beta2: f32, weight_decay: f32) -> i32;
+extern fn aether_op_lamb_step_f32(param: i64, grad: i64, m: i64, v: i64, n: i32, lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32, bias_correction1: f32, bias_correction2: f32) -> i32;
+extern fn aether_op_adafactor_step_f32(param: i64, grad: i64, row: i64, col: i64, n_rows: i32, n_cols: i32, lr: f32, eps: f32, decay_rate: f32) -> i32;
+
+fn main() -> i32 {
+    let p: i64 = aether_alloc_bytes(64);
+    let g: i64 = aether_alloc_bytes(64);
+    let m: i64 = aether_alloc_bytes(64);
+    let v: i64 = aether_alloc_bytes(64);
+
+    if aether_op_lion_step_f32(p, g, m, 16, 0.001, 0.9, 0.99, 0.0) != 0 { return 1; }
+    if aether_op_lamb_step_f32(p, g, m, v, 16, 0.001, 0.9, 0.999, 0.000001, 0.01, 1.0, 1.0) != 0 { return 2; }
+
+    let row: i64 = aether_alloc_bytes(16);  // 4 rows
+    let col: i64 = aether_alloc_bytes(16);  // 4 cols
+    if aether_op_adafactor_step_f32(p, g, row, col, 4, 4, 0.001, 0.000001, 0.999) != 0 { return 3; }
+
+    aether_free_bytes(p);
+    aether_free_bytes(g);
+    aether_free_bytes(m);
+    aether_free_bytes(v);
+    aether_free_bytes(row);
+    aether_free_bytes(col);
+    42
+}

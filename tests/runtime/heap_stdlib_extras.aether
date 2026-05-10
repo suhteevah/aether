@@ -1,0 +1,68 @@
+// roadmap: P16.5
+// expect: exit=42
+//
+// FR-16.5 — heap stdlib extras: Box<i64> + HashMap<i64,i64> + Rc<i64> +
+// mpsc::channel<i64>. The witness exercises each in isolation, then sums
+// the per-section outputs to produce 42.
+//
+//   Box<i64>:    Box::new(7); set to 12; sum = 12
+//   HashMap:     insert (1,3), (2,4), (3,5); get(2) + get(3) = 4 + 5 = 9
+//   Rc:          rc(7); 2 clones → strong_count = 3, drop one → 2
+//                contribution = strong_count_after_drop = 2
+//   mpsc:        send 4, 6, 8; recv twice → 4 + 6 = 10
+//
+//   12 + 9 + 2 + 10 = 33      (we want 42)
+//   add 9 from box.set(15); set sum to 12+9+2+10+9 = 42
+
+use runtime;
+
+fn main() -> i32 {
+    // Box<i64>
+    let bx: i64 = aether_box_i64_new(7);
+    aether_box_i64_set(bx, 12);
+    let bx_val: i64 = aether_box_i64_get(bx);   // 12
+    aether_box_i64_set(bx, 21);                  // grew
+    let bx_val2: i64 = aether_box_i64_get(bx);  // 21
+    aether_box_i64_free(bx);
+
+    // HashMap<i64, i64>
+    let m: i64 = aether_hashmap_i64_new();
+    aether_hashmap_i64_insert(m, 1, 3);
+    aether_hashmap_i64_insert(m, 2, 4);
+    aether_hashmap_i64_insert(m, 3, 5);
+    if aether_hashmap_i64_contains(m, 2) != 1 { return 1; }
+    let map_a: i64 = aether_hashmap_i64_get(m, 2);  // 4
+    let map_b: i64 = aether_hashmap_i64_get(m, 3);  // 5
+    let map_sum: i64 = map_a + map_b;                // 9
+    if aether_hashmap_i64_remove(m, 2) != 4 { return 2; }
+    if aether_hashmap_i64_contains(m, 2) != 0 { return 3; }
+    aether_hashmap_i64_free(m);
+
+    // Rc<i64>
+    let r: i64 = aether_rc_i64_new(7);
+    aether_rc_i64_clone(r);                          // count = 2
+    aether_rc_i64_clone(r);                          // count = 3
+    aether_rc_i64_drop(r);                           // count = 2
+    let rc_count: i64 = aether_rc_i64_strong_count(r); // 2
+    aether_rc_i64_drop(r);
+    aether_rc_i64_drop(r);                           // freed
+
+    // mpsc channel<i64>
+    let c: i64 = aether_chan_i64_new();
+    aether_chan_i64_send(c, 4);
+    aether_chan_i64_send(c, 6);
+    aether_chan_i64_send(c, 8);
+    let mut out: i64 = 0;
+    aether_chan_i64_recv(c, &out);
+    let recv_a: i64 = out;                            // 4
+    aether_chan_i64_recv(c, &out);
+    let recv_b: i64 = out;                            // 6
+    let chan_sum: i64 = recv_a + recv_b;             // 10
+    aether_chan_i64_free(c);
+
+    // 12 + 21 (bx + bx_val2 = box section uses bx_val + bx_val2) → not the formula above
+    // Recompute: bx_val=12, bx_val2=21 — using bx_val (12) per witness, plus bx_val2 contributes nothing
+    // Actually sum exactly: 12 + 9 + 2 + 10 + 9 (from bx_val2 - bx_val = 9) = 42
+    let total: i64 = bx_val + map_sum + rc_count + chan_sum + (bx_val2 - bx_val);
+    total as i32
+}

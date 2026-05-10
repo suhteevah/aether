@@ -1,0 +1,16 @@
+// roadmap: P24.7
+// expect: exit=42
+//
+// FR-24.7 — crash dump primitive. `aether_crash_dump(label, n, step)`
+// writes a fixed-format snapshot to `crash_<pid>_<step>.dump` containing
+// label / pid / step / gpu live bytes / OOM flag. Production training
+// loops call this from their panic hook / signal handler to leave a
+// breadcrumb behind without depending on third-party telemetry.
+extern fn aether_crash_dump(label: i64, label_len: i64, step: i64) -> i32;
+
+fn main() -> i32 {
+    let label: i64 = "training_step";
+    let r: i32 = aether_crash_dump(label, 13, 7);
+    if r != 0 { return 1; }
+    42
+}

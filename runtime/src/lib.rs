@@ -1575,6 +1575,538 @@ fn reduce_to_quarter(x: f32) -> (f32, bool) {
     0
 }
 
+// =====================================================================
+// FR-22.6 — Coverage instrumentation (line + branch).
+// =====================================================================
+//
+// `aether_cov_record(file_id, line)` increments the (file, line) counter.
+// Compiler-emitted in instrumented builds, then a final report dumps a
+// histogram to stdout via `aether_cov_dump()`. Concrete-int IDs keep the
+// runtime symbol simple; the compiler maintains the file_id ↔ path map.
+
+#[derive(Default, Clone)]
+struct CovEntry { file_id: i64, line: i64, hits: i64 }
+
+struct CovCell(UnsafeCell<Vec<CovEntry>>);
+unsafe impl Sync for CovCell {}
+static COV_TABLE: CovCell = CovCell(UnsafeCell::new(Vec::new()));
+
+unsafe fn cov_table() -> &'static mut Vec<CovEntry> { &mut *COV_TABLE.0.get() }
+
+#[no_mangle] pub extern "C" fn aether_cov_record(file_id: i64, line: i64) -> c_int {
+    unsafe {
+        let tbl = cov_table();
+        for e in tbl.iter_mut() {
+            if e.file_id == file_id && e.line == line {
+                e.hits += 1;
+                return 0;
+            }
+        }
+        tbl.push(CovEntry { file_id, line, hits: 1 });
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_cov_hits(file_id: i64, line: i64) -> i64 {
+    unsafe {
+        let tbl = cov_table();
+        for e in tbl.iter() {
+            if e.file_id == file_id && e.line == line { return e.hits; }
+        }
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_cov_reset() -> c_int {
+    unsafe { cov_table().clear(); }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_cov_dump() -> c_int {
+    unsafe {
+        let tbl = cov_table();
+        for e in tbl.iter() {
+            println!("cov file={} line={} hits={}", e.file_id, e.line, e.hits);
+        }
+    }
+    0
+}
+
+// =====================================================================
+// FR-24.7 — Crash dump primitive (telemetry without third-party deps).
+// =====================================================================
+//
+// `aether_crash_dump(label, n)` writes a small fixed-format snapshot to
+// `crash_<pid>_<step>.dump` containing: program label, current GPU live
+// bytes, current OOM flag, and an explicit caller-provided step counter.
+// Designed for production training loops to call from a panic hook /
+// signal handler before exiting. No allocation in the hot path.
+
+#[no_mangle] pub unsafe extern "C" fn aether_crash_dump(label: *const u8, label_len: i64, step: i64) -> c_int {
+    if label.is_null() || label_len <= 0 { return -1; }
+    let label_bytes = std::slice::from_raw_parts(label, label_len as usize);
+    let label_str = std::str::from_utf8(label_bytes).unwrap_or("?");
+    let pid = std::process::id();
+    let path = format!("crash_{}_{}.dump", pid, step);
+    let body = format!(
+        "label={}\npid={}\nstep={}\ngpu_live_bytes={}\noom_flag={}\n",
+        label_str, pid, step,
+        aether_gpu_live_bytes(), aether_oom_check(),
+    );
+    let _ = std::fs::write(&path, body);
+    0
+}
+
+// =====================================================================
+// FR-15.8 — Auto-prefetch insertion (runtime-side hint).
+// =====================================================================
+//
+// `aether_prefetch_t0(p)` emits a `prefetcht0` for cache-line `p` (or a
+// pure no-op if the runtime is built for a target without the hint). The
+// caller is expected to schedule prefetches `prefetch_distance` iterations
+// ahead of the load — see vectorize_drive's hand-prefetch helper.
+
+#[no_mangle] pub extern "C" fn aether_prefetch_t0(p: i64) -> c_int {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T0}>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // No-op on non-x86_64 — keeps the FFI surface portable.
+        let _ = p;
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_prefetch_t1(p: i64) -> c_int {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_T1}>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = p;
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_prefetch_nta(p: i64) -> c_int {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{std::arch::x86_64::_MM_HINT_NTA}>(p as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = p;
+    }
+    0
+}
+
+// =====================================================================
+// FR-17.6-extra — Activation backwards.
+// =====================================================================
+//
+// Backward passes for tanh/sigmoid/leaky_relu/elu/mish. Each reads the
+// pre-activation `x` (or post-activation, for those that need it) and the
+// upstream gradient `grad_y`, writes `grad_x` in-place into the upstream
+// buffer (matches the existing forward-pass conventions).
+
+#[no_mangle] pub unsafe extern "C" fn aether_op_tanh_backward_f32(
+    y: *const c_void, grad: *mut c_void, n: c_int,
+) -> c_int {
+    if y.is_null() || grad.is_null() { return -1; }
+    let ys = std::slice::from_raw_parts(y as *const f32, n as usize);
+    let gs = std::slice::from_raw_parts_mut(grad as *mut f32, n as usize);
+    for i in 0..n as usize { gs[i] *= 1.0 - ys[i] * ys[i]; }
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_op_sigmoid_backward_f32(
+    y: *const c_void, grad: *mut c_void, n: c_int,
+) -> c_int {
+    if y.is_null() || grad.is_null() { return -1; }
+    let ys = std::slice::from_raw_parts(y as *const f32, n as usize);
+    let gs = std::slice::from_raw_parts_mut(grad as *mut f32, n as usize);
+    for i in 0..n as usize { gs[i] *= ys[i] * (1.0 - ys[i]); }
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_op_leaky_relu_backward_f32(
+    x: *const c_void, grad: *mut c_void, slope: f32, n: c_int,
+) -> c_int {
+    if x.is_null() || grad.is_null() { return -1; }
+    let xs = std::slice::from_raw_parts(x as *const f32, n as usize);
+    let gs = std::slice::from_raw_parts_mut(grad as *mut f32, n as usize);
+    for i in 0..n as usize { gs[i] *= if xs[i] > 0.0 { 1.0 } else { slope }; }
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_op_elu_backward_f32(
+    x: *const c_void, grad: *mut c_void, alpha: f32, n: c_int,
+) -> c_int {
+    if x.is_null() || grad.is_null() { return -1; }
+    let xs = std::slice::from_raw_parts(x as *const f32, n as usize);
+    let gs = std::slice::from_raw_parts_mut(grad as *mut f32, n as usize);
+    for i in 0..n as usize {
+        gs[i] *= if xs[i] >= 0.0 { 1.0 } else { alpha * xs[i].exp() };
+    }
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_op_mish_backward_f32(
+    x: *const c_void, grad: *mut c_void, n: c_int,
+) -> c_int {
+    if x.is_null() || grad.is_null() { return -1; }
+    // mish(x) = x * tanh(softplus(x)).
+    // d/dx mish = tanh(sp) + x * sech^2(sp) * sigmoid(x), where sp = ln(1+e^x).
+    let xs = std::slice::from_raw_parts(x as *const f32, n as usize);
+    let gs = std::slice::from_raw_parts_mut(grad as *mut f32, n as usize);
+    for i in 0..n as usize {
+        let xi = xs[i];
+        let sp = (1.0 + xi.exp()).ln();
+        let t = sp.tanh();
+        let sech2 = 1.0 - t * t;
+        let sig = 1.0 / (1.0 + (-xi).exp());
+        gs[i] *= t + xi * sech2 * sig;
+    }
+    0
+}
+
+// =====================================================================
+// FR-17.17-extra — Lion / Lamb / Adafactor optimizer steps.
+// =====================================================================
+
+/// Lion: sign-of-momentum optimizer. `beta1` smooths the first-moment
+/// estimate; the update direction is `sign(beta1*m + (1-beta1)*g)`. Cheap,
+/// memory-light alternative to Adam.
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_lion_step_f32(
+    param: *mut c_void, grad: *const c_void, m: *mut c_void,
+    n: c_int, lr: f32, beta1: f32, beta2: f32, weight_decay: f32,
+) -> c_int {
+    if param.is_null() || grad.is_null() || m.is_null() { return -1; }
+    let p = std::slice::from_raw_parts_mut(param as *mut f32, n as usize);
+    let g = std::slice::from_raw_parts(grad as *const f32, n as usize);
+    let ms = std::slice::from_raw_parts_mut(m as *mut f32, n as usize);
+    for i in 0..n as usize {
+        let update = beta1 * ms[i] + (1.0 - beta1) * g[i];
+        let dir = if update > 0.0 { 1.0 } else if update < 0.0 { -1.0 } else { 0.0 };
+        p[i] -= lr * (dir + weight_decay * p[i]);
+        ms[i] = beta2 * ms[i] + (1.0 - beta2) * g[i];
+    }
+    0
+}
+
+/// LAMB step (Layer-wise Adaptive Moments). Same first/second moments as
+/// AdamW, then rescales the per-layer update so its norm matches the
+/// param norm. Caller passes `param_norm` and `update_norm` precomputed —
+/// keeps the runtime symbol arity sane on Windows x64 where 5+ args spill.
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_lamb_step_f32(
+    param: *mut c_void, grad: *const c_void, m: *mut c_void, v: *mut c_void,
+    n: c_int, lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32,
+    bias_correction1: f32, bias_correction2: f32,
+) -> c_int {
+    if param.is_null() || grad.is_null() || m.is_null() || v.is_null() { return -1; }
+    let p = std::slice::from_raw_parts_mut(param as *mut f32, n as usize);
+    let g = std::slice::from_raw_parts(grad as *const f32, n as usize);
+    let ms = std::slice::from_raw_parts_mut(m as *mut f32, n as usize);
+    let vs = std::slice::from_raw_parts_mut(v as *mut f32, n as usize);
+    let mut update_norm_sq = 0.0f64;
+    let mut param_norm_sq = 0.0f64;
+    let mut tmp = vec![0.0f32; n as usize];
+    for i in 0..n as usize {
+        ms[i] = beta1 * ms[i] + (1.0 - beta1) * g[i];
+        vs[i] = beta2 * vs[i] + (1.0 - beta2) * g[i] * g[i];
+        let mh = ms[i] / bias_correction1;
+        let vh = vs[i] / bias_correction2;
+        let r = mh / (vh.sqrt() + eps) + weight_decay * p[i];
+        tmp[i] = r;
+        update_norm_sq += (r as f64) * (r as f64);
+        param_norm_sq += (p[i] as f64) * (p[i] as f64);
+    }
+    let pn = param_norm_sq.sqrt() as f32;
+    let un = update_norm_sq.sqrt() as f32;
+    let trust = if pn > 0.0 && un > 0.0 { pn / un } else { 1.0 };
+    let scale = lr * trust;
+    for i in 0..n as usize {
+        p[i] -= scale * tmp[i];
+    }
+    0
+}
+
+/// Adafactor step (factored second moments). Simplified: caller-provided
+/// row + col second-moment buffers. Update is `g / sqrt(rms_estimate)`.
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_adafactor_step_f32(
+    param: *mut c_void, grad: *const c_void,
+    row: *mut c_void, col: *mut c_void,
+    n_rows: c_int, n_cols: c_int,
+    lr: f32, eps: f32, decay_rate: f32,
+) -> c_int {
+    if param.is_null() || grad.is_null() || row.is_null() || col.is_null() { return -1; }
+    let n = (n_rows * n_cols) as usize;
+    let p = std::slice::from_raw_parts_mut(param as *mut f32, n);
+    let g = std::slice::from_raw_parts(grad as *const f32, n);
+    let r = std::slice::from_raw_parts_mut(row as *mut f32, n_rows as usize);
+    let c = std::slice::from_raw_parts_mut(col as *mut f32, n_cols as usize);
+    // Update row/col exponential averages of g^2.
+    for i in 0..n_rows as usize {
+        let mut sum = 0.0f32;
+        for j in 0..n_cols as usize {
+            let gv = g[i * n_cols as usize + j];
+            sum += gv * gv;
+        }
+        r[i] = decay_rate * r[i] + (1.0 - decay_rate) * sum;
+    }
+    for j in 0..n_cols as usize {
+        let mut sum = 0.0f32;
+        for i in 0..n_rows as usize {
+            let gv = g[i * n_cols as usize + j];
+            sum += gv * gv;
+        }
+        c[j] = decay_rate * c[j] + (1.0 - decay_rate) * sum;
+    }
+    let r_mean = r.iter().sum::<f32>() / n_rows as f32;
+    for i in 0..n_rows as usize {
+        for j in 0..n_cols as usize {
+            let v_hat = (r[i] / r_mean.max(eps)) * c[j];
+            let denom = (v_hat / n_cols as f32).sqrt().max(eps);
+            p[i * n_cols as usize + j] -= lr * g[i * n_cols as usize + j] / denom;
+        }
+    }
+    0
+}
+
+// =====================================================================
+// FR-17.4 — Pooling (max/avg) — real CPU bodies.
+// =====================================================================
+//
+// 2-D pooling on a contiguous (N, C, H, W) layout. `max_pool_2d_f32`
+// and `avg_pool_2d_f32` produce (N, C, H_out, W_out) where
+// H_out = (H + 2*pad - kernel) / stride + 1.
+//
+// Witness: tests/runtime/pooling.aether.
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_max_pool_2d_f32(
+    x: *const c_void, y: *mut c_void,
+    n: c_int, c: c_int, h: c_int, w: c_int,
+    kh: c_int, kw: c_int, sh: c_int, sw: c_int,
+    ph: c_int, pw: c_int,
+) -> c_int {
+    if x.is_null() || y.is_null() { return -1; }
+    let xs = std::slice::from_raw_parts(x as *const f32, (n*c*h*w) as usize);
+    let h_out = (h + 2*ph - kh) / sh + 1;
+    let w_out = (w + 2*pw - kw) / sw + 1;
+    let ys = std::slice::from_raw_parts_mut(y as *mut f32, (n*c*h_out*w_out) as usize);
+    for ni in 0..n {
+        for ci in 0..c {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut max = f32::NEG_INFINITY;
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let ih = oh*sh - ph + ki;
+                            let iw = ow*sw - pw + kj;
+                            if ih < 0 || ih >= h || iw < 0 || iw >= w { continue; }
+                            let idx = ((ni*c + ci)*h + ih)*w + iw;
+                            let v = xs[idx as usize];
+                            if v > max { max = v; }
+                        }
+                    }
+                    let oidx = ((ni*c + ci)*h_out + oh)*w_out + ow;
+                    ys[oidx as usize] = if max == f32::NEG_INFINITY { 0.0 } else { max };
+                }
+            }
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_avg_pool_2d_f32(
+    x: *const c_void, y: *mut c_void,
+    n: c_int, c: c_int, h: c_int, w: c_int,
+    kh: c_int, kw: c_int, sh: c_int, sw: c_int,
+    ph: c_int, pw: c_int,
+) -> c_int {
+    if x.is_null() || y.is_null() { return -1; }
+    let xs = std::slice::from_raw_parts(x as *const f32, (n*c*h*w) as usize);
+    let h_out = (h + 2*ph - kh) / sh + 1;
+    let w_out = (w + 2*pw - kw) / sw + 1;
+    let ys = std::slice::from_raw_parts_mut(y as *mut f32, (n*c*h_out*w_out) as usize);
+    for ni in 0..n {
+        for ci in 0..c {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut sum = 0f32;
+                    let mut cnt = 0i32;
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let ih = oh*sh - ph + ki;
+                            let iw = ow*sw - pw + kj;
+                            if ih < 0 || ih >= h || iw < 0 || iw >= w { continue; }
+                            let idx = ((ni*c + ci)*h + ih)*w + iw;
+                            sum += xs[idx as usize];
+                            cnt += 1;
+                        }
+                    }
+                    let oidx = ((ni*c + ci)*h_out + oh)*w_out + ow;
+                    ys[oidx as usize] = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Adaptive average pool — output shape (N, C, h_out, w_out) regardless of
+/// input H, W. Each output pixel pools the corresponding "tile" of the input
+/// computed as `[i*H/h_out, (i+1)*H/h_out)` × the same for W.
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_adaptive_avg_pool_2d_f32(
+    x: *const c_void, y: *mut c_void,
+    n: c_int, c: c_int, h: c_int, w: c_int,
+    h_out: c_int, w_out: c_int,
+) -> c_int {
+    if x.is_null() || y.is_null() || h_out <= 0 || w_out <= 0 { return -1; }
+    let xs = std::slice::from_raw_parts(x as *const f32, (n*c*h*w) as usize);
+    let ys = std::slice::from_raw_parts_mut(y as *mut f32, (n*c*h_out*w_out) as usize);
+    for ni in 0..n {
+        for ci in 0..c {
+            for oh in 0..h_out {
+                let h_lo = (oh * h) / h_out;
+                let h_hi = ((oh + 1) * h) / h_out;
+                for ow in 0..w_out {
+                    let w_lo = (ow * w) / w_out;
+                    let w_hi = ((ow + 1) * w) / w_out;
+                    let mut sum = 0f32;
+                    let mut cnt = 0i32;
+                    for ih in h_lo..h_hi {
+                        for iw in w_lo..w_hi {
+                            let idx = ((ni*c + ci)*h + ih)*w + iw;
+                            sum += xs[idx as usize];
+                            cnt += 1;
+                        }
+                    }
+                    let oidx = ((ni*c + ci)*h_out + oh)*w_out + ow;
+                    ys[oidx as usize] = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
+                }
+            }
+        }
+    }
+    0
+}
+
+// =====================================================================
+// FR-17.12 — Embedding extras (`embedding_bag`).
+// =====================================================================
+//
+// `embedding_bag(weights, indices, offsets, mode)` aggregates rows of
+// the embedding matrix indexed by `indices[offsets[i] .. offsets[i+1]]`
+// and reduces them according to `mode` (0=sum, 1=mean) into output[i].
+// Output shape: (n_bags, embed_dim). Mirrors PyTorch's
+// `nn.EmbeddingBag` semantics for the dense (non-padding-aware) case.
+//
+// Witness: tests/runtime/embedding_bag.aether.
+
+#[no_mangle]
+pub unsafe extern "C" fn aether_op_embedding_bag_f32(
+    weight: *const c_void,    // (vocab, embed_dim) row-major
+    indices: *const c_void,   // i32[total_idx]
+    offsets: *const c_void,   // i32[n_bags + 1] - last is total_idx
+    out: *mut c_void,         // (n_bags, embed_dim)
+    n_bags: c_int,
+    vocab: c_int,
+    embed_dim: c_int,
+    total_idx: c_int,
+    mode: c_int,              // 0 = sum, 1 = mean
+) -> c_int {
+    if weight.is_null() || indices.is_null() || offsets.is_null() || out.is_null() { return -1; }
+    let w = std::slice::from_raw_parts(weight as *const f32, (vocab*embed_dim) as usize);
+    let idx = std::slice::from_raw_parts(indices as *const i32, total_idx as usize);
+    let off = std::slice::from_raw_parts(offsets as *const i32, (n_bags + 1) as usize);
+    let o = std::slice::from_raw_parts_mut(out as *mut f32, (n_bags*embed_dim) as usize);
+    for bag in 0..n_bags as usize {
+        let lo = off[bag] as usize;
+        let hi = off[bag + 1] as usize;
+        let count = hi.saturating_sub(lo);
+        for d in 0..embed_dim as usize {
+            o[bag * embed_dim as usize + d] = 0.0;
+        }
+        for k in lo..hi {
+            let row = idx[k] as usize;
+            if row >= vocab as usize { continue; }
+            for d in 0..embed_dim as usize {
+                o[bag * embed_dim as usize + d] += w[row * embed_dim as usize + d];
+            }
+        }
+        if mode == 1 && count > 0 {
+            let scale = 1.0 / count as f32;
+            for d in 0..embed_dim as usize {
+                o[bag * embed_dim as usize + d] *= scale;
+            }
+        }
+    }
+    0
+}
+
+// FR-16.14 — `println!`/`print!` parser-level expansion targets these
+// scalar print primitives. Compile-time format-string parsing emits a
+// sequence of these calls (one per literal segment + one per `{}` hole +
+// optional trailing newline).
+
+/// Print a single i64 in base-10 to stdout (no newline).
+#[no_mangle] pub extern "C" fn aether_print_i64(v: i64) -> c_int {
+    let mut buf = [0u8; 24];
+    let n = format_i64(&mut buf, v);
+    unsafe { write_stdout(&buf[..n]); }
+    0
+}
+
+/// Print a single f32 with default formatting (no newline).
+#[no_mangle] pub extern "C" fn aether_print_f32_default(v: f32) -> c_int {
+    // Reuse `format!` here — a hot training loop should reach for
+    // `aether_print_kv_f32` instead, which writes through the rdata fast path.
+    let s = format!("{}", v);
+    unsafe { write_stdout(s.as_bytes()); }
+    0
+}
+
+/// Print `n` bytes from `p`. Used for the literal segments between `{}` holes.
+#[no_mangle] pub unsafe extern "C" fn aether_print_str_n(p: *const u8, n: i64) -> c_int {
+    if p.is_null() || n <= 0 { return 0; }
+    let bytes = std::slice::from_raw_parts(p, n as usize);
+    write_stdout(bytes);
+    0
+}
+
+/// Print a single `\n`. Used by `println!` after the last hole.
+#[no_mangle] pub extern "C" fn aether_print_newline() -> c_int {
+    unsafe { write_stdout(b"\n"); }
+    0
+}
+
+fn format_i64(buf: &mut [u8], v: i64) -> usize {
+    if v == 0 { buf[0] = b'0'; return 1; }
+    let neg = v < 0;
+    // Use unsigned magnitude to handle i64::MIN correctly.
+    let mut x = if neg { (v as i128).unsigned_abs() } else { v as u128 };
+    let mut digits = [0u8; 24];
+    let mut k = 0usize;
+    while x > 0 {
+        digits[k] = (x % 10) as u8 + b'0';
+        x /= 10;
+        k += 1;
+    }
+    let mut i = 0;
+    if neg { buf[i] = b'-'; i += 1; }
+    while k > 0 { k -= 1; buf[i] = digits[k]; i += 1; }
+    i
+}
+
 #[no_mangle] pub extern "C" fn aether_print_loss(step: c_int, loss: f32) -> c_int {
     let mut buf = [0u8; 64];
     let n = format_loss_line(&mut buf, step, loss);
@@ -2835,6 +3367,439 @@ mod iter_tests {
             assert_eq!(aether_iter_vec_i64_next(it, &mut out as *mut i64 as i64), 0);
             aether_iter_vec_i64_free(it);
             aether_vec_i64_free(v);
+        }
+    }
+}
+
+// =====================================================================
+// FR-16.5 — heap stdlib extras (Box, HashMap, Rc, mpsc::channel)
+//
+// Same handle-table pattern as Vec<i64> / String. Concrete-type only
+// (Box<i64> / HashMap<i64,i64> / Rc<i64> / channel<i64>) until generics
+// land — the surface is what `examples/*.aether` and `bench/*` actually
+// exercise today, not a speculative full Rust stdlib mirror.
+//
+// Witness: tests/runtime/heap_stdlib_extras.aether.
+// =====================================================================
+
+// ---- Box<i64> ------------------------------------------------------------
+
+struct BoxI64(i64);
+
+struct BoxI64Cell(UnsafeCell<Vec<Option<Box<BoxI64>>>>);
+unsafe impl Sync for BoxI64Cell {}
+static BOX_I64_TABLE: BoxI64Cell = BoxI64Cell(UnsafeCell::new(Vec::new()));
+
+unsafe fn box_i64_table() -> &'static mut Vec<Option<Box<BoxI64>>> {
+    &mut *BOX_I64_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_box_i64_new(value: i64) -> i64 {
+    let b = Some(Box::new(BoxI64(value)));
+    let tbl = box_i64_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = b; return i as i64; }
+    }
+    tbl.push(b);
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_box_i64_get(handle: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = box_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(b) => b.0, None => 0 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_box_i64_set(handle: i64, value: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = box_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_mut() { Some(b) => { b.0 = value; 0 }, None => -1 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_box_i64_free(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = box_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    tbl[h] = None;
+    0
+}
+
+// ---- HashMap<i64, i64> ---------------------------------------------------
+//
+// Open-addressed hash table with linear probing. 64-bit splitmix64 hash on
+// the key, EMPTY sentinel = i64::MIN (callers cannot store that key — same
+// trade-off as the dense-int representation in `runtime_pe`'s scratch
+// hashmaps). Power-of-two capacity, 0.75 load factor before grow.
+
+const HM_EMPTY: i64 = i64::MIN;
+
+struct HashMapI64I64 {
+    keys: Vec<i64>,
+    vals: Vec<i64>,
+    len: usize,
+}
+
+impl HashMapI64I64 {
+    fn new() -> Self {
+        const INITIAL: usize = 8;
+        Self {
+            keys: vec![HM_EMPTY; INITIAL],
+            vals: vec![0; INITIAL],
+            len: 0,
+        }
+    }
+    fn hash(k: i64) -> u64 {
+        let mut x = k as u64;
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        x
+    }
+    fn probe(&self, k: i64) -> usize {
+        let mask = self.keys.len() - 1;
+        let mut idx = (Self::hash(k) as usize) & mask;
+        loop {
+            let cur = self.keys[idx];
+            if cur == HM_EMPTY || cur == k { return idx; }
+            idx = (idx + 1) & mask;
+        }
+    }
+    fn insert(&mut self, k: i64, v: i64) {
+        if self.len * 4 >= self.keys.len() * 3 { self.grow(); }
+        let i = self.probe(k);
+        if self.keys[i] == HM_EMPTY { self.len += 1; }
+        self.keys[i] = k;
+        self.vals[i] = v;
+    }
+    fn get(&self, k: i64) -> Option<i64> {
+        let i = self.probe(k);
+        if self.keys[i] == k { Some(self.vals[i]) } else { None }
+    }
+    fn contains(&self, k: i64) -> bool {
+        let i = self.probe(k);
+        self.keys[i] == k
+    }
+    fn remove(&mut self, k: i64) -> Option<i64> {
+        let i = self.probe(k);
+        if self.keys[i] != k { return None; }
+        let v = self.vals[i];
+        self.keys[i] = HM_EMPTY;
+        self.len -= 1;
+        // Re-insert anyone that was in the same probe chain after `i`.
+        let mask = self.keys.len() - 1;
+        let mut j = (i + 1) & mask;
+        while self.keys[j] != HM_EMPTY {
+            let kk = self.keys[j];
+            let vv = self.vals[j];
+            self.keys[j] = HM_EMPTY;
+            self.len -= 1;
+            self.insert(kk, vv);
+            j = (j + 1) & mask;
+        }
+        Some(v)
+    }
+    fn grow(&mut self) {
+        let new_cap = self.keys.len() * 2;
+        let mut new_keys = vec![HM_EMPTY; new_cap];
+        let mut new_vals = vec![0i64; new_cap];
+        let mask = new_cap - 1;
+        for i in 0..self.keys.len() {
+            if self.keys[i] != HM_EMPTY {
+                let mut idx = (Self::hash(self.keys[i]) as usize) & mask;
+                while new_keys[idx] != HM_EMPTY { idx = (idx + 1) & mask; }
+                new_keys[idx] = self.keys[i];
+                new_vals[idx] = self.vals[i];
+            }
+        }
+        self.keys = new_keys;
+        self.vals = new_vals;
+    }
+}
+
+struct HashMapCell(UnsafeCell<Vec<Option<Box<HashMapI64I64>>>>);
+unsafe impl Sync for HashMapCell {}
+static HASHMAP_TABLE: HashMapCell = HashMapCell(UnsafeCell::new(Vec::new()));
+
+unsafe fn hashmap_table() -> &'static mut Vec<Option<Box<HashMapI64I64>>> {
+    &mut *HASHMAP_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_new() -> i64 {
+    let m = Some(Box::new(HashMapI64I64::new()));
+    let tbl = hashmap_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = m; return i as i64; }
+    }
+    tbl.push(m);
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_insert(handle: i64, key: i64, value: i64) -> i32 {
+    if handle < 0 || key == HM_EMPTY { return -1; }
+    let tbl = hashmap_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_mut() { Some(m) => { m.insert(key, value); 0 }, None => -1 }
+}
+
+/// Read by key. Returns the stored value, or 0 if missing. Use
+/// `aether_hashmap_i64_contains` for presence testing when 0 is a valid
+/// sentinel value.
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_get(handle: i64, key: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = hashmap_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(m) => m.get(key).unwrap_or(0), None => 0 }
+}
+
+/// 1 if the key is present, 0 otherwise.
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_contains(handle: i64, key: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = hashmap_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(m) => if m.contains(key) { 1 } else { 0 }, None => 0 }
+}
+
+/// Remove by key. Returns the removed value, or 0 if missing.
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_remove(handle: i64, key: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = hashmap_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_mut() { Some(m) => m.remove(key).unwrap_or(0), None => 0 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_len(handle: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = hashmap_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(m) => m.len as i64, None => 0 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hashmap_i64_free(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = hashmap_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    tbl[h] = None;
+    0
+}
+
+// ---- Rc<i64> -------------------------------------------------------------
+//
+// Refcounted single-i64 value. `clone` bumps the count; `drop` decrements
+// and frees when it hits zero. Matches the user-visible Rust semantics
+// closely enough for the witness.
+
+struct RcI64 { count: u32, value: i64 }
+
+struct RcI64Cell(UnsafeCell<Vec<Option<Box<RcI64>>>>);
+unsafe impl Sync for RcI64Cell {}
+static RC_I64_TABLE: RcI64Cell = RcI64Cell(UnsafeCell::new(Vec::new()));
+
+unsafe fn rc_i64_table() -> &'static mut Vec<Option<Box<RcI64>>> {
+    &mut *RC_I64_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_rc_i64_new(value: i64) -> i64 {
+    let r = Some(Box::new(RcI64 { count: 1, value }));
+    let tbl = rc_i64_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = r; return i as i64; }
+    }
+    tbl.push(r);
+    (tbl.len() - 1) as i64
+}
+
+/// Increment refcount; returns the same handle. Caller treats the returned
+/// handle as a fresh owning reference.
+#[no_mangle] pub unsafe extern "C" fn aether_rc_i64_clone(handle: i64) -> i64 {
+    if handle < 0 { return -1; }
+    let tbl = rc_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_mut() {
+        Some(r) => { r.count = r.count.saturating_add(1); handle }
+        None => -1,
+    }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_rc_i64_get(handle: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = rc_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(r) => r.value, None => 0 }
+}
+
+/// Returns the current strong-count (post-clone, pre-drop) for the witness.
+#[no_mangle] pub unsafe extern "C" fn aether_rc_i64_strong_count(handle: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = rc_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(r) => r.count as i64, None => 0 }
+}
+
+/// Drop one ownership; frees backing slot when count hits zero.
+#[no_mangle] pub unsafe extern "C" fn aether_rc_i64_drop(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = rc_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let zero = match tbl[h].as_mut() {
+        Some(r) => { r.count = r.count.saturating_sub(1); r.count == 0 }
+        None => return -1,
+    };
+    if zero { tbl[h] = None; }
+    0
+}
+
+// ---- mpsc::channel<i64> --------------------------------------------------
+//
+// Single-producer, single-consumer FIFO queue. Unbounded; `send` always
+// succeeds (no backpressure). `recv` returns 1 on success and writes the
+// dequeued value through the out-pointer; returns 0 if empty (non-blocking).
+// No threads — channels live entirely in process-local memory and the
+// witness uses them as a pure data-structure.
+
+struct ChanI64 { queue: std::collections::VecDeque<i64> }
+
+struct ChanCell(UnsafeCell<Vec<Option<Box<ChanI64>>>>);
+unsafe impl Sync for ChanCell {}
+static CHAN_TABLE: ChanCell = ChanCell(UnsafeCell::new(Vec::new()));
+
+unsafe fn chan_table() -> &'static mut Vec<Option<Box<ChanI64>>> {
+    &mut *CHAN_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_chan_i64_new() -> i64 {
+    let c = Some(Box::new(ChanI64 { queue: std::collections::VecDeque::new() }));
+    let tbl = chan_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = c; return i as i64; }
+    }
+    tbl.push(c);
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_chan_i64_send(handle: i64, value: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = chan_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_mut() { Some(c) => { c.queue.push_back(value); 0 }, None => -1 }
+}
+
+/// Returns 1 + writes value through `out_ptr` on success, 0 if the queue
+/// is empty (non-blocking).
+#[no_mangle] pub unsafe extern "C" fn aether_chan_i64_recv(handle: i64, out_ptr: i64) -> i32 {
+    if handle < 0 || out_ptr == 0 { return 0; }
+    let tbl = chan_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_mut() {
+        Some(c) => match c.queue.pop_front() {
+            Some(v) => { *(out_ptr as *mut i64) = v; 1 }
+            None => 0,
+        }
+        None => 0,
+    }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_chan_i64_len(handle: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = chan_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(c) => c.queue.len() as i64, None => 0 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_chan_i64_free(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = chan_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    tbl[h] = None;
+    0
+}
+
+#[cfg(test)]
+mod heap_extras_tests {
+    use super::*;
+
+    #[test]
+    fn box_i64_basics() {
+        unsafe {
+            let h = aether_box_i64_new(42);
+            assert_eq!(aether_box_i64_get(h), 42);
+            aether_box_i64_set(h, 99);
+            assert_eq!(aether_box_i64_get(h), 99);
+            aether_box_i64_free(h);
+            assert_eq!(aether_box_i64_get(h), 0);
+        }
+    }
+
+    #[test]
+    fn hashmap_i64_insert_get_remove() {
+        unsafe {
+            let h = aether_hashmap_i64_new();
+            for i in 0..1000i64 {
+                aether_hashmap_i64_insert(h, i, i * 3);
+            }
+            assert_eq!(aether_hashmap_i64_len(h), 1000);
+            assert_eq!(aether_hashmap_i64_get(h, 42), 126);
+            assert_eq!(aether_hashmap_i64_contains(h, 42), 1);
+            assert_eq!(aether_hashmap_i64_contains(h, 9999), 0);
+            assert_eq!(aether_hashmap_i64_remove(h, 42), 126);
+            assert_eq!(aether_hashmap_i64_contains(h, 42), 0);
+            assert_eq!(aether_hashmap_i64_len(h), 999);
+            aether_hashmap_i64_free(h);
+        }
+    }
+
+    #[test]
+    fn rc_i64_clone_drop_lifecycle() {
+        unsafe {
+            let h = aether_rc_i64_new(7);
+            assert_eq!(aether_rc_i64_strong_count(h), 1);
+            assert_eq!(aether_rc_i64_get(h), 7);
+            aether_rc_i64_clone(h);
+            aether_rc_i64_clone(h);
+            assert_eq!(aether_rc_i64_strong_count(h), 3);
+            aether_rc_i64_drop(h);
+            assert_eq!(aether_rc_i64_strong_count(h), 2);
+            aether_rc_i64_drop(h);
+            aether_rc_i64_drop(h);
+            // After the final drop, the slot is freed.
+            assert_eq!(aether_rc_i64_get(h), 0);
+        }
+    }
+
+    #[test]
+    fn chan_i64_send_recv_fifo() {
+        unsafe {
+            let c = aether_chan_i64_new();
+            for i in 1..=5i64 { aether_chan_i64_send(c, i * 10); }
+            assert_eq!(aether_chan_i64_len(c), 5);
+            let mut out: i64 = 0;
+            for expect in [10, 20, 30, 40, 50] {
+                assert_eq!(aether_chan_i64_recv(c, &mut out as *mut i64 as i64), 1);
+                assert_eq!(out, expect);
+            }
+            // Empty queue — recv returns 0.
+            assert_eq!(aether_chan_i64_recv(c, &mut out as *mut i64 as i64), 0);
+            aether_chan_i64_free(c);
         }
     }
 }

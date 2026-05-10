@@ -1,0 +1,30 @@
+// roadmap: P17.4
+// expect: exit=42
+//
+// FR-17.4 — Pooling. Exercises the runtime FFI surface for max_pool_2d,
+// avg_pool_2d, and adaptive_avg_pool_2d. The op returns 0 on success;
+// any non-zero return indicates a linkage or arg-validation regression.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_max_pool_2d_f32(x: i64, y: i64, n: i32, c: i32, h: i32, w: i32, kh: i32, kw: i32, sh: i32, sw: i32, ph: i32, pw: i32) -> i32;
+extern fn aether_op_avg_pool_2d_f32(x: i64, y: i64, n: i32, c: i32, h: i32, w: i32, kh: i32, kw: i32, sh: i32, sw: i32, ph: i32, pw: i32) -> i32;
+extern fn aether_op_adaptive_avg_pool_2d_f32(x: i64, y: i64, n: i32, c: i32, h: i32, w: i32, h_out: i32, w_out: i32) -> i32;
+
+fn main() -> i32 {
+    // 1x1x4x4 input, kernel 2x2, stride 2 → 1x1x2x2 output (4 floats).
+    let xin: i64 = aether_alloc_bytes(64);   // 16 floats
+    let xout: i64 = aether_alloc_bytes(16);  // 4 floats
+
+    let r1: i32 = aether_op_max_pool_2d_f32(xin, xout, 1, 1, 4, 4, 2, 2, 2, 2, 0, 0);
+    if r1 != 0 { return 1; }
+
+    let r2: i32 = aether_op_avg_pool_2d_f32(xin, xout, 1, 1, 4, 4, 2, 2, 2, 2, 0, 0);
+    if r2 != 0 { return 2; }
+
+    let r3: i32 = aether_op_adaptive_avg_pool_2d_f32(xin, xout, 1, 1, 4, 4, 2, 2);
+    if r3 != 0 { return 3; }
+
+    aether_free_bytes(xin);
+    aether_free_bytes(xout);
+    42
+}

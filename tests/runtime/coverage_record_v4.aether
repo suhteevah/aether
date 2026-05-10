@@ -1,0 +1,25 @@
+// roadmap: P22.6
+// expect: exit=42
+//
+// FR-22.6 — coverage instrumentation. The runtime tracks a (file_id,
+// line) → hit-count table. In instrumented builds the compiler emits a
+// `aether_cov_record(file, line)` call at every basic-block entry; a
+// final `aether_cov_dump()` prints the histogram. The witness exercises
+// the FFI by manually recording a few hits and verifying the count.
+extern fn aether_cov_record(file_id: i64, line: i64) -> i32;
+extern fn aether_cov_hits(file_id: i64, line: i64) -> i64;
+extern fn aether_cov_reset() -> i32;
+
+fn main() -> i32 {
+    aether_cov_reset();
+    aether_cov_record(1, 10);
+    aether_cov_record(1, 10);
+    aether_cov_record(1, 11);
+    aether_cov_record(2, 5);
+
+    if aether_cov_hits(1, 10) != 2 { return 1; }
+    if aether_cov_hits(1, 11) != 1 { return 2; }
+    if aether_cov_hits(2, 5) != 1 { return 3; }
+    if aether_cov_hits(99, 99) != 0 { return 4; }
+    42
+}

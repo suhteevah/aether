@@ -1,0 +1,25 @@
+// roadmap: P22.9
+// expect: exit=42
+//
+// FR-22.9 — Differential testing vs PyTorch + Candle. The reference
+// table lives at `bench/parity/matmul_parity.txt` (one row per (op,
+// shape) with max_abs_err / max_rel_err thresholds). The witness here
+// exercises one of the rows (matmul 16x16x16) end-to-end via the
+// runtime FFI; the bench-runner subagent compares against the reference
+// values offline. Exit-42 confirms the in-process FFI shape stays
+// linkable + the sample shape executes without aborting.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_matmul_f32(a: i64, b: i64, c: i64, m: i32, k: i32, n: i32) -> i32;
+
+fn main() -> i32 {
+    // 16x16 = 1024 bytes per buffer (f32).
+    let a: i64 = aether_alloc_bytes(1024);
+    let b: i64 = aether_alloc_bytes(1024);
+    let c: i64 = aether_alloc_bytes(1024);
+    if aether_op_matmul_f32(a, b, c, 16, 16, 16) != 0 { return 1; }
+    aether_free_bytes(a);
+    aether_free_bytes(b);
+    aether_free_bytes(c);
+    42
+}

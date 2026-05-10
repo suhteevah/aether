@@ -1,0 +1,23 @@
+// roadmap: P16.14
+// expect: exit=42
+// expect_stdout: hello world\nstep 7 loss=2.5\n
+//
+// FR-16.14 — `println!`/`print!` with `{}` (i64) and `{:f}` (f32)
+// interpolation. The parser splits the format string into segments and
+// emits a sequence of `aether_print_str_n` / `aether_print_i64` /
+// `aether_print_f32_default` / `aether_print_newline` calls.
+//
+// The witness exercises:
+//   - one `println!("hello world")` — pure literal
+//   - one `println!("step {} loss={:f}", step, loss)` — mixed-type holes
+//
+// stdout is checked via `expect_stdout` so we don't depend on any side-channel.
+use runtime;
+
+fn main() -> i32 {
+    println!("hello world");
+    let step: i64 = 7;
+    let loss: f32 = 2.5;
+    println!("step {} loss={:f}", step, loss);
+    42
+}

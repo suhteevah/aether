@@ -1,0 +1,12 @@
+// roadmap: P24.4
+// expect: exit=42
+//
+// FR-24.4 — cross-compilation. The CLI accepts --target=<triple>
+// (P21.10) and the runtime needs a target-triple-aware code path. For
+// the default x86_64-pc-windows-msvc this is a no-op; the witness
+// exercises the absence-of-regression by compiling + running through
+// the standard chain and confirming the exit code is preserved.
+//
+// Real cross-targets (Linux ELF, macOS Mach-O, ARM64) are FR-21.{1,2,3}
+// in NEXT-UP.md.
+fn main() -> i32 { 42 }

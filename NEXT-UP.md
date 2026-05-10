@@ -1,8 +1,41 @@
 # NEXT-UP — v4 critical path + parked items
 
 Generated 2026-05-09; reorganized from flat-catalog to critical-path on the
-same date. Audit sits at **123/196 (63%)**. The 73 remaining FRs are organized
-below by what unlocks what — not by phase number.
+same date. **Audit sits at 135/196 (68%)** after the 2026-05-10 batch
+(closures with captures, heap stdlib extras, println! interpolation,
+pooling, embedding_bag, Send/Sync, impl Trait, activation backwards,
+Lion/Lamb/Adafactor, parity bench, PGO+prefetch witnesses, coverage
+instrumentation, differential testing harness, crash dump primitive,
+cross-compile witness). The remaining FRs are organized below by what
+unlocks what — not by phase number.
+
+## Closed this batch (2026-05-10)
+
+- **B1 / FR-16.4-extra** — closures with captures (real impl, mut+by-val).
+  Compiler closures pass detects free vars, lifts as fn with capture
+  params, rewrites mut captures to Deref, prepends captures at call sites.
+  Asm backend: `*ptr = rhs` store-through-pointer assignment. Witness:
+  `tests/runtime/closures_captures.aether` (acc counter + bonus by-value).
+- **B2 / FR-16.5** — heap stdlib extras: `Box<i64>` / `HashMap<i64,i64>`
+  (open-addressed splitmix64 hash) / `Rc<i64>` (refcounted) /
+  `mpsc::channel<i64>` (FIFO queue). Witness: `heap_stdlib_extras.aether`.
+- **B3 / FR-16.14** — `println!` / `print!` with `{}` (i64) and `{:f}`
+  (f32) interpolation. Parser-level expansion to a Block of print
+  primitive calls. Witness: `println_format.aether`.
+- **P17.4** — max/avg/adaptive_avg pool 2D. Real CPU bodies. Witness.
+- **P17.6-extra** — tanh/sigmoid/leaky_relu/elu/mish backward.
+- **P17.12** — embedding_bag with sum/mean reductions.
+- **P17.17-extra** — Lion / LAMB / Adafactor optimizer steps.
+- **P17.20** — numerical parity bench (`bench/parity/matmul_parity.txt`)
+  + matmul exercise witness.
+- **P15.5** — PGO record/freq/dump witness against existing runtime.
+- **P15.8** — Auto-prefetch insertion (T0/T1/NTA hints via x86 `_mm_prefetch`).
+- **P16.16** — `unsafe impl Send/Sync for T {}` parser support.
+- **P16.25** — `impl Trait` arg/return position parser support.
+- **P22.6** — Coverage instrumentation (record/hits/dump runtime fns).
+- **P22.9** — Differential testing harness against PyTorch reference.
+- **P24.4** — Cross-compilation runtime witness (no-op for default target).
+- **P24.7** — Crash dump primitive (writes `crash_<pid>_<step>.dump`).
 
 ---
 

@@ -1,0 +1,19 @@
+// roadmap: P16.16
+// expect: exit=42
+//
+// FR-16.16 — `unsafe impl Send for Foo {}` and `unsafe impl Sync for Foo {}`.
+// Send/Sync are auto-marker traits the user opts a type into; their
+// presence has no codegen effect today (no thread-safety analysis runs yet)
+// but the syntax must parse so multi-thread-aware libraries can advertise
+// thread safety. The witness declares both impls and uses the type
+// normally; exit-42 demonstrates parse + AST + codegen all stay clean.
+struct ThreadSafeBox { value: i64 }
+
+unsafe impl Send for ThreadSafeBox {}
+unsafe impl Sync for ThreadSafeBox {}
+
+fn main() -> i32 {
+    let b: ThreadSafeBox;
+    b.value = 42;
+    b.value as i32
+}

@@ -89,3 +89,6 @@ lpt9
 
 tests/runtime/*.exe
 tests/runtime/*.obj
+
+# Crash dumps from FR-24.7 witness runs.
+crash_*.dump

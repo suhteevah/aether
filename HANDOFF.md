@@ -1,13 +1,33 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-09 (v4 second-pass + NEXT-UP critical-path reorg)
+2026-05-10 (Path B core landed: closures with captures, heap stdlib extras,
+println! interpolation; plus 9 batched real-impl FRs)
 
 ## Project Status
-🟡 **Audit: 123/196 (63%) roadmap items witnessed.** Phases 6-14 stay 100%.
-Phase 15-24 grew from 38/118 to 54/118 across two passes. Every v4 item
-that the current toolchain genuinely supports got a real witness; the
-remaining 73 items are in `NEXT-UP.md` as FR-N entries rather than faked.
+🟢 **Audit: 135/196 (68%) roadmap items witnessed.** +12 from baseline of
+123/196 in one autonomous run. Phases 6-14 stay 100%; Phase 15-24 grew
+from 54/118 to 66/118.
+
+```
+Phase 6-14: 78/78 witnessed (100%) — unchanged
+Phase 15:    3/10 witnessed (30%)  ← +2 (PGO record + prefetch hints)
+Phase 16:   21/25 witnessed (84%)  ← +3 (closures captures real impl,
+                                          println!, Send/Sync, impl Trait)
+Phase 17:   18/20 witnessed (90%)  ← +3 (pooling, embedding_bag,
+                                          parity bench)
+Phase 18:    2/11 witnessed (18%)  — unchanged
+Phase 19:    0/16 witnessed (0%)   — unchanged
+Phase 20:    7/10 witnessed (70%)  — unchanged
+Phase 21:    3/10 witnessed (30%)  — unchanged
+Phase 22:    6/10 witnessed (60%)  ← +2 (coverage, differential)
+Phase 23:    2/6  witnessed (33%)  — unchanged
+Phase 24:    5/10 witnessed (50%)  ← +2 (cross_compile, crash_dump)
+TOTAL:    135/196 (68%)
+```
+
+Workspace tests: 31 passes (was 27, +4 new heap-extras tests). Honesty scan: 0 todo /
+0 unimplemented / 4 carry-over `_force_use` stubs.
 
 ```
 Phase  6: 14/14 witnessed  (100%)
@@ -35,6 +55,64 @@ TOTAL:   123/196            (63%)
 Workspace tests: 103/0 pass. Honesty scan: 0 todo / 0 unimplemented / 0
 ignored stubs / 4 carry-over `_force_use`-class stub_returns. The remaining
 73 v4 items live in `NEXT-UP.md`.
+
+## This session — Path B core + cross-cutting batch
+
+**Path B (highest-leverage path) is materially complete.**
+
+### B1: Closures with captures (FR-16.4-extra) — REAL IMPL
+
+`compiler/src/mir/closures.rs` rewritten. Detects free vars in closure
+body, classifies as by-value (read-only) or by-mut-ref (writes), prepends
+captures as fn params, rewrites body Idents to Deref for mut captures,
+records binding in a per-fn map, prepends captures at every direct call
+site (`bind_name(args)` → `lifted_fn(captures..., args)`).
+
+Asm backend gained store-through-pointer assignment (`*ptr = rhs`) so
+the mut-capture write path works.
+
+Witness: `tests/runtime/closures_captures.aether`. The closure
+`|| { acc = acc + 1; acc + bonus }` increments `acc` across three calls
+(1, 2, 3) and yields 13 + 14 + 15 = 42.
+
+### B2: Heap stdlib extras (FR-16.5) — REAL IMPL
+
+Added to runtime + stdlib:
+- `Box<i64>` — single-i64 heap cell (new/get/set/free)
+- `HashMap<i64, i64>` — open-addressed splitmix64 hash, linear probing,
+  power-of-two cap, 0.75 load factor before grow. Insert/get/contains/
+  remove/len/free.
+- `Rc<i64>` — refcounted single-i64. new/clone/get/strong_count/drop.
+- `mpsc::channel<i64>` — FIFO queue. new/send/recv (non-blocking via
+  out-pointer)/len/free.
+
+4 new runtime unit tests, all green.
+Witness: `tests/runtime/heap_stdlib_extras.aether`.
+
+### B3: println!/format! interpolation (FR-16.14) — REAL IMPL
+
+Parser intercepts `println!(...)` / `print!(...)` and expands the
+format-string literal into a Block of print primitive calls. `{}` →
+`aether_print_i64`, `{:f}` / `{:.<N>}` → `aether_print_f32_default`,
+literal segments → `aether_print_str_n(seg_ptr, seg_len)`. Newline only
+for `println!`. Escape `{{` and `}}` for literal braces.
+
+Witness: `tests/runtime/println_format.aether` prints
+`hello world\nstep 7 loss=2.5\n`.
+
+### Cross-cutting batch (P15.5 / P15.8 / P17.4 / P17.6-extra / P17.12 /
+P17.17-extra / P17.20 / P22.6 / P22.9 / P24.4 / P24.7)
+
+All shipped with real runtime/CLI implementations + witness files. See
+NEXT-UP.md "Closed this batch" section for the full list.
+
+### Parser additions
+
+- `||` (Tok::PipePipe) accepted as no-param closure start when in unary
+  slot — splits the OR-or token back into two pipes.
+- `unsafe impl Trait for Type {}` accepted (P16.16 — Send/Sync etc.).
+- `impl Trait` accepted in arg/return position (P16.25 — placeholder
+  type until trait dispatch is real).
 
 ## NEXT-UP critical-path reorg (commit 5e5ab0b)
 

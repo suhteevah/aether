@@ -1,0 +1,27 @@
+// roadmap: P17.6
+// expect: exit=42
+//
+// FR-17.6-extra — backward passes for tanh / sigmoid / leaky_relu / elu /
+// mish. Each runs in-place, multiplying the upstream gradient by the
+// activation's derivative at x. The witness wires the FFI surface; the
+// per-element correctness lives in the runtime unit tests.
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(buf: i64);
+extern fn aether_op_tanh_backward_f32(y: i64, grad: i64, n: i32) -> i32;
+extern fn aether_op_sigmoid_backward_f32(y: i64, grad: i64, n: i32) -> i32;
+extern fn aether_op_leaky_relu_backward_f32(x: i64, grad: i64, slope: f32, n: i32) -> i32;
+extern fn aether_op_elu_backward_f32(x: i64, grad: i64, alpha: f32, n: i32) -> i32;
+extern fn aether_op_mish_backward_f32(x: i64, grad: i64, n: i32) -> i32;
+
+fn main() -> i32 {
+    let x: i64 = aether_alloc_bytes(64);
+    let g: i64 = aether_alloc_bytes(64);
+    if aether_op_tanh_backward_f32(x, g, 16) != 0 { return 1; }
+    if aether_op_sigmoid_backward_f32(x, g, 16) != 0 { return 2; }
+    if aether_op_leaky_relu_backward_f32(x, g, 0.01, 16) != 0 { return 3; }
+    if aether_op_elu_backward_f32(x, g, 1.0, 16) != 0 { return 4; }
+    if aether_op_mish_backward_f32(x, g, 16) != 0 { return 5; }
+    aether_free_bytes(x);
+    aether_free_bytes(g);
+    42
+}

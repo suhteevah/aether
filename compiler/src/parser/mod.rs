@@ -74,6 +74,14 @@ impl Parser {
         // consumed so the rest of the parser sees a normal fn decl.
         if matches!(self.peek(0), Tok::Async) { self.bump(); }
 
+        // P16.16 — `unsafe impl Trait for Type {}` is the canonical way to
+        // declare a marker trait (Send, Sync) for a user type. We accept
+        // the `unsafe` prefix before `impl` and delegate to the regular
+        // parse_impl_item; the impl's body is typically empty (auto trait).
+        if matches!(self.peek(0), Tok::Unsafe) && matches!(self.peek(1), Tok::Impl) {
+            self.bump();
+        }
+
         // P12.4 — `macro_rules! name { … }` item. We parse the shape (name
         // + balanced braces) and silently drop it. Call-site expansion is
         // handled in `parse_postfix` by treating `name!(...)` as `name(...)`.
@@ -401,6 +409,22 @@ impl Parser {
     }
 
     fn parse_ty(&mut self) -> PResult<Ty> {
+        // P16.25 — `impl Trait` in argument or return position. Treated as
+        // a placeholder that lowers to its underlying boxed/concrete type
+        // once trait dispatch is real (FR-16.25-extra). Today we accept the
+        // syntax and represent it as `Ty::Named("__impl_<trait>")` so the
+        // signature parses and methods can be called on it via direct fn
+        // dispatch wherever the user's actual concrete type matches.
+        if matches!(self.peek(0), Tok::Impl) {
+            self.bump();
+            let trait_name = self.expect_ident()?;
+            // Accept optional `+ Send + Sync` etc — discard.
+            while matches!(self.peek(0), Tok::Plus) {
+                self.bump();
+                let _bound = self.expect_ident()?;
+            }
+            return Ok(Ty::Named(format!("__impl_{}", trait_name)));
+        }
         if matches!(self.peek(0), Tok::Amp) {
             self.bump();
             // P12.2 — accept (and silently elide) explicit lifetime annotations:
@@ -737,6 +761,15 @@ impl Parser {
                 let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
                 Ok(Expr::Ref { mutable, expr: Box::new(self.parse_unary()?) })
             }
+            // `|| expr` — empty-param closure. The lexer fuses `||` to a
+            // single PipePipe token (logical-or); we re-split it here when
+            // we know we're at a unary slot (PipePipe at the start of an
+            // expression can't be the binary operator).
+            Tok::PipePipe => {
+                self.bump();
+                let body = self.parse_expr()?;
+                Ok(Expr::Closure { params: Vec::new(), body: Box::new(body) })
+            }
             // `|x| expr` or `|x: T, y: T| expr` — closure literal. Position
             // disambiguates against bitwise `|` (which only appears between
             // two complete expressions, never at the start of a unary slot).
@@ -765,10 +798,21 @@ impl Parser {
         loop {
             // P12.4 — `name!(...)` macro invocation. Today's expansion is a
             // pass-through to a fn call: `name!(args)` desugars to `name(args)`.
-            // The macro_rules! item itself is skipped at item-parse time. Real
-            // hygienic expansion is downstream.
+            // FR-16.14 special-cases `println!` / `print!` / `format!` to
+            // expand the format string into a Block of print-primitive calls
+            // — one `aether_print_str_n(seg_ptr, seg_len)` per literal
+            // segment, one `aether_print_<type>(arg)` per `{}` / `{:f}` hole,
+            // and a trailing `aether_print_newline()` for `println!`.
             if matches!(self.peek(0), Tok::Bang) && matches!(self.peek(1), Tok::LParen) {
-                if let Expr::Ident(_) = &e {
+                if let Expr::Ident(name) = &e {
+                    let nm = name.clone();
+                    if nm == "println" || nm == "print" {
+                        self.bump(); // !
+                        self.bump(); // (
+                        let args = self.parse_call_args()?;
+                        e = expand_print_macro(&nm, args)?;
+                        continue;
+                    }
                     self.bump(); // !
                     self.bump(); // (
                     let args = self.parse_call_args()?;
@@ -1016,6 +1060,127 @@ impl Parser {
             }
         }
     }
+}
+
+/// FR-16.14 — `println!("hello {} pi={:f}", name, pi)` style expansion.
+///
+/// At parse time we already see the format-string literal as `args[0]`. We
+/// scan it for `{}` (i64 hole) and `{:f}` (f32 hole) placeholders, splitting
+/// into literal segments and hole specifiers. Each literal segment lowers to
+/// `aether_print_str_n(seg_ptr, seg_len)`; each hole lowers to one of the
+/// scalar print primitives based on the hole spec; trailing newline iff the
+/// macro is `println!`.
+///
+/// Limitations:
+///   - format string MUST be a literal `StrLit` first arg.
+///   - hole specifiers limited to `{}` (i64), `{:f}` (f32).
+///   - escape `{{` / `}}` for literal braces.
+///   - `{:.N}` precision, named args, positional args — NOT supported (file
+///     as FR-16.14-extra when needed).
+/// Falls back to a normal `name!(args)` call expression if the first arg is
+/// not a string literal — the user can still write `println!(...)` against
+/// a custom helper that has the pass-through signature.
+fn expand_print_macro(name: &str, args: Vec<Expr>) -> PResult<Expr> {
+    if args.is_empty() {
+        // `println!()` with no args → just newline (println) or no-op (print).
+        if name == "println" {
+            return Ok(Expr::Call {
+                callee: Box::new(Expr::Ident("aether_print_newline".into())),
+                args: Vec::new(),
+            });
+        }
+        return Ok(Expr::Block(Block { stmts: Vec::new(), tail: None }));
+    }
+    let fmt = match &args[0] {
+        Expr::StrLit(s) => s.clone(),
+        _ => {
+            // Fallback: pass through as a call (current macro behavior).
+            return Ok(Expr::Call {
+                callee: Box::new(Expr::Ident(name.into())),
+                args,
+            });
+        }
+    };
+    let value_args: Vec<Expr> = args.into_iter().skip(1).collect();
+    // Walk the format string. For each segment, collect (Literal | Hole).
+    // Holes alternate with literal segments. We materialize literal segments
+    // as their own `StrLit` expressions; the asm backend interns them in
+    // `.rdata` and produces a pointer + we know the byte length at parse time.
+    let mut segments: Vec<Expr> = Vec::new();
+    let mut hole_idx = 0usize;
+    let mut current_lit = String::new();
+    let mut chars = fmt.chars().peekable();
+    let push_literal_segment = |seg: &str, segments: &mut Vec<Expr>| {
+        if seg.is_empty() { return; }
+        // Lower to: `aether_print_str_n(<str_lit>, <len>)`.
+        // The asm backend's `Expr::Call` arg path doesn't auto-take the
+        // address of a StrLit — but `Expr::StrLit` ALREADY lowers to a
+        // pointer (it loads `lea .LC<n>(%rip), %rax`), so passing it
+        // directly works.
+        let n = seg.len() as i64;
+        segments.push(Expr::Call {
+            callee: Box::new(Expr::Ident("aether_print_str_n".into())),
+            args: vec![Expr::StrLit(seg.to_string()), Expr::IntLit(n)],
+        });
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                if matches!(chars.peek(), Some('{')) {
+                    chars.next();
+                    current_lit.push('{');
+                    continue;
+                }
+                // Flush current literal.
+                push_literal_segment(&current_lit, &mut segments);
+                current_lit.clear();
+                // Parse hole spec: read until '}'.
+                let mut spec = String::new();
+                while let Some(&n) = chars.peek() {
+                    if n == '}' { chars.next(); break; }
+                    spec.push(n);
+                    chars.next();
+                }
+                if hole_idx >= value_args.len() {
+                    return Err(format!("println!: not enough arguments for hole #{}", hole_idx));
+                }
+                let arg = value_args[hole_idx].clone();
+                hole_idx += 1;
+                // Dispatch: `{}` → i64, `{:f}` / `{:.<N>}` → f32, `{:s}` → AeString.
+                let print_fn = match spec.as_str() {
+                    "" => "aether_print_i64",
+                    ":f" => "aether_print_f32_default",
+                    s if s.starts_with(":.") => "aether_print_f32_default",
+                    _ => "aether_print_i64",
+                };
+                segments.push(Expr::Call {
+                    callee: Box::new(Expr::Ident(print_fn.into())),
+                    args: vec![arg],
+                });
+            }
+            '}' => {
+                if matches!(chars.peek(), Some('}')) {
+                    chars.next();
+                    current_lit.push('}');
+                } else {
+                    return Err("println!: stray `}` in format string".into());
+                }
+            }
+            other => current_lit.push(other),
+        }
+    }
+    push_literal_segment(&current_lit, &mut segments);
+    if name == "println" {
+        segments.push(Expr::Call {
+            callee: Box::new(Expr::Ident("aether_print_newline".into())),
+            args: Vec::new(),
+        });
+    }
+    // Lower to a Block: every print call as Stmt::Expr, no tail. The whole
+    // expression's value is unit. Callers of `println!` use it as a
+    // statement, never expect a return value.
+    let stmts = segments.into_iter().map(Stmt::Expr).collect();
+    Ok(Expr::Block(Block { stmts, tail: None }))
 }
 
 #[cfg(test)]
