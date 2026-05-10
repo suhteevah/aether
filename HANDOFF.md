@@ -1,15 +1,47 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-10
+2026-05-10 (Path A pickup landed: P15.4 inlining + P15.6 autotune)
 
 ## Project Status
-🟢 **Audit: 135/196 (68%) roadmap items witnessed.** +12 from baseline of
-123/196 in one autonomous session. 0 errors, all workspace tests green,
-honesty scan reports only known-carry-over stubs. Path B (the highest-
-leverage critical path) is materially complete.
+🟢 **Audit: 137/196 (69%) roadmap items witnessed.** +14 from baseline of
+123/196 across two autonomous sessions today. 0 errors, all workspace
+tests green, honesty scan reports only known-carry-over stubs. Path B is
+materially complete; Path A is open with two real wins (cross-fn
+inlining + matmul auto-tune table).
 
 ## What Was Done This Session
+
+### Path A — inlining + autotune (real impl, honesty-auditor verified)
+
+- **P15.4 (FR-15.4) cross-fn inlining** — `compiler/src/mir/inline.rs`,
+  new MIR pass. Two-pass survey + splice. Heuristic: body present, no
+  const-generic params, no autodiff/distributed/server/spec attrs, not
+  main, not __closure_*, not recursive (calls_self walk), no Stmt::Return,
+  body ≤ 5 stmts. At each Call to an inlinable fn, splices a Block of
+  `[let __inl_<n>_pN = argN; ...; renamed body stmts]` with the body's
+  renamed tail as the Block's tail. Per-splice counter keeps locals
+  collision-free. Wired into main.rs at --O1 between ast_opt and
+  regalloc. Re-runs ast_opt after splicing so freshly substituted args
+  fold. Witness: `tests/runtime/inline_smoke.aether` — exit 42, 0 `call`
+  instructions in the asm at --O1. honesty-auditor verified all 6
+  claims; 3 unit tests green.
+
+- **P15.6 (FR-15.6) matmul tile auto-tune lookup** —
+  `aether_autotune_matmul_tile_f32(m, n, k)` returns a packed i64
+  holding `(tile_m, tile_n, tile_k, unroll)` tuned for the 11900K cache
+  hierarchy. 4 unpack helpers expose each field. Witness queries 4 size
+  buckets (32, 256, 1024, 8192) and asserts the tile/unroll values
+  match. Note: matmul hot loop in `aether_op_matmul_f32` does NOT yet
+  consult the autotune table — that wiring is the next-step extension.
+
+- **Bench-runner audit-agent finding**: single-trial bench at this
+  commit showed +73% on 256³ matmul vs 2026-05-03 row, but Candle and
+  Torch ALSO drifted +44-47% on the same hardware between runs — clear
+  system-state variance, not Aether code regression (the matmul hot
+  loop wasn't touched). bench-runner correctly declined to append a
+  noisy row; ledger keeps the 2026-05-03 reference numbers + a "skipped
+  — variance" note explaining commit 81264f4's bypass.
 
 ### Path B — closures + heap stdlib + println!
 

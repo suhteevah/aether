@@ -25,6 +25,10 @@ Hardware: i9-11900K, RTX 3070 Ti 8 GiB, Win10 Pro. CUDA 12.6, candle 0.10.2 (loc
 
 Aether wins 3 of 4 GPU sgemm sizes. CPU is intentionally not bench'd today — the runtime's CPU path is the Phase-0 reference for correctness, not a perf target. AVX-512 microkernels land in roadmap item P10.6.
 
+### 2026-05-09 — commit 81264f4: skipped (cross-library variance)
+
+Single-trial run at this commit produced numbers whose run-to-run spread exceeded the cross-library deltas we'd be reporting on. Appending a row would have implied a verdict the data didn't support. Per the append-only honesty rule we recorded no row rather than recording a noisy one. Re-bench will land once the bench harness moves to median-of-5 (gating on `bench/matmul_micro/run_all.ps1` warm-up + trial-count refactor). No code path under this commit changed `runtime/src/cuda.rs` semantics, so the prior 2026-05-03 row remains the standing reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

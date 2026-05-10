@@ -9,7 +9,17 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-10)
+## Closed this batch (2026-05-10, Path A pickup)
+
+- **P15.4 / FR-15.4** — Cross-fn inlining, real impl. `compiler/src/mir/inline.rs`
+  (514 lines, 3 unit tests). Wired at `--O1` between ast_opt and regalloc.
+  Witness: `tests/runtime/inline_smoke.aether` (0 `call` instructions in
+  the emitted asm at --O1). honesty-auditor verified all 6 claims.
+- **P15.6 / FR-15.6** — Matmul tile auto-tune lookup table. Concrete
+  hand-curated table for 11900K cache hierarchy. Witness exercises
+  4 size buckets.
+
+## Closed earlier today (2026-05-10, batch 1)
 
 - **B1 / FR-16.4-extra** — closures with captures (real impl, mut+by-val).
   Compiler closures pass detects free vars, lifts as fn with capture
