@@ -1,0 +1,43 @@
+// roadmap: P18.7
+// expect: exit=42
+//
+// FR-18.7 — ZeRO-1/2/3 staged sharding (in-process sim).
+//
+// Verifies the documented memory savings shape:
+//   Z1 — shard optim state.        Per-rank ≈ params + grad + optim/ws
+//   Z2 — also shard grad.          Per-rank ≈ params + (grad+optim)/ws
+//   Z3 — also shard params.        Per-rank ≈ (params+grad+optim)/ws
+//
+// For ws=4 and n=1M params (AdamW = 2× param-count optim slots):
+//   Baseline = 4 * n * 4 = 16 MB.
+//   Z3       ≈ baseline / 4 = 4 MB.
+//
+// matt-voice note (per MATT_VOICE_FR.md §FR-18.7): "For QLoRA mostly
+// unnecessary (only adapters are trainable)." Listed here for FR-18
+// audit completeness.
+use runtime;
+
+extern fn aether_zero_simulate_stage_bytes_f32(n_params: i32, world_size: i32, stage: i32) -> i64;
+
+fn main() -> i32 {
+    let n: i32 = 1000000;
+    let ws: i32 = 4;
+    let baseline: i64 = 4 * 1000000 * 4;  // 16 MB
+
+    let z1: i64 = aether_zero_simulate_stage_bytes_f32(n, ws, 1);
+    let z2: i64 = aether_zero_simulate_stage_bytes_f32(n, ws, 2);
+    let z3: i64 = aether_zero_simulate_stage_bytes_f32(n, ws, 3);
+
+    // Each stage must be strictly less than the previous.
+    if z1 >= baseline { return 1; }
+    if z2 >= z1 { return 2; }
+    if z3 >= z2 { return 3; }
+
+    // Z3 with ws=4 should hit roughly baseline/4 (within 16 bytes for
+    // rounding). The simulator returns exact bytes so the check is tight.
+    let expected_z3: i64 = baseline / 4;
+    let diff: i64 = z3 - expected_z3;
+    if diff < 0 - 16 { return 4; }
+    if diff > 16 { return 4; }
+    42
+}

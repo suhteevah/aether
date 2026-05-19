@@ -45,6 +45,10 @@ Bench-runner append rule fires on `runtime/src/lib.rs` touched. The change is pu
 
 Bench-runner append rule fires again on `runtime/src/lib.rs` touched. Four new runtime symbols added (`aether_dequant_q4_0`, `aether_flash_attention_v2_f32`, `aether_store_i32`, `aether_sum_f32`) plus four new `.aether` witnesses. The matmul / softmax / SDPA / CE / LN / conv hot paths are untouched (the new FA2 fn is its own kernel, not a swap of the existing `aether_op_sdpa_causal_f32`). Standing 2026-05-03 matmul row remains the reference. A dedicated `bench/attention_fa2_vs_naive/` fixture is the right place to record the FA2 speedup once seq_len grows large enough for the O(N) memory advantage to bite — that fixture doesn't exist yet; deferred.
 
+### 2026-05-19 — pending commit (Phase 18 closeout — NCCL surface + 6 distributed sims): skipped (in-process simulations, no real multi-rank to bench)
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched. Eight new symbols added: `aether_nccl_*` (init/finalize/comm_create/destroy/world_size/rank/all_reduce_f32 — single-host fallback), `aether_tp_simulate_column_parallel_linear_f32`, `aether_pp_simulate_2stage_forward_f32`, `aether_fsdp_simulate_shard_alltoall_f32`, `aether_zero_simulate_stage_bytes_f32`, `aether_overlap_simulate_overlapped_us` / `_serial_us`, `aether_grad_compress_lowrank_f32`. Every fn is named `*_simulate_*` or returns single-host fallback values — there is no real multi-rank wall-time to measure on the kokonoe single-3070Ti box. The matmul path is untouched. Real cross-card bench fixtures live in MATT_VOICE_FR.md and require the cnc 2×P100 + libnccl link (FR-18.1-extra). Standing 2026-05-03 matmul row remains the reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

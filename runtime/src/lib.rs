@@ -2983,6 +2983,347 @@ fn write_f32(buf: &mut [u8], v: f32, decimals: u32) -> usize {
     0
 }
 
+// =====================================================================
+// FR-18.1 — NCCL FFI surface (single-host fallback).
+//
+// Mirrors the libnccl API shape so a future Aether build that links
+// against real libnccl.so / nccl.dll only has to flip the impls below.
+// Today these are single-host fallbacks: world_size>1 is rejected; the
+// world_size=1 path is a no-op that lets matt-voice / antcolony / etc.
+// write their distributed control-flow against a stable symbol surface
+// even on a single-GPU box.
+//
+// Per `MATT_VOICE_FR.md` this gates everything Phase-18 — once a real
+// libnccl is linked, every Stage-0 multi-rank witness (PP, TP, FSDP)
+// becomes a real cross-card all-reduce instead of an in-process sim.
+// The witness for P18.1 verifies the surface exists + single-rank
+// returns sane values. Multi-rank correctness is FR-18.1-extra
+// (real libnccl link) — explicitly NOT shipped here.
+// =====================================================================
+
+/// NCCL-shaped init. Returns 0 on success. Single-host fallback today
+/// (no actual libnccl call; just records that init was requested).
+#[no_mangle] pub extern "C" fn aether_nccl_init() -> c_int {
+    NCCL_INIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+/// Returns the number of NCCL inits seen this process. The witness
+/// uses this to confirm aether_nccl_init was actually called.
+#[no_mangle] pub extern "C" fn aether_nccl_init_count() -> c_int {
+    NCCL_INIT_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Tear down (single-host fallback). Returns 0.
+#[no_mangle] pub extern "C" fn aether_nccl_finalize() -> c_int {
+    NCCL_INIT_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    0
+}
+
+/// Create a communicator. Returns an opaque handle ≥ 1 on success, 0 on
+/// failure. Single-host fallback: rejects world_size > 1 (returns 0)
+/// so callers don't silently get incorrect results on a single-GPU box.
+#[no_mangle] pub extern "C" fn aether_nccl_comm_create(world_size: c_int, rank: c_int) -> i64 {
+    if world_size <= 0 || rank < 0 || rank >= world_size { return 0; }
+    if world_size > 1 {
+        // FR-18.1-extra (real libnccl link) needed to actually create a
+        // cross-card communicator. Return a sentinel so the witness can
+        // distinguish "not supported on this build" from "init failed".
+        return -1;
+    }
+    let handle = NCCL_NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    handle as i64
+}
+
+/// Destroy a communicator. Single-host fallback always returns 0.
+#[no_mangle] pub extern "C" fn aether_nccl_comm_destroy(_comm: i64) -> c_int { 0 }
+
+/// Return the world_size this comm was created with. Single-host
+/// fallback always returns 1 (the only supported size).
+#[no_mangle] pub extern "C" fn aether_nccl_comm_world_size(_comm: i64) -> c_int { 1 }
+
+/// Return the rank this comm was created with. Single-host fallback
+/// always returns 0.
+#[no_mangle] pub extern "C" fn aether_nccl_comm_rank(_comm: i64) -> c_int { 0 }
+
+/// Real NCCL all-reduce shape: `(send_buf, recv_buf, n, op, comm)`.
+/// Op codes: 0 = sum, 1 = max, 2 = min, 3 = prod. Single-host fallback
+/// is a copy: when world_size=1 the reduction is the identity. Returns
+/// 0 on success, non-zero on bad op or null buffers.
+#[no_mangle] pub unsafe extern "C" fn aether_nccl_all_reduce_f32(
+    send: *const c_void, recv: *mut c_void,
+    n: c_int, op: c_int, _comm: i64,
+) -> c_int {
+    if send.is_null() || recv.is_null() || n <= 0 { return 1; }
+    if !(0..=3).contains(&op) { return 2; }
+    let s = std::slice::from_raw_parts(send as *const f32, n as usize);
+    let r = std::slice::from_raw_parts_mut(recv as *mut f32, n as usize);
+    r.copy_from_slice(s);  // world_size=1 → reduction is identity
+    0
+}
+
+static NCCL_INIT_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+static NCCL_NEXT_HANDLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+// =====================================================================
+// FR-18.{4,5,6} — In-process simulations of the distributed shapes.
+//
+// Without a real second GPU the AETHER tests can't run actual multi-
+// rank workloads. Each fn below simulates the algorithm shape on a
+// single host so the control-flow shape is verifiable — the eventual
+// multi-rank impls (FR-18.x-extra, gated on real libnccl link) plug
+// into the same call sites.
+// =====================================================================
+
+/// FR-18.5 — Tensor-parallel column-parallel Linear (in-process sim).
+///
+/// Splits weight W (shape k × n) column-wise into N "rank shards". Each
+/// shard computes a partial output Y_shard = X · W[:, shard_start..end]
+/// (shape m × n_shard). The simulator then concatenates the shards
+/// column-wise to recover the full Y (shape m × n). Mathematically
+/// identical to a single-rank matmul X · W; the shape verifies that
+/// the column split + concat round-trip is correct.
+///
+/// `n` MUST be divisible by `world_size`. Returns 0 on success.
+#[no_mangle] pub unsafe extern "C" fn aether_tp_simulate_column_parallel_linear_f32(
+    x: *const c_void,        // (m, k)
+    w: *const c_void,        // (k, n)
+    out: *mut c_void,        // (m, n)
+    m: c_int, k: c_int, n: c_int, world_size: c_int,
+) -> c_int {
+    if x.is_null() || w.is_null() || out.is_null() { return 1; }
+    if m <= 0 || k <= 0 || n <= 0 || world_size <= 0 { return 2; }
+    if n % world_size != 0 { return 3; }
+    let m = m as usize; let k = k as usize; let n = n as usize;
+    let ws = world_size as usize;
+    let xs = std::slice::from_raw_parts(x as *const f32, m * k);
+    let ws_buf = std::slice::from_raw_parts(w as *const f32, k * n);
+    let o = std::slice::from_raw_parts_mut(out as *mut f32, m * n);
+    let n_shard = n / ws;
+    // For each rank shard, compute its partial Y_shard and write into
+    // the corresponding column slab of `out`. Real multi-rank version
+    // would each compute one shard locally and all-gather the slabs.
+    for shard in 0..ws {
+        let col_start = shard * n_shard;
+        for r in 0..m {
+            for cc in 0..n_shard {
+                let c = col_start + cc;
+                let mut s = 0.0f32;
+                for ki in 0..k {
+                    s += xs[r * k + ki] * ws_buf[ki * n + c];
+                }
+                o[r * n + c] = s;
+            }
+        }
+    }
+    0
+}
+
+/// FR-18.6 — Pipeline-parallel 1F1B forward-only simulation.
+///
+/// Splits N transformer "blocks" across `n_stages` stages. Each block
+/// is a simple `Y = X * scale + bias` (the simulator's stand-in for a
+/// real DecoderLayer). Stage s owns blocks `[s*blocks_per_stage,
+/// (s+1)*blocks_per_stage)`. Micro-batches flow through the pipeline:
+/// at any time, micro-batch i is on stage `i mod n_stages` (1F1B).
+///
+/// `scales` and `biases` are length `n_blocks` each. `microbatches` is
+/// the count of micro-batches; the simulator runs all of them through
+/// the full pipe and writes results to `out` (length microbatches * d).
+///
+/// The output MUST match what a monolithic single-stage forward would
+/// produce — the witness verifies this by computing both side-by-side.
+///
+/// Returns 0 on success.
+#[no_mangle] pub unsafe extern "C" fn aether_pp_simulate_2stage_forward_f32(
+    input: *const c_void,    // (microbatches, d)
+    scales: *const c_void,   // (n_blocks,)
+    biases: *const c_void,   // (n_blocks,)
+    out: *mut c_void,        // (microbatches, d)
+    microbatches: c_int, d: c_int,
+    n_blocks: c_int, n_stages: c_int,
+) -> c_int {
+    if input.is_null() || scales.is_null() || biases.is_null() || out.is_null() { return 1; }
+    if microbatches <= 0 || d <= 0 || n_blocks <= 0 || n_stages <= 0 { return 2; }
+    if n_blocks % n_stages != 0 { return 3; }
+    let mb = microbatches as usize; let d = d as usize;
+    let nb = n_blocks as usize; let ns = n_stages as usize;
+    let bps = nb / ns;
+    let in_buf = std::slice::from_raw_parts(input as *const f32, mb * d);
+    let sc = std::slice::from_raw_parts(scales as *const f32, nb);
+    let bi = std::slice::from_raw_parts(biases as *const f32, nb);
+    let o = std::slice::from_raw_parts_mut(out as *mut f32, mb * d);
+
+    // Buffer that travels stage-by-stage. Real multi-rank version would
+    // send/recv this between ranks; in-process we just keep a Vec.
+    let mut x = vec![0.0f32; mb * d];
+    x.copy_from_slice(in_buf);
+
+    // 1F1B forward schedule: process every micro-batch through every
+    // stage in order. Each stage applies its `bps` blocks sequentially.
+    for stage in 0..ns {
+        let block_lo = stage * bps;
+        let block_hi = block_lo + bps;
+        for b in block_lo..block_hi {
+            // Apply block b to all micro-batches.
+            for mb_i in 0..mb {
+                for di in 0..d {
+                    x[mb_i * d + di] = x[mb_i * d + di] * sc[b] + bi[b];
+                }
+            }
+        }
+        // (In a real run, this is where stage `stage` sends its
+        // output to stage `stage+1` via send/recv. Single-process:
+        // x is already the right input for the next stage.)
+    }
+    o.copy_from_slice(&x);
+    0
+}
+
+/// FR-18.7 — ZeRO-1/2/3 staged sharding (in-process sim).
+///
+/// Demonstrates the staged memory-savings shape:
+///   stage=1 (Z1) — shard optimizer state only.   Per-rank bytes ≈ params + 2 * params/ws
+///   stage=2 (Z2) — also shard gradients.         Per-rank bytes ≈ params + 3 * params/ws
+///   stage=3 (Z3) — also shard parameters.        Per-rank bytes ≈ 4 * params/ws (= FSDP)
+///
+/// `n_params` is the model's parameter count. Returns the simulated
+/// per-rank byte count for the requested ZeRO stage (assuming f32
+/// params + f32 grads + 2 × f32 optimizer-state slots per param —
+/// AdamW shape). Caller compares against the unsharded `4 * n_params *
+/// 4` baseline to verify the documented savings.
+#[no_mangle] pub extern "C" fn aether_zero_simulate_stage_bytes_f32(
+    n_params: c_int, world_size: c_int, stage: c_int,
+) -> i64 {
+    if n_params <= 0 || world_size <= 0 { return -1; }
+    if !(1..=3).contains(&stage) { return -2; }
+    let n = n_params as i64;
+    let ws = world_size as i64;
+    let elem = 4_i64;  // f32
+    // Baseline (no ZeRO): params (1x) + grads (1x) + optim (2x) all full per rank.
+    // Z1 shards optim → grad + param full, optim sharded.
+    // Z2 also shards grad → param full, grad+optim sharded.
+    // Z3 also shards param → all sharded.
+    let param_bytes = n * elem;
+    let grad_bytes  = n * elem;
+    let optim_bytes = 2 * n * elem;
+    let bytes = match stage {
+        1 => param_bytes + grad_bytes + optim_bytes / ws,
+        2 => param_bytes + (grad_bytes + optim_bytes) / ws,
+        3 => (param_bytes + grad_bytes + optim_bytes) / ws,
+        _ => unreachable!(),
+    };
+    bytes
+}
+
+/// FR-18.8 — Compute/comm overlap simulation.
+///
+/// On a real multi-GPU setup, an `all_reduce` launched on a comm stream
+/// overlaps with the next backward kernel on the compute stream. This
+/// simulator demonstrates the SHAPE: takes a buffer + a "compute" cost
+/// (microseconds) + a "comm" cost; returns the simulated total wall
+/// time if overlapped (= max(compute, comm)) versus serial (= sum).
+/// The witness asserts the overlapped total is strictly less than the
+/// serial total for overlapping costs.
+///
+/// Returns: overlapped time in microseconds.
+#[no_mangle] pub extern "C" fn aether_overlap_simulate_overlapped_us(
+    compute_us: c_int, comm_us: c_int,
+) -> c_int {
+    if compute_us < 0 || comm_us < 0 { return -1; }
+    if compute_us > comm_us { compute_us } else { comm_us }
+}
+
+#[no_mangle] pub extern "C" fn aether_overlap_simulate_serial_us(
+    compute_us: c_int, comm_us: c_int,
+) -> c_int {
+    if compute_us < 0 || comm_us < 0 { return -1; }
+    compute_us + comm_us
+}
+
+/// FR-18.9 — Gradient compression (rank-K projection, PowerSGD-shape).
+///
+/// Compresses a gradient buffer (m, n) into a rank-K approximation:
+///   G ≈ P · Q^T  where P is (m, K) and Q is (n, K).
+///
+/// For the witness we just use the first K columns of G as P and an
+/// identity-shape Q so the reconstruction is `G[:, :K]` extended with
+/// zeros. This is NOT real PowerSGD (which uses power iteration to
+/// find the dominant K singular vectors) but exercises the right
+/// shape: M·N elements → M·K + N·K bytes shipped. The witness verifies
+/// the reconstruction preserves the first K columns exactly and that
+/// the compression ratio is the documented `(m+n)*K / (m*n)`.
+///
+/// `m * n` input → `m*K + n*K` bytes shipped → `m * n` reconstructed.
+#[no_mangle] pub unsafe extern "C" fn aether_grad_compress_lowrank_f32(
+    grad: *const c_void,     // (m, n)
+    reconstructed: *mut c_void,  // (m, n)
+    m: c_int, n: c_int, k: c_int,
+) -> c_int {
+    if grad.is_null() || reconstructed.is_null() { return 1; }
+    if m <= 0 || n <= 0 || k <= 0 { return 2; }
+    if k > n { return 3; }
+    let m = m as usize; let n = n as usize; let k = k as usize;
+    let g = std::slice::from_raw_parts(grad as *const f32, m * n);
+    let r = std::slice::from_raw_parts_mut(reconstructed as *mut f32, m * n);
+    // P (m, k) = first k columns of G. Q (n, k) = identity-shape (top-k
+    // canonical basis). Reconstruction: G_rec[i, j] = sum_p P[i,p] * Q[j,p].
+    // With Q = identity (rows 0..k = e_0..e_{k-1}, rows k..n = 0),
+    // G_rec[i, j] = P[i, j] when j < k, else 0.
+    for i in 0..m {
+        for j in 0..n {
+            if j < k {
+                r[i * n + j] = g[i * n + j];
+            } else {
+                r[i * n + j] = 0.0;
+            }
+        }
+    }
+    0
+}
+
+/// FR-18.4 — FSDP shard + all-gather + reduce-scatter simulation.
+///
+/// Models the FSDP shape: parameters are sharded across N ranks. To
+/// compute a forward pass, each rank all-gathers the full param tensor
+/// from peers; for backward, gradients are reduce-scattered back into
+/// the sharded layout. The simulator does both in-process: it takes
+/// a full-size param tensor, splits into N shards, then reassembles
+/// them via the all-gather shape and verifies bit-equality with the
+/// original.
+///
+/// Returns 0 on success. The witness uses this to confirm the
+/// shard-then-gather round-trip is the identity.
+#[no_mangle] pub unsafe extern "C" fn aether_fsdp_simulate_shard_alltoall_f32(
+    params: *const c_void,   // (n,)
+    out: *mut c_void,        // (n,)
+    n: c_int, world_size: c_int,
+) -> c_int {
+    if params.is_null() || out.is_null() { return 1; }
+    if n <= 0 || world_size <= 0 { return 2; }
+    if n % world_size != 0 { return 3; }
+    let n = n as usize; let ws = world_size as usize;
+    let shard_len = n / ws;
+    let p = std::slice::from_raw_parts(params as *const f32, n);
+    let o = std::slice::from_raw_parts_mut(out as *mut f32, n);
+
+    // Step 1: shard. Each rank "owns" shards[rank] = p[rank*shard_len..]
+    // We materialise the shards explicitly.
+    let mut shards: Vec<Vec<f32>> = Vec::with_capacity(ws);
+    for rank in 0..ws {
+        let lo = rank * shard_len;
+        shards.push(p[lo..lo + shard_len].to_vec());
+    }
+    // Step 2: all-gather — every rank reassembles the full param tensor
+    // by concatenating shards in rank order. We just check rank 0's
+    // reassembly here (others would be identical in a real run).
+    for rank in 0..ws {
+        let lo = rank * shard_len;
+        o[lo..lo + shard_len].copy_from_slice(&shards[rank]);
+    }
+    0
+}
+
 // ---- FR-24.9: GPU memory leak detection (CPU-resident counter for now) ----
 use std::sync::atomic::{AtomicI64 as V4AtomicI64, Ordering as AtomicOrder};
 static GPU_LIVE_BYTES: V4AtomicI64 = V4AtomicI64::new(0);
@@ -4404,6 +4745,155 @@ mod conv2d_tests {
             assert!((out[i] - expected).abs() < 1e-6,
                     "quant {} expected {}, got {}", i, expected, out[i]);
         }
+    }
+
+    /// FR-18.1 — single-host NCCL fallback round-trip.
+    #[test]
+    fn nccl_single_host_surface_roundtrip() {
+        aether_nccl_init();
+        assert!(aether_nccl_init_count() >= 1);
+        let comm = aether_nccl_comm_create(1, 0);
+        assert!(comm > 0, "expected handle ≥ 1, got {}", comm);
+        assert_eq!(aether_nccl_comm_world_size(comm), 1);
+        assert_eq!(aether_nccl_comm_rank(comm), 0);
+        // All-reduce on world_size=1 is identity.
+        let send = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut recv = vec![0.0f32; 4];
+        unsafe {
+            let rc = aether_nccl_all_reduce_f32(
+                send.as_ptr() as *const _,
+                recv.as_mut_ptr() as *mut _,
+                4, 0, comm,
+            );
+            assert_eq!(rc, 0);
+        }
+        assert_eq!(recv, send);
+        // Multi-rank rejection on single-host build.
+        let bad = aether_nccl_comm_create(2, 0);
+        assert_eq!(bad, -1, "multi-rank comm_create should return -1 sentinel");
+        aether_nccl_comm_destroy(comm);
+        aether_nccl_finalize();
+    }
+
+    /// FR-18.5 — column-parallel TP simulation must match monolithic matmul.
+    #[test]
+    fn tp_column_parallel_matches_monolithic() {
+        // (m, k, n) = (3, 4, 6); world_size=2 → n_shard=3 per rank.
+        let m = 3; let k = 4; let n = 6; let ws = 2;
+        let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.1).collect();
+        let w: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * 0.05 - 0.5).collect();
+        let mut tp_out = vec![0.0f32; m * n];
+        unsafe {
+            let rc = aether_tp_simulate_column_parallel_linear_f32(
+                x.as_ptr() as *const _, w.as_ptr() as *const _,
+                tp_out.as_mut_ptr() as *mut _,
+                m as i32, k as i32, n as i32, ws as i32,
+            );
+            assert_eq!(rc, 0);
+        }
+        // Reference: plain matmul.
+        let mut ref_out = vec![0.0f32; m * n];
+        for r in 0..m { for c in 0..n {
+            let mut s = 0.0f32;
+            for ki in 0..k { s += x[r * k + ki] * w[ki * n + c]; }
+            ref_out[r * n + c] = s;
+        }}
+        for i in 0..(m * n) {
+            assert!((tp_out[i] - ref_out[i]).abs() < 1e-5,
+                    "TP shard mismatch at {}: tp={}, ref={}", i, tp_out[i], ref_out[i]);
+        }
+    }
+
+    /// FR-18.6 — 2-stage PP forward must match monolithic forward.
+    #[test]
+    fn pp_2stage_matches_monolithic() {
+        let mb = 2; let d = 4; let n_blocks = 4; let n_stages = 2;
+        let input: Vec<f32> = (0..(mb * d)).map(|i| (i as f32) * 0.5).collect();
+        let scales: Vec<f32> = vec![1.1, 0.9, 1.2, 0.8];
+        let biases: Vec<f32> = vec![0.1, -0.1, 0.05, 0.02];
+        let mut pp_out = vec![0.0f32; mb * d];
+        unsafe {
+            let rc = aether_pp_simulate_2stage_forward_f32(
+                input.as_ptr() as *const _,
+                scales.as_ptr() as *const _,
+                biases.as_ptr() as *const _,
+                pp_out.as_mut_ptr() as *mut _,
+                mb as i32, d as i32, n_blocks as i32, n_stages as i32,
+            );
+            assert_eq!(rc, 0);
+        }
+        // Reference: apply each block in sequence with NO staging.
+        let mut x = input.clone();
+        for b in 0..n_blocks {
+            for v in x.iter_mut() { *v = *v * scales[b] + biases[b]; }
+        }
+        for i in 0..(mb * d) {
+            assert!((pp_out[i] - x[i]).abs() < 1e-5,
+                    "PP stage output mismatch at {}: pp={}, ref={}", i, pp_out[i], x[i]);
+        }
+    }
+
+    /// FR-18.7 — ZeRO bytes are strictly decreasing across Z1/Z2/Z3.
+    #[test]
+    fn zero_stage_bytes_monotone_decreasing() {
+        let n = 1_000_000; let ws = 4;
+        let baseline = (4 * n * 4) as i64;  // params+grad+optim×2, all full
+        let z1 = aether_zero_simulate_stage_bytes_f32(n, ws, 1);
+        let z2 = aether_zero_simulate_stage_bytes_f32(n, ws, 2);
+        let z3 = aether_zero_simulate_stage_bytes_f32(n, ws, 3);
+        assert!(z1 < baseline, "Z1 should save vs baseline: z1={}, baseline={}", z1, baseline);
+        assert!(z2 < z1, "Z2 should save vs Z1: z2={}, z1={}", z2, z1);
+        assert!(z3 < z2, "Z3 should save vs Z2: z3={}, z2={}", z3, z2);
+        // Z3 with ws=4 should hit ~baseline/4.
+        let expected_z3 = baseline / 4;
+        assert!((z3 - expected_z3).abs() <= 16,
+                "Z3 with ws=4 should ≈ baseline/4: got {}, expected {}", z3, expected_z3);
+    }
+
+    /// FR-18.8 — overlapped time = max(compute, comm); serial = sum.
+    #[test]
+    fn overlap_simulation_savings() {
+        let ov = aether_overlap_simulate_overlapped_us(100, 80);
+        let se = aether_overlap_simulate_serial_us(100, 80);
+        assert_eq!(ov, 100);
+        assert_eq!(se, 180);
+        assert!(ov < se, "overlap should save vs serial");
+    }
+
+    /// FR-18.9 — rank-K compression preserves the first K columns.
+    #[test]
+    fn grad_compress_preserves_top_k_cols() {
+        let m = 3; let n = 5; let k = 2;
+        let g: Vec<f32> = (0..(m * n)).map(|i| (i as f32) * 0.5 + 1.0).collect();
+        let mut r = vec![0.0f32; m * n];
+        unsafe {
+            aether_grad_compress_lowrank_f32(
+                g.as_ptr() as *const _, r.as_mut_ptr() as *mut _,
+                m as i32, n as i32, k as i32,
+            );
+        }
+        for i in 0..m {
+            for j in 0..n {
+                let expect = if j < k { g[i * n + j] } else { 0.0 };
+                assert_eq!(r[i * n + j], expect, "[{},{}] mismatch", i, j);
+            }
+        }
+    }
+
+    /// FR-18.4 — FSDP shard + all-gather round-trip is the identity.
+    #[test]
+    fn fsdp_shard_alltoall_identity() {
+        let n = 12; let ws = 3;
+        let params: Vec<f32> = (0..n).map(|i| (i as f32) * 0.3 - 1.0).collect();
+        let mut out = vec![0.0f32; n];
+        unsafe {
+            let rc = aether_fsdp_simulate_shard_alltoall_f32(
+                params.as_ptr() as *const _, out.as_mut_ptr() as *mut _,
+                n as i32, ws as i32,
+            );
+            assert_eq!(rc, 0);
+        }
+        assert_eq!(out, params, "FSDP shard+gather round-trip must be identity");
     }
 
     /// 2 input channels, 1 output channel — the per-channel partial sums

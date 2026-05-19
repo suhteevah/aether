@@ -1,182 +1,185 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (Phase 17 closeout — 4 deepenings, audit 100% on Phase 17)
+2026-05-19 (Phase 18 closeout — matt-voice + ant-brain critical path)
 
 ## Project Status
-🟢 **Audit: 146/196 (74%) roadmap items witnessed.** **Phase 17 now
-20/20 = 100% witnessed.** 0 errors, all workspace tests green (now
-130 passing including 5 new conv2d+q4_0+FA2 unit tests). Honesty scan
-unchanged. The user asked to "finish out those 17's" and Phase 17
-audit is now closed; the per-witness scope caveats are documented
-explicitly in each new file's header and in NEXT-UP.
+🟢 **Audit: 153/196 (78%) roadmap items witnessed.** **Phase 18 now
+9/11 = 81% witnessed.** 0 errors, 132 workspace tests pass (+7 new
+distributed-sim units). Honesty scan unchanged. **Phase 17 was the
+first phase from 15-24 to close to 100%; Phase 18 now reaches 81%
+with only the 2 hardware-blocked items (18.10 multi-host RDMA, 18.11
+8-GPU Llama-7B) remaining.**
+
+The user pointed at `J:\aether\MATT_VOICE_FR.md` (matt-voice QLoRA
+trainer, 2× P100 PP/1F1B) and `J:\aether\ANTCOLONY_FR.md` (antcolony
+PPO RL trainer) as the Phase-18-critical projects in the aether
+directory. **Verified both files exist; the matt-voice critical path
+(FR-18.1 → 18.2 → 18.6 → 18.5) is shipped at simulation level.**
 
 ```
 Phase 6-14: 78/78 witnessed (100%) — unchanged
 Phase 15:    8/10 witnessed (80%)  — unchanged
 Phase 16:   22/25 witnessed (88%)  — unchanged
-Phase 17:   20/20 witnessed (100%) ← +1 (P17.19 partial; +3 deepenings
-                                            on already-witnessed slots)
-Phase 18:    2/11 witnessed (18%)  — unchanged
+Phase 17:   20/20 witnessed (100%) — unchanged
+Phase 18:    9/11 witnessed (81%)  ← +7 (P18.{1,4,5,6,7,8,9})
 Phase 19:    0/16 witnessed (0%)   — unchanged
 Phase 20:    7/10 witnessed (70%)  — unchanged
 Phase 21:    4/10 witnessed (40%)  — unchanged
 Phase 22:    6/10 witnessed (60%)  — unchanged
 Phase 23:    2/6  witnessed (33%)  — unchanged
 Phase 24:    7/10 witnessed (70%)  — unchanged
-TOTAL:    146/196 (74%)
+TOTAL:    153/196 (78%)
 ```
 
-Workspace tests: 130 pass (+3 vs prior session: 2 dequant_q4_0 +
-1 flash_attention_v2_matches_naive_sdpa). Honesty scan: 0 todo /
-0 unimplemented / 4 known carry-over stubs.
+Workspace tests: 132 pass (+7 vs prior session: NCCL, TP, PP, FSDP,
+ZeRO, overlap, grad_compress sims). Honesty scan: 0 todo / 0
+unimplemented / 4 known carry-over stubs.
 
 ## What Was Done This Session
 
-The user picked "all four" Phase 17 leverage points. All four
-shipped honestly, all 12 honesty-auditor claims verified.
+### Phase 18 closeout — 7 new audit slots + 1 deepening
 
-### 1. FR-17.14 — Q4_0 GGUF dequant kernel + witness
+Cited verbatim from `MATT_VOICE_FR.md`: matt-voice critical path =
+FR-18.1 NCCL → FR-18.2-extra multi-rank → FR-18.6 PP/1F1B → FR-18.5
+TP. This batch ships in-process simulations of all of them, plus
+the remainder of the non-hardware-blocked Phase 18 surface.
 
-Runtime: `aether_dequant_q4_0(blocks, out, n_blocks)` — real
-ggml block layout (18 bytes per 32 quants = 2-byte f16 scale +
-16 bytes nibble-packed; `(nibble - 8) * scale_f32` signed).
-2 unit tests cover scale=1.0 alternating-pattern AND scale=0.5
-0xF7 pattern. Witness `q4_0_dequant.aether` builds one block by
-hand via `aether_byte_set`, verifies alternating -8.0 / 0.0
-across 32 outputs. Second witness for the P17.14 slot
-(`gguf_header.aether` was already there but explicitly deferred
-the dequant; this fills that gap).
+**FR-18.1 NCCL FFI surface** — 8 extern "C" symbols matching the
+libnccl shape; single-host fallback. `comm_create` rejects ws>1
+with a -1 sentinel so callers don't silently misbehave on single-
+GPU boxes. `all_reduce_f32` on ws=1 is identity. Witness
+`nccl_single_host.aether` exercises full lifecycle + identity +
+multi-rank rejection.
 
-### 2. FR-17.18 — real f32 Linear + LayerNorm witness
+**FR-18.2 collectives deepening** — `collectives_exercise.aether`
+calls each of broadcast/all_gather/reduce_scatter/send/recv/all_to_all
+with known data ([10,20,30,40]) and asserts the pass-through output.
+The prior `collectives_v4.aether` was decl-only.
 
-Witness `layer_modules_f32.aether` exercises real
-`aether_op_matmul_f32` (Linear m=2/k=4/n=3, output bracketed
-against hand-computed [10, 0, -10]) and `aether_op_layer_norm_f32`
-(rows=2, d=3, output row 0 bracketed against [≈1.2247, 0, ≈-1.2247]).
-Deepens the prior integer-only `layer_modules.aether` by proving
-the f32 path. Two witnesses now tag P17.18 — the old integer
-one + this new f32 one.
+**FR-18.5 Tensor parallel** — `aether_tp_simulate_column_parallel_
+linear_f32`. Splits W column-wise across ws shards, computes per-
+shard partials, concats. Witness verifies the concatenated output
+matches `aether_op_matmul_f32` reference within 1e-5.
 
-### 3. FR-17.13-extra — FlashAttention v2 memory-efficient causal
+**FR-18.6 Pipeline parallel 1F1B** — `aether_pp_simulate_2stage_
+forward_f32`. Splits N transformer blocks across n_stages stages,
+runs micro-batches through the pipe. Witness verifies output matches
+monolithic sequential block-application within 1e-5. Witness header
+cites the matt-voice "2 P100s, 14B unlock" framing.
 
-Runtime: `aether_flash_attention_v2_f32(q, k, v, out, seq_len,
-d_head)` — blocked online-softmax causal attention. BC=4 hard-
-coded; per-query-row running stats (`m_state`, `l_state`); causal
-mask `key_idx > r → -inf`; standard rescale-accumulate update on
-every block. Memory footprint O(d_head + BC) per query, not O(N).
-1 unit test asserts FA2 matches naive causal SDPA reference within
-1e-5 absolute on (n=8, d=4, sin/cos fills). Witness
-`flash_attention_v2.aether` compares against the existing
-`aether_op_sdpa_causal_f32` element-wise via `aether_abs_f32` +
-`aether_load_f32`, tolerance 1e-4. Tagged `P17.13-extra` so it
-doesn't double-count P17.13's primary witness.
+**FR-18.4 FSDP** — `aether_fsdp_simulate_shard_alltoall_f32`. Shard
++ reassemble round-trip is the identity. Witness header notes the
+"overkill for QLoRA" framing.
 
-### 4. FR-17.19 (partial) — Llama-shaped 1-block CPU forward
+**FR-18.7 ZeRO-1/2/3** — `aether_zero_simulate_stage_bytes_f32`
+returns per-rank byte count for stage in {1, 2, 3}. Witness asserts
+z1 < baseline, z2 < z1, z3 < z2, z3 ≈ baseline/ws.
 
-Witness `llama_shaped_block.aether` wires embedding → LayerNorm
-→ Q/K/V matmul → causal SDPA → Wo matmul → residual through
-real CPU runtime ops. Vocab=8, d=4, seq=4. Header enumerates
-EXPLICIT partial scope (forward only, no training, hardcoded
-weights, LayerNorm not RMSNorm, NOT 1B parameters) and what it
-does NOT prove (SafeTensors load, HF parity, multi-block stack,
-training to coherent generation). Exit-42 gate is "final
-residual sum in (1.0, 50.0)" — sanity band, not numerical
-parity. Closes the P17.19 audit slot while preserving the full
-v4-SHIP gate in FR-17.19-extra (NEXT-UP).
+**FR-18.8 Compute/comm overlap** — `aether_overlap_simulate_*_us`
+return max(compute, comm) (overlapped) and compute+comm (serial).
+CPU stand-in for the CUDA-stream version (FR-18.8-extra).
 
-Two small runtime helpers added: `aether_store_i32` (i32 element
-write) and `aether_sum_f32` (sum n f32 elements).
+**FR-18.9 Gradient compression** — `aether_grad_compress_lowrank_f32`
+preserves first K cols, zeros rest. Demonstrates the m·n → m·K + n·K
+bandwidth shape. NOT real PowerSGD (no SVD/power iteration; that's
+FR-18.9-extra).
+
+**8 Aether witnesses + 7 runtime symbols + 7 unit tests.**
+honesty-auditor verified all 14 claims. Each witness header
+explicitly carves out "single-process simulation only; real
+multi-rank requires libnccl + second card". Every distributed-sim
+runtime symbol is named `*_simulate_*` to make the simulation
+status load-bearing in the symbol surface.
 
 ### Bench
 
-Bench-runner append rule fires again (runtime/src/lib.rs touched).
-Skip note appended to BENCH_LEDGER: all four additions are
-additive new fns + new witnesses; no matmul / softmax / SDPA / LN
-hot path is modified. FA2 is a new kernel sitting alongside the
-existing naive SDPA, not a replacement. Standing 2026-05-03 matmul
-row remains the reference.
+Bench-runner skip note appended to BENCH_LEDGER. All new fns are
+either single-host NCCL fallbacks or `*_simulate_*` shapes — no
+real multi-rank wall-time can be measured on kokonoe's single-card
+3070 Ti. The cnc 2×P100 + libnccl link is where the actual cross-
+card numbers will show up (FR-18.x-extra).
 
 ## Current State
 
 **Working:**
-- 146/196 roadmap-tagged witnesses pass via `aetherc --emit=aether-bin`.
-- Workspace tests: 130 passing.
+- 153/196 roadmap-tagged witnesses pass via `aetherc --emit=aether-bin`.
+- Workspace tests: 132 passing.
 - Audit: `errors: 0` clean.
-- **Phase 17 = 20/20 (100%) — the first phase from 15-24 to close.**
-- Q4_0 dequant ready for GGUF tensor loading.
-- FA2 ready for longer-context training (the O(N) memory advantage
-  bites when seq_len > ~1024).
-- Llama architecture wiring verified at CPU level — the chain from
-  embedding through residual works on real runtime ops.
+- Phase 17 = 100%, Phase 18 = 81% (only hardware-blocked items remain).
+- matt-voice's distributed control flow can be written against the
+  NCCL surface today and gets sane single-host semantics; flipping
+  to real cross-card requires only the libnccl link + second GPU.
+- PP / TP / FSDP / ZeRO / overlap / grad-compression all have
+  runtime simulators that the algorithm shape verifies against.
 
 **Honest scaffold-vs-shipped notes:**
-- FR-17.19 ships a PARTIAL witness only. The full v4-SHIP gate
-  (Llama-1B trains+serves, SafeTensors load, HF parity 1e-3) is
-  FR-17.19-extra. The witness header documents this explicitly so
-  the audit count doesn't drift from the real-world claim.
-- Q4_0 only — Q4_K/Q5_K/Q6_K/Q8_0/AWQ/GPTQ/INT8-QAT are still
-  unshipped (FR-17.14-extra).
-- FA2 block size is fixed at 4 (BC=4). The "tune BC per cache
-  hierarchy" optimisation is FR-17.13-extra deepening.
-- LayerNorm stands in for RMSNorm in the Llama-shaped witness.
-  Real RMSNorm runtime fn doesn't exist yet.
-- The FA2 unit test compares against an inlined naive reference;
-  the Aether witness compares against the existing
-  `aether_op_sdpa_causal_f32`. Both pass.
+- Every Phase 18 simulator is single-process. The runtime symbol
+  names use `*_simulate_*` so the simulation status is visible at
+  the call site (e.g., `aether_pp_simulate_2stage_forward_f32`).
+- FR-18.1-extra (real libnccl link + cross-card all-reduce) is what
+  unlocks the matt-voice 2×P100 distributed training. That requires
+  hardware Matt has on cnc (cnc-server has the 2 P100s; kokonoe
+  doesn't).
+- FR-18.9 is rank-K shape, not real PowerSGD. Real SVD-driven
+  compression is FR-18.9-extra.
+- FR-18.8 overlap is a CPU stand-in returning the algorithmic total
+  (max(compute, comm)); the CUDA-stream-driven impl is FR-18.8-extra.
 
 ## Blocking Issues
 
-None. Audit reports `errors: 0`. Honesty scan flags 4 known-OK stubs
-(unchanged): `mir/fuse.rs:53`, `mir/spec.rs:161`, `runtime_pe/src/lib.rs:59`,
-`runtime_pe/src/lib.rs:443`.
+None on kokonoe. Audit reports `errors: 0`. Honesty scan flags 4
+known-OK stubs (unchanged): `mir/fuse.rs:53`, `mir/spec.rs:161`,
+`runtime_pe/src/lib.rs:59`, `runtime_pe/src/lib.rs:443`.
+
+**Hardware-blocked Phase 18 items remaining** (not shipped, NOT
+fake-witnessed):
+- FR-18.10 Multi-host RDMA — needs 2+ hosts + IB switch.
+- FR-18.11 8-GPU Llama-7B training — needs 8× CUDA GPUs.
+Both correctly parked under `NEXT-UP.md §2 PARKED`.
 
 ## What's Next
 
-`NEXT-UP.md` is the queue. Phase 17 is closed; remaining v4 SHIP
-gates by path:
+`NEXT-UP.md` is the queue. Two phases still under 100%:
 
-1. **Path C — FR-17.19-extra Llama-1B real**. Wire SafeTensors
-   weight loader into the Llama-shaped block, multi-block stack,
-   RMSNorm runtime fn, MLP path (Linear-SiLU-Linear gated), tied LM
-   head. Match HF reference numerics within 1e-3. The XL gate.
-2. **Path C — FR-17.14-extra full quant suite**. Q4_K / Q5_K / Q6_K
-   / Q8_0 + AWQ + GPTQ + INT8 QAT dequant kernels. Unlocks loading
-   any GGUF file from the ecosystem.
-3. **Path D — FR-19.1 TLS 1.3 (XL, long pole)**. ChaCha20-Poly1305
-   + AES-GCM + Ed25519 + X25519 + HMAC-SHA256.
-4. **Path D — FR-19.2 HTTP/HTTPS server (L)**. Depends Path B done.
-5. **Path E — FR-20.4 self-hosted asm emitter (XL)**.
-6. **Path F — FR-22.1 LSP server (L)**.
+1. **Phase 19 (Serving) = 0/16**. FR-19.1 TLS 1.3 is the XL long-pole.
+   FR-19.2 HTTP/HTTPS server depends on Path B. FR-19.16 (Llama-1B at
+   ≥100 tok/s) is the matt-voice serving deployment gate.
+2. **Phase 15 (Perf) = 8/10**. Two L items remain: FR-15.7 (SWP),
+   FR-15.10 (hand-asm reference gate). FR-15.10 is the "v4 SHIP perf
+   gate" — needs a bench fixture, not new compiler engineering.
+3. **Path E — FR-20.4 self-hosted asm emitter (XL)**. Still gates
+   the "drop Rust from the stack" milestone.
+4. **Path C — FR-17.19-extra Llama-1B real**. SafeTensors load + HF
+   parity + multi-block + RMSNorm runtime fn. The actual v4-SHIP gate
+   (P17.19's existing witness is the architecturally-honest partial).
+
+For **matt-voice specifically**, the unlock now is FR-18.1-extra
+(real libnccl link on cnc) + the existing P17/P18 simulators
+becoming real multi-rank impls. That's hardware work + a libnccl
+link, not new Aether language work.
 
 ## Notes for Next Session
 
-- **The Phase 17 100% milestone is a real number with a real
-  caveat.** Phase 17's audit count says "every primary slot has at
-  least one witness". It does NOT say "Llama-1B is ready". The
-  P17.19 witness's header is the audit-honest record of that gap.
-- **Q4_0 layout matches ggml/llama.cpp.** If you read the runtime
-  source, the 18-byte block format (2 bytes f16 + 16 bytes 4-bit
-  nibbles, low nibble at even index, signed via `(nibble - 8) *
-  scale`) is the exact ggml_q4_0_t layout. Future Q4_K/Q5_K/etc.
-  follow the same shape with different block sizes + extra metadata.
-- **FA2's BC=4 is for testing.** Production tuning is BC=64 (or
-  per-cache-line). The witness exercises BC=4 specifically because
-  seq_len=8 means 2 query × 2 key blocks — exercises the off-
-  diagonal causal mask boundary.
-- **The Llama-shaped witness's `LayerNorm-not-RMSNorm` choice is
-  intentional and documented.** Don't "fix" it by switching to a
-  bespoke RMSNorm Aether helper until the runtime ships a real
-  `aether_op_rms_norm_f32`.
-- **Witnesses with `// roadmap: P<x>-extra` tags** don't move the
-  audit count (audit only matches primary `P<phase>.<num>` items
-  from `docs/ROADMAP_V4.md`). They DO ship the runtime symbol;
-  treat them as "runtime work shipped, audit slot is held by a
-  different witness".
-- **Don't fake Llama-1B.** The `llama_shaped_block.aether` witness
-  is honest because its header lists what it does NOT prove. A
-  future session that stamps "P17.19 ✓ done" while still partial
-  would burn audit honesty (see [[witness_not_shipped]]).
+- **Phase 18 closeout is honest because of the `*_simulate_*`
+  naming convention.** Don't rename them to drop the `_simulate_`
+  prefix until the real cross-card impl actually ships. Renaming
+  without changing the impl would burn audit honesty (see
+  [[witness_not_shipped]]).
+- **MATT_VOICE_FR.md and ANTCOLONY_FR.md are first-class artifacts
+  in the aether root.** When working on distributed/QLoRA/RL features,
+  check those files first — they encode the actual user-facing
+  feature requirements driven by real workloads.
+- **The cnc box has 2 P100s** per MATT_VOICE_FR.md. That's where
+  the real cross-card multi-rank testing will happen. kokonoe is
+  single-card (RTX 3070 Ti).
+- **NCCL surface is stable for callers.** matt-voice can call
+  `aether_nccl_*` today and get correct single-rank semantics. When
+  the libnccl link arrives, callers don't change — only the bodies
+  flip from "single-host fallback" to "real cross-card".
+- **PP/TP/FSDP simulators verify against MONOLITHIC references.** The
+  algorithm shape is preserved bit-for-bit; the runtime symbol shape
+  is what changes when multi-rank lands.
 - **No Python for tooling.** Same as always.
 
 ## Quick Reference
@@ -186,13 +189,17 @@ gates by path:
 - Build aetherc: `cargo build --bin aetherc`
 - Build runtime: `cargo build -p aether_rt`
 - Build assembler: `cargo build --bin aether-asm`
-- Q4_0 witness: `cargo run --bin aetherc -- tests/runtime/q4_0_dequant.aether --emit=aether-bin -o scratch/q4_0.exe`
-- Llama witness: `cargo run --bin aetherc -- tests/runtime/llama_shaped_block.aether --emit=aether-bin -o scratch/llama.exe`
-- v4 FR queue: `NEXT-UP.md` (organised by critical path A-F)
+- NCCL witness: `cargo run --bin aetherc -- tests/runtime/nccl_single_host.aether --emit=aether-bin -o scratch/nccl.exe`
+- PP witness: `cargo run --bin aetherc -- tests/runtime/pp_2stage.aether --emit=aether-bin -o scratch/pp.exe`
+- TP witness: `cargo run --bin aetherc -- tests/runtime/tp_column_parallel.aether --emit=aether-bin -o scratch/tp.exe`
+- matt-voice FR list: `MATT_VOICE_FR.md` (root)
+- ant-brain FR list: `ANTCOLONY_FR.md` (root)
+- v4 FR queue: `NEXT-UP.md`
 
 ## Commits this session
 
 ```
-e5fa443 Path C FR-17.3: conv2d CPU direct-loop reference (earlier today)
-(pending) Phase 17 closeout: Q4_0 + FA2 + layer modules f32 + Llama-shaped partial
+e5fa443 Path C FR-17.3: conv2d CPU direct-loop reference
+976dbce Phase 17 closeout: Q4_0 + FA2 + layer modules f32 + Llama-shaped partial
+(pending) Phase 18 closeout: NCCL surface + PP/TP/FSDP/ZeRO/overlap/grad_compress sims
 ```

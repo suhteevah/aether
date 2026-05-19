@@ -9,7 +9,68 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, Phase 17 closeout — 4 deepenings)
+## Closed this batch (2026-05-19, Phase 18 closeout — matt-voice + ant-brain critical path)
+
+The user pointed at `J:\aether\MATT_VOICE_FR.md` (QLoRA training for
+matt-voice on 2× P100 via PP/1F1B) and `J:\aether\ANTCOLONY_FR.md`
+(RL training, same distributed pitch) as the Phase-18-critical
+projects in the aether directory. This batch ships the matt-voice
+critical-path FRs (18.1 NCCL → 18.2 collectives → 18.6 PP → 18.5 TP)
+plus the rest of the non-hardware-blocked Phase 18 surface.
+
+- **P18.1 / FR-18.1** — NCCL FFI surface (single-host fallback).
+  8 extern "C" fns: `aether_nccl_init` / `_init_count` / `_finalize` /
+  `comm_create(ws, rank)` / `_destroy` / `_world_size` / `_rank` /
+  `all_reduce_f32(send, recv, n, op, comm)`. Single-host: comm_create
+  returns ≥1 handle for ws=1 and -1 sentinel for ws>1 (FR-18.1-extra
+  gates on real libnccl link). All-reduce on ws=1 is identity. Op
+  codes 0=sum, 1=max, 2=min, 3=prod. Witness `nccl_single_host.aether`
+  exercises full surface + lifecycle. Unit test confirms.
+- **P18.2 / FR-18.2 deepening** — `collectives_exercise.aether` actually
+  CALLS broadcast / all_gather / reduce_scatter / send / recv /
+  all_to_all with known data and verifies single-rank pass-through.
+  Prior `collectives_v4.aether` only declared the externs.
+- **P18.5 / FR-18.5** — Tensor-parallel column-parallel Linear sim.
+  Runtime `aether_tp_simulate_column_parallel_linear_f32`. Splits W
+  column-wise across `world_size` shards, computes per-shard partial,
+  concats. Witness `tp_column_parallel.aether` verifies vs monolithic
+  `aether_op_matmul_f32` within 1e-5. matt-voice "most useful on
+  current hardware" framing (MATT_VOICE_FR.md §FR-18.5).
+- **P18.6 / FR-18.6** — Pipeline parallel 1F1B sim. Runtime
+  `aether_pp_simulate_2stage_forward_f32`. Splits N transformer
+  blocks across `n_stages` stages, runs micro-batches through pipe.
+  Witness `pp_2stage.aether` verifies vs monolithic block-sequence
+  within 1e-5. Witness header cites MATT_VOICE_FR.md §FR-18.6
+  framing ("rank 0 layers 0-13, rank 1 layers 14-27 — unlocks 14B
+  and 32B base models"). **The matt-voice unlock.**
+- **P18.4 / FR-18.4** — FSDP shard + all-gather sim. Runtime
+  `aether_fsdp_simulate_shard_alltoall_f32`. Shards then reassembles;
+  round-trip is the identity. Witness header notes the matt-voice
+  "overkill for QLoRA" framing.
+- **P18.7 / FR-18.7** — ZeRO-1/2/3 staged sharding sim. Runtime
+  `aether_zero_simulate_stage_bytes_f32` returns per-rank bytes for
+  stage in {1, 2, 3}. Witness verifies z1 < baseline, z2 < z1, z3 < z2,
+  z3 ≈ baseline/4 for ws=4.
+- **P18.8 / FR-18.8** — Compute/comm overlap sim. Runtime returns
+  `max(compute, comm)` (overlapped) vs `compute + comm` (serial).
+  CPU stand-in for the CUDA-stream version (FR-18.8-extra).
+- **P18.9 / FR-18.9** — Gradient compression shape (low-rank).
+  Runtime `aether_grad_compress_lowrank_f32` preserves first K cols,
+  zeros rest. NOT real PowerSGD (no SVD / power iteration; that's
+  FR-18.9-extra). Demonstrates the m·n → m·K + n·K bandwidth shape.
+
+8 new Aether witnesses + 7 new runtime symbols + 7 new unit tests.
+honesty-auditor verified all 14 claims (zero false). Witness headers
+EXPLICITLY scope-out "in-process simulation only; real multi-rank
+needs libnccl link + second card" — every distributed-impl symbol is
+named `*_simulate_*` so the simulation status is load-bearing in the
+symbol surface.
+
+**Audit 146→153/196**, **Phase 18: 2/11 → 9/11 (81%)** — only the
+two hardware-blocked items remain (18.10 multi-host RDMA, 18.11
+8-GPU Llama-7B).
+
+## Closed earlier (2026-05-19, Phase 17 closeout — 4 deepenings)
 
 - **P17.14 / FR-17.14 deepening** — Q4_0 GGUF dequant kernel
   (`aether_dequant_q4_0`, real ggml block layout: 18-byte block =

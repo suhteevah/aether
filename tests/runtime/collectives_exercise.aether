@@ -1,0 +1,75 @@
+// roadmap: P18.2
+// expect: exit=42
+//
+// FR-18.2 deepening — actually exercise each collective with real
+// data and verify single-rank pass-through semantics. The prior
+// witness `collectives_v4.aether` only declared the externs; this
+// one calls each and checks the output buffers.
+//
+// Single-rank pass-through definitions:
+//   broadcast(buf, n, root)            — no-op (data already here)
+//   all_gather(src, dst[n*world], n, ws)   — dst[0..n] = src; world=1 → copy
+//   reduce_scatter(src, dst, n, ws)    — dst = src on ws=1
+//   send / recv                        — no-op on ws=1
+//   all_to_all(src, dst, n, ws)        — dst = src on ws=1
+//
+// The eventual NCCL backend changes only the body; this witness
+// shape stays.
+use runtime;
+
+extern fn aether_op_broadcast_f32(buf: i64, n: i32, root: i32) -> i32;
+extern fn aether_op_all_gather_f32(src: i64, dst: i64, n: i32, world: i32) -> i32;
+extern fn aether_op_reduce_scatter_f32(src: i64, dst: i64, n: i32, world: i32) -> i32;
+extern fn aether_op_send_f32(buf: i64, n: i32, dst_rank: i32) -> i32;
+extern fn aether_op_recv_f32(buf: i64, n: i32, src_rank: i32) -> i32;
+extern fn aether_op_all_to_all_f32(src: i64, dst: i64, n: i32, world: i32) -> i32;
+
+fn main() -> i32 {
+    let n: i32 = 4;
+    let src: i64 = aether_alloc_f32(n);
+    let dst: i64 = aether_alloc_f32(n);
+    if src == 0 { return 1; }
+    if dst == 0 { return 1; }
+
+    // Fill src = [10, 20, 30, 40].
+    aether_store_f32(src, 0, 10.0);
+    aether_store_f32(src, 1, 20.0);
+    aether_store_f32(src, 2, 30.0);
+    aether_store_f32(src, 3, 40.0);
+
+    // 1. broadcast — no-op on ws=1; src must be unchanged after call.
+    let rc1: i32 = aether_op_broadcast_f32(src, n, 0);
+    if rc1 != 0 { return 2; }
+    if aether_load_f32(src, 0) != 10.0 { return 3; }
+    if aether_load_f32(src, 3) != 40.0 { return 3; }
+
+    // 2. all_gather with ws=1 — dst[0..n] copies src.
+    let rc2: i32 = aether_op_all_gather_f32(src, dst, n, 1);
+    if rc2 != 0 { return 4; }
+    if aether_load_f32(dst, 0) != 10.0 { return 5; }
+    if aether_load_f32(dst, 3) != 40.0 { return 5; }
+
+    // 3. reduce_scatter — dst = src on ws=1.
+    aether_store_f32(dst, 0, 0.0);
+    aether_store_f32(dst, 3, 0.0);
+    let rc3: i32 = aether_op_reduce_scatter_f32(src, dst, n, 1);
+    if rc3 != 0 { return 6; }
+    if aether_load_f32(dst, 2) != 30.0 { return 7; }
+
+    // 4. send / recv on ws=1 — no-ops; src unchanged.
+    let rc4: i32 = aether_op_send_f32(src, n, 0);
+    if rc4 != 0 { return 8; }
+    let rc5: i32 = aether_op_recv_f32(src, n, 0);
+    if rc5 != 0 { return 8; }
+    if aether_load_f32(src, 1) != 20.0 { return 9; }
+
+    // 5. all_to_all on ws=1 — dst = src.
+    aether_store_f32(dst, 1, 0.0);
+    let rc6: i32 = aether_op_all_to_all_f32(src, dst, n, 1);
+    if rc6 != 0 { return 10; }
+    if aether_load_f32(dst, 1) != 20.0 { return 11; }
+
+    aether_free_f32(src, n);
+    aether_free_f32(dst, n);
+    42
+}

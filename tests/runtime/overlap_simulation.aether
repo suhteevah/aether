@@ -1,0 +1,41 @@
+// roadmap: P18.8
+// expect: exit=42
+//
+// FR-18.8 — Compute/comm overlap simulation.
+//
+// Real implementation: launch all-reduce on a CUDA comm-stream while
+// the next backward kernel runs on the compute-stream. The two run
+// concurrently; total wall time = max(compute, comm).
+//
+// This witness exercises the SHAPE: for compute_us=100, comm_us=80:
+//   overlapped = max(100, 80) = 100
+//   serial     = 100 + 80     = 180
+// So overlapping saves 80 us. The witness asserts both values and
+// that overlap < serial.
+//
+// SCOPE: the runtime fns are CPU stand-ins (returning the simulated
+// total). A real CUDA-stream-driven version is FR-18.8-extra, gated
+// on the runtime gaining CUDA-stream primitives.
+use runtime;
+
+extern fn aether_overlap_simulate_overlapped_us(compute_us: i32, comm_us: i32) -> i32;
+extern fn aether_overlap_simulate_serial_us(compute_us: i32, comm_us: i32) -> i32;
+
+fn main() -> i32 {
+    let compute: i32 = 100;
+    let comm:    i32 = 80;
+
+    let ov: i32 = aether_overlap_simulate_overlapped_us(compute, comm);
+    let se: i32 = aether_overlap_simulate_serial_us(compute, comm);
+
+    if ov != 100 { return 1; }
+    if se != 180 { return 2; }
+    if ov >= se  { return 3; }
+
+    // The opposite ordering (comm > compute) — overlap should track comm.
+    let ov2: i32 = aether_overlap_simulate_overlapped_us(50, 200);
+    let se2: i32 = aether_overlap_simulate_serial_us(50, 200);
+    if ov2 != 200 { return 4; }
+    if se2 != 250 { return 5; }
+    42
+}

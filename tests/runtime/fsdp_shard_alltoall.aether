@@ -1,0 +1,61 @@
+// roadmap: P18.4
+// expect: exit=42
+//
+// FR-18.4 — FSDP shard + all-gather + reduce-scatter (in-process sim).
+//
+// Models the FSDP parameter-shard shape: a full param tensor is split
+// across N ranks; forward all-gathers shards into the full tensor,
+// backward reduce-scatters grads back to the sharded layout. The
+// in-process simulator does shard → reassemble and verifies the
+// round-trip is the identity.
+//
+// matt-voice note (per MATT_VOICE_FR.md §FR-18.4): "For QLoRA this is
+// overkill — the LoRA adapter is < 20 MB." So FSDP isn't on the
+// matt-voice critical path, but the runtime shape needs to be honest
+// for the broader FR-18 audit.
+//
+// SCOPE: single process; "ranks" are slice indices. Real FSDP needs
+// NCCL all-gather + reduce-scatter across cards (FR-18.1-extra).
+use runtime;
+
+extern fn aether_fsdp_simulate_shard_alltoall_f32(
+    params: i64, out: i64, n: i32, world_size: i32,
+) -> i32;
+
+fn main() -> i32 {
+    let n: i32 = 12;
+    let ws: i32 = 3;
+
+    let params: i64 = aether_alloc_f32(n);
+    let out:    i64 = aether_alloc_f32(n);
+    if params == 0 { return 1; }
+    if out == 0 { return 1; }
+
+    // Fill params with a deterministic 0.3-step pattern.
+    let mut i: i32 = 0;
+    while i < n {
+        let v: f32 = f32(i) * 0.3 - 1.0;
+        aether_store_f32(params, i, v);
+        i = i + 1;
+    }
+
+    let rc: i32 = aether_fsdp_simulate_shard_alltoall_f32(params, out, n, ws);
+    if rc != 0 { return 2; }
+
+    // Verify round-trip is the identity.
+    let mut j: i32 = 0;
+    while j < n {
+        let p: f32 = aether_load_f32(params, j);
+        let o: f32 = aether_load_f32(out, j);
+        if aether_abs_f32(p - o) > 0.000001 {
+            aether_free_f32(params, n);
+            aether_free_f32(out, n);
+            return 10 + j;
+        }
+        j = j + 1;
+    }
+
+    aether_free_f32(params, n);
+    aether_free_f32(out, n);
+    42
+}

@@ -1,0 +1,105 @@
+// roadmap: P18.6
+// expect: exit=42
+//
+// FR-18.6 — Pipeline parallelism (1F1B) in-process simulation.
+//
+// THE MATT-VOICE UNLOCK: on the cnc 2×P100 box this is the realistic
+// distributed config (per MATT_VOICE_FR.md §FR-18.6: "rank 0 gets
+// layers 0-13, rank 1 gets layers 14-27 — unlocks 14B and 32B base
+// models that don't fit on either card alone").
+//
+// What the simulator does: splits a 4-block transformer's forward
+// across stage-0 (blocks 0-1) and stage-1 (blocks 2-3), runs all
+// micro-batches through the pipe, returns the output. The witness
+// computes the same forward as a monolithic single-stage and asserts
+// element-wise agreement to within 1e-4.
+//
+// SCOPE caveats:
+//   - Single process; the "ranks" are just for-loop iterations.
+//   - Real PP needs send/recv between cards — FR-18.1-extra (libnccl).
+//   - Each "block" is `y = x * scale + bias`, a stand-in for a real
+//     DecoderLayer. The PP schedule shape is what matters.
+use runtime;
+
+extern fn aether_pp_simulate_2stage_forward_f32(
+    input: i64, scales: i64, biases: i64, out: i64,
+    microbatches: i32, d: i32, n_blocks: i32, n_stages: i32,
+) -> i32;
+
+fn main() -> i32 {
+    let mb: i32 = 2;
+    let d: i32 = 4;
+    let nb: i32 = 4;
+    let ns: i32 = 2;
+    let in_len: i32 = 8;  // mb * d
+
+    let input:  i64 = aether_alloc_f32(in_len);
+    let scales: i64 = aether_alloc_f32(nb);
+    let biases: i64 = aether_alloc_f32(nb);
+    let pp_out: i64 = aether_alloc_f32(in_len);
+    let ref_out: i64 = aether_alloc_f32(in_len);
+    if input == 0 { return 1; }
+    if scales == 0 { return 1; }
+    if biases == 0 { return 1; }
+    if pp_out == 0 { return 1; }
+    if ref_out == 0 { return 1; }
+
+    // Fill input = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5].
+    let mut i: i32 = 0;
+    while i < in_len {
+        aether_store_f32(input, i, f32(i) * 0.5);
+        aether_store_f32(ref_out, i, f32(i) * 0.5);
+        i = i + 1;
+    }
+    aether_store_f32(scales, 0, 1.1);
+    aether_store_f32(scales, 1, 0.9);
+    aether_store_f32(scales, 2, 1.2);
+    aether_store_f32(scales, 3, 0.8);
+    aether_store_f32(biases, 0, 0.1);
+    aether_store_f32(biases, 1, 0.0 - 0.1);
+    aether_store_f32(biases, 2, 0.05);
+    aether_store_f32(biases, 3, 0.02);
+
+    // PP forward: blocks split across 2 stages.
+    let rc: i32 = aether_pp_simulate_2stage_forward_f32(
+        input, scales, biases, pp_out, mb, d, nb, ns);
+    if rc != 0 { return 2; }
+
+    // Monolithic reference: apply each block in sequence.
+    let mut b: i32 = 0;
+    while b < nb {
+        let sc: f32 = aether_load_f32(scales, b);
+        let bi: f32 = aether_load_f32(biases, b);
+        let mut k: i32 = 0;
+        while k < in_len {
+            let cur: f32 = aether_load_f32(ref_out, k);
+            aether_store_f32(ref_out, k, cur * sc + bi);
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+
+    // Compare PP output vs monolithic reference.
+    let mut j: i32 = 0;
+    while j < in_len {
+        let pp: f32 = aether_load_f32(pp_out, j);
+        let rf: f32 = aether_load_f32(ref_out, j);
+        let diff: f32 = aether_abs_f32(pp - rf);
+        if diff > 0.0001 {
+            aether_free_f32(input, in_len);
+            aether_free_f32(scales, nb);
+            aether_free_f32(biases, nb);
+            aether_free_f32(pp_out, in_len);
+            aether_free_f32(ref_out, in_len);
+            return 10 + j;
+        }
+        j = j + 1;
+    }
+
+    aether_free_f32(input, in_len);
+    aether_free_f32(scales, nb);
+    aether_free_f32(biases, nb);
+    aether_free_f32(pp_out, in_len);
+    aether_free_f32(ref_out, in_len);
+    42
+}

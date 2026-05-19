@@ -1,0 +1,65 @@
+// roadmap: P18.1
+// expect: exit=42
+//
+// FR-18.1 — NCCL FFI surface witness (single-host fallback).
+//
+// Verifies that the NCCL-shaped symbols exist in the runtime + behave
+// correctly in the single-host (world_size=1) fallback path:
+//   - aether_nccl_init / _init_count / _finalize lifecycle
+//   - aether_nccl_comm_create returns ≥ 1 handle for world_size=1
+//   - aether_nccl_comm_create returns -1 sentinel for world_size > 1
+//     (FR-18.1-extra is gated on a real libnccl link)
+//   - aether_nccl_all_reduce_f32 in world_size=1 is identity
+//
+// What this PROVES: every matt-voice + antcolony call site can target
+// the NCCL surface against a single GPU and get sane single-rank
+// semantics, with the same symbols that the future libnccl-linked
+// build will use cross-card. The shape gates Phase 18.
+//
+// What it does NOT prove: real 2-rank NCCL all-reduce across two
+// GPUs. That requires a real libnccl link + a second physical card.
+use runtime;
+
+extern fn aether_nccl_init() -> i32;
+extern fn aether_nccl_init_count() -> i32;
+extern fn aether_nccl_finalize() -> i32;
+extern fn aether_nccl_comm_create(world_size: i32, rank: i32) -> i64;
+extern fn aether_nccl_comm_destroy(comm: i64) -> i32;
+extern fn aether_nccl_comm_world_size(comm: i64) -> i32;
+extern fn aether_nccl_comm_rank(comm: i64) -> i32;
+extern fn aether_nccl_all_reduce_f32(send: i64, recv: i64, n: i32, op: i32, comm: i64) -> i32;
+
+fn main() -> i32 {
+    aether_nccl_init();
+    if aether_nccl_init_count() < 1 { return 1; }
+
+    let comm: i64 = aether_nccl_comm_create(1, 0);
+    if comm <= 0 { return 2; }
+    if aether_nccl_comm_world_size(comm) != 1 { return 3; }
+    if aether_nccl_comm_rank(comm) != 0 { return 4; }
+
+    // Single-host all-reduce: identity.
+    let send: i64 = aether_alloc_f32(4);
+    let recv: i64 = aether_alloc_f32(4);
+    if send == 0 { return 5; }
+    if recv == 0 { return 5; }
+    aether_store_f32(send, 0, 1.0);
+    aether_store_f32(send, 1, 2.0);
+    aether_store_f32(send, 2, 3.0);
+    aether_store_f32(send, 3, 4.0);
+    let rc: i32 = aether_nccl_all_reduce_f32(send, recv, 4, 0, comm);
+    if rc != 0 { return 6; }
+    if aether_load_f32(recv, 0) != 1.0 { return 7; }
+    if aether_load_f32(recv, 3) != 4.0 { return 8; }
+
+    // Multi-rank rejection: comm_create(world_size=2) must return -1
+    // sentinel on single-host build (FR-18.1-extra needed for real).
+    let bad: i64 = aether_nccl_comm_create(2, 0);
+    if bad != 0 - 1 { return 9; }
+
+    aether_nccl_comm_destroy(comm);
+    aether_nccl_finalize();
+    aether_free_f32(send, 4);
+    aether_free_f32(recv, 4);
+    42
+}

@@ -1,0 +1,76 @@
+// roadmap: P18.9
+// expect: exit=42
+//
+// FR-18.9 — Gradient compression (rank-K projection, PowerSGD-shape).
+//
+// Real PowerSGD uses power iteration to find the dominant K singular
+// vectors. This in-process simulator uses the simpler shape-equivalent
+// of "keep first K columns, drop the rest" — proving the m·n grad
+// surface compresses to m·K + n·K bytes shipped, with reconstruction
+// preserving the kept columns exactly.
+//
+// Bandwidth saver value (per MATT_VOICE_FR.md §FR-18.9): on PCIe-link
+// P100s, hiding the all-reduce behind compute is bytes-bound; a 4×
+// reduction in shipped bytes is a measurable wall-time win when
+// all_reduce shows up in profile. Single-host simulator can't measure
+// the wall-time win; it just shows the algorithmic shape.
+//
+// SCOPE: NOT real PowerSGD (no SVD / power iteration). FR-18.9-extra
+// adds the actual rank-K SVD.
+use runtime;
+
+extern fn aether_grad_compress_lowrank_f32(grad: i64, reconstructed: i64, m: i32, n: i32, k: i32) -> i32;
+
+fn main() -> i32 {
+    let m: i32 = 3;
+    let n: i32 = 5;
+    let k: i32 = 2;
+    let total: i32 = 15;  // m * n
+
+    let grad: i64 = aether_alloc_f32(total);
+    let rec:  i64 = aether_alloc_f32(total);
+    if grad == 0 { return 1; }
+    if rec  == 0 { return 1; }
+
+    // Fill grad with a 0.5-step ramp + offset.
+    let mut i: i32 = 0;
+    while i < total {
+        let v: f32 = f32(i) * 0.5 + 1.0;
+        aether_store_f32(grad, i, v);
+        i = i + 1;
+    }
+
+    let rc: i32 = aether_grad_compress_lowrank_f32(grad, rec, m, n, k);
+    if rc != 0 { return 2; }
+
+    // For each (row, col): if col < k, reconstruction must equal grad;
+    // else the reconstruction is 0 (dropped column).
+    let mut r: i32 = 0;
+    while r < m {
+        let mut c: i32 = 0;
+        while c < n {
+            let idx: i32 = r * n + c;
+            let g_val: f32 = aether_load_f32(grad, idx);
+            let r_val: f32 = aether_load_f32(rec, idx);
+            if c < k {
+                if g_val != r_val {
+                    aether_free_f32(grad, total);
+                    aether_free_f32(rec, total);
+                    return 10 + idx;
+                }
+            } else {
+                if r_val != 0.0 {
+                    aether_free_f32(grad, total);
+                    aether_free_f32(rec, total);
+                    return 100 + idx;
+                }
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    aether_free_f32(grad, total);
+    aether_free_f32(rec, total);
+    42
+}

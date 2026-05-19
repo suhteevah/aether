@@ -1,0 +1,90 @@
+// roadmap: P18.5
+// expect: exit=42
+//
+// FR-18.5 — Tensor parallelism (Megatron-style column-parallel Linear)
+// in-process simulation.
+//
+// Useful for matt-voice on cnc 2×P100 (per MATT_VOICE_FR.md §FR-18.5:
+// "Most useful for matt-voice on current hardware — keeps activations
+// smaller per card"). The witness splits a Linear's weight matrix
+// column-wise across N simulated ranks, computes per-rank partial
+// outputs, and verifies that concatenating the partials matches a
+// single-rank matmul reference to within 1e-5.
+//
+// SCOPE caveats:
+//   - Single process; "ranks" are loop iterations.
+//   - Real TP requires NCCL all-reduce / all-gather between cards
+//     (FR-18.1-extra for libnccl link).
+//
+// Shape: x = (m=3, k=4), W = (k=4, n=6), world_size=2.
+// Per-rank: each gets W[:, n_shard*rank..n_shard*(rank+1)] (n_shard=3).
+// Output: full (m=3, n=6) matrix.
+use runtime;
+
+extern fn aether_tp_simulate_column_parallel_linear_f32(
+    x: i64, w: i64, out: i64,
+    m: i32, k: i32, n: i32, world_size: i32,
+) -> i32;
+extern fn aether_op_matmul_f32(a: i64, b: i64, c: i64, m: i32, k: i32, n: i32) -> i32;
+
+fn main() -> i32 {
+    let m: i32 = 3;
+    let k: i32 = 4;
+    let n: i32 = 6;
+    let ws: i32 = 2;
+    let x_len: i32 = 12;   // m * k
+    let w_len: i32 = 24;   // k * n
+    let o_len: i32 = 18;   // m * n
+
+    let x:      i64 = aether_alloc_f32(x_len);
+    let w:      i64 = aether_alloc_f32(w_len);
+    let tp_out: i64 = aether_alloc_f32(o_len);
+    let ref_out:i64 = aether_alloc_f32(o_len);
+    if x == 0 { return 1; }
+    if w == 0 { return 1; }
+    if tp_out == 0 { return 1; }
+    if ref_out == 0 { return 1; }
+
+    // Fill x with a 0.1-step ramp; W with a 0.05-step ramp offset by -0.5.
+    let mut i: i32 = 0;
+    while i < x_len {
+        aether_store_f32(x, i, f32(i) * 0.1);
+        i = i + 1;
+    }
+    let mut j: i32 = 0;
+    while j < w_len {
+        aether_store_f32(w, j, f32(j) * 0.05 - 0.5);
+        j = j + 1;
+    }
+
+    // TP path.
+    let rc1: i32 = aether_tp_simulate_column_parallel_linear_f32(
+        x, w, tp_out, m, k, n, ws);
+    if rc1 != 0 { return 2; }
+
+    // Reference: monolithic single-rank matmul.
+    let rc2: i32 = aether_op_matmul_f32(x, w, ref_out, m, k, n);
+    if rc2 != 0 { return 3; }
+
+    // Compare.
+    let mut q: i32 = 0;
+    while q < o_len {
+        let tp: f32 = aether_load_f32(tp_out, q);
+        let rf: f32 = aether_load_f32(ref_out, q);
+        let diff: f32 = aether_abs_f32(tp - rf);
+        if diff > 0.00001 {
+            aether_free_f32(x, x_len);
+            aether_free_f32(w, w_len);
+            aether_free_f32(tp_out, o_len);
+            aether_free_f32(ref_out, o_len);
+            return 10 + q;
+        }
+        q = q + 1;
+    }
+
+    aether_free_f32(x, x_len);
+    aether_free_f32(w, w_len);
+    aether_free_f32(tp_out, o_len);
+    aether_free_f32(ref_out, o_len);
+    42
+}
