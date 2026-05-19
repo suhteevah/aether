@@ -9,7 +9,25 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-10, Path A pickup)
+## Closed this batch (2026-05-18, Path A continuation — FR-15.1 SSA-driven emit)
+
+- **P15.1 / FR-15.1** — SSA-driven opt pipeline rewrites the AST before
+  the asm backend sees it. New `compiler/src/mir/ssa_drive.rs` (343 lines,
+  3 unit tests) linearises each fn's leading arithmetic let-prefix +
+  optional tail into `Vec<SsaStmt>`, runs `ssa::rename_block` →
+  `opt::const_fold` → `opt::strength_reduce` → `opt::cse` → DCE (tail-
+  preserving), then materialises the optimised stmt list back into the
+  fn body. Wired at `--O1` between the inline+ast_opt pass and the
+  regalloc/vectorize drives; stderr now reports
+  `ssa N fn(s) X→Y stmts`. Audit's `runtime_check.rs` gained
+  `// build-flags: ...` support so the witness opts into `--O1`.
+  Witness: `tests/runtime/ssa_emit_drives_asm.aether` — at `--O1` the
+  emitted asm loses both `imulq` instructions (one via CSE, one via
+  strength-reduction → `shlq`) and the unused-let lowering disappears;
+  exit=42 confirms value semantics. honesty-auditor verified all 7
+  claims (file:line, command output, audit delta). **Audit: 141→142/196.**
+
+## Closed previously (2026-05-10, Path A pickup)
 
 - **P15.4 / FR-15.4** — Cross-fn inlining, real impl. `compiler/src/mir/inline.rs`
   (514 lines, 3 unit tests). Wired at `--O1` between ast_opt and regalloc.
@@ -79,10 +97,10 @@ within 5% wall on the 11900K + 3070 Ti at --O2.*
 
 | Order | FR | Effort | What lands | Unlocks |
 |---|---|---|---|---|
-| A1 | FR-15.1 | L | SSA-backed asm emit (linearise → opt → emit, not AST→emit) | A2, A3 |
+| A1 | FR-15.1 | L | SSA-backed asm emit (linearise → opt → emit, not AST→emit) — **DONE 2026-05-18** | A2, A3 |
 | A2 | FR-15.2 | L | regalloc drives `emit_expr_value`, hot locals in r10..r15 | A3 |
 | A3 | FR-15.3 | L | AVX2/AVX-512 emit (vmovups/vaddps/vmulps/vfmadd231ps/vbroadcastss) | A4, A5 |
-| A4 | FR-15.4 | M | cross-fn inlining heuristic + actual substitution | A5 |
+| A4 | FR-15.4 | M | cross-fn inlining heuristic + actual substitution — **DONE 2026-05-10** | A5 |
 | A5 | FR-15.10 | M | hand-asm reference matmul/softmax/LN/SDPA/CE in `bench/handasm/`, ≤1% gap measured | — |
 
 Optional micro-wins (don't gate the path): FR-15.5 PGO, FR-15.6 auto-tune,

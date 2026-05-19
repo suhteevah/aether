@@ -34,6 +34,7 @@ pub mod regalloc_drive;
 pub mod vectorize_drive;
 pub mod lto_drive;
 pub mod lifetimes_drive;
+pub mod ssa_drive;
 pub mod macros;
 pub mod test_harness;
 

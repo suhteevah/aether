@@ -357,6 +357,18 @@ fn main() {
             // `IntLit op IntLit` patterns to fold.
             mir::ast_opt::optimize_program(&mut prog, args.opt_level);
         }
+        // P15.1 — SSA-driven opt pipeline (linearise → rename_block →
+        // const_fold → strength_reduce → cse → dce → materialise) runs over
+        // each fn's leading arithmetic let-prefix + tail, in-place rewriting
+        // the AST before the asm backend sees it. Outside that linearisable
+        // subset the AST is left untouched, so non-arithmetic stmts/exprs
+        // are byte-compat with the pre-SSA path.
+        let ssa_rep = mir::ssa_drive::drive(&mut prog);
+        // Re-run ast_opt: materialised IntLits may now feed downstream
+        // identity collapses (`x + 0`, `x * 1`) that ast_opt picks up.
+        if ssa_rep.fns_processed > 0 {
+            mir::ast_opt::optimize_program(&mut prog, args.opt_level);
+        }
         // P11.2 — drive the linear-scan allocator over each fn body.
         let (regs, spills) = mir::regalloc_drive::drive(&prog);
         // P11.3 — drive the loop vectorizer over each for-loop with a
@@ -364,8 +376,10 @@ fn main() {
         // loops; the asm backend stays scalar today.
         let vec_loops = mir::vectorize_drive::drive(&prog);
         if !args.json_errors {
-            eprintln!("[aetherc] --O{} ast-opt applied; inlined {} call(s); regalloc {} regs / {} spills; vectorize {} loop(s)",
-                      args.opt_level, inlined, regs, spills, vec_loops);
+            eprintln!("[aetherc] --O{} ast-opt applied; inlined {} call(s); ssa {} fn(s) {}→{} stmts; regalloc {} regs / {} spills; vectorize {} loop(s)",
+                      args.opt_level, inlined,
+                      ssa_rep.fns_processed, ssa_rep.stmts_in, ssa_rep.stmts_out,
+                      regs, spills, vec_loops);
         }
     }
     // P11.4 — `--lto` runs cross-crate reachability and reports live/dead

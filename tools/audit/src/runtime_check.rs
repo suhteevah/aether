@@ -22,6 +22,10 @@ pub struct RuntimeCase {
     /// the named runtime feature is detected. Use `// requires: cuda`. The
     /// detection just probes for the cudart import in libaether_rt.a.
     pub requires: Option<String>,
+    /// Extra flags forwarded to aetherc on the build command line. Use e.g.
+    /// `// build-flags: --O1` to force an opt-level. Tokens are whitespace-
+    /// separated and inserted between the input path and `--emit=...`.
+    pub build_flags: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -54,6 +58,7 @@ pub fn cases(root: &Path) -> Vec<RuntimeCase> {
         let mut expected_stdout: Option<String> = None;
         let mut build_mode = "aether-bin".to_string();
         let mut requires: Option<String> = None;
+        let mut build_flags: Vec<String> = Vec::new();
         for line in src.lines().take(10) {
             let l = line.trim();
             if let Some(rest) = l.strip_prefix("// expect: exit=") {
@@ -68,12 +73,16 @@ pub fn cases(root: &Path) -> Vec<RuntimeCase> {
             if let Some(rest) = l.strip_prefix("// requires:") {
                 requires = Some(rest.trim().to_string());
             }
+            if let Some(rest) = l.strip_prefix("// build-flags:") {
+                build_flags = rest.split_whitespace().map(|s| s.to_string()).collect();
+            }
         }
         out.push(RuntimeCase {
             input: p, expected_exit,
             expected_stdout_contains: expected_stdout,
             build_mode,
             requires,
+            build_flags,
         });
     }
     out
@@ -116,7 +125,9 @@ pub fn run_case(root: &Path, case: &RuntimeCase) -> RuntimeResult {
     };
     let emit_flag = format!("--emit={}", emit_value);
     let mut build_cmd = Command::new(&aetherc);
-    build_cmd.arg(&case.input).arg(&emit_flag);
+    build_cmd.arg(&case.input);
+    for f in &case.build_flags { build_cmd.arg(f); }
+    build_cmd.arg(&emit_flag);
     if test_flag { build_cmd.arg("--test"); }
     let build = build_cmd.arg("-o").arg(&exe_path).output();
     let build = match build {

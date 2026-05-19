@@ -1,0 +1,28 @@
+// roadmap: P15.1
+// build-mode: aether-bin
+// build-flags: --O1
+// expect: exit=42
+//
+// FR-15.1 witness — the SSA-driven opt pipeline rewrites the AST
+// before the asm backend sees it. At --O1:
+//
+//   let a = 1 + 1;     →  const_fold:      a = 2
+//   let b = a * 8;     →  strength_reduce: b = a << 3
+//   let c = a * 8;     →  cse:             dropped (aliases b)
+//   let _u = 99;       →  dce:             dropped (unused)
+//   let e = c + 2;     →  cse + rewrite:   e = b + 2
+//   e + 24             →                   tail = e + 24
+//
+// Numerics: a=2, b=16, e=18, tail = 18 + 24 = 42.
+// The .exe exits with the program's tail value via aetherc's main
+// auto-return ABI, so exit=42 demonstrates the rewritten ast still
+// computes the same value end-to-end.
+
+fn main() {
+    let a = 1 + 1;
+    let b = a * 8;
+    let c = a * 8;
+    let _u = 99;
+    let e = c + 2;
+    e + 24
+}
