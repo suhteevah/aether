@@ -56,6 +56,15 @@ fn drive_fn(f: &mut FnDecl, r: &mut Report) {
     let Some(body) = f.body.as_mut() else { return; };
     let (linearised, prefix_len, tail_kind) = linearise(body);
     if linearised.is_empty() { return; }
+    // FR-15.1 safety: if the linearised prefix is followed by ANY non-
+    // linearisable statement, that suffix may reference one of the prefix's
+    // lhs names. Our SSA opt pipeline (specifically DCE + CSE) only sees
+    // the linearised set, so it would happily drop or rename a let that the
+    // suffix still depends on. The honest fix is to keep the linearisation
+    // restricted to bodies whose ONLY content is the let-prefix + (optional)
+    // absorbed tail. Wider applicability requires a true SSA-aware
+    // suffix-analysis — deferred to a future iteration.
+    if prefix_len < body.stmts.len() { return; }
 
     // Build the (lhs, op, rhs) triples that `ssa::rename_block` expects.
     let triples: Vec<(String, String, Vec<String>)> = linearised

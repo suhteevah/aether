@@ -116,7 +116,16 @@ pub enum AsmError {
 }
 
 pub fn emit(p: &Program) -> String {
-    let s = match try_emit(p) {
+    emit_with_plan(p, &Default::default())
+}
+
+/// Like `emit` but consumes a per-fn register-assignment plan produced by
+/// `mir::regalloc_plan::plan_program`. At `--O0` callers pass an empty map
+/// (the default) and the asm output is byte-identical to today. At `--O1+`
+/// callers pass the planner's output; hot locals are promoted into callee-
+/// saved r12..r15 across loop bodies / repeated reads.
+pub fn emit_with_plan(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> String {
+    let s = match try_emit(p, plan) {
         Ok(s) => s,
         Err(e) => format!("# asm backend error: {:?}\n", e),
     };
@@ -423,7 +432,7 @@ fn reorder_run(run: &[&str]) -> Vec<String> {
     out
 }
 
-pub fn try_emit(p: &Program) -> Result<String, AsmError> {
+pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Result<String, AsmError> {
     let mut s = String::new();
     s.push_str("# AETHER x86-64 assembly (Microsoft x64 ABI)\n");
     s.push_str("# Emitted by aetherc; comments here are debug-only and do not\n");
@@ -569,10 +578,11 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
     for item in &p.items {
         if let Item::Fn(f) = item {
             if f.body.is_some() && f.const_params.is_empty() {
+                let fn_plan = plan.get(&f.name);
                 let (floats, f64s) = emit_fn(
                     f, &mut text, &mut data, &sigs, &local_fns,
                     &struct_decls, &enum_decls, &fn_returns_enum,
-                    &const_env, Some(generics.clone()))?;
+                    &const_env, Some(generics.clone()), fn_plan)?;
                 all_floats.extend(floats);
                 all_f64s.extend(f64s);
             }
@@ -607,10 +617,14 @@ pub fn try_emit(p: &Program) -> Result<String, AsmError> {
             sigs.insert(mangled.clone(), rk);
             sigs.insert(format!("aether_{}", mangled), rk);
         }
+        // Const-generic specializations don't get a planned reg map (the
+        // planner runs on the source program; specs are synthesised post-plan).
+        // Future work: re-plan each spec on the fly. For now they stay on the
+        // stack path, which is the same conservative default as --O0.
         let (floats, f64s) = emit_fn(
             &spec, &mut text, &mut data, &sigs, &local_fns,
             &struct_decls, &enum_decls, &fn_returns_enum,
-            &spec_env, Some(generics.clone()))?;
+            &spec_env, Some(generics.clone()), None)?;
         all_floats.extend(floats);
         all_f64s.extend(f64s);
     }
@@ -907,6 +921,17 @@ struct Locals {
     /// concrete dim bindings from the caller's tensor_shapes, mangle, queue.
     /// `None` only in unit tests that build a Locals by hand.
     generics: Option<Rc<RefCell<GenericState>>>,
+    /// P15.2 — per-local physical register assignment computed by
+    /// `mir::regalloc_plan`. Empty at --O0; populated at --O1 for the
+    /// callee-saved subset (r12..r15). When a local maps here, its value
+    /// lives in BOTH the stack slot (write-through) AND the assigned reg.
+    /// Reads prefer the reg; writes hit both. Float / Tensor / composite
+    /// locals are excluded by the planner so this map is always Int-only.
+    reg_map: HashMap<String, u8>,
+    /// Callee-saved regs actually pushed by this fn's prologue, in push
+    /// order. Epilogue (and any Stmt::Return early-return path) pops them
+    /// in reverse. Always a subset of `reg_map`'s values (deduplicated).
+    saved_regs: Vec<u8>,
 }
 
 impl Locals {
@@ -920,8 +945,12 @@ impl Locals {
     fn frame_bytes(&self) -> usize {
         // 8 bytes per slot + 32 bytes shadow space + 8 bytes per outgoing arg
         // beyond the first 4 (caller-allocated stack args), rounded up to 16.
+        // P15.2 — when the fn pushes an odd count of callee-saved regs in the
+        // prologue, rsp arrives at the `subq` 8-byte-misaligned. Add 8 to the
+        // frame to restore 16-byte alignment post-subq (still rounds up).
         let raw = self.next_slot * 8 + 32 + self.max_call_extras * 8;
-        (raw + 15) & !15
+        let base = (raw + 15) & !15;
+        if self.saved_regs.len() % 2 == 1 { base + 8 } else { base }
     }
     fn fresh_label(&mut self, hint: &str) -> String {
         let n = self.label_counter; self.label_counter += 1;
@@ -994,7 +1023,8 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
            enum_decls: &HashMap<String, EnumDecl>,
            fn_returns_enum: &HashMap<String, String>,
            const_env: &HashMap<String, i64>,
-           generics: Option<Rc<RefCell<GenericState>>>)
+           generics: Option<Rc<RefCell<GenericState>>>,
+           fn_plan: Option<&HashMap<String, u8>>)
     -> Result<(Vec<(String, f32)>, Vec<(String, f64)>), AsmError>
 {
     let name = if f.name == "main" { "main".to_string() } else { format!("aether_{}", f.name) };
@@ -1013,6 +1043,18 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     locals.current_fn_returns_enum = fn_returns_enum.get(&f.name).cloned();
     locals.const_env = const_env.clone();
     locals.generics = generics;
+    // P15.2 — install per-fn reg plan (callee-saved r12..r15). Empty at --O0.
+    if let Some(plan) = fn_plan {
+        locals.reg_map = plan.clone();
+        let mut seen: HashSet<u8> = HashSet::new();
+        // Sort by reg id for stable push order across rebuilds; reverse pop
+        // order in the epilogue happens by iterating saved_regs in reverse.
+        let mut regs: Vec<u8> = plan.values().copied().collect();
+        regs.sort();
+        for r in regs {
+            if seen.insert(r) { locals.saved_regs.push(r); }
+        }
+    }
     let body = f.body.as_ref().unwrap();
     // Reserve slots for incoming params so the frame includes them.
     for p in &f.params { locals.alloc(&p.name); }
@@ -1032,6 +1074,14 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     out.push_str(&format!("{name}:\n"));
     out.push_str("    pushq %rbp\n");
     out.push_str("    movq %rsp, %rbp\n");
+    // P15.2 — save the callee-saved regs this fn promotes locals into. The
+    // ABI requires r12..r15 be preserved across calls; pushing in the
+    // prologue is the cheapest way to honour that. Frame-bytes calc below
+    // already adds 8 when the push count is odd to keep rsp 16-aligned
+    // after the subq.
+    for &r in &locals.saved_regs {
+        out.push_str(&format!("    pushq %r{}\n", r));
+    }
     // P13.4: when the frame would skip past a stack guard page (>4 KiB on
     // Windows), probe each page as we decrement rsp. Inline equivalent of the
     // MSVC `__chkstk` helper — keeps us free of an external linkage.
@@ -1202,6 +1252,11 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
         }
     }
     out.push_str(&format!("    addq ${}, %rsp\n", frame));
+    // P15.2 — restore callee-saved regs in reverse push order. No-op when
+    // the planner assigned none (--O0 stays byte-identical).
+    for &r in locals.saved_regs.iter().rev() {
+        out.push_str(&format!("    popq %r{}\n", r));
+    }
     out.push_str("    popq %rbp\n");
     out.push_str("    ret\n\n");
     let mut floats = Vec::with_capacity(locals.float_consts.len());
@@ -1490,6 +1545,12 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             }
             let frame = locals.frame_bytes();
             out.push_str(&format!("    addq ${}, %rsp\n", frame));
+            // P15.2 — Stmt::Return is an early-exit; it must run the same
+            // pop sequence the natural epilogue does, or the caller's
+            // callee-saved regs leak out clobbered.
+            for &r in locals.saved_regs.clone().iter().rev() {
+                out.push_str(&format!("    popq %r{}\n", r));
+            }
             out.push_str("    popq %rbp\n");
             out.push_str("    ret\n");
             Ok(())
@@ -1498,6 +1559,9 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             out.push_str("    xorl %eax, %eax\n");
             let frame = locals.frame_bytes();
             out.push_str(&format!("    addq ${}, %rsp\n", frame));
+            for &r in locals.saved_regs.clone().iter().rev() {
+                out.push_str(&format!("    popq %r{}\n", r));
+            }
             out.push_str("    popq %rbp\n");
             out.push_str("    ret\n");
             Ok(())
@@ -1730,6 +1794,19 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                 TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
                     out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
             }
+            // P15.2 — write-through: hot Int local also lives in its
+            // assigned callee-saved reg. We load from the just-written
+            // stack slot rather than copying %rax → %rN, because the
+            // peephole at lines 233-243 can collapse `movq $imm, %rax;
+            // movq %rax, slot` into `movq $imm, slot`, leaving %rax with
+            // a stale value. Loading from the slot is correct regardless
+            // of whether the peephole fired, and is invisible to it
+            // (peephole only matches %rax-destinated loads).
+            if matches!(kind, TyKind::Int) {
+                if let Some(&r) = locals.reg_map.get(name) {
+                    out.push_str(&format!("    movq -{}(%rbp), %r{}\n", slot * 8, r));
+                }
+            }
             Ok(())
         }
     }
@@ -1786,6 +1863,15 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             }
             let slot = locals.get(name).ok_or_else(|| AsmError::UnknownIdent(name.clone()))?;
             let kind = locals.types.get(name).copied().unwrap_or(TyKind::Int);
+            // P15.2 — if this Int local was promoted to a callee-saved reg,
+            // read from the reg instead of touching the stack. Float / Tensor
+            // / composite locals are never in the plan (planner excludes them).
+            if matches!(kind, TyKind::Int) {
+                if let Some(&r) = locals.reg_map.get(name) {
+                    out.push_str(&format!("    movq %r{}, %rax\n", r));
+                    return Ok(kind);
+                }
+            }
             match kind {
                 TyKind::Int => out.push_str(&format!("    movq -{}(%rbp), %rax\n", slot * 8)),
                 TyKind::F32 => out.push_str(&format!("    movss -{}(%rbp), %xmm0\n", slot * 8)),
@@ -1891,6 +1977,15 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 TyKind::F64 => out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", slot * 8)),
                 TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
                     out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
+            }
+            // P15.2 — assignment to a reg-promoted Int local also updates
+            // its callee-saved reg. Same load-from-slot pattern as
+            // Stmt::Let so the peephole's `imm→rax + rax→slot` collapse
+            // stays correct.
+            if matches!(kind, TyKind::Int) {
+                if let Some(&r) = locals.reg_map.get(&name) {
+                    out.push_str(&format!("    movq -{}(%rbp), %r{}\n", slot * 8, r));
+                }
             }
             Ok(kind)
         }
@@ -2701,6 +2796,9 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             // Run the same epilogue shape as `Stmt::Return`.
             let frame = locals.frame_bytes_cache;
             out.push_str(&format!("    addq ${}, %rsp\n", frame));
+            for &r in locals.saved_regs.clone().iter().rev() {
+                out.push_str(&format!("    popq %r{}\n", r));
+            }
             out.push_str("    popq %rbp\n");
             out.push_str("    ret\n");
             // Ok path: result of `?` is the payload (rdx) — move to rax.

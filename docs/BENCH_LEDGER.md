@@ -29,6 +29,10 @@ Aether wins 3 of 4 GPU sgemm sizes. CPU is intentionally not bench'd today — t
 
 Single-trial run at this commit produced numbers whose run-to-run spread exceeded the cross-library deltas we'd be reporting on. Appending a row would have implied a verdict the data didn't support. Per the append-only honesty rule we recorded no row rather than recording a noisy one. Re-bench will land once the bench harness moves to median-of-5 (gating on `bench/matmul_micro/run_all.ps1` warm-up + trial-count refactor). No code path under this commit changed `runtime/src/cuda.rs` semantics, so the prior 2026-05-03 row remains the standing reference.
 
+### 2026-05-18 — pending commit (FR-15.2 regalloc-in-emit): skipped (GPU contention + structural no-op for matmul)
+
+Bench-runner subagent invoked under the append rule (commit touches `compiler/src/codegen/asm/`). At run time the GPU was at 39% util with 7.3 GiB/8 GiB occupied by external processes (`Settlement Survival.exe` + `ollama.exe`). Per the honesty rule we declined to record numbers under contention. Independent structural argument: FR-15.2 promotes hot Int locals into callee-saved r12..r15 inside `.aether`-source fns; the matmul caller in Aether source passes Tensor handles (i64) to `aether_op_matmul_f32`, which is unchanged in `runtime/src/cuda.rs`. The cuBLAS sgemm time dominates the bench by orders of magnitude. Expected delta vs the 2026-05-03 row: indistinguishable from noise. The 2026-05-03 row stays the standing reference. Re-bench when the GPU is idle.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

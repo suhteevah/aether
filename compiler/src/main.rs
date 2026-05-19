@@ -382,6 +382,24 @@ fn main() {
                       regs, spills, vec_loops);
         }
     }
+
+    // P15.2 — compute the per-fn callee-saved-reg assignment plan that the
+    // asm backend consults to keep hot Int locals in r12..r15 across loop
+    // bodies and repeated reads. Empty at --O0 (asm output stays byte-
+    // identical to the pre-P15.2 baseline). The plan is consumed by the
+    // four `codegen::asm::emit*` call sites below.
+    let regalloc_plan = if args.opt_level >= 1 {
+        let m = mir::regalloc_plan::plan_program(&prog);
+        if !args.json_errors {
+            let promoted_fns = m.len();
+            let promoted_locals: usize = m.values().map(|v| v.len()).sum();
+            eprintln!("[aetherc] P15.2 regalloc plan: {} fn(s), {} local(s) promoted to r12..r15",
+                      promoted_fns, promoted_locals);
+        }
+        m
+    } else {
+        Default::default()
+    };
     // P11.4 — `--lto` runs cross-crate reachability and reports live/dead
     // fn counts. Today's compiler is single-crate so this is a witness of
     // the lto module on the path; multi-crate plumbing is downstream.
@@ -439,7 +457,7 @@ fn main() {
             eprintln!("[aetherc] wrote {:?}", args.output);
         }
         Emit::Asm => {
-            std::fs::write(&args.output, codegen::asm::emit(&prog)).unwrap();
+            std::fs::write(&args.output, codegen::asm::emit_with_plan(&prog, &regalloc_plan)).unwrap();
             eprintln!("[aetherc] wrote {:?}", args.output);
         }
         Emit::AetherBin => {
@@ -450,7 +468,7 @@ fn main() {
             // tool in the chain — Phase 5 replaces it with self-hosted.
             let mut s_path = args.output.clone();
             s_path.set_extension("s");
-            std::fs::write(&s_path, codegen::asm::emit(&prog)).unwrap();
+            std::fs::write(&s_path, codegen::asm::emit_with_plan(&prog, &regalloc_plan)).unwrap();
             let mut obj_path = args.output.clone();
             obj_path.set_extension("obj");
             // Locate aether-asm next to aetherc.
@@ -516,7 +534,7 @@ fn main() {
             // the import-table writer learns to point at libaether_rt.dll.
             let mut s_path = args.output.clone();
             s_path.set_extension("s");
-            std::fs::write(&s_path, codegen::asm::emit(&prog)).unwrap();
+            std::fs::write(&s_path, codegen::asm::emit_with_plan(&prog, &regalloc_plan)).unwrap();
             let exe_dir = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -537,7 +555,7 @@ fn main() {
             // and once an Aether linker lands, it drops `ld` too.
             let mut s_path = args.output.clone();
             s_path.set_extension("s");
-            std::fs::write(&s_path, codegen::asm::emit(&prog)).unwrap();
+            std::fs::write(&s_path, codegen::asm::emit_with_plan(&prog, &regalloc_plan)).unwrap();
             // Use gcc-as-driver: invokes `as` for assembly, then links with msvcrt.
             let status = Command::new("gcc")
                 .arg("-x").arg("assembler-with-cpp")

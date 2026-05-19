@@ -1,0 +1,35 @@
+// roadmap: P15.2
+// build-mode: aether-bin
+// build-flags: --O1
+// expect: exit=42
+//
+// FR-15.2 witness — the per-fn regalloc plan from mir::regalloc_plan
+// promotes hot Int locals into callee-saved r12..r15. The asm backend's
+// prologue pushes the assigned regs (with frame-alignment compensation),
+// Ident reads come from the regs instead of (%rbp), the Stmt::Let path
+// reloads from the slot into the reg via a peephole-safe load, and the
+// epilogue restores them in reverse order.
+//
+// Body uses 4 hot Int locals (a/b/c/d) in a long straight-line cascade
+// — each appears as a reg read multiple times. At --O0 every read
+// touches the stack; at --O1 they read from r12..r15.
+//
+// Math: a=1, b=2, c=3, d=4.
+//   ab = 2, ac = 3, ad = 4, bc = 6, bd = 8, cd = 12 → sum = 35.
+//   final = 35 + a + b + d = 35 + 1 + 2 + 4 = 42.
+
+fn main() -> i64 {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let d = 4;
+    let mut acc = 0;
+    acc = acc + a * b;
+    acc = acc + a * c;
+    acc = acc + a * d;
+    acc = acc + b * c;
+    acc = acc + b * d;
+    acc = acc + c * d;
+    acc = acc + a + b + d;
+    acc
+}
