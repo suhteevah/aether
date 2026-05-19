@@ -1,0 +1,74 @@
+// roadmap: P19.13
+// expect: exit=42
+//
+// FR-19.13 — Speech mel spectrogram primitives. Hann window +
+// naive DFT magnitude. SCOPE: building blocks. Mel filter bank
+// application is FR-19.13-extra.
+//
+// Tests:
+//   1. Hann(8) is symmetric, max near center.
+//   2. DFT of cos(2πk·i/N) with k=2, N=16 produces magnitude peak
+//      at bin 2.
+use runtime;
+
+extern fn aether_audio_hann_window(out: i64, n: i32) -> i32;
+extern fn aether_audio_dft_magnitude_f32(input: i64, n: i32, out_mag: i64, k_bins: i32) -> i32;
+
+fn main() -> i32 {
+    // Hann window of 8 samples.
+    let win: i64 = aether_alloc_f32(8);
+    aether_audio_hann_window(win, 8);
+    let w0: f32 = aether_load_f32(win, 0);
+    let w3: f32 = aether_load_f32(win, 3);
+    let w7: f32 = aether_load_f32(win, 7);
+    if w0 > 0.001 { return 1; }
+    if w7 > 0.001 { return 2; }
+    if w3 < 0.9 { return 3; }
+    if w3 > 1.0 { return 4; }
+
+    // DFT magnitude of a pure tone at bin 2.
+    // x[i] = cos(2π · 2 · i / 16)  for i in 0..16
+    let n: i32 = 16;
+    let tone: i64 = aether_alloc_f32(n);
+    let mut i: i32 = 0;
+    let two_pi: f32 = 6.2831853;
+    while i < n {
+        let x: f32 = two_pi * 2.0 * f32(i) / f32(n);
+        // No cos primitive in Aether — use a polynomial approx or
+        // call into the runtime. The runtime's aether_audio_dft_magnitude
+        // does the trig itself; for the input we use a tonal sequence
+        // that's pre-baked from i. We approximate cos via a 5-term
+        // Taylor (close enough for the bin peak to land correctly).
+        // For each i, reduce x to [-π, π] mod 2π and apply Taylor.
+        let mut t: f32 = x;
+        // Reduce mod 2π by subtracting two_pi repeatedly while >= π.
+        while t > 3.14159265 { t = t - two_pi; }
+        while t < 0.0 - 3.14159265 { t = t + two_pi; }
+        // 6-term Taylor: cos(t) ≈ 1 - t²/2 + t⁴/24 - t⁶/720 + ...
+        let t2: f32 = t * t;
+        let t4: f32 = t2 * t2;
+        let t6: f32 = t4 * t2;
+        let val: f32 = 1.0 - t2 * 0.5 + t4 / 24.0 - t6 / 720.0;
+        aether_store_f32(tone, i, val);
+        i = i + 1;
+    }
+
+    let mag: i64 = aether_alloc_f32(8);
+    aether_audio_dft_magnitude_f32(tone, n, mag, 8);
+
+    // Find the bin with the peak magnitude. Expect bin 2.
+    let mut max_bin: i32 = 0;
+    let mut max_val: f32 = aether_load_f32(mag, 0);
+    let mut j: i32 = 1;
+    while j < 8 {
+        let v: f32 = aether_load_f32(mag, j);
+        if v > max_val { max_val = v; max_bin = j; }
+        j = j + 1;
+    }
+    if max_bin != 2 { return 10 + max_bin; }
+
+    aether_free_f32(win, 8);
+    aether_free_f32(tone, n);
+    aether_free_f32(mag, 8);
+    42
+}

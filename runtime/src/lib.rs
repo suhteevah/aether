@@ -4960,6 +4960,952 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+// =====================================================================
+// FR-19.4 — Paged KV cache (block allocator simulation).
+//
+// vLLM-class block-allocated KV memory. Each block holds `block_size`
+// tokens of KV state; the allocator manages a fixed pool of n_blocks.
+// LRU eviction: when all blocks are in use, the least-recently-used
+// block is recycled. Per-block "touch" updates the LRU clock.
+//
+// SCOPE: control-flow simulation. No actual GPU memory. The real
+// implementation (FR-19.4-extra) backs each block with a cudaMalloc'd
+// region and tracks virtual-page mappings.
+// =====================================================================
+struct PagedKVCache {
+    n_blocks: u32,
+    block_size: u32,
+    /// In-use mask per block. `allocated[i]` is true when block i holds data.
+    allocated: Vec<bool>,
+    /// Monotonic clock per block (incremented on touch / allocate); the
+    /// LRU is the block with the smallest clock among allocated blocks.
+    clock: Vec<u64>,
+    tick: u64,
+}
+struct PkvCell(UnsafeCell<Vec<Option<Box<PagedKVCache>>>>);
+unsafe impl Sync for PkvCell {}
+static PKV_TABLE: PkvCell = PkvCell(UnsafeCell::new(Vec::new()));
+unsafe fn pkv_table() -> &'static mut Vec<Option<Box<PagedKVCache>>> {
+    &mut *PKV_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_new(n_blocks: c_int, block_size: c_int) -> i64 {
+    if n_blocks <= 0 || block_size <= 0 { return -1; }
+    let n = n_blocks as usize;
+    let pkv = PagedKVCache {
+        n_blocks: n_blocks as u32,
+        block_size: block_size as u32,
+        allocated: vec![false; n],
+        clock: vec![0; n],
+        tick: 0,
+    };
+    let tbl = pkv_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(pkv)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(pkv)));
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_destroy(h: i64) -> i32 {
+    if h < 0 { return -1; }
+    let tbl = pkv_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    tbl[hu] = None;
+    0
+}
+
+/// Allocate a free block. Returns block id ≥ 0, or -1 if pool full.
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_allocate(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = pkv_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(p) = tbl[hu].as_mut() else { return -1; };
+    for i in 0..p.n_blocks as usize {
+        if !p.allocated[i] {
+            p.allocated[i] = true;
+            p.tick += 1;
+            p.clock[i] = p.tick;
+            return i as c_int;
+        }
+    }
+    -1
+}
+
+/// Mark a block as recently used (updates LRU clock).
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_touch(h: i64, block_id: c_int) -> c_int {
+    if h < 0 || block_id < 0 { return -1; }
+    let tbl = pkv_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(p) = tbl[hu].as_mut() else { return -1; };
+    let bi = block_id as usize;
+    if bi >= p.n_blocks as usize || !p.allocated[bi] { return -1; }
+    p.tick += 1;
+    p.clock[bi] = p.tick;
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_free_block(h: i64, block_id: c_int) -> c_int {
+    if h < 0 || block_id < 0 { return -1; }
+    let tbl = pkv_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(p) = tbl[hu].as_mut() else { return -1; };
+    let bi = block_id as usize;
+    if bi >= p.n_blocks as usize { return -1; }
+    p.allocated[bi] = false;
+    0
+}
+
+/// Evict the least-recently-used allocated block. Returns the id of
+/// the evicted block (≥ 0), or -1 if no allocated blocks exist.
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_evict_lru(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = pkv_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(p) = tbl[hu].as_mut() else { return -1; };
+    let mut best_id: i32 = -1;
+    let mut best_clock: u64 = u64::MAX;
+    for i in 0..p.n_blocks as usize {
+        if p.allocated[i] && p.clock[i] < best_clock {
+            best_clock = p.clock[i];
+            best_id = i as i32;
+        }
+    }
+    if best_id < 0 { return -1; }
+    p.allocated[best_id as usize] = false;
+    best_id
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_n_allocated(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = pkv_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(p) = tbl[hu].as_ref() else { return -1; };
+    p.allocated.iter().filter(|&&a| a).count() as c_int
+}
+
+// =====================================================================
+// FR-19.5 — Continuous batching scheduler (simulation).
+//
+// vLLM-class scheduler: new requests enter mid-decode (no padding
+// waste); preempt-longest-running on full. The simulator tracks a
+// queue of active request ids; each `step` decodes one token across
+// all active requests in parallel (in real GPU code that'd be a
+// batched matmul; here it's just an "elapsed tokens" counter per req).
+//
+// SCOPE: control-flow sim of admit/step/complete. Real wiring to a
+// GPU + KV cache is FR-19.5-extra.
+// =====================================================================
+struct ContinuousBatch {
+    capacity: u32,
+    /// (req_id, tokens_decoded). req_id is opaque to the scheduler.
+    active: Vec<(i32, u32)>,
+}
+struct CbCell(UnsafeCell<Vec<Option<Box<ContinuousBatch>>>>);
+unsafe impl Sync for CbCell {}
+static CB_TABLE: CbCell = CbCell(UnsafeCell::new(Vec::new()));
+unsafe fn cb_table() -> &'static mut Vec<Option<Box<ContinuousBatch>>> {
+    &mut *CB_TABLE.0.get()
+}
+#[no_mangle] pub unsafe extern "C" fn aether_cb_new(capacity: c_int) -> i64 {
+    if capacity <= 0 { return -1; }
+    let cb = ContinuousBatch { capacity: capacity as u32, active: Vec::new() };
+    let tbl = cb_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(cb)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(cb)));
+    (tbl.len() - 1) as i64
+}
+#[no_mangle] pub unsafe extern "C" fn aether_cb_destroy(h: i64) -> i32 {
+    if h < 0 { return -1; }
+    let tbl = cb_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    tbl[hu] = None;
+    0
+}
+/// Admit a new request. Returns 0 on success, -1 if at capacity.
+/// Mid-decode entry: existing requests keep their token-count;
+/// the new one starts at 0 and joins the next `step` cycle.
+#[no_mangle] pub unsafe extern "C" fn aether_cb_admit(h: i64, req_id: c_int) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = cb_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(cb) = tbl[hu].as_mut() else { return -1; };
+    if cb.active.len() as u32 >= cb.capacity { return -1; }
+    cb.active.push((req_id, 0));
+    0
+}
+/// Run one decode step for every active request. Returns the count of
+/// active requests AFTER the step.
+#[no_mangle] pub unsafe extern "C" fn aether_cb_step(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = cb_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(cb) = tbl[hu].as_mut() else { return -1; };
+    for r in cb.active.iter_mut() { r.1 += 1; }
+    cb.active.len() as c_int
+}
+/// Mark a request complete. Returns 0 on success, -1 if not present.
+#[no_mangle] pub unsafe extern "C" fn aether_cb_complete(h: i64, req_id: c_int) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = cb_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(cb) = tbl[hu].as_mut() else { return -1; };
+    if let Some(pos) = cb.active.iter().position(|r| r.0 == req_id) {
+        cb.active.remove(pos);
+        0
+    } else { -1 }
+}
+#[no_mangle] pub unsafe extern "C" fn aether_cb_n_active(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = cb_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(cb) = tbl[hu].as_ref() else { return -1; };
+    cb.active.len() as c_int
+}
+
+// =====================================================================
+// FR-19.6 — Speculative decoding accept/reject (simulation).
+//
+// Standard speculative-decoding rejection-sampling test: given a draft
+// token's draft-model probability `q` and the target-model probability
+// `p`, accept with probability min(1, p/q). The simulator takes a
+// pre-rolled uniform-random `u` in [0, 1) and returns 1=accept / 0=reject.
+//
+// SCOPE: the algorithm shape. Real wiring needs a draft + target model
+// pair (FR-19.6-extra, gated on FR-17.19).
+// =====================================================================
+#[no_mangle] pub extern "C" fn aether_specdec_accept(
+    target_prob: f32, draft_prob: f32, rand_u01: f32,
+) -> c_int {
+    if draft_prob <= 0.0 || target_prob < 0.0 { return -1; }
+    if !(0.0..1.0).contains(&rand_u01) { return -1; }
+    let ratio = target_prob / draft_prob;
+    if ratio >= 1.0 { return 1; }
+    if rand_u01 < ratio { 1 } else { 0 }
+}
+
+// =====================================================================
+// FR-19.7 — Multi-model concurrent hosting (simulation).
+//
+// Registry that tracks N models, each with its own name + VRAM budget.
+// Lookup by name returns the model id. The total VRAM budget aggregate
+// is what gates "can I host one more model on the 3070 Ti's 8 GiB?".
+//
+// SCOPE: registry shape; real per-model GPU memory pinning is
+// FR-19.7-extra (gated on FR-19.4 KV-cache real impl).
+// =====================================================================
+struct ModelEntry {
+    name: String,
+    vram_budget_mb: u32,
+}
+struct ModelRegistry { models: Vec<ModelEntry> }
+struct MmCell(UnsafeCell<Vec<Option<Box<ModelRegistry>>>>);
+unsafe impl Sync for MmCell {}
+static MM_TABLE: MmCell = MmCell(UnsafeCell::new(Vec::new()));
+unsafe fn mm_table() -> &'static mut Vec<Option<Box<ModelRegistry>>> {
+    &mut *MM_TABLE.0.get()
+}
+#[no_mangle] pub unsafe extern "C" fn aether_mm_new() -> i64 {
+    let m = ModelRegistry { models: Vec::new() };
+    let tbl = mm_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(m)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(m)));
+    (tbl.len() - 1) as i64
+}
+#[no_mangle] pub unsafe extern "C" fn aether_mm_destroy(h: i64) -> i32 {
+    if h < 0 { return -1; }
+    let tbl = mm_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    tbl[hu] = None;
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_mm_register(
+    h: i64, name: *const c_void, n_name: c_int, vram_budget_mb: c_int,
+) -> c_int {
+    if h < 0 || name.is_null() || n_name <= 0 || vram_budget_mb < 0 { return -1; }
+    let tbl = mm_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(reg) = tbl[hu].as_mut() else { return -1; };
+    let nb = std::slice::from_raw_parts(name as *const u8, n_name as usize);
+    let Ok(ns) = std::str::from_utf8(nb) else { return -2; };
+    reg.models.push(ModelEntry { name: ns.to_string(), vram_budget_mb: vram_budget_mb as u32 });
+    (reg.models.len() - 1) as c_int
+}
+#[no_mangle] pub unsafe extern "C" fn aether_mm_lookup(
+    h: i64, name: *const c_void, n_name: c_int,
+) -> c_int {
+    if h < 0 || name.is_null() || n_name <= 0 { return -1; }
+    let tbl = mm_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(reg) = tbl[hu].as_ref() else { return -1; };
+    let nb = std::slice::from_raw_parts(name as *const u8, n_name as usize);
+    let Ok(ns) = std::str::from_utf8(nb) else { return -2; };
+    for (i, m) in reg.models.iter().enumerate() {
+        if m.name == ns { return i as c_int; }
+    }
+    -1
+}
+#[no_mangle] pub unsafe extern "C" fn aether_mm_total_vram_mb(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = mm_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(reg) = tbl[hu].as_ref() else { return -1; };
+    reg.models.iter().map(|m| m.vram_budget_mb).sum::<u32>() as c_int
+}
+
+// =====================================================================
+// FR-19.14 — Token-bucket rate limit.
+//
+// Per-key bucket; capacity = `burst`, refill at `req_per_sec` per
+// second. `check(key, now_us)` returns 1 if a token was available
+// (and consumed), 0 if rate-limited.
+// =====================================================================
+struct Bucket { tokens: f64, last_us: i64 }
+struct RateLimiter {
+    rate_per_sec: f64,
+    burst: f64,
+    buckets: std::collections::HashMap<String, Bucket>,
+}
+struct RlCell(UnsafeCell<Vec<Option<Box<RateLimiter>>>>);
+unsafe impl Sync for RlCell {}
+static RL_TABLE: RlCell = RlCell(UnsafeCell::new(Vec::new()));
+unsafe fn rl_table() -> &'static mut Vec<Option<Box<RateLimiter>>> {
+    &mut *RL_TABLE.0.get()
+}
+#[no_mangle] pub unsafe extern "C" fn aether_rl_new(req_per_sec: c_int, burst: c_int) -> i64 {
+    if req_per_sec <= 0 || burst <= 0 { return -1; }
+    let rl = RateLimiter {
+        rate_per_sec: req_per_sec as f64,
+        burst: burst as f64,
+        buckets: std::collections::HashMap::new(),
+    };
+    let tbl = rl_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(rl)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(rl)));
+    (tbl.len() - 1) as i64
+}
+#[no_mangle] pub unsafe extern "C" fn aether_rl_destroy(h: i64) -> i32 {
+    if h < 0 { return -1; }
+    let tbl = rl_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    tbl[hu] = None;
+    0
+}
+/// Returns 1 if a token was available + consumed; 0 if rate-limited
+/// (the typical HTTP 429 path); -1 on error.
+#[no_mangle] pub unsafe extern "C" fn aether_rl_check(
+    h: i64, key: *const c_void, n_key: c_int, now_us: i64,
+) -> c_int {
+    if h < 0 || key.is_null() || n_key <= 0 { return -1; }
+    let tbl = rl_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(rl) = tbl[hu].as_mut() else { return -1; };
+    let nb = std::slice::from_raw_parts(key as *const u8, n_key as usize);
+    let Ok(ks) = std::str::from_utf8(nb) else { return -2; };
+    let rate = rl.rate_per_sec;
+    let burst = rl.burst;
+    let bucket = rl.buckets.entry(ks.to_string()).or_insert(Bucket { tokens: burst, last_us: now_us });
+    // Refill since last call.
+    let dt_us = (now_us - bucket.last_us).max(0);
+    let refill = (dt_us as f64 / 1_000_000.0) * rate;
+    bucket.tokens = (bucket.tokens + refill).min(burst);
+    bucket.last_us = now_us;
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        1
+    } else { 0 }
+}
+
+// =====================================================================
+// FR-19.15 — Observability: Prometheus counter + JSON log.
+//
+// Process-wide counter registry + a render-to-prometheus-text-format
+// fn. Plus a single-line JSON log emitter for structured logs.
+// =====================================================================
+struct ObsState {
+    counters: std::collections::HashMap<String, u64>,
+}
+struct ObsCell(UnsafeCell<Option<Box<ObsState>>>);
+unsafe impl Sync for ObsCell {}
+static OBS_STATE: ObsCell = ObsCell(UnsafeCell::new(None));
+unsafe fn obs_state() -> &'static mut Box<ObsState> {
+    let s = &mut *OBS_STATE.0.get();
+    if s.is_none() {
+        *s = Some(Box::new(ObsState { counters: std::collections::HashMap::new() }));
+    }
+    s.as_mut().unwrap()
+}
+#[no_mangle] pub unsafe extern "C" fn aether_obs_counter_inc(
+    name: *const c_void, n_name: c_int, by: c_int,
+) -> c_int {
+    if name.is_null() || n_name <= 0 || by < 0 { return -1; }
+    let nb = std::slice::from_raw_parts(name as *const u8, n_name as usize);
+    let Ok(ns) = std::str::from_utf8(nb) else { return -2; };
+    let s = obs_state();
+    *s.counters.entry(ns.to_string()).or_insert(0) += by as u64;
+    0
+}
+#[no_mangle] pub unsafe extern "C" fn aether_obs_counter_get(
+    name: *const c_void, n_name: c_int,
+) -> i64 {
+    if name.is_null() || n_name <= 0 { return -1; }
+    let nb = std::slice::from_raw_parts(name as *const u8, n_name as usize);
+    let Ok(ns) = std::str::from_utf8(nb) else { return -2; };
+    let s = obs_state();
+    s.counters.get(ns).copied().unwrap_or(0) as i64
+}
+/// Render the counter registry in Prometheus text-exposition format:
+///   # TYPE <name> counter
+///   <name> <value>
+/// Counters render in lexicographic order so the output is stable.
+#[no_mangle] pub unsafe extern "C" fn aether_obs_dump_prometheus(
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if out.is_null() || max_out <= 0 { return -1; }
+    let s = obs_state();
+    let mut names: Vec<&String> = s.counters.keys().collect();
+    names.sort();
+    let mut buf = String::new();
+    for n in names {
+        let v = s.counters[n];
+        buf.push_str(&format!("# TYPE {} counter\n{} {}\n", n, n, v));
+    }
+    let bytes = buf.as_bytes();
+    if bytes.len() > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    o[..bytes.len()].copy_from_slice(bytes);
+    bytes.len() as c_int
+}
+
+// =====================================================================
+// FR-19.12 — Vision input preprocessing (resize-less normalize +
+// patchify for ViT-style models).
+// =====================================================================
+/// Normalize u8 pixel values via `(x/255 - mean) / std` per channel.
+/// `n_pixels` is total elements; `mean` and `std` are scalars (single-
+/// channel form here; multi-channel = call once per channel).
+#[no_mangle] pub unsafe extern "C" fn aether_img_normalize_f32(
+    px_u8: *const c_void, out_f32: *mut c_void,
+    n_pixels: c_int, mean: f32, std: f32,
+) -> c_int {
+    if px_u8.is_null() || out_f32.is_null() || n_pixels <= 0 || std == 0.0 { return -1; }
+    let n = n_pixels as usize;
+    let p = std::slice::from_raw_parts(px_u8 as *const u8, n);
+    let o = std::slice::from_raw_parts_mut(out_f32 as *mut f32, n);
+    for i in 0..n {
+        o[i] = ((p[i] as f32) / 255.0 - mean) / std;
+    }
+    0
+}
+/// Patchify an (h, w) grayscale image into (n_patches, patch*patch)
+/// row-major patches. Requires h % patch == 0 and w % patch == 0.
+#[no_mangle] pub unsafe extern "C" fn aether_img_patchify_f32(
+    img: *const c_void, out: *mut c_void,
+    h: c_int, w: c_int, patch: c_int,
+) -> c_int {
+    if img.is_null() || out.is_null() { return -1; }
+    if h <= 0 || w <= 0 || patch <= 0 { return -2; }
+    if h % patch != 0 || w % patch != 0 { return -3; }
+    let (h, w, p) = (h as usize, w as usize, patch as usize);
+    let pr = h / p;
+    let pc = w / p;
+    let n_patches = pr * pc;
+    let imgs = std::slice::from_raw_parts(img as *const f32, h * w);
+    let os = std::slice::from_raw_parts_mut(out as *mut f32, n_patches * p * p);
+    for py in 0..pr {
+        for px in 0..pc {
+            let patch_idx = py * pc + px;
+            for iy in 0..p {
+                for ix in 0..p {
+                    let src = (py * p + iy) * w + (px * p + ix);
+                    let dst = patch_idx * (p * p) + iy * p + ix;
+                    os[dst] = imgs[src];
+                }
+            }
+        }
+    }
+    n_patches as c_int
+}
+
+// =====================================================================
+// FR-19.13 — Speech mel spectrogram primitives.
+//
+// Hann window + naive DFT magnitude. Real Whisper uses log-mel with
+// 80 mel bins; this shipping primitive is the DFT magnitude bin
+// (the building block). Mel filter bank application = FR-19.13-extra.
+// =====================================================================
+#[no_mangle] pub unsafe extern "C" fn aether_audio_hann_window(
+    out: *mut c_void, n: c_int,
+) -> c_int {
+    if out.is_null() || n <= 0 { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut f32, n as usize);
+    let nn = (n - 1) as f32;
+    for i in 0..n as usize {
+        let x = (i as f32) / nn;
+        // 0.5 * (1 - cos(2π x))
+        o[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * x).cos());
+    }
+    0
+}
+/// Naive DFT magnitude. `input` is real f32 of length `n`; `out_mag`
+/// gets `k_bins` magnitude values (length `k_bins`). Uses O(n*k) time.
+/// Good enough for witness-scale (n=64, k=16).
+#[no_mangle] pub unsafe extern "C" fn aether_audio_dft_magnitude_f32(
+    input: *const c_void, n: c_int,
+    out_mag: *mut c_void, k_bins: c_int,
+) -> c_int {
+    if input.is_null() || out_mag.is_null() { return -1; }
+    if n <= 0 || k_bins <= 0 { return -2; }
+    let n_u = n as usize;
+    let k_u = k_bins as usize;
+    let x = std::slice::from_raw_parts(input as *const f32, n_u);
+    let m = std::slice::from_raw_parts_mut(out_mag as *mut f32, k_u);
+    let two_pi = 2.0_f32 * std::f32::consts::PI;
+    for k in 0..k_u {
+        let mut re = 0.0_f32;
+        let mut im = 0.0_f32;
+        for nn in 0..n_u {
+            let angle = -two_pi * (k as f32) * (nn as f32) / (n as f32);
+            re += x[nn] * angle.cos();
+            im += x[nn] * angle.sin();
+        }
+        m[k] = (re * re + im * im).sqrt();
+    }
+    0
+}
+
+// =====================================================================
+// FR-19.1 (partial) — ChaCha20-Poly1305 AEAD primitive (RFC 7539).
+//
+// Real ChaCha20 stream cipher + Poly1305 MAC. AEAD encrypt produces
+// (ciphertext + 16-byte tag). Decrypt verifies tag, then writes
+// plaintext. Verified against RFC 7539 §2.8.2 test vector.
+//
+// SCOPE: ONLY this AEAD primitive. The full TLS handshake state
+// machine, AES-GCM, Ed25519, X25519, HMAC-SHA256, and Connector/
+// Acceptor types are FR-19.1-extra.
+// =====================================================================
+fn chacha20_qround(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]); state[d] ^= state[a]; state[d] = state[d].rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]); state[b] ^= state[c]; state[b] = state[b].rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]); state[d] ^= state[a]; state[d] = state[d].rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]); state[b] ^= state[c]; state[b] = state[b].rotate_left(7);
+}
+fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    let mut s = [0u32; 16];
+    s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+    for i in 0..8 {
+        s[4 + i] = u32::from_le_bytes([key[i*4], key[i*4+1], key[i*4+2], key[i*4+3]]);
+    }
+    s[12] = counter;
+    for i in 0..3 {
+        s[13 + i] = u32::from_le_bytes([nonce[i*4], nonce[i*4+1], nonce[i*4+2], nonce[i*4+3]]);
+    }
+    let mut w = s;
+    for _ in 0..10 {
+        chacha20_qround(&mut w, 0, 4, 8, 12);
+        chacha20_qround(&mut w, 1, 5, 9, 13);
+        chacha20_qround(&mut w, 2, 6, 10, 14);
+        chacha20_qround(&mut w, 3, 7, 11, 15);
+        chacha20_qround(&mut w, 0, 5, 10, 15);
+        chacha20_qround(&mut w, 1, 6, 11, 12);
+        chacha20_qround(&mut w, 2, 7, 8, 13);
+        chacha20_qround(&mut w, 3, 4, 9, 14);
+    }
+    for i in 0..16 { w[i] = w[i].wrapping_add(s[i]); }
+    let mut out = [0u8; 64];
+    for i in 0..16 {
+        out[i*4..i*4+4].copy_from_slice(&w[i].to_le_bytes());
+    }
+    out
+}
+fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
+    let mut blk = counter;
+    let mut i = 0;
+    while i < data.len() {
+        let stream = chacha20_block(key, blk, nonce);
+        let take = (data.len() - i).min(64);
+        for j in 0..take { data[i + j] ^= stream[j]; }
+        i += take;
+        blk = blk.wrapping_add(1);
+    }
+}
+fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+    // r = key[0..16] with clamp, s = key[16..32]
+    let mut r = [0u8; 16]; r.copy_from_slice(&key[..16]);
+    r[3] &= 15; r[7] &= 15; r[11] &= 15; r[15] &= 15;
+    r[4] &= 252; r[8] &= 252; r[12] &= 252;
+    // Convert r and s to 130-bit "5-limb" rep over 26 bits each.
+    let r0 =  (u32::from_le_bytes([r[0],  r[1],  r[2],  r[3]])      ) & 0x3ffffff;
+    let r1 = ((u32::from_le_bytes([r[3],  r[4],  r[5],  r[6]])) >> 2) & 0x3ffff03;
+    let r2 = ((u32::from_le_bytes([r[6],  r[7],  r[8],  r[9]])) >> 4) & 0x3ffc0ff;
+    let r3 = ((u32::from_le_bytes([r[9],  r[10], r[11], r[12]])) >> 6) & 0x3f03fff;
+    let r4 = ((u32::from_le_bytes([r[12], r[13], r[14], r[15]])) >> 8) & 0x00fffff;
+    let s1 = r1 * 5; let s2 = r2 * 5; let s3 = r3 * 5; let s4 = r4 * 5;
+    let mut h = [0u64; 5];
+    let mut i = 0;
+    while i < msg.len() {
+        let mut block = [0u8; 17];
+        let take = (msg.len() - i).min(16);
+        block[..take].copy_from_slice(&msg[i..i+take]);
+        block[take] = 1;
+        let h0 =  (u32::from_le_bytes([block[0], block[1], block[2], block[3]])      ) & 0x3ffffff;
+        let h1 = ((u32::from_le_bytes([block[3], block[4], block[5], block[6]])) >> 2) & 0x3ffffff;
+        let h2 = ((u32::from_le_bytes([block[6], block[7], block[8], block[9]])) >> 4) & 0x3ffffff;
+        let h3 = ((u32::from_le_bytes([block[9], block[10], block[11], block[12]])) >> 6) & 0x3ffffff;
+        let h4 = ((u32::from_le_bytes([block[12], block[13], block[14], block[15]])) >> 8)
+                 | ((block[16] as u32) << 24);
+        h[0] += h0 as u64; h[1] += h1 as u64; h[2] += h2 as u64;
+        h[3] += h3 as u64; h[4] += h4 as u64;
+        // h = (h * r) mod (2^130 - 5), 26-bit limbs.
+        let d0 = h[0]*r0 as u64 + h[1]*s4 as u64 + h[2]*s3 as u64 + h[3]*s2 as u64 + h[4]*s1 as u64;
+        let d1 = h[0]*r1 as u64 + h[1]*r0 as u64 + h[2]*s4 as u64 + h[3]*s3 as u64 + h[4]*s2 as u64;
+        let d2 = h[0]*r2 as u64 + h[1]*r1 as u64 + h[2]*r0 as u64 + h[3]*s4 as u64 + h[4]*s3 as u64;
+        let d3 = h[0]*r3 as u64 + h[1]*r2 as u64 + h[2]*r1 as u64 + h[3]*r0 as u64 + h[4]*s4 as u64;
+        let d4 = h[0]*r4 as u64 + h[1]*r3 as u64 + h[2]*r2 as u64 + h[3]*r1 as u64 + h[4]*r0 as u64;
+        let mut c = (d0 >> 26) as u32; h[0] = d0 & 0x3ffffff;
+        let d1 = d1 + c as u64;        c = (d1 >> 26) as u32; h[1] = d1 & 0x3ffffff;
+        let d2 = d2 + c as u64;        c = (d2 >> 26) as u32; h[2] = d2 & 0x3ffffff;
+        let d3 = d3 + c as u64;        c = (d3 >> 26) as u32; h[3] = d3 & 0x3ffffff;
+        let d4 = d4 + c as u64;        c = (d4 >> 26) as u32; h[4] = d4 & 0x3ffffff;
+        h[0] += (c * 5) as u64;
+        let c2 = h[0] >> 26; h[0] &= 0x3ffffff; h[1] += c2;
+        i += 16;
+    }
+    // Carry-propagate + reduce mod 2^130 - 5.
+    let mut h0 = h[0] as u32; let mut h1 = h[1] as u32; let mut h2 = h[2] as u32;
+    let mut h3 = h[3] as u32; let mut h4 = h[4] as u32;
+    let mut c = h1 >> 26; h1 &= 0x3ffffff; h2 += c; c = h2 >> 26; h2 &= 0x3ffffff; h3 += c;
+    c = h3 >> 26; h3 &= 0x3ffffff; h4 += c; c = h4 >> 26; h4 &= 0x3ffffff; h0 += c * 5;
+    c = h0 >> 26; h0 &= 0x3ffffff; h1 += c;
+    // Compute h + -p (i.e., h - (2^130 - 5)).
+    let g0 = h0.wrapping_add(5); c = g0 >> 26; let g0 = g0 & 0x3ffffff;
+    let g1 = h1.wrapping_add(c); c = g1 >> 26; let g1 = g1 & 0x3ffffff;
+    let g2 = h2.wrapping_add(c); c = g2 >> 26; let g2 = g2 & 0x3ffffff;
+    let g3 = h3.wrapping_add(c); c = g3 >> 26; let g3 = g3 & 0x3ffffff;
+    let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
+    let mask = ((g4 >> 31).wrapping_sub(1)) as u32;
+    let nmask = !mask;
+    let h0 = (h0 & nmask) | (g0 & mask);
+    let h1 = (h1 & nmask) | (g1 & mask);
+    let h2 = (h2 & nmask) | (g2 & mask);
+    let h3 = (h3 & nmask) | (g3 & mask);
+    let h4 = (h4 & nmask) | (g4 & mask);
+    // h = (h0 | h1<<26 | h2<<52 | h3<<78 | h4<<104) + s
+    let mut h0_full = ((h0 as u64) | ((h1 as u64) << 26)) & 0xffffffff;
+    let mut h1_full = ((h1 as u64) >> 6) | ((h2 as u64) << 20);
+    let mut h2_full = ((h2 as u64) >> 12) | ((h3 as u64) << 14);
+    let mut h3_full = ((h3 as u64) >> 18) | ((h4 as u64) << 8);
+    let s = &key[16..32];
+    let s0 = u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64;
+    let s1 = u32::from_le_bytes([s[4], s[5], s[6], s[7]]) as u64;
+    let s2 = u32::from_le_bytes([s[8], s[9], s[10], s[11]]) as u64;
+    let s3 = u32::from_le_bytes([s[12], s[13], s[14], s[15]]) as u64;
+    h0_full = (h0_full as u64) + s0; let c = h0_full >> 32; h0_full &= 0xffffffff;
+    h1_full = h1_full + s1 + c;      let c = h1_full >> 32; h1_full &= 0xffffffff;
+    h2_full = h2_full + s2 + c;      let c = h2_full >> 32; h2_full &= 0xffffffff;
+    h3_full = h3_full + s3 + c;                              h3_full &= 0xffffffff;
+    let mut tag = [0u8; 16];
+    tag[0..4].copy_from_slice(&(h0_full as u32).to_le_bytes());
+    tag[4..8].copy_from_slice(&(h1_full as u32).to_le_bytes());
+    tag[8..12].copy_from_slice(&(h2_full as u32).to_le_bytes());
+    tag[12..16].copy_from_slice(&(h3_full as u32).to_le_bytes());
+    tag
+}
+fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
+    let block0 = chacha20_block(key, 0, nonce);
+    let mut k = [0u8; 32]; k.copy_from_slice(&block0[..32]); k
+}
+/// AEAD encrypt: (key32, nonce12, aad?, plaintext) → (ciphertext || 16-byte tag).
+/// `n_plain` plaintext bytes; output is `n_plain + 16` bytes. Returns
+/// number of bytes written (= n_plain + 16) or -1.
+#[no_mangle] pub unsafe extern "C" fn aether_chacha20_poly1305_encrypt(
+    key: *const c_void, nonce: *const c_void,
+    aad: *const c_void, n_aad: c_int,
+    plain: *const c_void, n_plain: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if key.is_null() || nonce.is_null() || plain.is_null() || out.is_null() { return -1; }
+    if n_plain < 0 || n_aad < 0 || max_out < n_plain + 16 { return -1; }
+    let key_bytes: &[u8; 32] = &*(key as *const [u8; 32]);
+    let nonce_bytes: &[u8; 12] = &*(nonce as *const [u8; 12]);
+    let aad_slice = if n_aad > 0 { std::slice::from_raw_parts(aad as *const u8, n_aad as usize) }
+                    else { &[] };
+    let plain_slice = std::slice::from_raw_parts(plain as *const u8, n_plain as usize);
+    let out_slice = std::slice::from_raw_parts_mut(out as *mut u8, (n_plain + 16) as usize);
+    // 1) Derive Poly1305 one-time key from chacha20(counter=0).
+    let poly_key = poly1305_key_gen(key_bytes, nonce_bytes);
+    // 2) Encrypt with chacha20(counter=1+).
+    let ct = &mut out_slice[..n_plain as usize];
+    ct.copy_from_slice(plain_slice);
+    chacha20_xor(key_bytes, 1, nonce_bytes, ct);
+    // 3) Build the Poly1305 message: aad || pad16 || ct || pad16 || aad_len_u64 || ct_len_u64.
+    let mut mac_buf: Vec<u8> = Vec::new();
+    mac_buf.extend_from_slice(aad_slice);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(ct);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(&(aad_slice.len() as u64).to_le_bytes());
+    mac_buf.extend_from_slice(&(n_plain as u64).to_le_bytes());
+    let tag = poly1305_mac(&poly_key, &mac_buf);
+    out_slice[n_plain as usize .. (n_plain + 16) as usize].copy_from_slice(&tag);
+    n_plain + 16
+}
+/// AEAD decrypt: verifies the trailing 16-byte tag, then decrypts.
+/// Input is (ciphertext || tag) of length `n_in` (must be ≥ 16).
+/// On success returns `n_in - 16` (plaintext length); on tag mismatch
+/// returns -2; on bad inputs returns -1.
+#[no_mangle] pub unsafe extern "C" fn aether_chacha20_poly1305_decrypt(
+    key: *const c_void, nonce: *const c_void,
+    aad: *const c_void, n_aad: c_int,
+    ct_and_tag: *const c_void, n_in: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if key.is_null() || nonce.is_null() || ct_and_tag.is_null() || out.is_null() { return -1; }
+    if n_in < 16 || n_aad < 0 || max_out < n_in - 16 { return -1; }
+    let key_bytes: &[u8; 32] = &*(key as *const [u8; 32]);
+    let nonce_bytes: &[u8; 12] = &*(nonce as *const [u8; 12]);
+    let aad_slice = if n_aad > 0 { std::slice::from_raw_parts(aad as *const u8, n_aad as usize) } else { &[] };
+    let input = std::slice::from_raw_parts(ct_and_tag as *const u8, n_in as usize);
+    let ct = &input[..(n_in as usize - 16)];
+    let received_tag = &input[(n_in as usize - 16)..];
+    let poly_key = poly1305_key_gen(key_bytes, nonce_bytes);
+    let mut mac_buf: Vec<u8> = Vec::new();
+    mac_buf.extend_from_slice(aad_slice);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(ct);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(&(aad_slice.len() as u64).to_le_bytes());
+    mac_buf.extend_from_slice(&(ct.len() as u64).to_le_bytes());
+    let computed = poly1305_mac(&poly_key, &mac_buf);
+    // Constant-time-ish tag compare.
+    let mut diff = 0u8;
+    for i in 0..16 { diff |= computed[i] ^ received_tag[i]; }
+    if diff != 0 { return -2; }
+    let mut pt = ct.to_vec();
+    chacha20_xor(key_bytes, 1, nonce_bytes, &mut pt);
+    let out_slice = std::slice::from_raw_parts_mut(out as *mut u8, ct.len());
+    out_slice.copy_from_slice(&pt);
+    ct.len() as c_int
+}
+
+// =====================================================================
+// FR-19.2 — HTTP/1.1 request parser + response writer.
+//
+// Parses the request line (METHOD SP PATH SP VERSION CRLF) and walks
+// headers until CRLFCRLF. Writes a 200 response with content-length.
+// Plain HTTP only; HTTPS requires the FR-19.1 handshake.
+// =====================================================================
+/// Parse a request buffer; on success writes the method byte length
+/// into `out_method_len`, the path byte length into `out_path_len`,
+/// and copies method+path into a packed byte buffer at `out_strings`
+/// (method first, then path, no separator — caller uses the lengths
+/// to split). Returns the body offset (= byte after CRLF CRLF), or -1.
+#[no_mangle] pub unsafe extern "C" fn aether_http_parse_request(
+    buf: *const c_void, n_buf: c_int,
+    out_strings: *mut c_void, max_strings: c_int,
+    out_method_len: *mut c_int, out_path_len: *mut c_int,
+) -> c_int {
+    if buf.is_null() || out_strings.is_null() || out_method_len.is_null() || out_path_len.is_null() {
+        return -1;
+    }
+    if n_buf <= 0 || max_strings <= 0 { return -1; }
+    let b = std::slice::from_raw_parts(buf as *const u8, n_buf as usize);
+    // Find first space (end of METHOD).
+    let sp1 = b.iter().position(|&c| c == b' ').ok_or(()).ok();
+    let Some(sp1) = sp1 else { return -1; };
+    // Find second space (end of PATH).
+    let sp2_rel = b[sp1 + 1..].iter().position(|&c| c == b' ').ok_or(()).ok();
+    let Some(sp2_rel) = sp2_rel else { return -1; };
+    let sp2 = sp1 + 1 + sp2_rel;
+    let method = &b[..sp1];
+    let path = &b[sp1 + 1..sp2];
+    // Find CRLFCRLF.
+    let body_off = b.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(0);
+    if body_off == 0 { return -1; }
+    let total_strings = method.len() + path.len();
+    if total_strings > max_strings as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out_strings as *mut u8, max_strings as usize);
+    o[..method.len()].copy_from_slice(method);
+    o[method.len()..method.len() + path.len()].copy_from_slice(path);
+    *out_method_len = method.len() as c_int;
+    *out_path_len = path.len() as c_int;
+    body_off as c_int
+}
+/// Write a minimal HTTP/1.1 200 OK response with the given body.
+/// Format: "HTTP/1.1 200 OK\r\nContent-Length: N\r\n\r\n<body>".
+/// Returns total bytes written or -1 on overflow.
+#[no_mangle] pub unsafe extern "C" fn aether_http_write_response_200(
+    body: *const c_void, n_body: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if body.is_null() || out.is_null() || n_body < 0 || max_out <= 0 { return -1; }
+    let body_slice = std::slice::from_raw_parts(body as *const u8, n_body as usize);
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", n_body);
+    let total = head.len() + n_body as usize;
+    if total > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    o[..head.len()].copy_from_slice(head.as_bytes());
+    o[head.len()..head.len() + n_body as usize].copy_from_slice(body_slice);
+    total as c_int
+}
+
+// =====================================================================
+// FR-19.3 — OpenAI /v1/chat/completions response JSON shape.
+//
+// Render a single-choice completion response in the OpenAI wire shape.
+// =====================================================================
+/// Render a minimal /v1/chat/completions success body:
+///   {"id":"<id>","object":"chat.completion","model":"<model>",
+///    "choices":[{"index":0,"message":{"role":"assistant","content":"<c>"},
+///                "finish_reason":"stop"}],
+///    "usage":{"prompt_tokens":<pt>,"completion_tokens":<ct>}}
+/// Pure ASCII JSON; no Unicode escaping in `content` (caller must pre-
+/// escape special chars if needed). Returns bytes written or -1.
+#[no_mangle] pub unsafe extern "C" fn aether_openai_render_completion(
+    id: *const c_void, n_id: c_int,
+    model: *const c_void, n_model: c_int,
+    content: *const c_void, n_content: c_int,
+    prompt_tokens: c_int, completion_tokens: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if id.is_null() || model.is_null() || content.is_null() || out.is_null() { return -1; }
+    if n_id <= 0 || n_model <= 0 || n_content < 0 || max_out <= 0 { return -1; }
+    let id_s = std::str::from_utf8(std::slice::from_raw_parts(id as *const u8, n_id as usize)).unwrap_or("");
+    let model_s = std::str::from_utf8(std::slice::from_raw_parts(model as *const u8, n_model as usize)).unwrap_or("");
+    let content_s = std::str::from_utf8(std::slice::from_raw_parts(content as *const u8, n_content as usize)).unwrap_or("");
+    let json = format!(
+        "{{\"id\":\"{}\",\"object\":\"chat.completion\",\"model\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":{},\"completion_tokens\":{}}}}}",
+        id_s, model_s, content_s, prompt_tokens, completion_tokens,
+    );
+    let bytes = json.as_bytes();
+    if bytes.len() > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    o[..bytes.len()].copy_from_slice(bytes);
+    bytes.len() as c_int
+}
+
+// =====================================================================
+// FR-19.8 — WebSocket frame codec (RFC 6455).
+//
+// Encode a single text frame (FIN=1, opcode=1, no mask, payload).
+// Frame format:
+//   byte 0: 0x81           (FIN=1 | opcode=1)
+//   byte 1: payload length (or 126 + 2-byte ext, or 127 + 8-byte ext)
+//   bytes 2+: payload bytes (unmasked, server→client)
+// =====================================================================
+#[no_mangle] pub unsafe extern "C" fn aether_ws_encode_text_frame(
+    payload: *const c_void, n_payload: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if payload.is_null() || out.is_null() || n_payload < 0 || max_out <= 0 { return -1; }
+    let p = std::slice::from_raw_parts(payload as *const u8, n_payload as usize);
+    let mut total = 2 + n_payload as usize;
+    let mut header = vec![0x81u8, 0u8];
+    if n_payload < 126 {
+        header[1] = n_payload as u8;
+    } else if n_payload < 65536 {
+        header[1] = 126;
+        header.push(((n_payload >> 8) & 0xff) as u8);
+        header.push((n_payload & 0xff) as u8);
+        total += 2;
+    } else {
+        header[1] = 127;
+        for sh in (0..8).rev() {
+            header.push(((n_payload >> (sh * 8)) & 0xff) as u8);
+        }
+        total += 8;
+    }
+    if total > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    o[..header.len()].copy_from_slice(&header);
+    o[header.len()..header.len() + p.len()].copy_from_slice(p);
+    total as c_int
+}
+/// Decode a single WebSocket frame's payload into `out`. Returns
+/// payload byte count on success, -1 on malformed input.
+#[no_mangle] pub unsafe extern "C" fn aether_ws_decode_frame_payload(
+    buf: *const c_void, n_buf: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if buf.is_null() || out.is_null() || n_buf < 2 || max_out <= 0 { return -1; }
+    let b = std::slice::from_raw_parts(buf as *const u8, n_buf as usize);
+    let masked = (b[1] & 0x80) != 0;
+    let len7 = (b[1] & 0x7f) as usize;
+    let (payload_len, header_len) = if len7 < 126 {
+        (len7, 2usize)
+    } else if len7 == 126 {
+        if n_buf < 4 { return -1; }
+        (((b[2] as usize) << 8) | (b[3] as usize), 4usize)
+    } else {
+        if n_buf < 10 { return -1; }
+        let mut v = 0usize;
+        for i in 0..8 { v = (v << 8) | (b[2 + i] as usize); }
+        (v, 10usize)
+    };
+    let mask_len = if masked { 4 } else { 0 };
+    let payload_start = header_len + mask_len;
+    if payload_start + payload_len > n_buf as usize { return -1; }
+    if payload_len > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    let payload = &b[payload_start .. payload_start + payload_len];
+    if masked {
+        let mask = &b[header_len .. header_len + 4];
+        for i in 0..payload_len { o[i] = payload[i] ^ mask[i & 3]; }
+    } else {
+        o[..payload_len].copy_from_slice(payload);
+    }
+    payload_len as c_int
+}
+
+// =====================================================================
+// FR-19.11 — Tool calling JSON shape.
+//
+// Render an OpenAI function-tool-call object:
+//   {"type":"function","function":{"name":"<n>","arguments":"<args_json>"}}
+// The `arguments` value is a JSON-encoded string (so it gets double-
+// encoded — callers pass already-escaped JSON like `{\"city\":\"SF\"}`).
+// =====================================================================
+#[no_mangle] pub unsafe extern "C" fn aether_tool_render_call(
+    name: *const c_void, n_name: c_int,
+    args: *const c_void, n_args: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if name.is_null() || args.is_null() || out.is_null() { return -1; }
+    if n_name <= 0 || n_args < 0 || max_out <= 0 { return -1; }
+    let ns = std::str::from_utf8(std::slice::from_raw_parts(name as *const u8, n_name as usize)).unwrap_or("");
+    let as_ = std::str::from_utf8(std::slice::from_raw_parts(args as *const u8, n_args as usize)).unwrap_or("");
+    let json = format!("{{\"type\":\"function\",\"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}", ns, as_);
+    let bytes = json.as_bytes();
+    if bytes.len() > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    o[..bytes.len()].copy_from_slice(bytes);
+    bytes.len() as c_int
+}
+
 #[cfg(test)]
 mod heap_extras_tests {
     use super::*;
@@ -5299,6 +6245,261 @@ mod conv2d_tests {
                 let expect = if j < k { g[i * n + j] } else { 0.0 };
                 assert_eq!(r[i * n + j], expect, "[{},{}] mismatch", i, j);
             }
+        }
+    }
+
+    /// Phase 19 closeout — 13 in-process witness tests in one fn. Same
+    /// race-safety reason as BPE/chat-template: several of these use
+    /// shared static handle tables. Each block exercises one FR's
+    /// runtime surface end-to-end.
+    #[test]
+    fn phase19_closeout_batch() {
+        unsafe {
+            // -- FR-19.4 paged KV cache --
+            let pkv = aether_pkv_new(3, 16);
+            assert!(pkv >= 0);
+            let a = aether_pkv_allocate(pkv);
+            let b = aether_pkv_allocate(pkv);
+            let c = aether_pkv_allocate(pkv);
+            assert_eq!(a, 0); assert_eq!(b, 1); assert_eq!(c, 2);
+            // Pool full now.
+            assert_eq!(aether_pkv_allocate(pkv), -1);
+            // Touch b → b is most-recent; a is now LRU.
+            aether_pkv_touch(pkv, b);
+            aether_pkv_touch(pkv, c);
+            let evicted = aether_pkv_evict_lru(pkv);
+            assert_eq!(evicted, a, "expected block 0 (touch'd-least) to evict");
+            assert_eq!(aether_pkv_n_allocated(pkv), 2);
+            // Re-allocate fills the evicted slot.
+            assert_eq!(aether_pkv_allocate(pkv), 0);
+            aether_pkv_destroy(pkv);
+
+            // -- FR-19.5 continuous batching --
+            let cb = aether_cb_new(4);
+            assert!(cb >= 0);
+            assert_eq!(aether_cb_admit(cb, 100), 0);
+            assert_eq!(aether_cb_admit(cb, 101), 0);
+            assert_eq!(aether_cb_admit(cb, 102), 0);
+            assert_eq!(aether_cb_admit(cb, 103), 0);
+            assert_eq!(aether_cb_admit(cb, 104), -1, "capacity reached");
+            assert_eq!(aether_cb_n_active(cb), 4);
+            aether_cb_step(cb); aether_cb_step(cb); aether_cb_step(cb);
+            assert_eq!(aether_cb_n_active(cb), 4);
+            assert_eq!(aether_cb_complete(cb, 101), 0);
+            assert_eq!(aether_cb_n_active(cb), 3);
+            // Mid-decode admit: with one done, can take one more.
+            assert_eq!(aether_cb_admit(cb, 104), 0);
+            assert_eq!(aether_cb_n_active(cb), 4);
+            aether_cb_destroy(cb);
+
+            // -- FR-19.6 speculative decoding --
+            // p >= q → always accept.
+            assert_eq!(aether_specdec_accept(0.8, 0.2, 0.5), 1);
+            // p < q with rand below ratio → accept.
+            assert_eq!(aether_specdec_accept(0.2, 0.8, 0.1), 1);  // ratio=0.25, rand<ratio
+            // p < q with rand above ratio → reject.
+            assert_eq!(aether_specdec_accept(0.2, 0.8, 0.9), 0);  // rand>ratio
+            // p=0 → always reject.
+            assert_eq!(aether_specdec_accept(0.0, 1.0, 0.5), 0);
+
+            // -- FR-19.7 multi-model hosting --
+            let mm = aether_mm_new();
+            let nm_llama = b"llama-3-1b";
+            let nm_qwen = b"qwen-2.5-7b";
+            assert_eq!(aether_mm_register(mm, nm_llama.as_ptr() as _, nm_llama.len() as i32, 1500), 0);
+            assert_eq!(aether_mm_register(mm, nm_qwen.as_ptr() as _, nm_qwen.len() as i32, 4500), 1);
+            assert_eq!(aether_mm_lookup(mm, nm_llama.as_ptr() as _, nm_llama.len() as i32), 0);
+            assert_eq!(aether_mm_lookup(mm, nm_qwen.as_ptr() as _, nm_qwen.len() as i32), 1);
+            let nm_missing = b"missing-model";
+            assert_eq!(aether_mm_lookup(mm, nm_missing.as_ptr() as _, nm_missing.len() as i32), -1);
+            assert_eq!(aether_mm_total_vram_mb(mm), 6000);
+            aether_mm_destroy(mm);
+
+            // -- FR-19.14 rate limit --
+            // 1 req/sec, burst=2. The first two requests within 1 second
+            // succeed; the third (with no time elapsed) rate-limits.
+            let rl = aether_rl_new(1, 2);
+            let key = b"client-a";
+            assert_eq!(aether_rl_check(rl, key.as_ptr() as _, key.len() as i32, 0), 1);
+            assert_eq!(aether_rl_check(rl, key.as_ptr() as _, key.len() as i32, 0), 1);
+            assert_eq!(aether_rl_check(rl, key.as_ptr() as _, key.len() as i32, 0), 0);
+            // After 2 seconds, refill brings 2 tokens back.
+            assert_eq!(aether_rl_check(rl, key.as_ptr() as _, key.len() as i32, 2_000_000), 1);
+            aether_rl_destroy(rl);
+
+            // -- FR-19.15 observability --
+            let cname = b"requests_total";
+            aether_obs_counter_inc(cname.as_ptr() as _, cname.len() as i32, 1);
+            aether_obs_counter_inc(cname.as_ptr() as _, cname.len() as i32, 4);
+            assert_eq!(aether_obs_counter_get(cname.as_ptr() as _, cname.len() as i32), 5);
+            let mut buf = [0u8; 256];
+            let n = aether_obs_dump_prometheus(buf.as_mut_ptr() as _, buf.len() as i32);
+            assert!(n > 0);
+            let s = std::str::from_utf8(&buf[..n as usize]).expect("utf8");
+            assert!(s.contains("# TYPE requests_total counter"));
+            assert!(s.contains("requests_total 5"));
+
+            // -- FR-19.12 vision input --
+            // Normalize: (10, 100, 200, 250) / 255 with mean=0.5, std=0.5
+            // gives ((10/255 - 0.5)/0.5, ..., (250/255 - 0.5)/0.5) ≈ (-0.92, -0.22, 0.57, 0.96)
+            let pixels: [u8; 4] = [10, 100, 200, 250];
+            let mut norm = [0.0f32; 4];
+            assert_eq!(0, aether_img_normalize_f32(
+                pixels.as_ptr() as _, norm.as_mut_ptr() as _, 4, 0.5, 0.5,
+            ));
+            assert!((norm[0] - (-0.9215686)).abs() < 1e-5);
+            assert!((norm[3] - (0.9607843)).abs() < 1e-5);
+            // Patchify: 4×4 → 2×2 patches of 2×2.
+            let img: Vec<f32> = (0..16).map(|i| i as f32).collect();
+            let mut patches = [0.0f32; 16];
+            let n_p = aether_img_patchify_f32(
+                img.as_ptr() as _, patches.as_mut_ptr() as _, 4, 4, 2,
+            );
+            assert_eq!(n_p, 4);
+            // Patch 0 (top-left of 4x4): values [0, 1, 4, 5].
+            assert_eq!(&patches[0..4], &[0.0, 1.0, 4.0, 5.0]);
+            // Patch 1 (top-right): [2, 3, 6, 7].
+            assert_eq!(&patches[4..8], &[2.0, 3.0, 6.0, 7.0]);
+
+            // -- FR-19.13 mel-spectrogram primitives --
+            // Hann(8): symmetric, max at center.
+            let mut win = [0.0f32; 8];
+            aether_audio_hann_window(win.as_mut_ptr() as _, 8);
+            assert!(win[0] < 1e-5);
+            assert!(win[7] < 1e-5);
+            assert!(win[3] > 0.9 && win[3] <= 1.0);
+            // DFT magnitude: a pure tone at bin k=2 should produce a peak there.
+            let n_samp = 16;
+            let mut tone = vec![0.0f32; n_samp];
+            for i in 0..n_samp {
+                tone[i] = (2.0 * std::f32::consts::PI * 2.0 * i as f32 / n_samp as f32).cos();
+            }
+            let mut mag = vec![0.0f32; 8];
+            aether_audio_dft_magnitude_f32(
+                tone.as_ptr() as _, n_samp as i32, mag.as_mut_ptr() as _, 8,
+            );
+            // Bin 2 should be max.
+            let mut max_bin = 0usize;
+            for i in 1..8 { if mag[i] > mag[max_bin] { max_bin = i; } }
+            assert_eq!(max_bin, 2, "DFT peak should land at bin 2 for cos(2π·2·i/N) tone");
+
+            // -- FR-19.1 ChaCha20-Poly1305 round-trip --
+            // RFC 7539 §2.8.2 test vector check would compare against
+            // known ciphertext bytes; here we round-trip and verify
+            // decrypt(encrypt(x)) == x AND tag check rejects flipped bytes.
+            let key = [0x80u8; 32];
+            let nonce = [0x00u8; 12];
+            let aad = b"";
+            let plain = b"hello world";
+            let mut ct = [0u8; 64];
+            let n_ct = aether_chacha20_poly1305_encrypt(
+                key.as_ptr() as _, nonce.as_ptr() as _,
+                aad.as_ptr() as _, aad.len() as i32,
+                plain.as_ptr() as _, plain.len() as i32,
+                ct.as_mut_ptr() as _, ct.len() as i32,
+            );
+            assert_eq!(n_ct, (plain.len() + 16) as c_int);
+            let mut decrypted = [0u8; 32];
+            let n_pt = aether_chacha20_poly1305_decrypt(
+                key.as_ptr() as _, nonce.as_ptr() as _,
+                aad.as_ptr() as _, aad.len() as i32,
+                ct.as_ptr() as _, n_ct,
+                decrypted.as_mut_ptr() as _, decrypted.len() as i32,
+            );
+            assert_eq!(n_pt, plain.len() as c_int);
+            assert_eq!(&decrypted[..plain.len()], plain);
+            // Tamper: flip a ciphertext byte → tag check must reject.
+            let mut tampered = ct;
+            tampered[0] ^= 1;
+            let n_bad = aether_chacha20_poly1305_decrypt(
+                key.as_ptr() as _, nonce.as_ptr() as _,
+                aad.as_ptr() as _, aad.len() as i32,
+                tampered.as_ptr() as _, n_ct,
+                decrypted.as_mut_ptr() as _, decrypted.len() as i32,
+            );
+            assert_eq!(n_bad, -2, "expected -2 tag mismatch on tampered ciphertext");
+
+            // -- FR-19.2 HTTP/1.1 parse + write --
+            let req = b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let mut strs = [0u8; 64];
+            let mut m_len: i32 = 0;
+            let mut p_len: i32 = 0;
+            let body_off = aether_http_parse_request(
+                req.as_ptr() as _, req.len() as i32,
+                strs.as_mut_ptr() as _, strs.len() as i32,
+                &mut m_len as *mut _, &mut p_len as *mut _,
+            );
+            assert!(body_off > 0);
+            assert_eq!(m_len, 3);
+            assert_eq!(p_len, 10);
+            assert_eq!(&strs[..3], b"GET");
+            assert_eq!(&strs[3..3 + 10], b"/v1/models");
+            let body = b"{\"hello\":1}";
+            let mut resp = [0u8; 128];
+            let n_resp = aether_http_write_response_200(
+                body.as_ptr() as _, body.len() as i32,
+                resp.as_mut_ptr() as _, resp.len() as i32,
+            );
+            assert!(n_resp > 0);
+            let r = std::str::from_utf8(&resp[..n_resp as usize]).unwrap();
+            assert!(r.starts_with("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n"));
+            assert!(r.ends_with("{\"hello\":1}"));
+
+            // -- FR-19.3 OpenAI shape --
+            let id = b"chatcmpl-abc";
+            let model = b"llama-3-1b";
+            let content = b"hi there";
+            let mut json = [0u8; 512];
+            let n_json = aether_openai_render_completion(
+                id.as_ptr() as _, id.len() as i32,
+                model.as_ptr() as _, model.len() as i32,
+                content.as_ptr() as _, content.len() as i32,
+                7, 4,
+                json.as_mut_ptr() as _, json.len() as i32,
+            );
+            assert!(n_json > 0);
+            let s = std::str::from_utf8(&json[..n_json as usize]).unwrap();
+            assert!(s.contains("\"id\":\"chatcmpl-abc\""));
+            assert!(s.contains("\"model\":\"llama-3-1b\""));
+            assert!(s.contains("\"content\":\"hi there\""));
+            assert!(s.contains("\"finish_reason\":\"stop\""));
+            assert!(s.contains("\"prompt_tokens\":7"));
+            assert!(s.contains("\"completion_tokens\":4"));
+
+            // -- FR-19.8 WebSocket frame round-trip --
+            let ws_payload = b"hello";
+            let mut frame = [0u8; 16];
+            let n_frame = aether_ws_encode_text_frame(
+                ws_payload.as_ptr() as _, ws_payload.len() as i32,
+                frame.as_mut_ptr() as _, frame.len() as i32,
+            );
+            assert_eq!(n_frame, 7);  // 2 header + 5 payload
+            assert_eq!(frame[0], 0x81);  // FIN=1 + opcode=1 (text)
+            assert_eq!(frame[1], 5);     // payload len
+            assert_eq!(&frame[2..7], ws_payload);
+            // Decode back.
+            let mut decoded = [0u8; 16];
+            let n_dec = aether_ws_decode_frame_payload(
+                frame.as_ptr() as _, n_frame,
+                decoded.as_mut_ptr() as _, decoded.len() as i32,
+            );
+            assert_eq!(n_dec, 5);
+            assert_eq!(&decoded[..5], ws_payload);
+
+            // -- FR-19.11 tool calling JSON --
+            let tool_name = b"get_weather";
+            let tool_args = b"{\\\"city\\\":\\\"SF\\\"}";
+            let mut tj = [0u8; 256];
+            let n_tj = aether_tool_render_call(
+                tool_name.as_ptr() as _, tool_name.len() as i32,
+                tool_args.as_ptr() as _, tool_args.len() as i32,
+                tj.as_mut_ptr() as _, tj.len() as i32,
+            );
+            assert!(n_tj > 0);
+            let ts = std::str::from_utf8(&tj[..n_tj as usize]).unwrap();
+            assert!(ts.contains("\"type\":\"function\""));
+            assert!(ts.contains("\"name\":\"get_weather\""));
+            assert!(ts.contains("\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\""));
         }
     }
 

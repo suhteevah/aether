@@ -1,0 +1,71 @@
+// roadmap: P19.3
+// expect: exit=42
+//
+// FR-19.3 — OpenAI /v1/chat/completions response JSON shape.
+// Renders a sample completion and verifies the byte sequence
+// contains the expected JSON keys + values.
+use runtime;
+
+extern fn aether_openai_render_completion(
+    id: i64, n_id: i32, model: i64, n_model: i32,
+    content: i64, n_content: i32,
+    prompt_tokens: i32, completion_tokens: i32,
+    out: i64, max_out: i32,
+) -> i32;
+
+fn fill_id(buf: i64) {
+    // "chatcmpl-abc" — 12 bytes
+    aether_byte_set(buf,  0, 99);  aether_byte_set(buf,  1, 104);
+    aether_byte_set(buf,  2, 97);  aether_byte_set(buf,  3, 116);
+    aether_byte_set(buf,  4, 99);  aether_byte_set(buf,  5, 109);
+    aether_byte_set(buf,  6, 112); aether_byte_set(buf,  7, 108);
+    aether_byte_set(buf,  8, 45);  aether_byte_set(buf,  9, 97);
+    aether_byte_set(buf, 10, 98);  aether_byte_set(buf, 11, 99);
+}
+
+fn fill_model(buf: i64) {
+    // "llama-3-1b" — 10 bytes
+    aether_byte_set(buf, 0, 108); aether_byte_set(buf, 1, 108);
+    aether_byte_set(buf, 2, 97);  aether_byte_set(buf, 3, 109);
+    aether_byte_set(buf, 4, 97);  aether_byte_set(buf, 5, 45);
+    aether_byte_set(buf, 6, 51);  aether_byte_set(buf, 7, 45);
+    aether_byte_set(buf, 8, 49);  aether_byte_set(buf, 9, 98);
+}
+
+fn fill_content(buf: i64) {
+    // "hi there" — 8 bytes
+    aether_byte_set(buf, 0, 104); aether_byte_set(buf, 1, 105);
+    aether_byte_set(buf, 2, 32);  aether_byte_set(buf, 3, 116);
+    aether_byte_set(buf, 4, 104); aether_byte_set(buf, 5, 101);
+    aether_byte_set(buf, 6, 114); aether_byte_set(buf, 7, 101);
+}
+
+fn main() -> i32 {
+    let id: i64 = aether_alloc_bytes(12);
+    fill_id(id);
+    let model: i64 = aether_alloc_bytes(10);
+    fill_model(model);
+    let content: i64 = aether_alloc_bytes(8);
+    fill_content(content);
+    let out: i64 = aether_alloc_bytes(512);
+
+    let n: i32 = aether_openai_render_completion(
+        id, 12, model, 10, content, 8, 7, 4, out, 512,
+    );
+    if n <= 0 { return 1; }
+
+    // First char should be '{'.
+    if aether_byte_at(out, 0) != 123 { return 2; }
+    // Should contain '"id":"' starting somewhere — check chars at
+    // offset 2..8 (after `{"`).
+    if aether_byte_at(out, 2) != 105 { return 3; }  // 'i'
+    if aether_byte_at(out, 3) != 100 { return 4; }  // 'd'
+    if aether_byte_at(out, 4) != 34  { return 5; }  // '"'
+    if aether_byte_at(out, 5) != 58  { return 6; }  // ':'
+
+    aether_free_bytes(id, 12);
+    aether_free_bytes(model, 10);
+    aether_free_bytes(content, 8);
+    aether_free_bytes(out, 512);
+    42
+}

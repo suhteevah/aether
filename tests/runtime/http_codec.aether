@@ -1,0 +1,119 @@
+// roadmap: P19.2
+// expect: exit=42
+//
+// FR-19.2 — HTTP/1.1 request parser + response writer.
+// Parses "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n" and
+// writes a 200 response with JSON body. HTTPS gated on FR-19.1
+// handshake (TLS).
+use runtime;
+
+extern fn aether_http_parse_request(
+    buf: i64, n_buf: i32,
+    out_strings: i64, max_strings: i32,
+    out_method_len: i64, out_path_len: i64,
+) -> i32;
+extern fn aether_http_write_response_200(body: i64, n_body: i32, out: i64, max_out: i32) -> i32;
+
+// Fill "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n" (45 bytes).
+fn fill_request(buf: i64) {
+    aether_byte_set(buf,  0, 71);   // G
+    aether_byte_set(buf,  1, 69);   // E
+    aether_byte_set(buf,  2, 84);   // T
+    aether_byte_set(buf,  3, 32);   // ' '
+    aether_byte_set(buf,  4, 47);   // /
+    aether_byte_set(buf,  5, 118);  // v
+    aether_byte_set(buf,  6, 49);   // 1
+    aether_byte_set(buf,  7, 47);   // /
+    aether_byte_set(buf,  8, 109);  // m
+    aether_byte_set(buf,  9, 111);  // o
+    aether_byte_set(buf, 10, 100);  // d
+    aether_byte_set(buf, 11, 101);  // e
+    aether_byte_set(buf, 12, 108);  // l
+    aether_byte_set(buf, 13, 115);  // s
+    aether_byte_set(buf, 14, 32);   // ' '
+    aether_byte_set(buf, 15, 72);   // H
+    aether_byte_set(buf, 16, 84);   // T
+    aether_byte_set(buf, 17, 84);   // T
+    aether_byte_set(buf, 18, 80);   // P
+    aether_byte_set(buf, 19, 47);   // /
+    aether_byte_set(buf, 20, 49);   // 1
+    aether_byte_set(buf, 21, 46);   // .
+    aether_byte_set(buf, 22, 49);   // 1
+    aether_byte_set(buf, 23, 13);   // \r
+    aether_byte_set(buf, 24, 10);   // \n
+    // "Host: localhost"
+    aether_byte_set(buf, 25, 72);   // H
+    aether_byte_set(buf, 26, 111);  // o
+    aether_byte_set(buf, 27, 115);  // s
+    aether_byte_set(buf, 28, 116);  // t
+    aether_byte_set(buf, 29, 58);   // :
+    aether_byte_set(buf, 30, 32);   // ' '
+    aether_byte_set(buf, 31, 108);  // l
+    aether_byte_set(buf, 32, 111);  // o
+    aether_byte_set(buf, 33, 99);   // c
+    aether_byte_set(buf, 34, 97);   // a
+    aether_byte_set(buf, 35, 108);  // l
+    aether_byte_set(buf, 36, 104);  // h
+    aether_byte_set(buf, 37, 111);  // o
+    aether_byte_set(buf, 38, 115);  // s
+    aether_byte_set(buf, 39, 116);  // t
+    aether_byte_set(buf, 40, 13); aether_byte_set(buf, 41, 10);
+    aether_byte_set(buf, 42, 13); aether_byte_set(buf, 43, 10);
+}
+
+// Fill `{"ok":1}` (8 bytes) for the response body.
+fn fill_body(buf: i64) {
+    aether_byte_set(buf, 0, 123);  // {
+    aether_byte_set(buf, 1, 34);   // "
+    aether_byte_set(buf, 2, 111);  // o
+    aether_byte_set(buf, 3, 107);  // k
+    aether_byte_set(buf, 4, 34);   // "
+    aether_byte_set(buf, 5, 58);   // :
+    aether_byte_set(buf, 6, 49);   // 1
+    aether_byte_set(buf, 7, 125);  // }
+}
+
+fn main() -> i32 {
+    let req: i64 = aether_alloc_bytes(44);
+    fill_request(req);
+    let strs: i64 = aether_alloc_bytes(64);
+
+    // out_method_len + out_path_len are i32 buffers; use 4-byte
+    // chunks of an aether_alloc_bytes region. Helper macro would be
+    // nice — for now the runtime fn writes via raw pointer.
+    let len_buf: i64 = aether_alloc_bytes(8);
+    let body_off: i32 = aether_http_parse_request(req, 44, strs, 64, len_buf, len_buf + 4);
+    if body_off <= 0 { return 1; }
+    // out_method_len = low 4 bytes; out_path_len = next 4.
+    let m_lo: i64 = aether_byte_at(len_buf, 0);
+    let p_lo: i64 = aether_byte_at(len_buf, 4);
+    if m_lo != 3  { return 2; }   // "GET" length
+    if p_lo != 10 { return 3; }   // "/v1/models" length
+    // Method bytes are at strs[0..3] = "GET".
+    if aether_byte_at(strs, 0) != 71 { return 4; }
+    if aether_byte_at(strs, 1) != 69 { return 5; }
+    if aether_byte_at(strs, 2) != 84 { return 6; }
+    // Path bytes are at strs[3..13] = "/v1/models".
+    if aether_byte_at(strs, 3) != 47  { return 7; }
+    if aether_byte_at(strs, 4) != 118 { return 8; }
+    if aether_byte_at(strs, 12) != 115 { return 9; }  // 's' (last char)
+
+    // Write a 200 response.
+    let body: i64 = aether_alloc_bytes(8);
+    fill_body(body);
+    let resp: i64 = aether_alloc_bytes(128);
+    let n_resp: i32 = aether_http_write_response_200(body, 8, resp, 128);
+    if n_resp <= 0 { return 10; }
+    // Should start with "HTTP/1.1 200 OK\r\n".
+    if aether_byte_at(resp, 0) != 72  { return 11; }  // H
+    if aether_byte_at(resp, 9) != 50  { return 12; }  // 2 (first char of 200)
+    if aether_byte_at(resp, 10) != 48 { return 13; }  // 0
+    if aether_byte_at(resp, 11) != 48 { return 14; }  // 0
+
+    aether_free_bytes(req, 44);
+    aether_free_bytes(strs, 64);
+    aether_free_bytes(len_buf, 8);
+    aether_free_bytes(body, 8);
+    aether_free_bytes(resp, 128);
+    42
+}

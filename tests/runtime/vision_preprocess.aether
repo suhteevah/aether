@@ -1,0 +1,51 @@
+// roadmap: P19.12
+// expect: exit=42
+//
+// FR-19.12 — Vision input: normalize u8 → f32 + patchify (h, w) into
+// (n_patches, patch²) row-major. 4×4 input → 4 patches of 2×2.
+use runtime;
+
+extern fn aether_img_normalize_f32(px_u8: i64, out: i64, n: i32, mean: f32, std: f32) -> i32;
+extern fn aether_img_patchify_f32(img: i64, out: i64, h: i32, w: i32, patch: i32) -> i32;
+
+fn main() -> i32 {
+    // Normalize: pixels [10, 100, 200, 250] with mean=0.5, std=0.5.
+    let px: i64 = aether_alloc_bytes(4);
+    aether_byte_set(px, 0, 10);
+    aether_byte_set(px, 1, 100);
+    aether_byte_set(px, 2, 200);
+    aether_byte_set(px, 3, 250);
+
+    let norm: i64 = aether_alloc_f32(4);
+    if aether_img_normalize_f32(px, norm, 4, 0.5, 0.5) != 0 { return 1; }
+    let n0: f32 = aether_load_f32(norm, 0);
+    let n3: f32 = aether_load_f32(norm, 3);
+    // Expected: (10/255 - 0.5) / 0.5 ≈ -0.9215; (250/255 - 0.5)/0.5 ≈ 0.9607
+    if aether_abs_f32(n0 - (0.0 - 0.9215686)) > 0.001 { return 2; }
+    if aether_abs_f32(n3 - 0.9607843) > 0.001 { return 3; }
+
+    // Patchify: 4×4 with values 0..15, patch=2 → 4 patches.
+    let img: i64 = aether_alloc_f32(16);
+    let mut i: i32 = 0;
+    while i < 16 {
+        aether_store_f32(img, i, f32(i));
+        i = i + 1;
+    }
+    let patches: i64 = aether_alloc_f32(16);
+    let n_patches: i32 = aether_img_patchify_f32(img, patches, 4, 4, 2);
+    if n_patches != 4 { return 10; }
+    // Patch 0 (top-left): values [0, 1, 4, 5].
+    if aether_load_f32(patches, 0) != 0.0 { return 11; }
+    if aether_load_f32(patches, 1) != 1.0 { return 12; }
+    if aether_load_f32(patches, 2) != 4.0 { return 13; }
+    if aether_load_f32(patches, 3) != 5.0 { return 14; }
+    // Patch 1 (top-right): values [2, 3, 6, 7].
+    if aether_load_f32(patches, 4) != 2.0 { return 15; }
+    if aether_load_f32(patches, 7) != 7.0 { return 16; }
+
+    aether_free_bytes(px, 4);
+    aether_free_f32(norm, 4);
+    aether_free_f32(img, 16);
+    aether_free_f32(patches, 16);
+    42
+}

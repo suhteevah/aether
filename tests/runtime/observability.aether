@@ -1,0 +1,74 @@
+// roadmap: P19.15
+// expect: exit=42
+//
+// FR-19.15 — Observability: Prometheus counter + render to text-
+// exposition format. Witness increments a counter twice (1 + 4),
+// verifies the get reads back 5, dumps prometheus format, checks
+// the output contains "requests_total 5" and the TYPE comment.
+use runtime;
+
+extern fn aether_obs_counter_inc(name: i64, n: i32, by: i32) -> i32;
+extern fn aether_obs_counter_get(name: i64, n: i32) -> i64;
+extern fn aether_obs_dump_prometheus(out: i64, max: i32) -> i32;
+
+fn fill_counter_name(buf: i64) {
+    // "p19_req_total" (13 bytes) — unique to avoid collisions with
+    // other tests that share the OBS_STATE global counter registry.
+    aether_byte_set(buf,  0, 112); // p
+    aether_byte_set(buf,  1, 49);  // 1
+    aether_byte_set(buf,  2, 57);  // 9
+    aether_byte_set(buf,  3, 95);  // _
+    aether_byte_set(buf,  4, 114); // r
+    aether_byte_set(buf,  5, 101); // e
+    aether_byte_set(buf,  6, 113); // q
+    aether_byte_set(buf,  7, 95);  // _
+    aether_byte_set(buf,  8, 116); // t
+    aether_byte_set(buf,  9, 111); // o
+    aether_byte_set(buf, 10, 116); // t
+    aether_byte_set(buf, 11, 97);  // a
+    aether_byte_set(buf, 12, 108); // l
+}
+
+fn main() -> i32 {
+    let name: i64 = aether_alloc_bytes(13);
+    fill_counter_name(name);
+
+    aether_obs_counter_inc(name, 13, 1);
+    aether_obs_counter_inc(name, 13, 4);
+    let v: i64 = aether_obs_counter_get(name, 13);
+    if v != 5 { return 1; }
+
+    let out: i64 = aether_alloc_bytes(1024);
+    let n: i32 = aether_obs_dump_prometheus(out, 1024);
+    if n <= 0 { return 2; }
+
+    // Verify a few expected bytes of the prometheus text format.
+    // The output is sorted lex, so "p19_req_total" comes after any
+    // other counter named alphabetically before it. We look for the
+    // substring "p19_req_total 5\n" by scanning the buffer.
+    let mut found_value: i32 = 0;
+    let mut i: i32 = 0;
+    // Scan up to n-14 so the (i+14) byte read is in bounds. With
+    // "# TYPE p19_req_total counter\np19_req_total 5\n" the second
+    // 'p' lands at i=29 which is past n-16 — bug in the prior bound.
+    while i < n - 14 {
+        if aether_byte_at(out, i as i64) == 112 {       // 'p'
+            if aether_byte_at(out, (i + 1) as i64) == 49 {  // '1'
+                if aether_byte_at(out, (i + 2) as i64) == 57 {  // '9'
+                    // Probably hit "p19_req_total"; check the trailing " 5"
+                    if aether_byte_at(out, (i + 13) as i64) == 32 {  // ' '
+                        if aether_byte_at(out, (i + 14) as i64) == 53 {  // '5'
+                            found_value = 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if found_value != 1 { return 3; }
+
+    aether_free_bytes(name, 13);
+    aether_free_bytes(out, 1024);
+    42
+}

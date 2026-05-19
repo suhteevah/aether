@@ -1,0 +1,38 @@
+// roadmap: P19.14
+// expect: exit=42
+//
+// FR-19.14 — Token-bucket rate limit. 1 req/sec, burst=2. First two
+// requests succeed; third (no time elapsed) rate-limits (returns 0,
+// the typical HTTP 429 path). After 2 seconds, bucket refills.
+use runtime;
+
+extern fn aether_rl_new(req_per_sec: i32, burst: i32) -> i64;
+extern fn aether_rl_destroy(h: i64) -> i32;
+extern fn aether_rl_check(h: i64, key: i64, n: i32, now_us: i64) -> i32;
+
+fn fill_client_a(buf: i64) {
+    aether_byte_set(buf, 0, 99);  // c
+    aether_byte_set(buf, 1, 108); // l
+    aether_byte_set(buf, 2, 105); // i
+    aether_byte_set(buf, 3, 101); // e
+    aether_byte_set(buf, 4, 110); // n
+    aether_byte_set(buf, 5, 116); // t
+    aether_byte_set(buf, 6, 45);  // -
+    aether_byte_set(buf, 7, 97);  // a
+}
+
+fn main() -> i32 {
+    let h: i64 = aether_rl_new(1, 2);
+    if h < 0 { return 1; }
+    let k: i64 = aether_alloc_bytes(8);
+    fill_client_a(k);
+
+    if aether_rl_check(h, k, 8, 0) != 1 { return 10; }
+    if aether_rl_check(h, k, 8, 0) != 1 { return 11; }
+    if aether_rl_check(h, k, 8, 0) != 0 { return 12; }  // rate-limited
+    if aether_rl_check(h, k, 8, 2000000) != 1 { return 13; }  // refilled
+
+    aether_rl_destroy(h);
+    aether_free_bytes(k, 8);
+    42
+}

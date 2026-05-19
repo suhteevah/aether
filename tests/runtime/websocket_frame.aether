@@ -1,0 +1,51 @@
+// roadmap: P19.8
+// expect: exit=42
+//
+// FR-19.8 — WebSocket text-frame round-trip (RFC 6455).
+// Encode "hello" as an unmasked text frame, verify byte layout
+// (0x81 + len + payload), decode it back, byte-equality check.
+use runtime;
+
+extern fn aether_ws_encode_text_frame(payload: i64, n: i32, out: i64, max_out: i32) -> i32;
+extern fn aether_ws_decode_frame_payload(buf: i64, n_buf: i32, out: i64, max_out: i32) -> i32;
+
+fn fill_hello(buf: i64) {
+    aether_byte_set(buf, 0, 104); aether_byte_set(buf, 1, 101);
+    aether_byte_set(buf, 2, 108); aether_byte_set(buf, 3, 108);
+    aether_byte_set(buf, 4, 111);
+}
+
+fn main() -> i32 {
+    let payload: i64 = aether_alloc_bytes(5);
+    fill_hello(payload);
+    let frame: i64 = aether_alloc_bytes(16);
+
+    let n_frame: i32 = aether_ws_encode_text_frame(payload, 5, frame, 16);
+    if n_frame != 7 { return 1; }  // 2 header + 5 payload
+
+    // Frame layout:
+    //   byte 0: 0x81 (FIN=1, opcode=1)
+    //   byte 1: 5    (payload length)
+    //   bytes 2..7: payload
+    if aether_byte_at(frame, 0) != 129 { return 2; }  // 0x81
+    if aether_byte_at(frame, 1) != 5   { return 3; }
+    if aether_byte_at(frame, 2) != 104 { return 4; }  // 'h'
+    if aether_byte_at(frame, 6) != 111 { return 5; }  // 'o'
+
+    let decoded: i64 = aether_alloc_bytes(16);
+    let n_dec: i32 = aether_ws_decode_frame_payload(frame, n_frame, decoded, 16);
+    if n_dec != 5 { return 10; }
+
+    let mut i: i32 = 0;
+    while i < 5 {
+        if aether_byte_at(decoded, i as i64) != aether_byte_at(payload, i as i64) {
+            return 20 + i;
+        }
+        i = i + 1;
+    }
+
+    aether_free_bytes(payload, 5);
+    aether_free_bytes(frame, 16);
+    aether_free_bytes(decoded, 16);
+    42
+}

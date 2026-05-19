@@ -1,0 +1,70 @@
+// roadmap: P19.11
+// expect: exit=42
+//
+// FR-19.11 — Tool calling JSON shape. Render an OpenAI
+// function-tool-call object:
+//   {"type":"function","function":{"name":"get_weather","arguments":"..."}}
+// SCOPE: just the wire shape; JSON-schema validation of arguments
+// is FR-19.11-extra.
+use runtime;
+
+extern fn aether_tool_render_call(
+    name: i64, n_name: i32, args: i64, n_args: i32,
+    out: i64, max_out: i32,
+) -> i32;
+
+fn fill_name(buf: i64) {
+    // "get_weather" — 11 bytes
+    aether_byte_set(buf,  0, 103); aether_byte_set(buf,  1, 101);
+    aether_byte_set(buf,  2, 116); aether_byte_set(buf,  3, 95);
+    aether_byte_set(buf,  4, 119); aether_byte_set(buf,  5, 101);
+    aether_byte_set(buf,  6, 97);  aether_byte_set(buf,  7, 116);
+    aether_byte_set(buf,  8, 104); aether_byte_set(buf,  9, 101);
+    aether_byte_set(buf, 10, 114);
+}
+
+fn fill_args(buf: i64) {
+    // `{\"city\":\"SF\"}` — 17 bytes (the JSON-escaped form so the
+    // runtime can render `arguments`'s string value verbatim).
+    aether_byte_set(buf,  0, 123);  // {
+    aether_byte_set(buf,  1, 92);   // \
+    aether_byte_set(buf,  2, 34);   // "
+    aether_byte_set(buf,  3, 99);   // c
+    aether_byte_set(buf,  4, 105);  // i
+    aether_byte_set(buf,  5, 116);  // t
+    aether_byte_set(buf,  6, 121);  // y
+    aether_byte_set(buf,  7, 92);   // \
+    aether_byte_set(buf,  8, 34);   // "
+    aether_byte_set(buf,  9, 58);   // :
+    aether_byte_set(buf, 10, 92);   // \
+    aether_byte_set(buf, 11, 34);   // "
+    aether_byte_set(buf, 12, 83);   // S
+    aether_byte_set(buf, 13, 70);   // F
+    aether_byte_set(buf, 14, 92);   // \
+    aether_byte_set(buf, 15, 34);   // "
+    aether_byte_set(buf, 16, 125);  // }
+}
+
+fn main() -> i32 {
+    let name: i64 = aether_alloc_bytes(11);
+    fill_name(name);
+    let args: i64 = aether_alloc_bytes(17);
+    fill_args(args);
+    let out: i64 = aether_alloc_bytes(256);
+
+    let n: i32 = aether_tool_render_call(name, 11, args, 17, out, 256);
+    if n <= 0 { return 1; }
+
+    // First char should be '{'.
+    if aether_byte_at(out, 0) != 123 { return 2; }
+    // "type":"function" — quickly check the 't' of "type" at offset 2.
+    if aether_byte_at(out, 2) != 116 { return 3; }  // 't'
+    if aether_byte_at(out, 3) != 121 { return 4; }  // 'y'
+    if aether_byte_at(out, 4) != 112 { return 5; }  // 'p'
+    if aether_byte_at(out, 5) != 101 { return 6; }  // 'e'
+
+    aether_free_bytes(name, 11);
+    aether_free_bytes(args, 17);
+    aether_free_bytes(out, 256);
+    42
+}

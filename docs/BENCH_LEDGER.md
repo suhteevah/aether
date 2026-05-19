@@ -57,6 +57,10 @@ Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `ae
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `aether_template_new` / `_free` / `aether_template_set_var` / `aether_template_push_message` / `aether_template_render`. Pure-Rust state-machine template parser. No GPU / no matmul / no SIMD. Matmul bench is untouched. A `bench/chat_template_throughput/` fixture for "ms per render of a typical chat template" is the right surface to log this once the matt-voice serving deploy actually renders user prompts at scale — fixture doesn't exist yet. 2026-05-03 matmul row remains the reference.
 
+### 2026-05-19 — pending commit (Phase 19 closeout — 13 items): skipped (additive, no matmul / SDPA / LN path touched)
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched. 13 new runtime symbols across PKV-sim / CB-sim / specdec / MM-sim / rate-limit / observability / image-preprocess / DFT+Hann / ChaCha20-Poly1305 / HTTP-parse+write / OpenAI-JSON-render / WS-frame-codec / tool-call-render. Pure CPU code; no GPU; no matmul; no SDPA / LN. Matmul bench is untouched. Real bench fixtures gating on the closeout items live behind their own FR-19.x-extras (e.g. real cross-card NCCL for the PKV+CB chain, real TLS handshake for HTTP+OpenAI). Standing 2026-05-03 matmul row remains the reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

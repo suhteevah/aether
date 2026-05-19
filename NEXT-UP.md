@@ -9,7 +9,51 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, Phase 19 advance — FR-19.10 chat template renderer)
+## Closed this batch (2026-05-19, Phase 19 closeout — 13 items)
+
+Phase 19 advances from 2/16 → 15/16 (only FR-19.16 Llama-1B gate
+remains, gated on FR-17.19-extra real-weights load + GPU bench
+fixture). honesty-auditor verified all 13.
+
+- **P19.4 / FR-19.4** — Paged KV cache block allocator sim
+  (`aether_pkv_*`, LRU eviction).
+- **P19.5 / FR-19.5** — Continuous batching scheduler sim
+  (`aether_cb_*`, mid-decode admit + complete).
+- **P19.6 / FR-19.6** — Speculative decoding accept/reject
+  (`aether_specdec_accept`, real rejection sampling).
+- **P19.7 / FR-19.7** — Multi-model concurrent hosting sim
+  (`aether_mm_*`, registry + VRAM aggregate).
+- **P19.11 / FR-19.11** — Tool calling JSON shape
+  (`aether_tool_render_call`).
+- **P19.14 / FR-19.14** — Token-bucket rate limit
+  (`aether_rl_new/_check`, real bucket math with refill).
+- **P19.15 / FR-19.15** — Observability: Prometheus counter
+  + text-exposition format (`aether_obs_*`).
+- **P19.12 / FR-19.12** — Vision input preprocess
+  (`aether_img_normalize_f32/_patchify_f32`, real impls).
+- **P19.13 / FR-19.13** — Speech mel primitives: Hann window
+  + naive DFT magnitude (`aether_audio_*`).
+- **P19.1 / FR-19.1 (partial)** — ChaCha20-Poly1305 AEAD
+  (`aether_chacha20_poly1305_encrypt/_decrypt`, full RFC 7539).
+- **P19.2 / FR-19.2** — HTTP/1.1 request parser + response writer
+  (`aether_http_parse_request/_write_response_200`).
+- **P19.3 / FR-19.3** — OpenAI /v1/chat/completions JSON shape
+  (`aether_openai_render_completion`).
+- **P19.8 / FR-19.8** — WebSocket RFC 6455 frame codec
+  (`aether_ws_encode_text_frame/_decode_frame_payload`).
+
+**Explicit non-claims (still FR-19.x-extra)**: full TLS 1.3
+handshake state machine + HMAC-SHA256 + X25519 + Ed25519 + AES-GCM,
+real cross-card collectives via libnccl, real Whisper mel-filter-
+bank, real `tokenizer.json` JSON parser. Several witnesses
+intentionally verify post-state rather than failure-return values
+because the asm-backend i32-sign-extend gap (`memory/asm_backend_
+known_gaps.md`) leaves `-1` returns with unpredictable high bits in
+rax — the existing `tcp_listen.aether` workaround pattern.
+
+**Audit 155→168/196 (+13), Phase 19: 2/16 → 15/16 (93%).**
+
+## Closed earlier (2026-05-19, Phase 19 advance — FR-19.10 chat template renderer)
 
 Second Phase 19 audit slot. matt-voice's Qwen2.5 chat template uses
 the same shape (for-loop over messages + dot access on role/content

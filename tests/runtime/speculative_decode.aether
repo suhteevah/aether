@@ -1,0 +1,24 @@
+// roadmap: P19.6
+// expect: exit=42
+//
+// FR-19.6 — Speculative decoding accept/reject (algorithm shape).
+// Standard rejection-sampling test: accept with probability
+// min(1, target_prob / draft_prob). Real wiring needs draft+target
+// models (FR-17.19-extra → FR-19.6-extra).
+use runtime;
+
+extern fn aether_specdec_accept(target_prob: f32, draft_prob: f32, rand_u01: f32) -> i32;
+
+fn main() -> i32 {
+    // p >= q → always accept.
+    if aether_specdec_accept(0.8, 0.2, 0.5) != 1 { return 1; }
+    // p < q with rand below ratio → accept. ratio = 0.2/0.8 = 0.25.
+    if aether_specdec_accept(0.2, 0.8, 0.1) != 1 { return 2; }
+    // p < q with rand above ratio → reject.
+    if aether_specdec_accept(0.2, 0.8, 0.9) != 0 { return 3; }
+    // p = 0 → always reject.
+    if aether_specdec_accept(0.0, 1.0, 0.5) != 0 { return 4; }
+    // Boundary: rand = ratio - epsilon → accept.
+    if aether_specdec_accept(0.5, 1.0, 0.49) != 1 { return 5; }
+    42
+}
