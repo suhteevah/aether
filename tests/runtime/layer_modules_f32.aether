@@ -1,0 +1,125 @@
+// roadmap: P17.18
+// expect: exit=42
+//
+// FR-17.18 (f32 deepening) — real f32 Linear + LayerNorm witness.
+//
+// Deepens the existing layer_modules.aether (which is integer-only by
+// design — "Stack arrays only support int/handle elements" gap).
+// This version exercises the real f32 runtime ops:
+//   aether_op_matmul_f32  for the Linear weight matmul
+//   aether_op_layer_norm_f32 for the LayerNorm
+//
+// Setup:
+//   x (2, 4) = [[1, 2, 3, 4], [5, 6, 7, 8]]
+//   W (4, 3) = [[1,0,-1],[1,0,-1],[1,0,-1],[1,0,-1]] (sum/zero/-sum)
+//   y = x @ W:
+//     row 0 = [10, 0, -10]
+//     row 1 = [26, 0, -26]
+//
+// LayerNorm gamma=[1,1,1] beta=[0,0,0] eps=1e-5:
+//   Both rows normalise to ≈[1.2247, 0.0, -1.2247] (symmetric about 0).
+//
+// Exit 42 iff first-row normalised output lands in expected tolerance.
+
+use runtime;
+
+extern fn aether_op_matmul_f32(a: i64, b: i64, c: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_op_layer_norm_f32(
+    x: i64, gamma: i64, beta: i64, eps: f32,
+    out: i64, mean_out: i64, inv_std_out: i64,
+    rows: i32, d: i32,
+) -> i32;
+
+fn fill_x(buf: i64) {
+    let mut i: i32 = 0;
+    while i < 8 {
+        aether_store_f32(buf, i, f32(i + 1));
+        i = i + 1;
+    }
+}
+
+// Fill W (4 x 3) row-major = [1,0,-1, 1,0,-1, 1,0,-1, 1,0,-1]
+fn fill_w(buf: i64) {
+    let mut r: i32 = 0;
+    while r < 4 {
+        aether_store_f32(buf, r * 3 + 0,  1.0);
+        aether_store_f32(buf, r * 3 + 1,  0.0);
+        aether_store_f32(buf, r * 3 + 2, 0.0 - 1.0);
+        r = r + 1;
+    }
+}
+
+fn fill_gamma_beta(gamma: i64, beta: i64) {
+    let mut i: i32 = 0;
+    while i < 3 {
+        aether_store_f32(gamma, i, 1.0);
+        aether_store_f32(beta,  i, 0.0);
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let x:     i64 = aether_alloc_f32(8);
+    let w:     i64 = aether_alloc_f32(12);
+    let y:     i64 = aether_alloc_f32(6);
+    let gamma: i64 = aether_alloc_f32(3);
+    let beta:  i64 = aether_alloc_f32(3);
+    let out:   i64 = aether_alloc_f32(6);
+    let mean_buf:    i64 = aether_alloc_f32(2);
+    let inv_std_buf: i64 = aether_alloc_f32(2);
+    if x == 0 { return 1; }
+    if w == 0 { return 1; }
+    if y == 0 { return 1; }
+    if gamma == 0 { return 1; }
+    if beta == 0 { return 1; }
+    if out == 0 { return 1; }
+    if mean_buf == 0 { return 1; }
+    if inv_std_buf == 0 { return 1; }
+
+    fill_x(x);
+    fill_w(w);
+    fill_gamma_beta(gamma, beta);
+
+    // Linear forward: y = x @ W (m=2, k=4, n=3)
+    let rc1: i32 = aether_op_matmul_f32(x, w, y, 2, 4, 3);
+    if rc1 != 0 { return 2; }
+
+    // Verify matmul row 0 — expect [10, 0, -10].
+    let y00: f32 = aether_load_f32(y, 0);
+    let y01: f32 = aether_load_f32(y, 1);
+    let y02: f32 = aether_load_f32(y, 2);
+    if y00 < 9.99 { return 10; }
+    if y00 > 10.01 { return 11; }
+    if y01 < 0.0 - 0.01 { return 12; }
+    if y01 > 0.01 { return 13; }
+    if y02 < 0.0 - 10.01 { return 14; }
+    if y02 > 0.0 - 9.99 { return 15; }
+
+    // LayerNorm forward: rows=2, d=3, eps=1e-5
+    let eps: f32 = 0.00001;
+    let rc2: i32 = aether_op_layer_norm_f32(y, gamma, beta, eps,
+                                             out, mean_buf, inv_std_buf,
+                                             2, 3);
+    if rc2 != 0 { return 3; }
+
+    // Row 0 should be ≈ [1.2247, 0.0, -1.2247].
+    let o00: f32 = aether_load_f32(out, 0);
+    let o01: f32 = aether_load_f32(out, 1);
+    let o02: f32 = aether_load_f32(out, 2);
+    if o00 < 1.22 { return 20; }
+    if o00 > 1.23 { return 21; }
+    if o01 < 0.0 - 0.01 { return 22; }
+    if o01 > 0.01 { return 23; }
+    if o02 < 0.0 - 1.23 { return 24; }
+    if o02 > 0.0 - 1.22 { return 25; }
+
+    aether_free_f32(x,           8);
+    aether_free_f32(w,           12);
+    aether_free_f32(y,           6);
+    aether_free_f32(gamma,       3);
+    aether_free_f32(beta,        3);
+    aether_free_f32(out,         6);
+    aether_free_f32(mean_buf,    2);
+    aether_free_f32(inv_std_buf, 2);
+    42
+}

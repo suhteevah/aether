@@ -1,0 +1,64 @@
+// roadmap: P17.14
+// expect: exit=42
+//
+// FR-17.14 Q4_0 GGUF dequant witness — builds one 18-byte Q4_0 block
+// by hand, calls aether_dequant_q4_0, verifies the recovered f32
+// values match the hand-computed reference.
+//
+// Block layout (18 bytes):
+//   [0..2] = f16 scale `d`        (0x3C00 → 1.0)
+//   [2..18] = 16 bytes of nibble-packed quants (32 quants, low nibble
+//             at even index, high at odd; (nibble - 8) signed)
+//
+// We set every byte 2..18 to 0x80 (low=0 → -8, high=8 → 0).
+// With scale=1.0 the dequant produces alternating -8.0 / 0.0 across
+// the 32 output slots.
+use runtime;
+
+extern fn aether_dequant_q4_0(blocks: i64, out: i64, n_blocks: i32) -> i32;
+
+fn main() -> i32 {
+    let block:  i64 = aether_alloc_bytes(18);
+    let output: i64 = aether_alloc_f32(32);
+    if block  == 0 { return 1; }
+    if output == 0 { return 1; }
+
+    // f16 1.0 = 0x3C00 (little-endian).
+    aether_byte_set(block, 0, 0x00);
+    aether_byte_set(block, 1, 0x3C);
+    // Fill bytes 2..18 with 0x80.
+    let mut i: i64 = 2;
+    while i < 18 {
+        aether_byte_set(block, i, 0x80);
+        i = i + 1;
+    }
+
+    let rc: i32 = aether_dequant_q4_0(block, output, 1);
+    if rc != 0 { return 2; }
+
+    // Verify alternating -8.0 / 0.0 pattern.
+    let mut j: i32 = 0;
+    while j < 32 {
+        let v: f32 = aether_load_f32(output, j);
+        if j % 2 == 0 {
+            // even index → low nibble (0) → -8.0
+            if v != -8.0 {
+                aether_free_bytes(block, 18);
+                aether_free_f32(output, 32);
+                return 3 + j;
+            }
+        } else {
+            // odd index → high nibble (8) → 0.0
+            if v != 0.0 {
+                aether_free_bytes(block, 18);
+                aether_free_f32(output, 32);
+                return 100 + j;
+            }
+        }
+        j = j + 1;
+    }
+
+    aether_free_bytes(block, 18);
+    aether_free_f32(output, 32);
+    42
+}

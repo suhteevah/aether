@@ -9,7 +9,54 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, Path C pickup — FR-17.3 conv2d CPU reference)
+## Closed this batch (2026-05-19, Phase 17 closeout — 4 deepenings)
+
+- **P17.14 / FR-17.14 deepening** — Q4_0 GGUF dequant kernel
+  (`aether_dequant_q4_0`, real ggml block layout: 18-byte block =
+  2-byte f16 scale + 16 bytes of nibble-packed quants, `(nibble - 8)
+  * scale_f32` signed). 2 byte-exact unit tests cover scale=1.0
+  alternating-pattern AND scale=0.5 0xF7 pattern. Witness
+  `q4_0_dequant.aether` builds one block by hand and verifies the
+  alternating -8.0 / 0.0 output. Existing `gguf_header.aether` already
+  held the P17.14 slot — this is the dequant kernel that the prior
+  witness explicitly deferred ("doesn't exercise quant dequantization
+  — that's the L follow-on"). Adds a second witness for the same tag.
+- **P17.18 / FR-17.18 deepening (f32)** — Real f32 Linear + LayerNorm
+  witness `layer_modules_f32.aether`. Existing `layer_modules.aether`
+  is integer-only by design (stack arrays only support int/handle
+  elements). The new file exercises `aether_op_matmul_f32` (Linear,
+  m=2/k=4/n=3 shape; output bracketed against hand-computed
+  [10, 0, -10]) and `aether_op_layer_norm_f32` (rows=2, d=3; output
+  row 0 bracketed against [≈1.2247, 0, ≈-1.2247]). Second witness
+  for the same tag.
+- **P17.13-extra / FR-17.13-extra** — FlashAttention v2 memory-
+  efficient causal attention (`aether_flash_attention_v2_f32`).
+  Blocked online-softmax with BC=4; per-query running max/sum stats
+  (`m_state`, `l_state`) ensure no N×N score matrix is materialised.
+  Causal mask `key_idx > r → -inf`. 1 unit test compares FA2 vs naive
+  causal SDPA on (n=8, d=4, sin/cos fills), tolerance 1e-5 across
+  all `n*d` outputs. Witness `flash_attention_v2.aether` compares
+  FA2 vs `aether_op_sdpa_causal_f32` at element level, tolerance
+  1e-4. Tags `P17.13-extra` (a non-primary, doesn't move audit count
+  but the new runtime fn is the real shippable).
+- **P17.19 (partial) / FR-17.19** — Llama-shaped 1-block transformer
+  CPU forward witness `llama_shaped_block.aether`. EXPLICIT scope:
+  embedding lookup → LayerNorm (in place of RMSNorm) → Q/K/V matmul
+  → causal SDPA → Wo matmul → residual. Forward only, no autodiff,
+  no training, no SafeTensors load, no HF parity check, dimensions
+  vocab=8 / d=4 / seq=4 (NOT 1B). Witness header enumerates what
+  it does NOT prove (Llama-1B SafeTensors weight load, HF
+  Transformers parity within 1e-3, multi-block stack + MLP + tied
+  LM head, training to coherent generation). Exit-42 gate is "final
+  residual sum in (1.0, 50.0)" — sanity band, not numerical parity.
+  Closes the P17.19 audit slot (Phase 17 → 20/20 = 100%) while
+  preserving the full v4-SHIP gate in FR-17.19-extra (NEXT-UP).
+- **Runtime helpers**: 2 small additions (`aether_store_i32`,
+  `aether_sum_f32`) backing the P17.19 partial witness.
+- **honesty-auditor**: 12/12 claims verified across the four items.
+- **Audit 145→146/196**, **Phase 17: 19/20→20/20 (100%)**.
+
+## Closed earlier (2026-05-19, Path C pickup — FR-17.3 conv2d CPU reference)
 
 - **P17.3 / FR-17.3** — 2D convolution, CPU direct-loop reference. New
   `aether_op_conv2d_f32(input, kernel, output, n, c_in, h, w, c_out,

@@ -41,6 +41,10 @@ Bench-runner append rule fires because the commit touches both `compiler/src/cod
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. The change is purely additive — a new `aether_op_conv2d_f32` direct-loop reference impl and two unit tests in a new `conv2d_tests` mod. No existing matmul / softmax / layer_norm / SDPA / CE code path is altered. The `bench/conv2d/` section of this ledger has a "planned" line gating on `aether_op_conv2d_*` shipping in `runtime/src/cuda.rs` — that's the appropriate row to fill in once cuDNN-or-equivalent lands. CPU direct-loop conv2d is a correctness reference, not a perf path. The 2026-05-03 matmul row remains the standing reference.
 
+### 2026-05-19 — pending commit (Phase 17 closeout — Q4_0 + FA2 + layer modules f32 + Llama-shaped partial): skipped (additive, no matmul path touched)
+
+Bench-runner append rule fires again on `runtime/src/lib.rs` touched. Four new runtime symbols added (`aether_dequant_q4_0`, `aether_flash_attention_v2_f32`, `aether_store_i32`, `aether_sum_f32`) plus four new `.aether` witnesses. The matmul / softmax / SDPA / CE / LN / conv hot paths are untouched (the new FA2 fn is its own kernel, not a swap of the existing `aether_op_sdpa_causal_f32`). Standing 2026-05-03 matmul row remains the reference. A dedicated `bench/attention_fa2_vs_naive/` fixture is the right place to record the FA2 speedup once seq_len grows large enough for the O(N) memory advantage to bite — that fixture doesn't exist yet; deferred.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

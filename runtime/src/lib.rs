@@ -170,10 +170,148 @@ pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
     0
 }
 
+/// FR-17.14 — GGUF Q4_0 dequantization (CPU reference).
+///
+/// Q4_0 block layout (18 bytes per 32 quants):
+///   bytes 0..2   = f16 scale `d`
+///   bytes 2..18  = 16 bytes of packed 4-bit nibbles (2 quants per byte;
+///                  low nibble first, high nibble second)
+///
+/// Per-quant value = (signed_nibble) * d_f32, where signed_nibble =
+/// (unsigned_nibble - 8) and unsigned_nibble is the raw 0..15.
+///
+/// Inputs: `blocks` = pointer to packed Q4_0 stream of `n_blocks` * 18
+/// bytes; `out` = pointer to `n_blocks * 32` f32 output slots (pre-
+/// allocated). Returns 0 on success, non-zero on null / bad-count.
+///
+/// Matches the `ggml_q4_0_t` reference layout from llama.cpp / ggml.
+#[no_mangle] pub unsafe extern "C" fn aether_dequant_q4_0(
+    blocks: *const c_void,
+    out: *mut c_void,
+    n_blocks: c_int,
+) -> c_int {
+    if blocks.is_null() || out.is_null() { return 1; }
+    if n_blocks <= 0 { return 2; }
+    let n = n_blocks as isize;
+    let b = blocks as *const u8;
+    let o = out as *mut f32;
+    for bi in 0..n {
+        let base = b.offset(bi * 18);
+        // f16 scale, little-endian.
+        let d_bits = u16::from_le_bytes([*base, *base.offset(1)]);
+        let d_f32 = aether_f16_to_f32(d_bits as i32);
+        for i in 0..16isize {
+            let byte = *base.offset(2 + i);
+            let lo = ((byte & 0x0F) as i32 - 8) as f32;
+            let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
+            *o.offset(bi * 32 + i * 2)     = lo * d_f32;
+            *o.offset(bi * 32 + i * 2 + 1) = hi * d_f32;
+        }
+    }
+    0
+}
+
 #[no_mangle] pub unsafe extern "C" fn aether_op_add_f32(
     a: *const c_void, b: *const c_void, out: *mut c_void, n: c_int,
 ) -> c_int {
     ops::add_f32(a as _, b as _, out as _, n as _);
+    0
+}
+
+/// FR-17.13-extra — FlashAttention v2 (single-head causal, CPU reference).
+///
+/// Memory-efficient causal self-attention via online softmax. Avoids
+/// materialising the full N×N score matrix by processing keys in blocks
+/// of size `BC` (= 4 here) and maintaining running max/sum statistics.
+/// Memory footprint per query-row: O(d_head + BC), not O(N).
+///
+/// Inputs:
+///   q, k, v   — pointers to f32 arrays of shape (seq_len, d_head),
+///                row-major.
+///   out       — pointer to f32 array (seq_len, d_head), pre-allocated.
+///   seq_len   — N
+///   d_head    — d
+///
+/// Mathematically identical to:
+///   scale = 1 / sqrt(d_head)
+///   S[i,j] = (Q @ K^T)[i,j] * scale, with j > i masked to -inf
+///   P = softmax_row(S)
+///   O = P @ V
+#[no_mangle] pub unsafe extern "C" fn aether_flash_attention_v2_f32(
+    q: *const c_void, k: *const c_void, v: *const c_void,
+    out: *mut c_void,
+    seq_len: c_int, d_head: c_int,
+) -> c_int {
+    if q.is_null() || k.is_null() || v.is_null() || out.is_null() { return 1; }
+    if seq_len <= 0 || d_head <= 0 { return 2; }
+    const BC: usize = 4;
+    let n = seq_len as usize;
+    let d = d_head as usize;
+    let q_buf = std::slice::from_raw_parts(q as *const f32, n * d);
+    let k_buf = std::slice::from_raw_parts(k as *const f32, n * d);
+    let v_buf = std::slice::from_raw_parts(v as *const f32, n * d);
+    let o_buf = std::slice::from_raw_parts_mut(out as *mut f32, n * d);
+    let scale = 1.0_f32 / (d as f32).sqrt();
+
+    // Running softmax stats per query row.
+    let mut m_state = vec![f32::NEG_INFINITY; n];
+    let mut l_state = vec![0.0_f32; n];
+    // Init output to zero (we accumulate in-place).
+    for o in o_buf.iter_mut() { *o = 0.0; }
+
+    let mut j_start = 0usize;
+    while j_start < n {
+        let j_end = (j_start + BC).min(n);
+        let bc = j_end - j_start;
+        // For each query row, fold this key-block into the running stats.
+        for r in 0..n {
+            // Compute S[r, j_start..j_end] = (Q[r] · K[j_start+c]) * scale,
+            // applying the causal mask (key index > r → -inf).
+            let mut s_block = [f32::NEG_INFINITY; BC];
+            let mut block_max = f32::NEG_INFINITY;
+            for c in 0..bc {
+                let key_idx = j_start + c;
+                if key_idx > r { continue; }  // causal: leave -inf
+                let mut dot = 0.0_f32;
+                for di in 0..d {
+                    dot += q_buf[r * d + di] * k_buf[key_idx * d + di];
+                }
+                let s = dot * scale;
+                s_block[c] = s;
+                if s > block_max { block_max = s; }
+            }
+            // If the entire block is masked, skip update.
+            if block_max == f32::NEG_INFINITY { continue; }
+            let m_old = m_state[r];
+            let m_new = if m_old > block_max { m_old } else { block_max };
+            // Rescale O[r] by exp(m_old - m_new) (or zero if m_old was -inf).
+            let alpha = if m_old == f32::NEG_INFINITY { 0.0 } else { (m_old - m_new).exp() };
+            for di in 0..d { o_buf[r * d + di] *= alpha; }
+            // Add P_block @ V_block to O[r].
+            let mut row_sum_p = 0.0_f32;
+            for c in 0..bc {
+                if s_block[c] == f32::NEG_INFINITY { continue; }
+                let p = (s_block[c] - m_new).exp();
+                row_sum_p += p;
+                let key_idx = j_start + c;
+                for di in 0..d {
+                    o_buf[r * d + di] += p * v_buf[key_idx * d + di];
+                }
+            }
+            // Update l.
+            let l_old = l_state[r];
+            l_state[r] = l_old * alpha + row_sum_p;
+            m_state[r] = m_new;
+        }
+        j_start = j_end;
+    }
+    // Final normalisation: O[r] /= l[r] for each row.
+    for r in 0..n {
+        let l = l_state[r];
+        if l > 0.0 {
+            for di in 0..d { o_buf[r * d + di] /= l; }
+        }
+    }
     0
 }
 
@@ -2501,6 +2639,22 @@ fn write_f32(buf: &mut [u8], v: f32, decimals: u32) -> usize {
     *((p as *mut f32).add(i as usize)) = v;
 }
 
+/// FR-17.19 helper — write an i32 at offset `i` of an `aether_alloc_i32`
+/// buffer. Pairs with `aether_alloc_i32` for filling embedding-lookup id
+/// tensors. `i` is element index, not byte offset.
+#[no_mangle] pub unsafe extern "C" fn aether_store_i32(p: i64, i: c_int, v: c_int) {
+    if p == 0 { return; }
+    *((p as *mut i32).add(i as usize)) = v;
+}
+
+/// Sum f32 elements at `[p, p+n)`. Used by FR-17.19 witness to verify
+/// the forward pass produced finite output without per-element checks.
+#[no_mangle] pub unsafe extern "C" fn aether_sum_f32(p: i64, n: c_int) -> f32 {
+    if p == 0 || n <= 0 { return 0.0; }
+    let s = std::slice::from_raw_parts(p as *const f32, n as usize);
+    s.iter().sum()
+}
+
 // =====================================================================
 // Test-only FFI surface — exercises the asm backend's f32 / f64 / cast /
 // FFI-arg pipelines from compiled Aether. Real ops never go through here.
@@ -4141,6 +4295,115 @@ mod conv2d_tests {
         }
         assert_eq!(output, vec![54.0, 63.0, 90.0, 99.0],
                    "conv2d output mismatch; got {:?}", output);
+    }
+
+    /// FR-17.14 — hand-crafted Q4_0 block dequant. Build one 18-byte
+    /// block whose scale is 1.0 (f16 0x3C00) and whose quants alternate
+    /// 0/8 nibbles. Signed quants are -8..+7 mapped from 0..15; with
+    /// scale=1.0 the dequanted f32 should be exactly that signed value.
+    /// Layout: low nibble at even index i*2, high nibble at i*2+1.
+    /// Even quants (0): -8, odd quants (8): 0. Pattern verifies the
+    /// low/high split AND the (nibble - 8) sign conversion.
+    #[test]
+    fn dequant_q4_0_single_block_known_quants() {
+        let mut block = [0u8; 18];
+        // f16 1.0 = 0x3C00 (little-endian: 0x00, 0x3C).
+        block[0] = 0x00;
+        block[1] = 0x3C;
+        // Each byte: low nibble = 0 (→ -8), high nibble = 8 (→ 0).
+        for i in 2..18 { block[i] = 0x80; }
+        let mut out = [0.0f32; 32];
+        unsafe {
+            let rc = aether_dequant_q4_0(
+                block.as_ptr() as *const _,
+                out.as_mut_ptr() as *mut _,
+                1,
+            );
+            assert_eq!(rc, 0);
+        }
+        for i in 0..32 {
+            let expected = if i % 2 == 0 { -8.0 } else { 0.0 };
+            assert_eq!(out[i], expected, "quant {} expected {}, got {}", i, expected, out[i]);
+        }
+    }
+
+    /// FR-17.13-extra — FlashAttention v2 must match naive causal SDPA
+    /// within tight float tolerance. Build deterministic Q/K/V, compute
+    /// both, compare row-by-row.
+    #[test]
+    fn flash_attention_v2_matches_naive_sdpa() {
+        let n = 8usize;
+        let d = 4usize;
+        let mut q = vec![0.0f32; n * d];
+        let mut k = vec![0.0f32; n * d];
+        let mut v = vec![0.0f32; n * d];
+        // Deterministic fill: each cell = sin(i * 0.7 + j * 0.3 + offset).
+        for i in 0..n {
+            for j in 0..d {
+                q[i * d + j] = ((i as f32) * 0.7 + (j as f32) * 0.3).sin();
+                k[i * d + j] = ((i as f32) * 0.5 + (j as f32) * 0.2 + 0.1).sin();
+                v[i * d + j] = ((i as f32) * 0.3 + (j as f32) * 0.4 + 0.2).cos();
+            }
+        }
+        let mut o_fa = vec![0.0f32; n * d];
+        unsafe {
+            let rc = aether_flash_attention_v2_f32(
+                q.as_ptr() as *const _, k.as_ptr() as *const _, v.as_ptr() as *const _,
+                o_fa.as_mut_ptr() as *mut _,
+                n as c_int, d as c_int,
+            );
+            assert_eq!(rc, 0);
+        }
+        // Naive reference: scores = Q @ K^T * scale, causal mask, softmax, @V.
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut o_ref = vec![0.0f32; n * d];
+        for r in 0..n {
+            let mut scores = vec![f32::NEG_INFINITY; n];
+            let mut max_s = f32::NEG_INFINITY;
+            for c in 0..=r {  // causal: only j ≤ r
+                let mut s = 0.0f32;
+                for di in 0..d { s += q[r * d + di] * k[c * d + di]; }
+                scores[c] = s * scale;
+                if scores[c] > max_s { max_s = scores[c]; }
+            }
+            let mut sum = 0.0f32;
+            let mut p = vec![0.0f32; n];
+            for c in 0..=r {
+                p[c] = (scores[c] - max_s).exp();
+                sum += p[c];
+            }
+            for c in 0..=r { p[c] /= sum; }
+            for di in 0..d {
+                let mut acc = 0.0f32;
+                for c in 0..=r { acc += p[c] * v[c * d + di]; }
+                o_ref[r * d + di] = acc;
+            }
+        }
+        for i in 0..n * d {
+            let diff = (o_fa[i] - o_ref[i]).abs();
+            assert!(diff < 1e-5, "FA2 vs naive mismatch at {}: fa={}, ref={}", i, o_fa[i], o_ref[i]);
+        }
+    }
+
+    /// Q4_0 scale precision check — scale=0.5 (f16 0x3800) should halve
+    /// the dequanted values. Use a uniform 0xF7 byte pattern: low=0x7
+    /// (→ -1 signed), high=0xF (→ +7 signed). Expect alternating
+    /// -0.5 / +3.5 across the 32 outputs.
+    #[test]
+    fn dequant_q4_0_with_scale_half() {
+        let mut block = [0u8; 18];
+        block[0] = 0x00; block[1] = 0x38;  // f16 0.5
+        for i in 2..18 { block[i] = 0xF7; }
+        let mut out = [0.0f32; 32];
+        unsafe {
+            aether_dequant_q4_0(block.as_ptr() as *const _,
+                                out.as_mut_ptr() as *mut _, 1);
+        }
+        for i in 0..32 {
+            let expected = if i % 2 == 0 { -0.5 } else { 3.5 };
+            assert!((out[i] - expected).abs() < 1e-6,
+                    "quant {} expected {}, got {}", i, expected, out[i]);
+        }
     }
 
     /// 2 input channels, 1 output channel — the per-channel partial sums

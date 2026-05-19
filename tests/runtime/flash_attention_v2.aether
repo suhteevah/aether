@@ -1,0 +1,95 @@
+// roadmap: P17.13-extra
+// expect: exit=42
+//
+// FR-17.13-extra — FlashAttention v2 vs naive causal SDPA agreement.
+//
+// Block-wise online-softmax FA2 (memory-efficient causal attention)
+// must produce the same output as the existing naive scaled-dot-product
+// attention `aether_op_sdpa_causal_f32` to within 1e-4 absolute on a
+// small case. Uses seq_len=8, d_head=4, single head/batch.
+//
+// Both impls take row-major (N, d) for Q/K/V and produce (N, d) for O.
+//
+// The deterministic Q/K/V values come from sin / cos so the test
+// surfaces any block-boundary bug in the online softmax (block size
+// is hard-coded to 4 in the runtime; with seq_len=8 we exercise 2
+// query × 2 key blocks = 4 block interactions including the off-
+// diagonal causally-masked one).
+use runtime;
+
+extern fn aether_flash_attention_v2_f32(
+    q: i64, k: i64, v: i64, out: i64, seq_len: i32, d_head: i32,
+) -> i32;
+extern fn aether_op_sdpa_causal_f32(
+    q: i64, k: i64, v: i64, out: i64, attn_out: i64,
+    bh: i32, s_len: i32, d: i32,
+) -> i32;
+
+fn fill_qkv(q: i64, k: i64, v: i64, n: i32, d: i32) {
+    let mut i: i32 = 0;
+    while i < n {
+        let mut j: i32 = 0;
+        while j < d {
+            let fi: f32 = f32(i);
+            let fj: f32 = f32(j);
+            aether_store_f32(q, i * d + j, fi * 0.1 + fj * 0.05);
+            aether_store_f32(k, i * d + j, fi * 0.07 + fj * 0.03 + 0.1);
+            aether_store_f32(v, i * d + j, fi * 0.05 + fj * 0.02 + 0.2);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn max_abs_diff(a: i64, b: i64, n: i32) -> f32 {
+    let mut max_d: f32 = 0.0;
+    let mut i: i32 = 0;
+    while i < n {
+        let av: f32 = aether_load_f32(a, i);
+        let bv: f32 = aether_load_f32(b, i);
+        let d: f32 = aether_abs_f32(av - bv);
+        if d > max_d { max_d = d; }
+        i = i + 1;
+    }
+    max_d
+}
+
+fn main() -> i32 {
+    let n:  i32 = 8;
+    let d:  i32 = 4;
+    let nd: i32 = 32;
+    let nn: i32 = 64;
+
+    let q:        i64 = aether_alloc_f32(nd);
+    let k:        i64 = aether_alloc_f32(nd);
+    let v:        i64 = aether_alloc_f32(nd);
+    let o_fa:     i64 = aether_alloc_f32(nd);
+    let o_ref:    i64 = aether_alloc_f32(nd);
+    let attn_ref: i64 = aether_alloc_f32(nn);
+    if q == 0 { return 1; }
+    if k == 0 { return 1; }
+    if v == 0 { return 1; }
+    if o_fa == 0 { return 1; }
+    if o_ref == 0 { return 1; }
+    if attn_ref == 0 { return 1; }
+
+    fill_qkv(q, k, v, n, d);
+
+    let rc1: i32 = aether_flash_attention_v2_f32(q, k, v, o_fa, n, d);
+    if rc1 != 0 { return 2; }
+
+    let rc2: i32 = aether_op_sdpa_causal_f32(q, k, v, o_ref, attn_ref, 1, n, d);
+    if rc2 != 0 { return 3; }
+
+    let diff: f32 = max_abs_diff(o_fa, o_ref, nd);
+
+    aether_free_f32(q,        nd);
+    aether_free_f32(k,        nd);
+    aether_free_f32(v,        nd);
+    aether_free_f32(o_fa,     nd);
+    aether_free_f32(o_ref,    nd);
+    aether_free_f32(attn_ref, nn);
+
+    if diff > 0.0001 { return 10; }
+    42
+}
