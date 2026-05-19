@@ -9,7 +9,38 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, Phase 19 kickoff — FR-19.9 BPE tokenizer)
+## Closed this batch (2026-05-19, Phase 19 advance — FR-19.10 chat template renderer)
+
+Second Phase 19 audit slot. matt-voice's Qwen2.5 chat template uses
+the same shape (for-loop over messages + dot access on role/content
++ if-guard on add_generation_prompt) as Llama-3, so this is on-path.
+
+- **P19.10 / FR-19.10** — Jinja-lite chat template renderer.
+  5 new runtime fns: `aether_template_new` / `_free` /
+  `_set_var(name, value)` / `_push_message(role, content)` /
+  `_render(template, out)`. Supports `{{ var }}` scalar lookup,
+  `{{ msg.role }}` / `{{ msg.content }}` dot access, `{% for msg in
+  messages %} ... {% endfor %}` loop, `{% if var %} ... {% endif %}`
+  conditional. Truthy = non-empty string, not "0", not "false".
+  Nested for/if balanced via `find_matching_block` depth counter.
+  **Witness** `chat_template_render.aether` hand-builds the
+  Llama-3-shaped template (byte-by-byte, since Aether doesn't have
+  string-literal→heap-bytes coercion at FFI), pushes 2 messages,
+  renders, verifies 116-byte output + spot-check bytes at known
+  offsets. Unit test `chat_template_llama3_shape` exercises both
+  the multi-message + add_generation_prompt branch AND the unset
+  case where the trailing assistant header is omitted; byte-exact
+  rendered string match. honesty-auditor verified all 6 claims.
+  **Audit 154→155/196; Phase 19: 1/16 → 2/16 (12%).**
+
+**Explicit non-claims (FR-19.10-extra)**: filters (`| trim`,
+`| upper`), whitespace-strip markers (`{%-` / `-%}`), `else` /
+`elif`, arbitrary expressions (string concat, comparisons),
+multi-template files / file-load. matt-voice's Qwen2.5
+`chat_template.jinja` uses the supported shape; loading it from
+disk is a small JSON-fetch + the runtime API shipped today.
+
+## Closed earlier (2026-05-19, Phase 19 kickoff — FR-19.9 BPE tokenizer)
 
 First Phase 19 (serving stack) audit slot. matt-voice's Qwen2.5
 uses BPE so this is on-path for the serving deploy.

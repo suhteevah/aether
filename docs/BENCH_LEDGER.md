@@ -53,6 +53,10 @@ Bench-runner append rule fires on `runtime/src/lib.rs` touched. Eight new symbol
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `aether_bpe_tokenizer_new` / `_free` / `aether_bpe_add_merge` / `aether_bpe_encode` / `aether_bpe_decode`. The implementation is the textbook BPE merge loop in pure Rust — no GPU, no matmul, no SIMD. The matmul bench is untouched. A dedicated `bench/tokenizer_throughput/` fixture is the right place to log "MB/s through encode" once the matt-voice Qwen2.5 tokenizer.json loader (FR-19.9-extra) lands; that fixture doesn't exist yet. The 2026-05-03 matmul row remains the standing reference.
 
+### 2026-05-19 — pending commit (FR-19.10 chat template renderer): skipped (template engine; not on matmul path)
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `aether_template_new` / `_free` / `aether_template_set_var` / `aether_template_push_message` / `aether_template_render`. Pure-Rust state-machine template parser. No GPU / no matmul / no SIMD. Matmul bench is untouched. A `bench/chat_template_throughput/` fixture for "ms per render of a typical chat template" is the right surface to log this once the matt-voice serving deploy actually renders user prompts at scale — fixture doesn't exist yet. 2026-05-03 matmul row remains the reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

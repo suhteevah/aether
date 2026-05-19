@@ -4702,6 +4702,264 @@ unsafe fn bpe_table() -> &'static mut Vec<Option<Box<BpeTokenizer>>> {
     written as c_int
 }
 
+// =====================================================================
+// FR-19.10 — Jinja-lite chat-template renderer.
+//
+// Minimal subset of Jinja sufficient for HF chat templates:
+//   - `{{ var }}`         — scalar variable substitution
+//   - `{{ var.field }}`   — single-level dot access (for message
+//                            iteration: `msg.role`, `msg.content`)
+//   - `{% for msg in messages %}...{% endfor %}` — list iteration
+//   - `{% if var %}...{% endif %}` — truthy conditional on a scalar
+//                                     (truthy = non-empty string)
+//
+// NOT supported (FR-19.10-extra):
+//   - Filters (`| trim`, `| upper`, etc.)
+//   - Whitespace-strip markers (`{%-` / `-%}`)
+//   - `else` / `elif`
+//   - Nested-loop variable shadowing
+//   - Arbitrary expressions (no string concat, no comparisons)
+//   - Loop unrolling tricks
+//
+// State per handle:
+//   vars     — name → string (scalar)
+//   messages — Vec<(role, content)> for the `messages` list (the
+//              only multi-field list-typed binding supported)
+//
+// The witness builds a Llama-3-shaped template, pushes two messages,
+// and verifies the rendered output contains the expected turn-
+// boundary markers in the right order.
+// =====================================================================
+
+struct ChatTemplateCtx {
+    vars: std::collections::HashMap<String, String>,
+    messages: Vec<(String, String)>,
+}
+
+struct TplCell(UnsafeCell<Vec<Option<Box<ChatTemplateCtx>>>>);
+unsafe impl Sync for TplCell {}
+static TPL_TABLE: TplCell = TplCell(UnsafeCell::new(Vec::new()));
+unsafe fn tpl_table() -> &'static mut Vec<Option<Box<ChatTemplateCtx>>> {
+    &mut *TPL_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_template_new() -> i64 {
+    let ctx = ChatTemplateCtx { vars: Default::default(), messages: Default::default() };
+    let tbl = tpl_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(ctx)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(ctx)));
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_template_free(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = tpl_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    tbl[h] = None;
+    0
+}
+
+/// Set a scalar variable: `name` (UTF-8) → `value` (UTF-8 bytes).
+/// Names and values are copied into the context. Returns 0 on success.
+#[no_mangle] pub unsafe extern "C" fn aether_template_set_var(
+    handle: i64,
+    name: *const c_void, n_name: c_int,
+    value: *const c_void, n_value: c_int,
+) -> c_int {
+    if handle < 0 || name.is_null() || value.is_null() { return -1; }
+    if n_name <= 0 || n_value < 0 { return -1; }
+    let tbl = tpl_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(ctx) = tbl[h].as_mut() else { return -1; };
+    let name_bytes = std::slice::from_raw_parts(name as *const u8, n_name as usize);
+    let value_bytes = std::slice::from_raw_parts(value as *const u8, n_value as usize);
+    let Ok(name_s) = std::str::from_utf8(name_bytes) else { return -2; };
+    let Ok(value_s) = std::str::from_utf8(value_bytes) else { return -2; };
+    ctx.vars.insert(name_s.to_string(), value_s.to_string());
+    0
+}
+
+/// Append a (role, content) message to the `messages` list.
+#[no_mangle] pub unsafe extern "C" fn aether_template_push_message(
+    handle: i64,
+    role: *const c_void, n_role: c_int,
+    content: *const c_void, n_content: c_int,
+) -> c_int {
+    if handle < 0 || role.is_null() || content.is_null() { return -1; }
+    if n_role <= 0 || n_content < 0 { return -1; }
+    let tbl = tpl_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(ctx) = tbl[h].as_mut() else { return -1; };
+    let rb = std::slice::from_raw_parts(role as *const u8, n_role as usize);
+    let cb = std::slice::from_raw_parts(content as *const u8, n_content as usize);
+    let Ok(rs) = std::str::from_utf8(rb) else { return -2; };
+    let Ok(cs) = std::str::from_utf8(cb) else { return -2; };
+    ctx.messages.push((rs.to_string(), cs.to_string()));
+    0
+}
+
+/// Render the `template` (UTF-8) into `out` (max `max_out` bytes).
+/// Returns the number of bytes written, or -1 on overflow / bad template.
+#[no_mangle] pub unsafe extern "C" fn aether_template_render(
+    handle: i64,
+    template: *const c_void, n_template: c_int,
+    out: *mut c_void, max_out: c_int,
+) -> c_int {
+    if handle < 0 || template.is_null() || out.is_null() { return -1; }
+    if n_template <= 0 || max_out <= 0 { return -1; }
+    let tbl = tpl_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(ctx) = tbl[h].as_ref() else { return -1; };
+    let tpl_bytes = std::slice::from_raw_parts(template as *const u8, n_template as usize);
+    let Ok(tpl_str) = std::str::from_utf8(tpl_bytes) else { return -2; };
+    let mut buf: Vec<u8> = Vec::with_capacity(max_out as usize);
+    if render_inner(tpl_str, ctx, None, &mut buf).is_err() { return -1; }
+    if buf.len() > max_out as usize { return -1; }
+    let out_slice = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    out_slice[..buf.len()].copy_from_slice(&buf);
+    buf.len() as c_int
+}
+
+/// Resolve a `var` or `var.field` reference against the context (and
+/// optionally a `loop_msg` if we're inside a `{% for msg in messages %}`).
+/// Returns the resolved string slice. Empty string on missing var
+/// (Jinja-compatible: undefined → empty in default mode).
+fn resolve(name: &str, ctx: &ChatTemplateCtx, loop_msg: Option<&(String, String)>) -> String {
+    let name = name.trim();
+    if let Some((loop_name, loop_val)) = name.split_once('.') {
+        // Field access: `loop_name.field`. Only one binding shape is
+        // supported (the for-loop's message variable).
+        if let Some(msg) = loop_msg {
+            if loop_name.trim() == LOOP_VAR_PLACEHOLDER || true {
+                // We don't track the user-chosen loop var name; any dotted
+                // access inside a for-loop falls through to the message.
+                // Practical: chat templates always loop over `messages`
+                // and call the var `message`/`msg`/etc.
+                let field = loop_val.trim();
+                return match field {
+                    "role"    => msg.0.clone(),
+                    "content" => msg.1.clone(),
+                    _ => String::new(),
+                };
+            }
+        }
+        return String::new();
+    }
+    ctx.vars.get(name).cloned().unwrap_or_default()
+}
+
+const LOOP_VAR_PLACEHOLDER: &str = "<loop_var>";
+
+#[derive(Debug)]
+struct RenderError(&'static str);
+
+fn render_inner(
+    tpl: &str,
+    ctx: &ChatTemplateCtx,
+    loop_msg: Option<&(String, String)>,
+    out: &mut Vec<u8>,
+) -> Result<(), RenderError> {
+    let b = tpl.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if i + 1 < b.len() && b[i] == b'{' && b[i + 1] == b'{' {
+            let close = find_subslice(&b[i + 2..], b"}}").ok_or(RenderError("unclosed {{"))?;
+            let expr = std::str::from_utf8(&b[i + 2..i + 2 + close])
+                .map_err(|_| RenderError("non-utf8 expr"))?;
+            let value = resolve(expr, ctx, loop_msg);
+            out.extend_from_slice(value.as_bytes());
+            i += 2 + close + 2;
+        } else if i + 1 < b.len() && b[i] == b'{' && b[i + 1] == b'%' {
+            let close = find_subslice(&b[i + 2..], b"%}").ok_or(RenderError("unclosed {%"))?;
+            let directive = std::str::from_utf8(&b[i + 2..i + 2 + close])
+                .map_err(|_| RenderError("non-utf8 directive"))?
+                .trim();
+            let after_directive = i + 2 + close + 2;
+            if let Some(_rest) = directive.strip_prefix("for ") {
+                // Find matching {% endfor %} accounting for nesting.
+                let body_start = after_directive;
+                let (body_end, after_endfor) = find_matching_block(&tpl[body_start..], "for ", "endfor")?;
+                let body = &tpl[body_start..body_start + body_end];
+                // Only `for X in messages` is supported.
+                if !directive.contains("in messages") {
+                    return Err(RenderError("unsupported for clause"));
+                }
+                for msg in &ctx.messages {
+                    render_inner(body, ctx, Some(msg), out)?;
+                }
+                i = body_start + after_endfor;
+            } else if let Some(cond) = directive.strip_prefix("if ") {
+                let body_start = after_directive;
+                let (body_end, after_endif) = find_matching_block(&tpl[body_start..], "if ", "endif")?;
+                let body = &tpl[body_start..body_start + body_end];
+                if is_truthy(cond.trim(), ctx, loop_msg) {
+                    render_inner(body, ctx, loop_msg, out)?;
+                }
+                i = body_start + after_endif;
+            } else if directive == "endfor" || directive == "endif" {
+                return Err(RenderError("dangling end-directive"));
+            } else {
+                return Err(RenderError("unknown directive"));
+            }
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+fn is_truthy(expr: &str, ctx: &ChatTemplateCtx, loop_msg: Option<&(String, String)>) -> bool {
+    let v = resolve(expr, ctx, loop_msg);
+    !v.is_empty() && v != "0" && v.to_lowercase() != "false"
+}
+
+/// Find the matching closing tag for a block opener. `open_tag` is the
+/// directive prefix that introduces a nested block (e.g. `"for "`,
+/// `"if "`); `close_tag` is the exact directive that closes it
+/// (`"endfor"`, `"endif"`). Returns `(byte_offset_of_close_directive,
+/// byte_offset_after_close_directive_and_trailing_%})`.
+///
+/// Skips over BOTH `{% for ... %}...{% endfor %}` AND `{% if ... %}
+/// ...{% endif %}` nested constructs uniformly (i.e. nesting from
+/// EITHER kind increments depth), since a `for` inside an `if` and
+/// vice versa both need to be balanced.
+fn find_matching_block(rest: &str, _open_tag: &str, close_tag: &str) -> Result<(usize, usize), RenderError> {
+    let b = rest.as_bytes();
+    let mut depth = 1i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        if i + 1 < b.len() && b[i] == b'{' && b[i + 1] == b'%' {
+            let close = find_subslice(&b[i + 2..], b"%}").ok_or(RenderError("unclosed {%"))?;
+            let directive = std::str::from_utf8(&b[i + 2..i + 2 + close])
+                .map_err(|_| RenderError("non-utf8 directive"))?
+                .trim();
+            if directive.starts_with("for ") || directive.starts_with("if ") {
+                depth += 1;
+            } else if directive == close_tag && depth == 1 {
+                // This is our matching close.
+                return Ok((i, i + 2 + close + 2));
+            } else if directive == "endfor" || directive == "endif" {
+                depth -= 1;
+            }
+            i += 2 + close + 2;
+        } else {
+            i += 1;
+        }
+    }
+    Err(RenderError("missing matching end-directive"))
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 #[cfg(test)]
 mod heap_extras_tests {
     use super::*;
@@ -5041,6 +5299,70 @@ mod conv2d_tests {
                 let expect = if j < k { g[i * n + j] } else { 0.0 };
                 assert_eq!(r[i * n + j], expect, "[{},{}] mismatch", i, j);
             }
+        }
+    }
+
+    /// FR-19.10 — Llama-3-shaped chat template renders correct turn
+    /// boundaries. Combined in one test fn for the same static-table
+    /// race-safety reason as `bpe_roundtrip_and_lowest_rank`.
+    #[test]
+    fn chat_template_llama3_shape() {
+        unsafe {
+            let h = aether_template_new();
+            assert!(h >= 0);
+            // Llama-3-ish template (minus whitespace-strip + filters,
+            // which we don't support):
+            let tpl = b"{% for msg in messages %}<|start_header_id|>{{ msg.role }}<|end_header_id|>\n\n{{ msg.content }}<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>\n\n{% endif %}";
+            // Push two messages.
+            let user_role = b"user";
+            let user_content = b"hi";
+            assert_eq!(0, aether_template_push_message(
+                h, user_role.as_ptr() as _, user_role.len() as i32,
+                user_content.as_ptr() as _, user_content.len() as i32,
+            ));
+            let asst_role = b"assistant";
+            let asst_content = b"hello";
+            assert_eq!(0, aether_template_push_message(
+                h, asst_role.as_ptr() as _, asst_role.len() as i32,
+                asst_content.as_ptr() as _, asst_content.len() as i32,
+            ));
+            // Set add_generation_prompt=1 so the trailing assistant header
+            // gets emitted.
+            let agp_name = b"add_generation_prompt";
+            let agp_val = b"1";
+            assert_eq!(0, aether_template_set_var(
+                h, agp_name.as_ptr() as _, agp_name.len() as i32,
+                agp_val.as_ptr() as _, agp_val.len() as i32,
+            ));
+            // Render.
+            let mut buf = [0u8; 512];
+            let n = aether_template_render(
+                h, tpl.as_ptr() as _, tpl.len() as i32,
+                buf.as_mut_ptr() as _, buf.len() as i32,
+            );
+            assert!(n > 0, "render returned {}", n);
+            let rendered = std::str::from_utf8(&buf[..n as usize]).expect("utf8");
+            let expected = "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+            assert_eq!(rendered, expected, "rendered output mismatch");
+            aether_template_free(h);
+
+            // Negative case: add_generation_prompt unset → no trailing
+            // assistant header.
+            let h2 = aether_template_new();
+            aether_template_push_message(
+                h2, user_role.as_ptr() as _, user_role.len() as i32,
+                user_content.as_ptr() as _, user_content.len() as i32,
+            );
+            let mut buf2 = [0u8; 512];
+            let n2 = aether_template_render(
+                h2, tpl.as_ptr() as _, tpl.len() as i32,
+                buf2.as_mut_ptr() as _, buf2.len() as i32,
+            );
+            assert!(n2 > 0);
+            let rendered2 = std::str::from_utf8(&buf2[..n2 as usize]).expect("utf8");
+            let expected2 = "<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>";
+            assert_eq!(rendered2, expected2);
+            aether_template_free(h2);
         }
     }
 
