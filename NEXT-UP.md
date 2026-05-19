@@ -9,7 +9,35 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, Phase 18 closeout — matt-voice + ant-brain critical path)
+## Closed this batch (2026-05-19, Phase 19 kickoff — FR-19.9 BPE tokenizer)
+
+First Phase 19 (serving stack) audit slot. matt-voice's Qwen2.5
+uses BPE so this is on-path for the serving deploy.
+
+- **P19.9 / FR-19.9** — Byte-level BPE tokenizer. New runtime fns:
+  `aether_bpe_tokenizer_new` / `_free` / `aether_bpe_add_merge(left,
+  right, rank, bytes, n)` / `aether_bpe_encode(text, n, out_ids, max)`
+  / `aether_bpe_decode(ids, n, out_bytes, max)`. Real BPE algorithm:
+  initial vocab is bytes 0..255 implicit; merged tokens get ids 256+
+  registered via `add_merge` with a `(left_id, right_id, rank,
+  merged_bytes)` tuple. The encode loop scans for the lowest-rank
+  adjacent pair, replaces all non-overlapping occurrences with the
+  merged id, loops to fixed point. Decode concatenates
+  `decode_table[id]` byte sequences. **Witness**
+  `bpe_tokenizer_roundtrip.aether` builds a 4-rule "hello" prefix
+  tokenizer, encodes "hello world" → `[259, 32, 119, 111, 114, 108,
+  100]`, decodes back byte-for-byte. Unit test verifies the same
+  scenario PLUS lowest-rank-wins behaviour across competing merges.
+  honesty-auditor verified all 6 claims. **Audit 153→154/196;
+  Phase 19: 0/16 → 1/16 (6%).**
+
+**Explicit non-claims (FR-19.9-extra)**: tokenizer.json parser,
+sentencepiece BPE, tiktoken cl100k regex pre-tokenisation, 1 MB
+WikiText HF parity round-trip. matt-voice's Qwen2.5 tokenizer.json
+load lives in FR-19.9-extra; the algorithm shipped here is the
+correct shape to plug under it.
+
+## Closed earlier (2026-05-19, Phase 18 closeout — matt-voice + ant-brain critical path)
 
 The user pointed at `J:\aether\MATT_VOICE_FR.md` (QLoRA training for
 matt-voice on 2× P100 via PP/1F1B) and `J:\aether\ANTCOLONY_FR.md`

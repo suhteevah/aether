@@ -1,0 +1,151 @@
+// roadmap: P19.9
+// expect: exit=42
+//
+// FR-19.9 — Byte-level BPE tokenizer witness.
+//
+// Builds a tiny tokenizer by hand and exercises encode → decode:
+//   merges:
+//     ( 'h'=104,  'e'=101 ) rank 0 → "he"    (id 256)
+//     (   256,    'l'=108 ) rank 1 → "hel"   (id 257)
+//     (   257,    'l'=108 ) rank 2 → "hell"  (id 258)
+//     (   258,    'o'=111 ) rank 3 → "hello" (id 259)
+//
+// Encode "hello world" — expected tokens:
+//   [259, 32, 119, 111, 114, 108, 100]  ('hello', ' ', 'w', 'o', 'r', 'l', 'd')
+// Decode them back — expected byte string: "hello world" (11 bytes).
+//
+// What this PROVES end-to-end:
+//   - The BPE algorithm shape (lowest-rank merge wins, applied to all
+//     non-overlapping occurrences, repeat until no merge fires).
+//   - The byte-level fallback (no merge ever fired for ' ', 'w', 'r',
+//     'l', 'd', so they stay as their raw byte ids).
+//   - The decode_table[id] → bytes round-trip preserves the source
+//     byte-for-byte.
+//
+// What it does NOT prove (still FR-19.9-extra):
+//   - tokenizer.json parser
+//   - sentencepiece BPE (different surface; uses SOS markers + space
+//     handling)
+//   - tiktoken cl100k (uses regex pre-tokenisation + GPT-2 byte map)
+//
+// matt-voice relevance: Qwen2.5 uses BPE so this is on-path for the
+// inference deploy, though the actual tokenizer.json load is the next
+// FR.
+use runtime;
+
+extern fn aether_bpe_tokenizer_new() -> i64;
+extern fn aether_bpe_tokenizer_free(h: i64) -> i32;
+extern fn aether_bpe_add_merge(
+    h: i64, left_id: i32, right_id: i32, rank: i32,
+    merged_bytes: i64, n_bytes: i32,
+) -> i32;
+extern fn aether_bpe_encode(
+    h: i64, text: i64, n_text: i32, out_ids: i64, max_ids: i32,
+) -> i32;
+extern fn aether_bpe_decode(
+    h: i64, ids: i64, n_ids: i32, out_bytes: i64, max_bytes: i32,
+) -> i32;
+
+fn main() -> i32 {
+    let h: i64 = aether_bpe_tokenizer_new();
+    if h < 0 { return 1; }
+
+    // Build the byte buffers for each merged token in turn.
+    // "he"
+    let he: i64 = aether_alloc_bytes(2);
+    aether_byte_set(he, 0, 104);
+    aether_byte_set(he, 1, 101);
+    let id_he: i32 = aether_bpe_add_merge(h, 104, 101, 0, he, 2);
+    if id_he != 256 { return 10; }
+
+    // "hel"
+    let hel: i64 = aether_alloc_bytes(3);
+    aether_byte_set(hel, 0, 104);
+    aether_byte_set(hel, 1, 101);
+    aether_byte_set(hel, 2, 108);
+    let id_hel: i32 = aether_bpe_add_merge(h, id_he, 108, 1, hel, 3);
+    if id_hel != 257 { return 11; }
+
+    // "hell"
+    let hell: i64 = aether_alloc_bytes(4);
+    aether_byte_set(hell, 0, 104);
+    aether_byte_set(hell, 1, 101);
+    aether_byte_set(hell, 2, 108);
+    aether_byte_set(hell, 3, 108);
+    let id_hell: i32 = aether_bpe_add_merge(h, id_hel, 108, 2, hell, 4);
+    if id_hell != 258 { return 12; }
+
+    // "hello"
+    let hello: i64 = aether_alloc_bytes(5);
+    aether_byte_set(hello, 0, 104);
+    aether_byte_set(hello, 1, 101);
+    aether_byte_set(hello, 2, 108);
+    aether_byte_set(hello, 3, 108);
+    aether_byte_set(hello, 4, 111);
+    let id_hello: i32 = aether_bpe_add_merge(h, id_hell, 111, 3, hello, 5);
+    if id_hello != 259 { return 13; }
+
+    // Build input "hello world" (11 bytes).
+    let text: i64 = aether_alloc_bytes(11);
+    aether_byte_set(text, 0,  104);  // h
+    aether_byte_set(text, 1,  101);  // e
+    aether_byte_set(text, 2,  108);  // l
+    aether_byte_set(text, 3,  108);  // l
+    aether_byte_set(text, 4,  111);  // o
+    aether_byte_set(text, 5,  32);   // ' '
+    aether_byte_set(text, 6,  119);  // w
+    aether_byte_set(text, 7,  111);  // o
+    aether_byte_set(text, 8,  114);  // r
+    aether_byte_set(text, 9,  108);  // l
+    aether_byte_set(text, 10, 100);  // d
+
+    // Encode.
+    let ids: i64 = aether_alloc_bytes(32 * 4);  // 32 i32s = 128 bytes
+    let n_ids: i32 = aether_bpe_encode(h, text, 11, ids, 32);
+    if n_ids != 7 { return 20; }
+
+    // Verify the 7 token ids. Each is an i32 stored in 4 bytes
+    // little-endian; we read the low byte for the ids that fit in u8
+    // and compute the full i32 for the high one ([259]).
+    // Low byte at offset 4*i; high bytes verify zero for byte-fitting ids.
+    if aether_byte_at(ids, 0 * 4 + 0) != 3   { return 21; }  // 259 & 0xFF = 3
+    if aether_byte_at(ids, 0 * 4 + 1) != 1   { return 22; }  // (259 >> 8) = 1
+    if aether_byte_at(ids, 1 * 4 + 0) != 32  { return 23; }  // ' '
+    if aether_byte_at(ids, 2 * 4 + 0) != 119 { return 24; }  // 'w'
+    if aether_byte_at(ids, 3 * 4 + 0) != 111 { return 25; }  // 'o'
+    if aether_byte_at(ids, 4 * 4 + 0) != 114 { return 26; }  // 'r'
+    if aether_byte_at(ids, 5 * 4 + 0) != 108 { return 27; }  // 'l'
+    if aether_byte_at(ids, 6 * 4 + 0) != 100 { return 28; }  // 'd'
+
+    // Decode back to bytes.
+    let decoded: i64 = aether_alloc_bytes(32);
+    let n_bytes: i32 = aether_bpe_decode(h, ids, n_ids, decoded, 32);
+    if n_bytes != 11 { return 30; }
+
+    // Verify decoded bytes match the source.
+    let mut i: i64 = 0;
+    while i < 11 {
+        if aether_byte_at(decoded, i) != aether_byte_at(text, i) {
+            aether_free_bytes(he, 2);
+            aether_free_bytes(hel, 3);
+            aether_free_bytes(hell, 4);
+            aether_free_bytes(hello, 5);
+            aether_free_bytes(text, 11);
+            aether_free_bytes(ids, 128);
+            aether_free_bytes(decoded, 32);
+            aether_bpe_tokenizer_free(h);
+            return 40 + (i as i32);
+        }
+        i = i + 1;
+    }
+
+    aether_free_bytes(he, 2);
+    aether_free_bytes(hel, 3);
+    aether_free_bytes(hell, 4);
+    aether_free_bytes(hello, 5);
+    aether_free_bytes(text, 11);
+    aether_free_bytes(ids, 128);
+    aether_free_bytes(decoded, 32);
+    aether_bpe_tokenizer_free(h);
+    42
+}

@@ -4538,6 +4538,170 @@ unsafe fn chan_table() -> &'static mut Vec<Option<Box<ChanI64>>> {
     0
 }
 
+// =====================================================================
+// FR-19.9 — Byte-level BPE tokenizer.
+//
+// Real BPE algorithm with the same shape as huggingface tokenizers:
+//   - Initial vocab: ids 0..255 = raw bytes 0..255 (byte-level fallback)
+//   - Merged tokens: ids 256+, registered via aether_bpe_add_merge with
+//     a (left_id, right_id, rank, merged_bytes) tuple.
+//   - Encode loop: repeatedly find the adjacent pair with the LOWEST
+//     rank in the current token list and replace all non-overlapping
+//     occurrences with the merged token id. Loop until no merge fires.
+//   - Decode: concat decode_table[id] for each id.
+//
+// What this proves: the BPE algorithm shape works end-to-end through
+// the asm chain, encoding then decoding gives back the original bytes.
+// What it does NOT prove: tokenizer.json parser, sentencepiece,
+// tiktoken cl100k. Those are FR-19.9-extra. matt-voice's Qwen2.5
+// tokenizer is BPE so this is on-path for the serving deploy.
+// =====================================================================
+
+struct BpeTokenizer {
+    /// id -> byte sequence backing the token. ids 0..255 are implicit
+    /// single-byte slots; ids 256+ come from add_merge calls.
+    decode_table: Vec<Vec<u8>>,
+    /// (left_id, right_id) -> (merged_id, rank). Lower rank = applied
+    /// earlier in the encode loop.
+    merges: std::collections::HashMap<(u32, u32), (u32, u32)>,
+}
+
+struct BpeCell(UnsafeCell<Vec<Option<Box<BpeTokenizer>>>>);
+unsafe impl Sync for BpeCell {}
+static BPE_TABLE: BpeCell = BpeCell(UnsafeCell::new(Vec::new()));
+unsafe fn bpe_table() -> &'static mut Vec<Option<Box<BpeTokenizer>>> {
+    &mut *BPE_TABLE.0.get()
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_tokenizer_new() -> i64 {
+    let mut decode_table: Vec<Vec<u8>> = Vec::with_capacity(256);
+    for b in 0..256u32 { decode_table.push(vec![b as u8]); }
+    let t = BpeTokenizer { decode_table, merges: Default::default() };
+    let tbl = bpe_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(t)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(t)));
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_tokenizer_free(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = bpe_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    tbl[h] = None;
+    0
+}
+
+/// Register a merge rule. Returns the new token's id (≥ 256) on
+/// success; -1 on error (bad handle, bad left/right ids, dup pair,
+/// or merged_bytes pointer/len invalid).
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_add_merge(
+    handle: i64,
+    left_id: c_int, right_id: c_int, rank: c_int,
+    merged_bytes: *const c_void, n_bytes: c_int,
+) -> c_int {
+    if handle < 0 || rank < 0 || left_id < 0 || right_id < 0 { return -1; }
+    if merged_bytes.is_null() || n_bytes <= 0 { return -1; }
+    let tbl = bpe_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(t) = tbl[h].as_mut() else { return -1; };
+    let left = left_id as u32;
+    let right = right_id as u32;
+    if (left as usize) >= t.decode_table.len() { return -1; }
+    if (right as usize) >= t.decode_table.len() { return -1; }
+    if t.merges.contains_key(&(left, right)) { return -1; }
+    let bytes = std::slice::from_raw_parts(merged_bytes as *const u8, n_bytes as usize).to_vec();
+    let new_id = t.decode_table.len() as u32;
+    t.decode_table.push(bytes);
+    t.merges.insert((left, right), (new_id, rank as u32));
+    new_id as c_int
+}
+
+/// Encode `text` (UTF-8 bytes) into token ids. Writes up to `max_ids`
+/// ids into `out_ids`. Returns the number of ids written, or -1 on
+/// overflow / bad handle. `out_ids` is treated as a `*mut i32` buffer.
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_encode(
+    handle: i64,
+    text: *const c_void, n_text: c_int,
+    out_ids: *mut c_void, max_ids: c_int,
+) -> c_int {
+    if handle < 0 || text.is_null() || out_ids.is_null() { return -1; }
+    if n_text < 0 || max_ids <= 0 { return -1; }
+    let tbl = bpe_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(t) = tbl[h].as_ref() else { return -1; };
+    // 1. Initial tokens: each byte is its own id.
+    let bytes = std::slice::from_raw_parts(text as *const u8, n_text as usize);
+    let mut tokens: Vec<u32> = bytes.iter().map(|&b| b as u32).collect();
+    // 2. BPE merge loop: each iteration find the pair with lowest rank,
+    //    replace ALL non-overlapping occurrences.
+    loop {
+        if tokens.len() < 2 { break; }
+        let mut best_pair: Option<(u32, u32)> = None;
+        let mut best_rank: u32 = u32::MAX;
+        let mut best_merged: u32 = 0;
+        for i in 0..tokens.len() - 1 {
+            if let Some(&(merged, rank)) = t.merges.get(&(tokens[i], tokens[i + 1])) {
+                if rank < best_rank {
+                    best_rank = rank;
+                    best_pair = Some((tokens[i], tokens[i + 1]));
+                    best_merged = merged;
+                }
+            }
+        }
+        let Some((bl, br)) = best_pair else { break; };
+        let mut new_tokens: Vec<u32> = Vec::with_capacity(tokens.len());
+        let mut i = 0;
+        while i < tokens.len() {
+            if i + 1 < tokens.len() && tokens[i] == bl && tokens[i + 1] == br {
+                new_tokens.push(best_merged);
+                i += 2;
+            } else {
+                new_tokens.push(tokens[i]);
+                i += 1;
+            }
+        }
+        tokens = new_tokens;
+    }
+    if tokens.len() > max_ids as usize { return -1; }
+    let out = std::slice::from_raw_parts_mut(out_ids as *mut i32, max_ids as usize);
+    for (i, tok) in tokens.iter().enumerate() { out[i] = *tok as i32; }
+    tokens.len() as c_int
+}
+
+/// Decode `n_ids` ids back into UTF-8 bytes. Writes up to `max_bytes`
+/// into `out_bytes`. Returns bytes written, or -1 on bad handle / id
+/// out of range / overflow.
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_decode(
+    handle: i64,
+    ids: *const c_void, n_ids: c_int,
+    out_bytes: *mut c_void, max_bytes: c_int,
+) -> c_int {
+    if handle < 0 || ids.is_null() || out_bytes.is_null() { return -1; }
+    if n_ids <= 0 || max_bytes <= 0 { return -1; }
+    let tbl = bpe_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(t) = tbl[h].as_ref() else { return -1; };
+    let id_buf = std::slice::from_raw_parts(ids as *const i32, n_ids as usize);
+    let out = std::slice::from_raw_parts_mut(out_bytes as *mut u8, max_bytes as usize);
+    let mut written = 0usize;
+    for &id in id_buf {
+        if id < 0 { return -1; }
+        let id_u = id as usize;
+        if id_u >= t.decode_table.len() { return -1; }
+        let bytes = &t.decode_table[id_u];
+        if written + bytes.len() > max_bytes as usize { return -1; }
+        out[written..written + bytes.len()].copy_from_slice(bytes);
+        written += bytes.len();
+    }
+    written as c_int
+}
+
 #[cfg(test)]
 mod heap_extras_tests {
     use super::*;
@@ -4877,6 +5041,76 @@ mod conv2d_tests {
                 let expect = if j < k { g[i * n + j] } else { 0.0 };
                 assert_eq!(r[i * n + j], expect, "[{},{}] mismatch", i, j);
             }
+        }
+    }
+
+    /// FR-19.9 — BPE encode + decode round-trip AND lowest-rank-wins
+    /// selection, exercised back-to-back so the test is sequential (the
+    /// runtime's BPE handle table is UnsafeCell + Sync — like all the
+    /// other heap-extras tables — so two parallel cargo-test threads
+    /// would race on the shared Vec push).
+    ///
+    /// Scenario A: build merges that take "hello" from 5 single-byte
+    /// tokens down to 1; encode "hello world"; verify token ids; decode
+    /// to original bytes.
+    ///
+    /// Scenario B: with 3 competing merges where the lowest-rank rule
+    /// would beat an earlier-defined higher-rank rule, verify the BPE
+    /// loop picks the rank-0 pair first.
+    #[test]
+    fn bpe_roundtrip_and_lowest_rank() {
+        unsafe {
+            // ---- Scenario A: "hello world" full round-trip. ----
+            let h = aether_bpe_tokenizer_new();
+            assert!(h >= 0);
+            let he    = b"he";    let hel   = b"hel";
+            let hell  = b"hell";  let hello = b"hello";
+            let id_he    = aether_bpe_add_merge(h, 104, 101, 0, he.as_ptr() as _,    2);
+            let id_hel   = aether_bpe_add_merge(h, id_he, 108, 1, hel.as_ptr() as _,  3);
+            let id_hell  = aether_bpe_add_merge(h, id_hel, 108, 2, hell.as_ptr() as _, 4);
+            let id_hello = aether_bpe_add_merge(h, id_hell, 111, 3, hello.as_ptr() as _, 5);
+            assert_eq!(id_he,    256);
+            assert_eq!(id_hel,   257);
+            assert_eq!(id_hell,  258);
+            assert_eq!(id_hello, 259);
+            let text = b"hello world";
+            let mut ids = [0i32; 32];
+            let n = aether_bpe_encode(
+                h, text.as_ptr() as _, text.len() as i32,
+                ids.as_mut_ptr() as _, ids.len() as i32,
+            );
+            assert_eq!(n, 7, "encoded len");
+            assert_eq!(&ids[..7], &[259, 32, 119, 111, 114, 108, 100]);
+            let mut out = [0u8; 32];
+            let m = aether_bpe_decode(
+                h, ids.as_ptr() as _, n,
+                out.as_mut_ptr() as _, out.len() as i32,
+            );
+            assert_eq!(m, 11);
+            assert_eq!(&out[..11], b"hello world");
+            aether_bpe_tokenizer_free(h);
+
+            // ---- Scenario B: lowest-rank-wins. ----
+            // (a, b) rank 5; (b, c) rank 0; (a, bc) rank 1. Encoding
+            // "abc" must pick (b, c) first because of its rank-0
+            // priority, then (a, bc) → final "abc" token. The (a, b)
+            // rank-5 merge is never fired (its 'b' is consumed first).
+            let h2 = aether_bpe_tokenizer_new();
+            let ab  = b"ab";
+            let bc  = b"bc";
+            let abc = b"abc";
+            let id_ab  = aether_bpe_add_merge(h2, 97, 98, 5, ab.as_ptr() as _, 2);
+            let id_bc  = aether_bpe_add_merge(h2, 98, 99, 0, bc.as_ptr() as _, 2);
+            let id_abc = aether_bpe_add_merge(h2, 97, id_bc, 1, abc.as_ptr() as _, 3);
+            assert_eq!(id_ab,  256);
+            assert_eq!(id_bc,  257);
+            assert_eq!(id_abc, 258);
+            let mut ids2 = [0i32; 8];
+            let n2 = aether_bpe_encode(h2, b"abc".as_ptr() as _, 3,
+                                       ids2.as_mut_ptr() as _, 8);
+            assert_eq!(n2, 1);
+            assert_eq!(ids2[0], 258, "expected single 'abc' token via rank-0 (b,c) first");
+            aether_bpe_tokenizer_free(h2);
         }
     }
 

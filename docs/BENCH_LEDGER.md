@@ -49,6 +49,10 @@ Bench-runner append rule fires again on `runtime/src/lib.rs` touched. Four new r
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. Eight new symbols added: `aether_nccl_*` (init/finalize/comm_create/destroy/world_size/rank/all_reduce_f32 — single-host fallback), `aether_tp_simulate_column_parallel_linear_f32`, `aether_pp_simulate_2stage_forward_f32`, `aether_fsdp_simulate_shard_alltoall_f32`, `aether_zero_simulate_stage_bytes_f32`, `aether_overlap_simulate_overlapped_us` / `_serial_us`, `aether_grad_compress_lowrank_f32`. Every fn is named `*_simulate_*` or returns single-host fallback values — there is no real multi-rank wall-time to measure on the kokonoe single-3070Ti box. The matmul path is untouched. Real cross-card bench fixtures live in MATT_VOICE_FR.md and require the cnc 2×P100 + libnccl link (FR-18.1-extra). Standing 2026-05-03 matmul row remains the reference.
 
+### 2026-05-19 — pending commit (FR-19.9 BPE tokenizer): skipped (no matmul path; tokenizer is its own micro-bench surface)
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `aether_bpe_tokenizer_new` / `_free` / `aether_bpe_add_merge` / `aether_bpe_encode` / `aether_bpe_decode`. The implementation is the textbook BPE merge loop in pure Rust — no GPU, no matmul, no SIMD. The matmul bench is untouched. A dedicated `bench/tokenizer_throughput/` fixture is the right place to log "MB/s through encode" once the matt-voice Qwen2.5 tokenizer.json loader (FR-19.9-extra) lands; that fixture doesn't exist yet. The 2026-05-03 matmul row remains the standing reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.
