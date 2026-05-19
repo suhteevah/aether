@@ -17,6 +17,18 @@ impl XmmReg {
     pub fn lo3(self) -> u8 { (self as u8) & 0b111 }
 }
 
+/// 256-bit AVX2 YMM register. Limited to ymm0..ymm7 for now — that's
+/// what fits in the 2-byte VEX prefix without needing the 3-byte C4
+/// form. Extending to ymm8..ymm15 means flipping to C4 prefix; deferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YmmReg {
+    Ymm0 = 0, Ymm1 = 1, Ymm2 = 2, Ymm3 = 3,
+    Ymm4 = 4, Ymm5 = 5, Ymm6 = 6, Ymm7 = 7,
+}
+impl YmmReg {
+    pub fn lo3(self) -> u8 { (self as u8) & 0b111 }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CondCode {
     /// equal (ZF=1)
@@ -197,6 +209,44 @@ pub enum Instr {
     LeaRipSym { dst: Reg, sym: String },
     /// `lea r64, disp32(%rbp)` — address of a stack slot.
     LeaRegFromRbpDisp { dst: Reg, disp: i32 },
+    // -------- AVX2 (256-bit ymm) — FR-15.3 -----------------------------------
+    // All 6 ops below use the 2-byte VEX prefix (C5), which fits the
+    // ymm0..ymm7 reg subset (no extension bits) and the .L=1 / .pp=00
+    // (no SIMD prefix) shape that AVX *PS opcodes need.
+    //
+    // VEX-2byte layout (after the C5 byte):
+    //   bit 7: ~R (inverted REX.R; 1 for ymm < 8)
+    //   bits 6-3: ~vvvv (inverted second-source ymm index)
+    //   bit 2: L (1 for 256-bit ymm)
+    //   bits 1-0: pp (00 = no prefix; ps/PS instructions)
+    //
+    /// `vxorps %src2, %src1, %dst` (AT&T) — dst = src1 ^ src2 (256-bit XOR).
+    /// Used to zero an accumulator: `vxorps %ymm0, %ymm0, %ymm0`.
+    /// Encoding: C5 + VEX-byte1 + 57 + ModRM(11 dst src2).
+    VxorpsYmmYmmYmm { dst: YmmReg, src1: YmmReg, src2: YmmReg },
+    /// `vmovups disp(%base), %dst` — load 32 bytes (8x f32) from memory.
+    /// Encoding: C5 + VEX-byte1 + 10 + ModRM(mod=10 dst base) + disp32.
+    /// `base` must NOT be rsp (needs SIB) or rbp without disp (parser rule).
+    VmovupsMemToYmm { dst: YmmReg, base: Reg, disp: i32 },
+    /// `vmovups %src, disp(%base)` — store 32 bytes to memory.
+    /// Encoding: C5 + VEX-byte1 + 11 + ModRM(mod=10 src base) + disp32.
+    VmovupsYmmToMem { src: YmmReg, base: Reg, disp: i32 },
+    /// `vaddps %src2, %src1, %dst` — dst = src1 + src2, lane-parallel 8x f32.
+    /// Encoding: C5 + VEX-byte1 + 58 + ModRM(11 dst src2).
+    VaddpsYmmYmmYmm { dst: YmmReg, src1: YmmReg, src2: YmmReg },
+    /// `vmulps %src2, %src1, %dst` — dst = src1 * src2, lane-parallel 8x f32.
+    /// Encoding: C5 + VEX-byte1 + 59 + ModRM(11 dst src2).
+    VmulpsYmmYmmYmm { dst: YmmReg, src1: YmmReg, src2: YmmReg },
+    /// `vmovups %src, (%rsp)` — store ymm to top-of-stack. RSP as a memory
+    /// base requires a SIB byte (ModRM.rm=4 means "consult SIB"). Encoding:
+    /// C5 FC 11 04 24 (5 bytes). Needed by the FR-15.3 horizontal-sum
+    /// epilogue which spills the YMM accumulator to a 32-byte scratch.
+    VmovupsYmmToRspNoDisp { src: YmmReg },
+    /// `vzeroupper` — zero high 128 bits of ymm0..ymm15. Mandatory before
+    /// any subsequent SSE2 instruction to avoid the AVX-to-SSE transition
+    /// penalty. Encoding: C5 F8 77 (3 bytes; L=0, vvvv=1111).
+    Vzeroupper,
+
     /// `call rel32` — symbol resolved via PLT-style external relocation.
     CallSym { sym: String },
     /// `callq *%reg` — indirect call through a 64-bit register holding a
@@ -706,6 +756,59 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
                 }),
             }
         }
+
+        // ── AVX2 (256-bit ymm) — FR-15.3 ────────────────────────────────────
+        VxorpsYmmYmmYmm { dst, src1, src2 } => {
+            // C5 + [~R(1) | ~vvvv | L=1 | pp=00] + 57 + ModRM(11 dst.lo3 src2.lo3)
+            let vex1 = 0b1000_0100u8 | ((!src1.lo3() & 0xF) << 3);
+            let modrm = 0b1100_0000u8 | (dst.lo3() << 3) | src2.lo3();
+            Encoded { bytes: vec![0xC5, vex1, 0x57, modrm], reloc: None }
+        }
+        VaddpsYmmYmmYmm { dst, src1, src2 } => {
+            let vex1 = 0b1000_0100u8 | ((!src1.lo3() & 0xF) << 3);
+            let modrm = 0b1100_0000u8 | (dst.lo3() << 3) | src2.lo3();
+            Encoded { bytes: vec![0xC5, vex1, 0x58, modrm], reloc: None }
+        }
+        VmulpsYmmYmmYmm { dst, src1, src2 } => {
+            let vex1 = 0b1000_0100u8 | ((!src1.lo3() & 0xF) << 3);
+            let modrm = 0b1100_0000u8 | (dst.lo3() << 3) | src2.lo3();
+            Encoded { bytes: vec![0xC5, vex1, 0x59, modrm], reloc: None }
+        }
+        VmovupsMemToYmm { dst, base, disp } => {
+            // C5 FC 10 ModRM(mod=10 dst base) disp32. base != rsp (no SIB
+            // support here yet); rbp requires explicit disp which the mod=10
+            // form provides. ymm0..ymm7 only — no REX extension bits.
+            assert!(!matches!(base, Reg::Rsp), "VmovupsMemToYmm with rsp base requires SIB");
+            assert_eq!(base.extension(), 0, "VmovupsMemToYmm requires base in rax..rdi");
+            // No src1 register (load) — vvvv must be 1111 (i.e., 0).
+            let vex1 = 0b1111_1100u8;
+            let modrm = 0b1000_0000u8 | (dst.lo3() << 3) | base.lo3();
+            let mut b = vec![0xC5, vex1, 0x10, modrm];
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        VmovupsYmmToMem { src, base, disp } => {
+            assert!(!matches!(base, Reg::Rsp), "VmovupsYmmToMem with rsp base requires SIB");
+            assert_eq!(base.extension(), 0, "VmovupsYmmToMem requires base in rax..rdi");
+            let vex1 = 0b1111_1100u8;
+            let modrm = 0b1000_0000u8 | (src.lo3() << 3) | base.lo3();
+            let mut b = vec![0xC5, vex1, 0x11, modrm];
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        Vzeroupper => {
+            // C5 F8 77 — VEX.128.0F.WIG 77. L=0 (not 256-bit!), vvvv=1111, pp=00.
+            // Intel SDM: this clears the high 128 bits of ymm0..ymm15 only.
+            Encoded { bytes: vec![0xC5, 0xF8, 0x77], reloc: None }
+        }
+        VmovupsYmmToRspNoDisp { src } => {
+            // `vmovups %ymm_src, (%rsp)` — SIB-byte encoding because rsp
+            // can't be encoded in the r/m field directly. ModRM=00_src_100
+            // (rm=4 → SIB). SIB=00_100_100 (scale=0, index=none(=4), base=rsp(=4)).
+            let modrm = 0b0000_0100u8 | (src.lo3() << 3);
+            let sib = 0b0010_0100u8;
+            Encoded { bytes: vec![0xC5, 0xFC, 0x11, modrm, sib], reloc: None }
+        }
     }
 }
 
@@ -930,5 +1033,109 @@ mod tests {
         let e = encode_instruction(&Instr::CallSym { sym: "puts".into() });
         assert_eq!(e.bytes, vec![0xE8, 0, 0, 0, 0]);
         assert_eq!(e.reloc.as_ref().unwrap().offset_in_instr, 1);
+    }
+
+    // ── AVX2 (FR-15.3) ──────────────────────────────────────────────────────
+    // All bytes below verified against Intel SDM Vol. 2 (VEX-encoded forms).
+    // Re-derivation: pick the dst/src1/src2 trio, build VEX byte1 = 1_<~src1>_1_00
+    // for ymm forms, append opcode + ModRM(11 dst src2).
+
+    #[test]
+    fn vxorps_ymm0_ymm0_ymm0() {
+        // C5 FC 57 C0 — zero ymm0. src1 = ymm0 → ~vvvv = 1111.
+        assert_eq!(
+            enc(Instr::VxorpsYmmYmmYmm {
+                dst: YmmReg::Ymm0, src1: YmmReg::Ymm0, src2: YmmReg::Ymm0,
+            }),
+            vec![0xC5, 0xFC, 0x57, 0xC0]
+        );
+    }
+
+    #[test]
+    fn vxorps_ymm3_ymm1_ymm2() {
+        // src1 = ymm1 → ~vvvv = 1110 → byte1 = 1_1110_1_00 = 0xF4.
+        // ModRM = 11 dst.lo3(=3) src2.lo3(=2) = 11_011_010 = 0xDA.
+        assert_eq!(
+            enc(Instr::VxorpsYmmYmmYmm {
+                dst: YmmReg::Ymm3, src1: YmmReg::Ymm1, src2: YmmReg::Ymm2,
+            }),
+            vec![0xC5, 0xF4, 0x57, 0xDA]
+        );
+    }
+
+    #[test]
+    fn vaddps_ymm0_ymm0_ymm1() {
+        // `vaddps %ymm1, %ymm0, %ymm0`: dst+src1=ymm0, src2=ymm1.
+        // VEX byte1 with src1=ymm0 → 0xFC. ModRM = 11_000_001 = 0xC1.
+        assert_eq!(
+            enc(Instr::VaddpsYmmYmmYmm {
+                dst: YmmReg::Ymm0, src1: YmmReg::Ymm0, src2: YmmReg::Ymm1,
+            }),
+            vec![0xC5, 0xFC, 0x58, 0xC1]
+        );
+    }
+
+    #[test]
+    fn vmulps_ymm2_ymm1_ymm3() {
+        // dst=ymm2 src1=ymm1 src2=ymm3. byte1 = 1_1110_1_00 = 0xF4.
+        // ModRM = 11_010_011 = 0xD3.
+        assert_eq!(
+            enc(Instr::VmulpsYmmYmmYmm {
+                dst: YmmReg::Ymm2, src1: YmmReg::Ymm1, src2: YmmReg::Ymm3,
+            }),
+            vec![0xC5, 0xF4, 0x59, 0xD3]
+        );
+    }
+
+    #[test]
+    fn vmovups_load_ymm1_from_rcx_disp0() {
+        // `vmovups 0(%rcx), %ymm1` — dst=ymm1, base=rcx, disp=0.
+        // byte1 = 0xFC (no src1, vvvv must be 1111).
+        // ModRM = 10_001_001 = 0x89. disp32 = 0x00000000.
+        assert_eq!(
+            enc(Instr::VmovupsMemToYmm {
+                dst: YmmReg::Ymm1, base: Reg::Rcx, disp: 0,
+            }),
+            vec![0xC5, 0xFC, 0x10, 0x89, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn vmovups_load_ymm2_from_rdx_disp32() {
+        // `vmovups 32(%rdx), %ymm2` — dst=ymm2, base=rdx(=2), disp=32.
+        // ModRM = 10_010_010 = 0x92. disp32 LE = 20 00 00 00.
+        assert_eq!(
+            enc(Instr::VmovupsMemToYmm {
+                dst: YmmReg::Ymm2, base: Reg::Rdx, disp: 32,
+            }),
+            vec![0xC5, 0xFC, 0x10, 0x92, 0x20, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn vmovups_store_ymm0_to_rax_disp64() {
+        // `vmovups %ymm0, 64(%rax)` — opcode 11; src=ymm0, base=rax(=0).
+        // ModRM = 10_000_000 = 0x80. disp32 LE = 40 00 00 00.
+        assert_eq!(
+            enc(Instr::VmovupsYmmToMem {
+                src: YmmReg::Ymm0, base: Reg::Rax, disp: 64,
+            }),
+            vec![0xC5, 0xFC, 0x11, 0x80, 0x40, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn vzeroupper_bytes() {
+        // `vzeroupper` -> C5 F8 77 (L=0, vvvv=1111, pp=00).
+        assert_eq!(enc(Instr::Vzeroupper), vec![0xC5, 0xF8, 0x77]);
+    }
+
+    #[test]
+    fn vmovups_ymm0_to_rsp_nodisp() {
+        // `vmovups %ymm0, (%rsp)` -> C5 FC 11 04 24 (SIB form).
+        assert_eq!(
+            enc(Instr::VmovupsYmmToRspNoDisp { src: YmmReg::Ymm0 }),
+            vec![0xC5, 0xFC, 0x11, 0x04, 0x24]
+        );
     }
 }

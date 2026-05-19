@@ -1,0 +1,29 @@
+// roadmap: P15.3
+// build-mode: aether-bin
+// expect: exit=42
+//
+// FR-15.3 witness — the asm backend recognises the
+// `__aether_avx2_dot_f32(a_ptr, b_ptr, n)` builtin and inlines a 256-bit
+// AVX2 dot loop using aether_asm's new VEX-encoded ops (vxorps, vmovups,
+// vmulps, vaddps, vzeroupper). The result is compared against a scalar
+// reference via the runtime; exit=42 means the AVX2 result agrees with
+// the scalar reference within 1e-3 relative tolerance.
+//
+// 1024 = 128 iterations of 8-lane SIMD. Arrays are heap-allocated via
+// `aether_avx2_witness_arr` so vmovups reads exactly 1024*4 = 4096 bytes.
+
+extern fn aether_avx2_witness_arr(seed: i64, n: i64) -> i64;
+extern fn aether_dot_f32_scalar(a: i64, b: i64, n: i64) -> f32;
+extern fn aether_f32_close_exit(a: f32, b: f32) -> i32;
+extern fn aether_free_bytes(p: i64, n: i64);
+
+fn main() -> i32 {
+    let a_ptr = aether_avx2_witness_arr(1, 1024);
+    let b_ptr = aether_avx2_witness_arr(2, 1024);
+    let avx_dot: f32 = __aether_avx2_dot_f32(a_ptr, b_ptr, 1024);
+    let ref_dot: f32 = aether_dot_f32_scalar(a_ptr, b_ptr, 1024);
+    let rc = aether_f32_close_exit(avx_dot, ref_dot);
+    aether_free_bytes(a_ptr, 4096);
+    aether_free_bytes(b_ptr, 4096);
+    rc
+}

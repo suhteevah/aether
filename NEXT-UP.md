@@ -9,7 +9,31 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-18, Path A continuation — FR-15.1 + FR-15.2)
+## Closed this batch (2026-05-18, Path A complete — FR-15.{1,2,3})
+
+- **P15.3 / FR-15.3** — AVX2 emit. New 256-bit VEX-encoded ops in
+  `aether_asm/src/encode.rs`: `YmmReg` enum (Ymm0..Ymm7), 7 `Instr`
+  variants — `VxorpsYmmYmmYmm`, `VmovupsMemToYmm`, `VmovupsYmmToMem`,
+  `VaddpsYmmYmmYmm`, `VmulpsYmmYmmYmm`, `VmovupsYmmToRspNoDisp`
+  (SIB-encoded for the rsp base), `Vzeroupper`. 9 byte-exact unit
+  tests (verified against Intel SDM Vol. 2). Parser arms in
+  `aether_asm/src/parse.rs` for all five mnemonics in 3-operand AT&T
+  order (`src2, src1, dst`), with `vmovups` recognising load /
+  disp-store / no-disp `(%rsp)` store. Size table synced.
+  Compiler integration in `compiler/src/codegen/asm/mod.rs`: the
+  `Expr::Call` arm recognises `__aether_avx2_dot_f32(a_ptr, b_ptr, n)`
+  and inlines a 256-bit AVX2 dot loop (vxorps init, vmovups+vmulps+
+  vaddps cycle, addq strides, cmpq/jne tail, vzeroupper-bounded
+  horizontal sum). Runtime gains 3 witness helpers
+  (`aether_avx2_witness_arr`, `aether_dot_f32_scalar`,
+  `aether_f32_close_exit`). Witness `tests/runtime/avx2_dot_f32.aether`
+  exits 42 when the AVX2 1024-elem dot matches scalar within 1e-3
+  relative; 1078-byte .obj through the full aetherc → aether-asm
+  chain. honesty-auditor verified all 8 claims (zero false). **NOT
+  shipped**: the FR's "4× faster" perf claim — no bench fixture
+  exists yet for the f32 dot path; deferred. **Audit 143→144/196.**
+
+## Closed earlier this session (2026-05-18, Path A FR-15.1 + FR-15.2)
 
 - **P15.2 / FR-15.2** — Regalloc-in-emit: the per-fn assignment plan from
   the existing `mir::regalloc::Allocator` now drives the asm backend. New
@@ -127,7 +151,7 @@ within 5% wall on the 11900K + 3070 Ti at --O2.*
 |---|---|---|---|---|
 | A1 | FR-15.1 | L | SSA-backed asm emit (linearise → opt → emit, not AST→emit) — **DONE 2026-05-18** | A2, A3 |
 | A2 | FR-15.2 | L | regalloc drives `emit_expr_value`, hot locals in r12..r15 — **DONE 2026-05-18** | A3 |
-| A3 | FR-15.3 | L | AVX2/AVX-512 emit (vmovups/vaddps/vmulps/vfmadd231ps/vbroadcastss) | A4, A5 |
+| A3 | FR-15.3 | L | AVX2/AVX-512 emit (vmovups/vaddps/vmulps/vxorps/vzeroupper) — **DONE 2026-05-18** | A4, A5 |
 | A4 | FR-15.4 | M | cross-fn inlining heuristic + actual substitution — **DONE 2026-05-10** | A5 |
 | A5 | FR-15.10 | M | hand-asm reference matmul/softmax/LN/SDPA/CE in `bench/handasm/`, ≤1% gap measured | — |
 

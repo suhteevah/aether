@@ -614,6 +614,61 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     *(p as *mut u8).add(i as usize) = (v & 0xFF) as u8;
 }
 
+// ─── FR-15.3 (AVX2) — witness helpers ───────────────────────────────────────
+// These three fns let an `.aether` source build two f32 arrays, call the
+// compiler's recognized `__aether_avx2_dot_f32` builtin on them, and compare
+// the result to a scalar reference. Returns a meaningful exit code at the
+// far end. The arrays are heap-allocated via the same `aether_alloc_bytes`
+// box-leak path so they free cleanly via `aether_free_bytes`.
+
+/// Allocate `n` f32 slots (= 4*n bytes), fill deterministically from `seed`,
+/// return the pointer as i64. Fill pattern is a simple LCG-like ramp so that
+/// the dot product is a non-trivial value the AVX2 path can mis-compute on.
+#[no_mangle] pub extern "C" fn aether_avx2_witness_arr(seed: i64, n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    let bytes = (n as usize) * 4;
+    let p = aether_alloc_bytes(bytes as i64);
+    if p == 0 { return 0; }
+    unsafe {
+        let f = p as *mut f32;
+        let mut s = seed as u32;
+        for i in 0..n as usize {
+            // splitmix-ish step → f32 in roughly [0, 4).
+            s = s.wrapping_mul(2654435761).wrapping_add(0x9E37);
+            let mantissa = (s >> 9) & 0x7F_FFFF;
+            let bits = 0x3F80_0000u32 | mantissa; // 1.0 .. 2.0
+            let v = f32::from_bits(bits) - 1.0 + ((i & 7) as f32) * 0.25;
+            *f.add(i) = v;
+        }
+    }
+    p
+}
+
+/// Reference scalar dot product over `n` f32 elements at `a` and `b`.
+/// Used to verify the AVX2 inline-emit's result. Rust may auto-vectorise
+/// this loop into AVX2/AVX-512 of its own, which is fine — both versions
+/// converge on the same value modulo float reassociation.
+#[no_mangle] pub unsafe extern "C" fn aether_dot_f32_scalar(a: i64, b: i64, n: i64) -> f32 {
+    if a == 0 || b == 0 || n <= 0 { return 0.0; }
+    let aa = a as *const f32;
+    let bb = b as *const f32;
+    let mut acc = 0.0f32;
+    for i in 0..n as usize {
+        acc += *aa.add(i) * *bb.add(i);
+    }
+    acc
+}
+
+/// Return 42 if `a` and `b` agree to within a 1e-3 relative tolerance,
+/// otherwise return the witness's failure code 1. Provides a clean
+/// "if avx == scalar then 42 else 1" expression that survives the .aether
+/// surface without needing f32 abs / unary-neg (still gapped today).
+#[no_mangle] pub extern "C" fn aether_f32_close_exit(a: f32, b: f32) -> i32 {
+    let diff = (a - b).abs();
+    let mag = a.abs().max(b.abs()).max(1.0);
+    if diff / mag < 1.0e-3 { 42 } else { 1 }
+}
+
 /// Write `n` bytes from `buf` to file `path` (overwriting). Returns 0 on
 /// success, non-zero on failure.
 #[no_mangle] pub unsafe extern "C" fn aether_write_file(path: i64, buf: i64, n: i64) -> i32 {

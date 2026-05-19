@@ -262,6 +262,14 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
         Instr::MovRspDispFromReg { .. } | Instr::MovRegFromRspDisp { .. } => 8,
         Instr::MovssXmmToRspDisp { .. } | Instr::MovsdXmmToRspDisp { .. } => 9,
         Instr::MovssRspDispToXmm { .. } | Instr::MovsdRspDispToXmm { .. } => 9,
+        // AVX2 — FR-15.3. Sizes verified against `encode_instruction` bytes.
+        Instr::VxorpsYmmYmmYmm { .. } => 4,   // C5 + vex1 + 57 + ModRM
+        Instr::VaddpsYmmYmmYmm { .. } => 4,   // C5 + vex1 + 58 + ModRM
+        Instr::VmulpsYmmYmmYmm { .. } => 4,   // C5 + vex1 + 59 + ModRM
+        Instr::VmovupsMemToYmm { .. } => 8,   // C5 + vex1 + 10 + ModRM + disp32
+        Instr::VmovupsYmmToMem { .. } => 8,   // C5 + vex1 + 11 + ModRM + disp32
+        Instr::VmovupsYmmToRspNoDisp { .. } => 5,  // C5 FC 11 ModRM SIB
+        Instr::Vzeroupper            => 3,   // C5 F8 77
     }).sum()
 }
 
@@ -301,6 +309,21 @@ fn parse_xmm(s: &str, line: u32) -> Result<XmmReg, AsmError> {
         "xmm4" => XmmReg::Xmm4, "xmm5" => XmmReg::Xmm5,
         "xmm6" => XmmReg::Xmm6, "xmm7" => XmmReg::Xmm7,
         _ => return Err(syn(line, format!("unknown xmm register: %{s}"))),
+    })
+}
+
+/// Parse a 256-bit ymm register (`%ymm0` .. `%ymm7`). FR-15.3 — only
+/// ymm0..7 supported until aether_asm gains 3-byte VEX (C4) encoding
+/// for the upper bank.
+fn parse_ymm(s: &str, line: u32) -> Result<crate::encode::YmmReg, AsmError> {
+    use crate::encode::YmmReg;
+    let s = s.trim().trim_start_matches('%');
+    Ok(match s {
+        "ymm0" => YmmReg::Ymm0, "ymm1" => YmmReg::Ymm1,
+        "ymm2" => YmmReg::Ymm2, "ymm3" => YmmReg::Ymm3,
+        "ymm4" => YmmReg::Ymm4, "ymm5" => YmmReg::Ymm5,
+        "ymm6" => YmmReg::Ymm6, "ymm7" => YmmReg::Ymm7,
+        _ => return Err(syn(line, format!("unknown ymm register: %{s}"))),
     })
 }
 
@@ -649,6 +672,42 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             let (imm, reg) = split_comma(rest);
             Instr::MovRegImm32 { dst: parse_reg(reg, lineno)?, imm: parse_imm(imm, lineno)? as i32 }
         }
+
+        // ── AVX2 (FR-15.3) ──────────────────────────────────────────────────
+        // AT&T 3-operand form: `vXXXps %src2, %src1, %dst`. Split on the
+        // first two commas to extract each operand.
+        "vxorps" | "vaddps" | "vmulps" => {
+            let parts: Vec<&str> = rest.splitn(3, ',').map(|s| s.trim()).collect();
+            if parts.len() != 3 {
+                return Err(syn(lineno, format!("{mnem} needs 3 ymm operands")));
+            }
+            let src2 = parse_ymm(parts[0], lineno)?;
+            let src1 = parse_ymm(parts[1], lineno)?;
+            let dst  = parse_ymm(parts[2], lineno)?;
+            match mnem {
+                "vxorps" => Instr::VxorpsYmmYmmYmm { dst, src1, src2 },
+                "vaddps" => Instr::VaddpsYmmYmmYmm { dst, src1, src2 },
+                "vmulps" => Instr::VmulpsYmmYmmYmm { dst, src1, src2 },
+                _ => unreachable!(),
+            }
+        }
+        "vmovups" => {
+            let (a, b) = split_comma(rest);
+            // Forms: `vmovups disp(%base), %ymm` (load),
+            //        `vmovups %ymm, disp(%base)` (store), or
+            //        `vmovups %ymm, (%rsp)` (no-disp store; SIB-encoded).
+            if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                Instr::VmovupsMemToYmm { dst: parse_ymm(b, lineno)?, base, disp }
+            } else if let Some((disp, base)) = parse_base_mem(b, lineno) {
+                Instr::VmovupsYmmToMem { src: parse_ymm(a, lineno)?, base, disp }
+            } else if b.trim() == "(%rsp)" {
+                Instr::VmovupsYmmToRspNoDisp { src: parse_ymm(a, lineno)? }
+            } else {
+                return Err(syn(lineno, format!("vmovups: unsupported operands `{a}`, `{b}` — need disp(%base) on one side or (%rsp)")));
+            }
+        }
+        "vzeroupper" => Instr::Vzeroupper,
+
         other   => return Err(syn(lineno, format!("unsupported instruction: {other}"))),
     })
 }

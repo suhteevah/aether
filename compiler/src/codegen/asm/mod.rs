@@ -2348,6 +2348,60 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                     return Ok(TyKind::Int);
                 }
             }
+            // FR-15.3 — recognized AVX2 builtin: `__aether_avx2_dot_f32(a_ptr,
+            // b_ptr, n) -> f32`. Inlines a 256-bit AVX2 dot product loop using
+            // aether_asm's new VEX-encoded ops (vxorps/vmovups/vmulps/vaddps/
+            // vzeroupper). `n` MUST be > 0 and a multiple of 8 at runtime;
+            // the loop assumes that. The args are evaluated into rcx/rdx/r8
+            // by simple inline movq — this is safe when the args are simple
+            // pointer-yielding exprs (Ref / Ident / Field) and IntLits, which
+            // is the witness's case. Pure i64 throughout; returns f32.
+            if name == "__aether_avx2_dot_f32" && args.len() == 3 {
+                let ka = emit_expr_value(&args[0], out, data, locals)?;
+                if !matches!(ka, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr(
+                        "__aether_avx2_dot_f32 arg 0 must be i64 / pointer"));
+                }
+                out.push_str("    movq %rax, %rcx\n");
+                let kb = emit_expr_value(&args[1], out, data, locals)?;
+                if !matches!(kb, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr(
+                        "__aether_avx2_dot_f32 arg 1 must be i64 / pointer"));
+                }
+                out.push_str("    movq %rax, %rdx\n");
+                let kn = emit_expr_value(&args[2], out, data, locals)?;
+                if !matches!(kn, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr(
+                        "__aether_avx2_dot_f32 arg 2 (n) must be i64"));
+                }
+                out.push_str("    movq %rax, %r8\n");
+                // Acc = ymm0; index = rax. Step: 8 f32 per iter (32 bytes).
+                let loop_lbl = locals.fresh_label("avx2dot");
+                out.push_str("    vxorps %ymm0, %ymm0, %ymm0\n");
+                out.push_str("    xorq %rax, %rax\n");
+                out.push_str(&format!("{}:\n", loop_lbl));
+                out.push_str("    vmovups 0(%rcx), %ymm1\n");
+                out.push_str("    vmovups 0(%rdx), %ymm2\n");
+                out.push_str("    vmulps %ymm2, %ymm1, %ymm1\n");
+                out.push_str("    vaddps %ymm1, %ymm0, %ymm0\n");
+                out.push_str("    addq $32, %rcx\n");
+                out.push_str("    addq $32, %rdx\n");
+                out.push_str("    addq $8, %rax\n");
+                out.push_str("    cmpq %rax, %r8\n");
+                out.push_str(&format!("    jne {}\n", loop_lbl));
+                // Horizontal sum: store ymm0 to a 32-byte stack scratch,
+                // vzeroupper to release AVX state, sum 8 f32s scalar-style.
+                out.push_str("    subq $32, %rsp\n");
+                out.push_str("    vmovups %ymm0, (%rsp)\n");
+                out.push_str("    vzeroupper\n");
+                out.push_str("    movss (%rsp), %xmm0\n");
+                for off in [4, 8, 12, 16, 20, 24, 28] {
+                    out.push_str(&format!("    movss {}(%rsp), %xmm1\n", off));
+                    out.push_str("    addss %xmm1, %xmm0\n");
+                }
+                out.push_str("    addq $32, %rsp\n");
+                return Ok(TyKind::F32);
+            }
             // Builtin numeric casts: f32(x) / f64(x) / i64(x).
             // Keep the surrounding default_float intact so that bare literal
             // arguments don't get widened/narrowed by accident — the cast

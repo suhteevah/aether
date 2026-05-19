@@ -33,6 +33,10 @@ Single-trial run at this commit produced numbers whose run-to-run spread exceede
 
 Bench-runner subagent invoked under the append rule (commit touches `compiler/src/codegen/asm/`). At run time the GPU was at 39% util with 7.3 GiB/8 GiB occupied by external processes (`Settlement Survival.exe` + `ollama.exe`). Per the honesty rule we declined to record numbers under contention. Independent structural argument: FR-15.2 promotes hot Int locals into callee-saved r12..r15 inside `.aether`-source fns; the matmul caller in Aether source passes Tensor handles (i64) to `aether_op_matmul_f32`, which is unchanged in `runtime/src/cuda.rs`. The cuBLAS sgemm time dominates the bench by orders of magnitude. Expected delta vs the 2026-05-03 row: indistinguishable from noise. The 2026-05-03 row stays the standing reference. Re-bench when the GPU is idle.
 
+### 2026-05-18 — pending commit (FR-15.3 AVX2 emit): skipped (no overlap with matmul hot path)
+
+Bench-runner append rule fires because the commit touches both `compiler/src/codegen/asm/` and `runtime/src/lib.rs`. The asm-backend addition is a new compiler-recognized builtin `__aether_avx2_dot_f32` that inlines an AVX2 dot loop using new VEX-encoded ops (`vxorps`/`vmovups`/`vmulps`/`vaddps`/`vzeroupper`). The runtime additions are three witness-only helpers (`aether_avx2_witness_arr`, `aether_dot_f32_scalar`, `aether_f32_close_exit`) — none of them appear on any standing bench path. The matmul benches drive `aether_op_matmul_f32` through cuBLAS, which this commit does not change. Expected delta vs the 2026-05-03 row: zero. A standalone "1024-elem f32 dot AVX2 vs scalar" bench fixture is the right place to record the per-instruction headline — that fixture doesn't exist yet; deferred. The 2026-05-03 row remains the standing reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.
