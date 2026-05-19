@@ -1,0 +1,67 @@
+// roadmap: P17.19
+// expect: exit=42
+//
+// FR-17.19-extra — SafeTensors multi-tensor parser deepening.
+//
+// Hand-builds a 2-tensor SafeTensors blob (f32 "w" shape [2,2] +
+// f16 "b" shape [2]) and exercises aether_safetensors_n_tensors /
+// _get_shape / _get_dtype. matt-voice's Qwen2.5 deploy walks
+// model.safetensors using these fns to discover each tensor's
+// metadata before reading the raw bytes.
+//
+// SCOPE: header parser deepening. Streaming download / mmap'd
+// weight load over the 1.3 GiB Llama-1B bundle is the next layer.
+use runtime;
+
+extern fn aether_copy_cstr(dst: i64, cstr: i64, max: i32) -> i32;
+extern fn aether_safetensors_n_tensors(buf: i64, len: i64) -> i32;
+extern fn aether_safetensors_get_shape(
+    buf: i64, len: i64, name: i64, n_name: i64, out_dims: i64, max_dims: i32,
+) -> i32;
+extern fn aether_safetensors_get_dtype(buf: i64, len: i64, name: i64, n_name: i64) -> i32;
+
+fn main() -> i32 {
+    let blob: i64 = aether_alloc_bytes(256);
+    // Copy the JSON header in first (after the 8-byte length prefix);
+    // get the actual byte count back from the helper.
+    let n_hdr: i32 = aether_copy_cstr(
+        blob + 8,
+        "{\"w\":{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,16]},\"b\":{\"dtype\":\"F16\",\"shape\":[2],\"data_offsets\":[16,20]}}",
+        200,
+    );
+    if n_hdr <= 0 { return 1; }
+    // Write the 8-byte little-endian length prefix. Since n_hdr < 256
+    // here we only need the low byte; bytes 1..8 stay zero from
+    // aether_alloc_bytes's zero-init.
+    aether_byte_set(blob, 0, n_hdr as i64);
+
+    let total: i64 = 8 + (n_hdr as i64) + 20;  // + 16-byte f32 + 4-byte f16 payloads
+
+    if aether_safetensors_n_tensors(blob, total) != 2 { return 2; }
+
+    // "w" shape + dtype
+    let name_w: i64 = aether_alloc_bytes(2);
+    aether_copy_cstr(name_w, "w", 2);
+    let dims_w: i64 = aether_alloc_bytes(32);
+    let n_w: i32 = aether_safetensors_get_shape(blob, total, name_w, 1, dims_w, 4);
+    if n_w != 2 { return 3; }
+    if aether_byte_at(dims_w, 0) != 2 { return 4; }
+    if aether_byte_at(dims_w, 8) != 2 { return 5; }
+    if aether_safetensors_get_dtype(blob, total, name_w, 1) != 0 { return 6; }  // F32
+
+    // "b" shape + dtype
+    let name_b: i64 = aether_alloc_bytes(2);
+    aether_copy_cstr(name_b, "b", 2);
+    let dims_b: i64 = aether_alloc_bytes(32);
+    let n_b: i32 = aether_safetensors_get_shape(blob, total, name_b, 1, dims_b, 4);
+    if n_b != 1 { return 7; }
+    if aether_byte_at(dims_b, 0) != 2 { return 8; }
+    if aether_safetensors_get_dtype(blob, total, name_b, 1) != 1 { return 9; }  // F16
+
+    aether_free_bytes(blob, 128);
+    aether_free_bytes(name_w, 2);
+    aether_free_bytes(name_b, 2);
+    aether_free_bytes(dims_w, 32);
+    aether_free_bytes(dims_b, 32);
+    42
+}

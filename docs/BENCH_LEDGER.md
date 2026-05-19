@@ -57,6 +57,30 @@ Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `ae
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `aether_template_new` / `_free` / `aether_template_set_var` / `aether_template_push_message` / `aether_template_render`. Pure-Rust state-machine template parser. No GPU / no matmul / no SIMD. Matmul bench is untouched. A `bench/chat_template_throughput/` fixture for "ms per render of a typical chat template" is the right surface to log this once the matt-voice serving deploy actually renders user prompts at scale — fixture doesn't exist yet. 2026-05-03 matmul row remains the reference.
 
+### 2026-05-19 — pending commit (matt-voice deploy pack — 5 extras): cuda build now live; no matmul bench rerun
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched.
+Five deliverables:
+
+1. `cargo build -p aether_rt --features cuda` now succeeds on
+   kokonoe (CUDA toolkit v12.6 + cudarc 0.13). The resulting
+   `target/debug/libaether_rt.a` contains cuBLAS symbols (39507
+   matches via grep). `tests/runtime/cuda_train_tiny.aether` now
+   exits 0 through real GPU training (was skipped on the previous
+   default build).
+2-5. SafeTensors multi-tensor / Q4_K_M dequant / tokenizer.json
+   loader / chat_template.jinja loader — all on the matt-voice
+   serving-deploy critical path; none touch the matmul hot path.
+
+The 2026-05-03 matmul bench stays the standing reference. The
+expected next bench row appears when:
+- (a) someone reruns `bench/matmul_micro/run_all.ps1` AFTER the
+  cuda-feature rebuild to compare cuBLAS sgemm vs the 2026-05-03
+  reference (which was already cuda-built, so should be ±noise);
+- (b) the FR-19.16-extra path actually loads Llama-1B weights
+  and runs the inference bench through cuBLAS — that row goes
+  under `bench/llama_inference`.
+
 ### 2026-05-19 — pending commit (Phase 19 closeout — 13 items): skipped (additive, no matmul / SDPA / LN path touched)
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. 13 new runtime symbols across PKV-sim / CB-sim / specdec / MM-sim / rate-limit / observability / image-preprocess / DFT+Hann / ChaCha20-Poly1305 / HTTP-parse+write / OpenAI-JSON-render / WS-frame-codec / tool-call-render. Pure CPU code; no GPU; no matmul; no SDPA / LN. Matmul bench is untouched. Real bench fixtures gating on the closeout items live behind their own FR-19.x-extras (e.g. real cross-card NCCL for the PKV+CB chain, real TLS handshake for HTTP+OpenAI). Standing 2026-05-03 matmul row remains the reference.

@@ -1,0 +1,34 @@
+// roadmap: P19.9
+// expect: exit=42
+//
+// FR-19.9-extra — HF tokenizer.json loader. matt-voice's Qwen2.5
+// deploy uses this exact path: download tokenizer.json + walk vocab
+// + walk merges → registered BPE tokenizer ready to encode prompts.
+//
+// Tiny tokenizer JSON loaded inline; 4 merges expected.
+use runtime;
+
+extern fn aether_copy_cstr(dst: i64, cstr: i64, max: i32) -> i32;
+extern fn aether_bpe_tokenizer_new() -> i64;
+extern fn aether_bpe_tokenizer_free(h: i64) -> i32;
+extern fn aether_tokenizer_json_load(h: i64, json: i64, n: i32) -> i32;
+
+fn main() -> i32 {
+    let buf: i64 = aether_alloc_bytes(512);
+    let n: i32 = aether_copy_cstr(
+        buf,
+        "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"h\":1,\"e\":2,\"l\":3,\"o\":4,\"he\":5,\"hel\":6,\"hell\":7,\"hello\":8},\"merges\":[[\"h\",\"e\"],[\"he\",\"l\"],[\"hel\",\"l\"],[\"hell\",\"o\"]]}}",
+        500,
+    );
+    if n <= 0 { return 1; }
+
+    let bh: i64 = aether_bpe_tokenizer_new();
+    if bh < 0 { return 2; }
+
+    let n_loaded: i32 = aether_tokenizer_json_load(bh, buf, n);
+    if n_loaded != 4 { return 10 + n_loaded; }
+
+    aether_bpe_tokenizer_free(bh);
+    aether_free_bytes(buf, 512);
+    42
+}

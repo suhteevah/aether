@@ -9,7 +9,63 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, Phase 19 hits 100% — FR-19.16 partial)
+## Closed this batch (2026-05-19, matt-voice deploy pack — 5 extras)
+
+Targeted the FR-x-extras from the prior commit's "remaining gates"
+list. Audit count stays 169/196 because all 4 code extras tag
+already-witnessed primary FRs — the right kind of "extras filled
+out" progress.
+
+- **cuda feature build (config)** — `cargo build -p aether_rt
+  --features cuda` succeeds on kokonoe (CUDA toolkit v12.6 + cudarc
+  0.13). `libaether_rt.a` now contains 39507 cuBLAS symbol matches.
+  `cuda_train_tiny.aether` goes from skipped → `OK exit=0` through
+  real GPU training.
+- **FR-17.19-extra** — SafeTensors multi-tensor parser:
+  `aether_safetensors_n_tensors` / `_get_shape` / `_get_dtype`.
+  Dtype enum F32=0, F16=1, BF16=2, I32=3, I16=4, U8=5, I64=6.
+  Witness `safetensors_multi.aether` builds a 2-tensor blob and
+  verifies all 3 lookups.
+- **FR-17.14-extra** — Q4_K_M dequant (Qwen2.5-7B format).
+  Real ggml super-block layout: 144 bytes / 256 quants / f16 d +
+  f16 dmin + 12 packed 6-bit scales-and-mins + 128 nibble-packed
+  quants. `q4k_get_scale_min` replicates ggml's `get_scale_min_k4`.
+  Witness `q4_k_dequant.aether` verifies hand-crafted sub-block 0
+  outputs match (l & 0xF).
+- **FR-19.9-extra** — HF tokenizer.json loader. Hand-walks the
+  `vocab` object + `merges` array, registers tokens at their
+  explicit HF ids (essential for matt-voice's Qwen2.5 weight
+  indexing). 3 new fns: `aether_bpe_add_token_with_id`,
+  `aether_bpe_add_merge_by_id`, `aether_tokenizer_json_load`.
+  Witness `tokenizer_json_load.aether` loads a tiny BPE JSON and
+  verifies n_merges == 4.
+- **FR-19.10-extra** — `chat_template.jinja` file loader.
+  `aether_template_render_from_file` wraps `std::fs::read` + the
+  render engine. Witness `chat_template_from_file.aether` writes
+  → reads → renders → verifies output.
+
+**Plus**: `aether_copy_cstr` helper for moving NUL-terminated
+string literals from `.rdata` (where `Expr::StrLit` lowers them)
+into heap buffers — unblocks witnesses that need to pass multi-
+char literals to extern fns without per-byte `aether_byte_set`.
+
+honesty-auditor verdict: 7/7 claims verified, zero false. All four
+deepening extras ship real impls (no stubs); cuda build is a
+configuration win confirmed by 39507 cuBLAS-symbol matches in
+libaether_rt.a + cuda_train_tiny going from skipped to exit=0.
+
+**Remaining matt-voice-critical extras NOT shipped this batch**:
+- FR-19.1-extra: full TLS 1.3 handshake (HMAC-SHA256 + X25519 +
+  Ed25519 + AES-GCM + state machine). XL effort.
+- FR-17.19-extra (deeper): real Llama-1B SafeTensors weight load
+  (the 1.3 GiB bundle download + mmap'd weight access).
+- FR-19.5-extra: real continuous-batching wiring through cuda
+  matmul (vs the in-process sim already shipped).
+- FR-18.1-extra: real libnccl link for cross-card collectives.
+- FR-19.16-extra: full Llama-1B inference at >100 tok/s on the
+  3070 Ti (the v4 SHIP gate — composite of the above).
+
+## Closed earlier (2026-05-19, Phase 19 hits 100% — FR-19.16 partial)
 
 - **P19.16 / FR-19.16 (partial)** — Llama-architecture inference
   bench achieving ≥100 tok/s. New runtime fn

@@ -1,0 +1,58 @@
+// roadmap: P19.10
+// expect: exit=42
+//
+// FR-19.10-extra — chat_template.jinja file loader. Reads a template
+// from disk via aether_template_render_from_file (wrapping
+// aether_read_file + the render engine), verifies it renders the
+// expected output.
+use runtime;
+
+extern fn aether_copy_cstr(dst: i64, cstr: i64, max: i32) -> i32;
+extern fn aether_write_file(path: i64, buf: i64, n: i32) -> i32;
+extern fn aether_template_new() -> i64;
+extern fn aether_template_free(h: i64) -> i32;
+extern fn aether_template_push_message(h: i64, role: i64, n_role: i32, content: i64, n_content: i32) -> i32;
+extern fn aether_template_render_from_file(h: i64, path: i64, n_path: i32, out: i64, max_out: i32) -> i32;
+
+fn main() -> i32 {
+    // Path for the temp jinja file (NUL-terminated for aether_write_file's
+    // C-string interface).
+    let path: i64 = aether_alloc_bytes(64);
+    let path_n: i32 = aether_copy_cstr(path, "scratch/_chat_tpl_fr_extra.jinja", 64);
+    aether_byte_set(path, path_n as i64, 0);  // null-terminate
+
+    // Template contents.
+    let tpl: i64 = aether_alloc_bytes(128);
+    let tpl_n: i32 = aether_copy_cstr(
+        tpl,
+        "{% for msg in messages %}[{{ msg.role }}: {{ msg.content }}]{% endfor %}",
+        128,
+    );
+
+    if aether_write_file(path, tpl, tpl_n) != 0 { return 1; }
+
+    let h: i64 = aether_template_new();
+    if h < 0 { return 2; }
+
+    let role: i64 = aether_alloc_bytes(8);
+    let role_n: i32 = aether_copy_cstr(role, "user", 8);
+    let content: i64 = aether_alloc_bytes(8);
+    let content_n: i32 = aether_copy_cstr(content, "hi", 8);
+    aether_template_push_message(h, role, role_n, content, content_n);
+
+    let out: i64 = aether_alloc_bytes(128);
+    let n: i32 = aether_template_render_from_file(h, path, path_n, out, 128);
+    if n != 10 { return 3; }  // "[user: hi]"
+
+    if aether_byte_at(out, 0) != 91  { return 4; }   // '['
+    if aether_byte_at(out, 1) != 117 { return 5; }   // 'u'
+    if aether_byte_at(out, 9) != 93  { return 6; }   // ']'
+
+    aether_template_free(h);
+    aether_free_bytes(path, 64);
+    aether_free_bytes(tpl, 128);
+    aether_free_bytes(role, 8);
+    aether_free_bytes(content, 8);
+    aether_free_bytes(out, 128);
+    42
+}

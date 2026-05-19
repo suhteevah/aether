@@ -1,0 +1,76 @@
+// roadmap: P17.14
+// expect: exit=42
+//
+// FR-17.14-extra — Q4_K_M dequant kernel (the Qwen2.5-7B format).
+//
+// ggml Q4_K super-block layout (144 bytes / 256 quants):
+//   bytes 0..2    : f16 d     (super-block scale)
+//   bytes 2..4    : f16 dmin  (super-block min)
+//   bytes 4..16   : packed 6-bit scales (8) + mins (8)
+//   bytes 16..144 : 128 bytes of 4-bit quants
+//
+// We hand-build ONE super-block with:
+//   d = 1.0 (f16 0x3C00)
+//   dmin = 0.0
+//   scales[0] = 0x01, scales[4] = 0x00 → sub-block 0 has scale=1, min=0
+//   quants[0..32]: low nibbles = 0..15..0..15 (sub-block 0)
+//
+// Expected sub-block 0 dequant: out[l] = 1 * 1 * (l & 0xF) - 0 = l & 0xF.
+// We verify out[0..16] match 0..15.
+//
+// SCOPE: this is the algorithm proof. Real Qwen2.5-7B GGUF parse +
+// per-tensor block iteration is FR-17.14-extra-deeper (the GGUF
+// reader at FR-17.14's main slot).
+use runtime;
+
+extern fn aether_dequant_q4_k_m(blocks: i64, out: i64, n_blocks: i32) -> i32;
+
+fn main() -> i32 {
+    let block: i64 = aether_alloc_bytes(144);
+    // d = 1.0 (f16 0x3C00, little-endian).
+    aether_byte_set(block, 0, 0x00);
+    aether_byte_set(block, 1, 0x3C);
+    // dmin = 0.0
+    aether_byte_set(block, 2, 0x00);
+    aether_byte_set(block, 3, 0x00);
+    // scales[0] = 0x01 (sub-block 0 scale = 1 & 63 = 1)
+    aether_byte_set(block, 4 + 0, 0x01);
+    // scales[4] = 0x00 (sub-block 0 min = 0 & 63 = 0)
+    aether_byte_set(block, 4 + 4, 0x00);
+    // Other scales/mins zero (irrelevant for this witness; we only
+    // check sub-block 0 outputs).
+    // Quants: bytes 16..47 (sub-block 0 = 32 quants from low nibbles
+    // of qs[0..31]; sub-block 1 = 32 quants from high nibbles).
+    // Set qs[l] low = l & 0xF (so dequant of sub-block 0 quants is 0..15..0..15)
+    // and qs[l] high = (l + 1) & 0xF (irrelevant; sub-block 1 with
+    // unknown scale will give some other value).
+    let mut l: i32 = 0;
+    while l < 32 {
+        let lo: i32 = l & 0x0F;
+        let hi: i32 = (l + 1) & 0x0F;
+        aether_byte_set(block, (16 + l) as i64, (lo | (hi << 4)) as i64);
+        l = l + 1;
+    }
+    // Remaining bytes (48..144) zero. aether_alloc_bytes already
+    // zero-inits.
+
+    let out: i64 = aether_alloc_f32(256);
+    if aether_dequant_q4_k_m(block, out, 1) != 0 { return 1; }
+
+    // Verify sub-block 0 (out[0..32]) matches 0..15..0..15.
+    let mut i: i32 = 0;
+    while i < 32 {
+        let expected: f32 = f32(i & 0x0F);
+        let got: f32 = aether_load_f32(out, i);
+        if aether_abs_f32(got - expected) > 0.000001 {
+            aether_free_bytes(block, 144);
+            aether_free_f32(out, 256);
+            return 10 + i;
+        }
+        i = i + 1;
+    }
+
+    aether_free_bytes(block, 144);
+    aether_free_f32(out, 256);
+    42
+}
