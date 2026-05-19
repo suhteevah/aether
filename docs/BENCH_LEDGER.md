@@ -37,6 +37,10 @@ Bench-runner subagent invoked under the append rule (commit touches `compiler/sr
 
 Bench-runner append rule fires because the commit touches both `compiler/src/codegen/asm/` and `runtime/src/lib.rs`. The asm-backend addition is a new compiler-recognized builtin `__aether_avx2_dot_f32` that inlines an AVX2 dot loop using new VEX-encoded ops (`vxorps`/`vmovups`/`vmulps`/`vaddps`/`vzeroupper`). The runtime additions are three witness-only helpers (`aether_avx2_witness_arr`, `aether_dot_f32_scalar`, `aether_f32_close_exit`) — none of them appear on any standing bench path. The matmul benches drive `aether_op_matmul_f32` through cuBLAS, which this commit does not change. Expected delta vs the 2026-05-03 row: zero. A standalone "1024-elem f32 dot AVX2 vs scalar" bench fixture is the right place to record the per-instruction headline — that fixture doesn't exist yet; deferred. The 2026-05-03 row remains the standing reference.
 
+### 2026-05-19 — pending commit (FR-17.3 conv2d CPU reference): skipped (additive new fn, no matmul path touched)
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched. The change is purely additive — a new `aether_op_conv2d_f32` direct-loop reference impl and two unit tests in a new `conv2d_tests` mod. No existing matmul / softmax / layer_norm / SDPA / CE code path is altered. The `bench/conv2d/` section of this ledger has a "planned" line gating on `aether_op_conv2d_*` shipping in `runtime/src/cuda.rs` — that's the appropriate row to fill in once cuDNN-or-equivalent lands. CPU direct-loop conv2d is a correctness reference, not a perf path. The 2026-05-03 matmul row remains the standing reference.
+
 ## bench/conv2d — 3-way (planned, gates on P7.3)
 
 Pending — fires once `aether_op_conv2d_*` ships in `runtime/src/cuda.rs`.

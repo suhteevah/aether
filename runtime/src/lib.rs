@@ -114,6 +114,62 @@ pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
     _m: c_int, _k: c_int, _n: c_int,
 ) -> c_int { /* Phase 1 — bf16 path */ 0 }
 
+/// FR-17.3 — 2D convolution (CPU reference, direct loops).
+///
+/// Layout: NCHW for input + output, KH×KW for kernel. Stride = 1,
+/// padding = 0, dilation = 1, groups = 1. No bias (caller may add).
+///
+/// Input  shape: `(n, c_in, h, w)`     — `n * c_in * h * w` f32 elements.
+/// Kernel shape: `(c_out, c_in, kh, kw)` — `c_out * c_in * kh * kw` f32.
+/// Output shape: `(n, c_out, h_out, w_out)` where
+///   `h_out = h - kh + 1`, `w_out = w - kw + 1`. Caller pre-allocates.
+///
+/// Returns 0 on success, non-zero on shape-invalid input. This is the
+/// reference scalar impl — im2col + sgemm and cuDNN are FR-17.3 follow-ons.
+#[no_mangle] pub unsafe extern "C" fn aether_op_conv2d_f32(
+    input: *const c_void,
+    kernel: *const c_void,
+    output: *mut c_void,
+    n: c_int, c_in: c_int, h: c_int, w: c_int,
+    c_out: c_int, kh: c_int, kw: c_int,
+) -> c_int {
+    if input.is_null() || kernel.is_null() || output.is_null() { return 1; }
+    if n <= 0 || c_in <= 0 || h <= 0 || w <= 0
+        || c_out <= 0 || kh <= 0 || kw <= 0 { return 2; }
+    if kh > h || kw > w { return 3; }
+    let h_out = (h - kh + 1) as usize;
+    let w_out = (w - kw + 1) as usize;
+    let (n, c_in, h, w) = (n as usize, c_in as usize, h as usize, w as usize);
+    let (c_out, kh, kw) = (c_out as usize, kh as usize, kw as usize);
+    let in_buf  = std::slice::from_raw_parts(input  as *const f32, n * c_in * h * w);
+    let k_buf   = std::slice::from_raw_parts(kernel as *const f32, c_out * c_in * kh * kw);
+    let out_buf = std::slice::from_raw_parts_mut(output as *mut f32, n * c_out * h_out * w_out);
+
+    for ni in 0..n {
+        for co in 0..c_out {
+            for oh in 0..h_out {
+                for ow in 0..w_out {
+                    let mut acc: f32 = 0.0;
+                    for ci in 0..c_in {
+                        for ki in 0..kh {
+                            for kj in 0..kw {
+                                let ih = oh + ki;
+                                let iw = ow + kj;
+                                let in_idx = ((ni * c_in + ci) * h + ih) * w + iw;
+                                let k_idx  = ((co * c_in + ci) * kh + ki) * kw + kj;
+                                acc += in_buf[in_idx] * k_buf[k_idx];
+                            }
+                        }
+                    }
+                    let out_idx = ((ni * c_out + co) * h_out + oh) * w_out + ow;
+                    out_buf[out_idx] = acc;
+                }
+            }
+        }
+    }
+    0
+}
+
 #[no_mangle] pub unsafe extern "C" fn aether_op_add_f32(
     a: *const c_void, b: *const c_void, out: *mut c_void, n: c_int,
 ) -> c_int {
@@ -4054,5 +4110,59 @@ mod heap_extras_tests {
             assert_eq!(aether_chan_i64_recv(c, &mut out as *mut i64 as i64), 0);
             aether_chan_i64_free(c);
         }
+    }
+}
+
+#[cfg(test)]
+mod conv2d_tests {
+    use super::*;
+
+    /// 1×1×4×4 input (sequential 1..16) convolved with a 1×1×3×3 kernel of
+    /// all 1s produces a 1×1×2×2 output whose four cells sum the
+    /// corresponding 3×3 window of the input. Hand-computed values are:
+    ///   out[0,0] = 1+2+3+5+6+7+9+10+11 = 54
+    ///   out[0,1] = 2+3+4+6+7+8+10+11+12 = 63
+    ///   out[1,0] = 5+6+7+9+10+11+13+14+15 = 90
+    ///   out[1,1] = 6+7+8+10+11+12+14+15+16 = 99
+    #[test]
+    fn conv2d_f32_4x4_with_3x3_all_ones() {
+        let input: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+        let kernel: Vec<f32> = vec![1.0; 9];
+        let mut output: Vec<f32> = vec![0.0; 4];
+        unsafe {
+            let rc = aether_op_conv2d_f32(
+                input.as_ptr() as *const _,
+                kernel.as_ptr() as *const _,
+                output.as_mut_ptr() as *mut _,
+                1, 1, 4, 4,
+                1, 3, 3,
+            );
+            assert_eq!(rc, 0, "conv2d returned non-zero status");
+        }
+        assert_eq!(output, vec![54.0, 63.0, 90.0, 99.0],
+                   "conv2d output mismatch; got {:?}", output);
+    }
+
+    /// 2 input channels, 1 output channel — the per-channel partial sums
+    /// must add. Use channel 0 = all 1s, channel 1 = all 2s; kernel for
+    /// channel 0 = all 1s, kernel for channel 1 = all 1s. Each 3×3 window
+    /// sums to 9 (from channel 0) + 18 (from channel 1) = 27.
+    #[test]
+    fn conv2d_f32_two_in_channels_sum() {
+        let mut input: Vec<f32> = vec![1.0; 16];
+        input.extend(std::iter::repeat(2.0).take(16));  // channel 1
+        let kernel: Vec<f32> = vec![1.0; 18];           // 1 out * 2 in * 3*3
+        let mut output: Vec<f32> = vec![0.0; 4];
+        unsafe {
+            let rc = aether_op_conv2d_f32(
+                input.as_ptr() as *const _,
+                kernel.as_ptr() as *const _,
+                output.as_mut_ptr() as *mut _,
+                1, 2, 4, 4,
+                1, 3, 3,
+            );
+            assert_eq!(rc, 0);
+        }
+        assert_eq!(output, vec![27.0; 4]);
     }
 }

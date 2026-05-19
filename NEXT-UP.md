@@ -9,7 +9,24 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-18, Path A complete — FR-15.{1,2,3})
+## Closed this batch (2026-05-19, Path C pickup — FR-17.3 conv2d CPU reference)
+
+- **P17.3 / FR-17.3** — 2D convolution, CPU direct-loop reference. New
+  `aether_op_conv2d_f32(input, kernel, output, n, c_in, h, w, c_out,
+  kh, kw)` in `runtime/src/lib.rs` (43 lines) with 7-nested-loop NCHW
+  direct convolution. Stride=1, padding=0, no dilation, no groups.
+  Returns 0 / 1 / 2 / 3 on null / bad-shape / kh-too-big. 2 new unit
+  tests verify hand-computed values: 1×1×4×4×[1..16] ⊛ 1×1×3×3×1s →
+  [54, 63, 90, 99]; 2-input-channel sum → 27s. Witness
+  `tests/runtime/conv2d_smoke.aether` (66 lines) goes through the
+  full `--emit=aether-bin` chain: 3505-byte .obj, exit=42 if all four
+  output cells match hand-computed reference. honesty-auditor verified
+  all 5 claims. **NOT shipped**: im2col+sgemm optimisation, cuDNN
+  feature gate, dilation, padding, depthwise, groups, transposed conv,
+  GPU `runtime/src/cuda.rs::aether_op_conv2d_f32`. Those are FR-17.3-
+  extra. **Audit 144→145/196; Phase 17: 18→19/20.**
+
+## Closed earlier (2026-05-18, Path A complete — FR-15.{1,2,3})
 
 - **P15.3 / FR-15.3** — AVX2 emit. New 256-bit VEX-encoded ops in
   `aether_asm/src/encode.rs`: `YmmReg` enum (Ymm0..Ymm7), 7 `Instr`
@@ -180,7 +197,7 @@ trains for N steps on a synthetic corpus, generates coherent tokens.*
 |---|---|---|---|---|
 | C1 | FR-17.1-extra | M | f16/bf16 dtype matrix (CPU + CUDA via tensor cores) | C5, C6 |
 | C2 | FR-17.13 | L | RoPE + FlashAttention v2 (memory-efficient causal) | C6 |
-| C3 | FR-17.3 | L | conv1d/2d/3d via im2col+sgemm OR cuDNN | (path-extra) |
+| C3 | FR-17.3 | L | conv1d/2d/3d via im2col+sgemm OR cuDNN — **CPU direct loop shipped 2026-05-19; im2col/cuDNN/dilation/padding/groups deferred to FR-17.3-extra** | (path-extra) |
 | C4 | FR-17.14-extra | L | GGUF reader + Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 + fused dequant matmul | C6, D-extra |
 | C5 | FR-17.18-extra | M | BatchNorm/Dropout/MultiheadAttention/TransformerEncoder layers (depends B1+B2) | C6 |
 | C6 | FR-17.19 | XL | `examples/llama_1b.aether` loads SafeTensors → matches HF reference within 1e-3 → trains | — |

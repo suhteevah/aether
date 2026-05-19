@@ -1,24 +1,20 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-18 (Path A complete — FR-15.1 + FR-15.2 + FR-15.3 all shipped same session)
+2026-05-19 (Path C pickup — FR-17.3 conv2d CPU reference shipped)
 
 ## Project Status
-🟢 **Audit: 144/196 (73%) roadmap items witnessed.** +3 from session
-baseline of 141/196. 0 errors, all workspace tests green (1 flaky TCP
-loopback that passes in isolation; not related to compiler changes).
-Honesty scan unchanged (4 known-OK stubs). **Path A's three L-effort
-items all shipped, all honesty-auditor verified.** The path that the
-prior handoff said was "real engineering each, picking one and doing
-it honestly beats three half-implementations" was completed cleanly:
-3-for-3 real impls, 23/23 honesty-auditor claims verified, zero
-false claims.
+🟢 **Audit: 145/196 (73%) roadmap items witnessed.** +1 from session
+baseline of 144/196. 0 errors, all workspace tests green (including 2
+new conv2d unit tests). Honesty scan unchanged (4 known-OK stubs).
+Path C kicked off with the cleanest audit-missing item: P17.3 (Phase
+17 is now 19/20 — only Llama-1B reference XL gate left in this phase).
 
 ```
 Phase 6-14: 78/78 witnessed (100%) — unchanged
-Phase 15:    8/10 witnessed (80%)  ← +3 (FR-15.1 + FR-15.2 + FR-15.3)
+Phase 15:    8/10 witnessed (80%)  — unchanged (Path A complete on 5/18)
 Phase 16:   22/25 witnessed (88%)  — unchanged
-Phase 17:   18/20 witnessed (90%)  — unchanged
+Phase 17:   19/20 witnessed (95%)  ← +1 (FR-17.3 conv2d CPU reference)
 Phase 18:    2/11 witnessed (18%)  — unchanged
 Phase 19:    0/16 witnessed (0%)   — unchanged
 Phase 20:    7/10 witnessed (70%)  — unchanged
@@ -26,191 +22,143 @@ Phase 21:    4/10 witnessed (40%)  — unchanged
 Phase 22:    6/10 witnessed (60%)  — unchanged
 Phase 23:    2/6  witnessed (33%)  — unchanged
 Phase 24:    7/10 witnessed (70%)  — unchanged
-TOTAL:    144/196 (73%)
+TOTAL:    145/196 (73%)
 ```
 
-Workspace tests: 125 pass (3 ssa_drive + 3 regalloc_plan + 9 new AVX2
-byte tests + 110 previous). Honesty scan: 0 todo / 0 unimplemented /
-4 known carry-over stubs.
+Workspace tests: 127 pass (3 ssa_drive + 3 regalloc_plan + 9 AVX2
+encoder + 2 new conv2d + 110 previous). Honesty scan: 0 todo /
+0 unimplemented / 4 known carry-over stubs.
 
 ## What Was Done This Session
 
-### FR-15.3 — AVX2 emit (real impl, honesty-auditor verified)
+### FR-17.3 — conv2d CPU reference (real impl, honesty-auditor verified)
 
-The compiler now drives 256-bit AVX2 instructions from `.aether`
-source through the full aetherc → asm-text → aether-asm → bytes
-chain. The shipped capability is *correctness* — perf measurement
-is deferred to a future bench fixture.
+The Path C audit had exactly 2 missing items: P17.3 (convolutions, L
+effort) and P17.19 (Llama-1B reference, XL gate). FR-17.3 was the
+cleanest self-contained shippable.
 
-**`aether_asm/src/encode.rs` additions:**
-- `pub enum YmmReg { Ymm0..Ymm7 }` (limited to the subset that fits
-  in the 2-byte VEX prefix; ymm8..ymm15 require the 3-byte C4
-  prefix and are deferred).
-- 7 new `Instr` variants — `VxorpsYmmYmmYmm`, `VmovupsMemToYmm`,
-  `VmovupsYmmToMem`, `VaddpsYmmYmmYmm`, `VmulpsYmmYmmYmm`,
-  `VmovupsYmmToRspNoDisp` (the rsp form needs a SIB byte because
-  rsp can't be encoded directly in ModRM.r/m), `Vzeroupper`.
-- 9 byte-exact unit tests verified against Intel SDM Vol. 2.
-- Each variant's doc comment explains the encoding (VEX byte
-  layout, ModRM bit map, when SIB is needed).
+**Pre-audit state**: Path C status was largely "witnessed by stamp"
+already — P17.1 (f16/bf16) has a real conversion-round-trip witness
+(`dtype_half_round_trip.aether`); P17.13 (attention) has
+`cuda_attention.aether` exercising real Q/K/V + softmax + matmul;
+P17.14 (GGUF) has `gguf_header.aether` parsing the first 24 bytes
+(quant dequant deferred); P17.18 (layer modules) is integer-only
+(`layer_modules.aether`); P17.19 (Llama-1B) is the unwitnessed XL
+gate. The decision was to fill the P17.3 slot honestly rather than
+chase the Llama-1B XL.
 
-**`aether_asm/src/parse.rs` additions:**
-- `parse_ymm` helper (only ymm0..ymm7).
-- Mnemonic arms for `vxorps`, `vaddps`, `vmulps`, `vmovups`,
-  `vzeroupper`. The 3-operand AT&T order is `src2, src1, dst`
-  (matches binutils convention).
-- `vmovups` recognises three forms: `disp(%base), %ymm` (load),
-  `%ymm, disp(%base)` (store), `%ymm, (%rsp)` (no-disp SIB store).
-- Size table `synthetic_text_size` synced — all 7 sizes match
-  the encoder's byte counts exactly.
+**`runtime/src/lib.rs` additions (43-line impl + 2 unit tests):**
+- `pub unsafe extern "C" fn aether_op_conv2d_f32(input, kernel,
+  output, n, c_in, h, w, c_out, kh, kw) -> c_int` — NCHW direct
+  convolution via 7 nested scalar loops. Stride=1, padding=0, no
+  dilation, no groups. Returns 0/1/2/3 on success / null /
+  invalid-shape / kh-or-kw-too-big.
+- Unit test `conv2d_f32_4x4_with_3x3_all_ones` — 1×1×4×4 input
+  [1..16] convolved with 1×1×3×3 all-1s kernel produces exactly
+  [54, 63, 90, 99] (hand-computed window sums).
+- Unit test `conv2d_f32_two_in_channels_sum` — 2 input channels
+  (ch0 all-1s, ch1 all-2s) with all-1s kernel sums per-channel
+  partial dots: every output cell = 9 + 18 = 27.
 
-**`compiler/src/codegen/asm/mod.rs` integration:**
-- Inside the `Expr::Call` arm, after the `println` special-case and
-  before the standard call codegen, the call name
-  `__aether_avx2_dot_f32` (with exactly 3 args) triggers an inline
-  AVX2 dot loop. Args (each `TyKind::Int`) get evaluated and moved
-  into `%rcx` (a_ptr), `%rdx` (b_ptr), `%r8` (n).
-- Loop body: `vxorps %ymm0,%ymm0,%ymm0` (acc init), `xorq %rax,%rax`
-  (index), labelled loop emitting `vmovups 0(%rcx),%ymm1`,
-  `vmovups 0(%rdx),%ymm2`, `vmulps %ymm2,%ymm1,%ymm1`,
-  `vaddps %ymm1,%ymm0,%ymm0`, `addq $32` strides, `addq $8` index,
-  `cmpq+jne` tail.
-- Horizontal-sum epilogue: `subq $32,%rsp`, `vmovups %ymm0,(%rsp)`,
-  `vzeroupper`, then 8-way scalar `movss+addss` sum into `%xmm0`,
-  `addq $32,%rsp`. Returns `Ok(TyKind::F32)`.
+**Witness — `tests/runtime/conv2d_smoke.aether`** (66 lines, exit=42):
+- Declares `extern fn aether_op_conv2d_f32(...)` matching runtime.
+- Allocates 16-elem input + 9-elem kernel + 4-elem output (all f32
+  via `aether_alloc_f32`).
+- Fills input with `1..16` using `aether_store_f32(input, i, f32(i+1))`.
+- Calls conv2d with `(1, 1, 4, 4, 1, 3, 3)` shape args.
+- Reads 4 outputs via `aether_load_f32`, compares each to
+  hand-computed 54/63/90/99, returns distinct error code per cell
+  on mismatch.
+- Builds through the full `aetherc → aether-asm → aether-bin`
+  chain (3505-byte .obj). Exit=42 on first run.
 
-**`runtime/src/lib.rs` witness helpers:**
-- `aether_avx2_witness_arr(seed, n) -> i64` — allocates n f32 slots
-  via `aether_alloc_bytes`, fills deterministically from an LCG.
-- `aether_dot_f32_scalar(a, b, n) -> f32` — reference scalar dot.
-- `aether_f32_close_exit(a, b) -> i32` — returns 42 if values
-  agree within 1e-3 relative tolerance, else 1.
-
-**Witness — `tests/runtime/avx2_dot_f32.aether`:** declares the
-four needed externs (the three above + `aether_free_bytes`), calls
-`__aether_avx2_dot_f32(a_ptr, b_ptr, 1024)`, compares to scalar
-reference, frees buffers, returns the exit code. Builds via the
-`--emit=aether-bin` audit chain → 1078-byte `.obj` → linked exe
-that exits 42.
-
-honesty-auditor verified all 8 claims with file:line + reproduced
-byte literals + command output. **Zero false claims.**
-
-### FR-15.1 + FR-15.2 (earlier this session)
-
-[See prior handoff and `git log` at commits 32784f7 + ffb2336 for
-full write-ups; nothing changed since.]
+honesty-auditor verified all 5 claims with file:line evidence and
+reproduced command output. **Zero false claims.**
 
 ### Bench
 
-Bench-runner append rule fires for commits touching
-`compiler/src/codegen/asm/` or `runtime/src/lib.rs`. **Both** were
-touched by FR-15.3. Skip note appended to `BENCH_LEDGER.md` with
-the honest reasoning: the matmul benches drive
-`aether_op_matmul_f32` via cuBLAS — a path this commit does NOT
-change. The new AVX2 builtin and witness helpers don't sit on the
-matmul bench path. A standalone "f32 dot AVX2 vs scalar" bench is
-the right place to measure the per-instruction headline; that
-fixture doesn't exist yet.
+Bench-runner append rule fires on `runtime/src/lib.rs` touched. Skip
+note appended: this is a purely additive change (new fn + new unit
+test mod); no matmul / softmax / layer_norm code path is altered.
+The standing 2026-05-03 matmul row remains the reference. The right
+place to log conv2d perf is the `bench/conv2d/` section's planned
+row, which gates on a `runtime/src/cuda.rs::aether_op_conv2d_f32`
+landing — not on this CPU reference impl.
 
 ## Current State
 
 **Working:**
-- 144/196 roadmap-tagged witnesses pass via `aetherc --emit=aether-bin`.
-- Workspace tests: 125 passing.
+- 145/196 roadmap-tagged witnesses pass via `aetherc --emit=aether-bin`.
+- Workspace tests: 127 passing.
 - Audit: `errors: 0` clean.
-- `--O1` does SSA-driven AST rewrite + callee-saved reg promotion.
-- The asm backend can drive AVX2 inline from `.aether` source via
-  the recognised `__aether_avx2_dot_f32` builtin.
-- Path A foundation done: SSA → opt → emit, regalloc-in-emit,
-  AVX2 encoder. The next step (FR-15.10 hand-asm gate) only
-  needs a bench fixture, not new compiler engineering.
+- Phase 17 is 19/20 — only the Llama-1B XL gate (P17.19) is
+  unwitnessed.
+- Path C foundation: f16/bf16 conversions, GGUF header parse,
+  SafeTensors round-trip, attention forward, layer modules,
+  optimizers — all witnessed and the runtime ops are real impls
+  (subject to per-witness scope caveats listed in NEXT-UP).
+- conv2d direct-loop CPU reference works; ready for the
+  im2col+sgemm and cuDNN follow-ons.
 
 **Honest scaffold-vs-shipped notes:**
-- FR-15.3 ships *correctness* through the compile chain, not perf.
-  The "1024-elem f32 dot ≥4× faster" claim is unverified — no
-  comparison bench exists yet. The encoder + parser + compiler-
-  side emit are all real; the speed-up claim is the next step.
-- Only one AVX2 pattern is recognised today: the
-  `__aether_avx2_dot_f32` builtin. General for-loop vectorisation
-  via pattern detection (turning a `for i in 0..N { acc[i] = a[i] +
-  b[i] }` body into AVX2 emit) is the next iteration.
-- `YmmReg` is limited to ymm0..ymm7 (2-byte VEX). ymm8..ymm15
-  require 3-byte VEX (C4 prefix); deferred.
-- AVX-512 (zmm regs, EVEX prefix) is not started.
-- FR-15.2 ships wiring but not the 30% obj-shrink perf headline.
-- The SSA driver only fires when the linearised prefix is the
-  whole body.
-- v3's vectorize_drive still only reports counts; vectorisation
-  doesn't drive asm emit yet — FR-15.3 covers ONE recognised path
-  via builtin, not pattern-driven loop vectorisation.
-- Matmul hot loop still doesn't consult P15.6's autotune table.
-- Capturing closures used in pass-as-value position still
-  mis-codegen.
+- FR-17.3 ships ONLY the CPU direct-loop scope. The wider FR (im2col
+  + sgemm, cuDNN behind feature gate, dilation, padding, depthwise,
+  groups, transposed conv, conv1d/conv3d) is FR-17.3-extra.
+- The GPU side (`runtime/src/cuda.rs::aether_op_conv2d_f32`) is
+  not implemented. The new fn is CPU-only.
+- P17.14 (GGUF) has a header-parse witness; Q4_0/Q4_K/Q5_K/Q6_K/Q8_0
+  dequant + AWQ + GPTQ + INT8 QAT are NOT shipped.
+- P17.18 (layer modules) witness uses integer math (no f32 array
+  primitives needed); the f32 transformer block lives in
+  `cuda_train_transformer_block.aether` and reuses the runtime ops.
+- P17.13 (attention) witness uses naive softmax-attention. Memory-
+  efficient FlashAttention v2 / PagedAttention is NOT shipped.
 
 ## Blocking Issues
 
 None. Audit reports `errors: 0`. Honesty scan flags 4 known-OK stubs
 (unchanged across the session): `mir/fuse.rs:53`, `mir/spec.rs:161`,
-`runtime_pe/src/lib.rs:59` (no_std stub), `runtime_pe/src/lib.rs:443`
-(panic=abort glue).
-
-Flaky `tcp_send_recv_loopback` in `aether_rt::tests` fails ~10% under
-workspace-wide parallel run; passes 100% in isolation. Not related
-to compiler changes.
+`runtime_pe/src/lib.rs:59`, `runtime_pe/src/lib.rs:443`.
 
 ## What's Next
 
-Path A is materially complete. Recommended next targets:
+`NEXT-UP.md` is the queue. Path C still has two un-witnessed long-
+tail FRs (Llama-1B XL gate; FR-17.3-extra deepening of conv2d):
 
-1. **Path A — FR-15.10 hand-asm reference gate (M)**. Write
-   hand-tuned AVX2 reference asm for matmul/softmax/LN/SDPA/CE in
-   `bench/handasm/`, measure aether's `--O2` emit within 1% wall
-   on 11900K + 3070 Ti. This is the gating witness that says "v4
-   perf shipped" — but it depends on actually wiring AVX2 into the
-   matmul caller-side, which needs the loop-vectoriser, which is
-   either FR-15.3-extra (extend the recognised-builtin set) or a
-   real pattern-detector pass.
-2. **Path C — Tensor stack toward v4 SHIP**: FR-17.1-extra f16/bf16
-   (M) → FR-17.13 RoPE + FlashAttention (L) → FR-17.14-extra GGUF
-   + quant (L) → FR-17.19 Llama-1B reference (XL gate).
-3. **Path D — Serving**: FR-19.1 TLS 1.3 (XL, long pole).
-4. **Path E — Self-host**: FR-20.4 self-hosted asm emitter (XL).
-5. **Path F — Tooling**: FR-22.1 LSP (L), FR-22.2 DAP (M).
+1. **Path C — FR-17.14 quant dequant (L)**. Real Q4_0/Q4_K dequant
+   kernels in the runtime. Unblocks Llama-1B GGUF inference. Fewer
+   pieces than Llama-1B itself.
+2. **Path C — FR-17.13-extra FlashAttention v2 (L)**. Memory-
+   efficient causal attention. The current witness exercises naive
+   attention only.
+3. **Path C — FR-17.19 Llama-1B reference (XL gate, v4 SHIP)**.
+   `examples/llama_1b.aether` loads SafeTensors → matches HF
+   reference within 1e-3 → trains. Depends on FR-17.18 layer modules
+   in real f32 (not the integer witness shipped today).
+4. **Path D — FR-19.1 TLS 1.3 (XL, long pole)**.
+5. **Path E — FR-20.4 self-hosted asm emitter (XL)**.
+6. **Path F — FR-22.1 LSP server (L)**.
 
 ## Notes for Next Session
 
-- **Three Path A L items in one session is a real achievement.**
-  All three honesty-auditored, all three commits standalone, all
-  three roadmap-witnessed. Resist the temptation to claim more
-  than what was honestly shipped — FR-15.3 ships *correctness*,
-  not the perf headline.
-- **Don't fake the FR-15.10 gate.** The 1%-of-handasm pact needs
-  real hand-asm references in `bench/handasm/` and a comparison
-  bench that produces honest numbers on the 11900K + 3070 Ti.
-  Stamping it without that work would burn audit honesty.
-- **VEX encoding fundamentals are now in the codebase.** If you
-  extend to ymm8..ymm15 you need 3-byte VEX (C4 prefix). The
-  current `assert_eq!(base.extension(), 0, ...)` and
-  `parse_ymm` `ymm0..ymm7` limit catch attempts to use the upper
-  bank — bypass them carefully.
-- **The compiler-recognised builtin pattern works.** Adding more
-  AVX2 operations is now a matter of (a) extending the encoder
-  with the new Instr variant, (b) extending the parser arm, (c)
-  syncing the size table, (d) recognising the call name in
-  `Expr::Call`, (e) emitting the inline asm text. Each new
-  builtin is ~30 lines of compiler integration.
-- **`aether-asm` and `libaether_rt.a` rebuild separately.** After
-  adding mnemonics, `cargo build --bin aether-asm` is mandatory.
-  After adding runtime symbols, `cargo build -p aether_rt` is
-  mandatory. The `--emit=aether-bin` chain links against both;
-  stale binaries surface as "unsupported instruction" or
-  "undefined reference" at link time.
-- **Closures-with-captures uses direct-call rewrite, not env structs.**
-- **`Stmt::Return` + `Expr::Try` early-return paths** must run the
-  same pop sequence as the natural epilogue — FR-15.2's r12..r15
-  push/pop discipline depends on this.
-- **No Python for tooling.** Rust binaries in `tools/` or pure Aether.
+- **Conv2d's direct-loop CPU impl is the reference, not the perf
+  path.** The im2col + matmul-of-Toeplitz route reuses the existing
+  `aether_op_matmul_f32` for the sgemm step — that's where any future
+  perf claim lives. The runtime test mod has 2 hand-computed-value
+  tests that any optimiser MUST agree with.
+- **`aether_alloc_f32(n)` returns 0 on n<=0 and on allocation failure.**
+  Witnesses should check for 0 before storing into the buffer.
+- **`f32(int)` cast inside Aether** works via the asm backend's
+  builtin numeric cast (recognised in `Expr::Call` for `f32`/`f64`/`i64`
+  with 1 arg). Use it instead of declaring more conversion externs.
+- **MS x64 ABI for 10-arg fns**: aether_op_conv2d_f32 takes 10 args
+  (3 pointers + 7 ints). Args 5+ go on the stack at `[rsp + 32 + (i-4)*8]`.
+  The compiler's call codegen handles this automatically; tested by
+  the conv2d_smoke witness arriving at exit=42.
+- **The 2 unwitnessed Phase 17 items now**: P17.3-extra (this
+  session's deferred wider FR scope) and P17.19 (Llama-1B XL gate).
+  Per the v4-SHIP definition in `memory/v4_ship_milestone.md`,
+  Llama-1B is the gate; everything else is long-tail polish.
 
 ## Quick Reference
 
@@ -221,14 +169,12 @@ Path A is materially complete. Recommended next targets:
 - Build runtime archive: `cargo build -p aether_rt`
 - v4 FR queue: `NEXT-UP.md` (organised by critical path A-F)
 - Compile a witness: `cargo run --bin aetherc -- tests/runtime/foo.aether --emit=aether-bin -o scratch/foo.exe`
-- AVX2 witness: `cargo run --bin aetherc -- tests/runtime/avx2_dot_f32.aether --emit=aether-bin -o scratch/avx2.exe; ./scratch/avx2.exe; echo $?`
+- Conv2d witness: `cargo run --bin aetherc -- tests/runtime/conv2d_smoke.aether --emit=aether-bin -o scratch/conv2d.exe`
 - Witness can pin opt-level: `// build-flags: --O1` at top of `.aether`
 - Flags: `--O0/--O1/--O2/--lto/--target=<triple>/--no-std/--reproducible/--incremental`
 
 ## Commits this session
 
 ```
-32784f7 Path A FR-15.1: SSA-driven opt pipeline rewrites AST at --O1
-ffb2336 Path A FR-15.2: regalloc plan drives r12..r15 promotion in asm backend
-(pending) Path A FR-15.3: AVX2 emit via aether_asm + compiler-recognised dot builtin
+(pending) Path C FR-17.3: conv2d CPU direct-loop reference + witness
 ```
