@@ -64,6 +64,7 @@ struct CudaCtx {
     dequant_q6_k_gpu:  CudaFunction,
     fused_q4k_matmul_seq1: CudaFunction,
     fused_q4k_matmul_seq1_v2: CudaFunction,
+    fused_q6k_matmul_seq1_v2: CudaFunction,
 }
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
@@ -752,6 +753,102 @@ extern "C" __global__ void fused_q4k_matmul_seq1_v2(
     }
 }
 
+// matt-voice / FR-17.14-extra-deepest — FUSED Q6_K matmul v2 for seq=1.
+//
+// Same pattern as fused_q4k_matmul_seq1_v2 but reading 210-byte
+// Q6_K super-blocks instead of 144-byte Q4_K.
+//
+// Per Q6_K super-block (256 outputs):
+//   - 2 n_outer halves, 4 sub_pos each = 8 (n_outer, sub_pos) combos
+//   - Each combo covers 32 contiguous output positions
+//
+// Lane mapping: all 32 lanes execute the SAME (n_outer, sub_pos) per
+// inner iteration. Each lane handles one quant. 8 iterations
+// (2 × 4) cover all 256 quants. No warp divergence.
+//
+// Per lane per super-block: 8 fma + 8 byte reads from W. No diverging
+// switch -- each iteration is a specialized code path because the
+// outer (n_outer, sub_pos) loops are compile-time constants under
+// #pragma unroll.
+extern "C" __global__ void fused_q6k_matmul_seq1_v2(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks)
+{
+    __shared__ float a_tile[256];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        a_tile[threadIdx.x] = a[bi * 256 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)ni * n_blocks * 210 + (size_t)bi * 210;
+            const unsigned char* ql = base;
+            const unsigned char* qh = base + 128;
+            const signed char*   sc = (const signed char*)(base + 192);
+            unsigned short d_bits = ((unsigned short)base[209] << 8) | (unsigned short)base[208];
+            float d = aether_f16_to_f32_dev(d_bits);
+
+            // 2 halves × 4 sub_pos. With unrolled iteration the (n_outer,
+            // sub_pos) values are compile-time constants, so the inner
+            // if-else cascade becomes 8 separate specialised code paths.
+            // All 32 lanes execute the same path at the same time = no
+            // intra-warp divergence.
+            #pragma unroll
+            for (int n_outer = 0; n_outer < 2; n_outer++) {
+                int ql_off = n_outer * 64;
+                int qh_off = n_outer * 32;
+                int sc_off = n_outer * 8;
+
+                #pragma unroll
+                for (int sub_pos = 0; sub_pos < 4; sub_pos++) {
+                    int l_iter = lane;  // 0..31
+                    int scale_idx = sc_off + (l_iter >> 4) + 2 * sub_pos;
+                    float sc_val = (float)sc[scale_idx];
+
+                    int q;
+                    if (sub_pos == 0) {
+                        unsigned char ql_byte = ql[ql_off + l_iter];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)((ql_byte & 0xFu) | ((qh_byte & 3u) << 4)) - 32;
+                    } else if (sub_pos == 1) {
+                        unsigned char ql_byte = ql[ql_off + l_iter + 32];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)((ql_byte & 0xFu) | (((qh_byte >> 2) & 3u) << 4)) - 32;
+                    } else if (sub_pos == 2) {
+                        unsigned char ql_byte = ql[ql_off + l_iter];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)(((ql_byte >> 4) & 0xFu) | (((qh_byte >> 4) & 3u) << 4)) - 32;
+                    } else {
+                        unsigned char ql_byte = ql[ql_off + l_iter + 32];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)(((ql_byte >> 4) & 0xFu) | (((qh_byte >> 6) & 3u) << 4)) - 32;
+                    }
+                    float w_val = d * sc_val * (float)q;
+                    int a_idx = (n_outer * 128) + (sub_pos * 32) + l_iter;
+                    acc += a_tile[a_idx] * w_val;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+    }
+    if (lane == 0 && ni < n) {
+        out[ni] = acc;
+    }
+}
+
 extern "C" __global__ void dequant_q6_k(
     const unsigned char* __restrict__ blocks,
     float*               __restrict__ out,
@@ -859,7 +956,7 @@ fn ctx() -> &'static CudaCtx {
               "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1",
-              "fused_q4k_matmul_seq1_v2"])
+              "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -887,6 +984,7 @@ fn ctx() -> &'static CudaCtx {
         let dequant_q6_k_gpu      = device.get_func("aether_kernels", "dequant_q6_k").unwrap();
         let fused_q4k_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1").unwrap();
         let fused_q4k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v2").unwrap();
+        let fused_q6k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_v2").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
@@ -895,7 +993,8 @@ fn ctx() -> &'static CudaCtx {
                   rms_norm_fwd, rope_apply, gqa_repeat_kv,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu,
-                  fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2 }
+                  fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2,
+                  fused_q6k_matmul_seq1_v2 }
     })
 }
 
@@ -1906,6 +2005,39 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().fused_q4k_matmul_seq1_v2.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks))
             .expect("launch fused_q4k_matmul_seq1_v2");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest v2 -- fused Q6_K matmul for seq=1.
+/// Same interface as the Q4_K v2 fused matmul, reads Q6_K bytes
+/// directly. Used for V proj + ffn_down + lm_head in Qwen2.5.
+#[no_mangle] pub extern "C" fn aether_op_fused_q6k_matmul_seq1_v2_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cta_threads = 256u32;
+    let outputs_per_cta = 8u32;
+    let grid_x = ((n as u32) + outputs_per_cta - 1) / outputs_per_cta;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (cta_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q6k_matmul_seq1_v2.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q6k_matmul_seq1_v2");
     }
     0
 }
