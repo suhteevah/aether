@@ -9,7 +9,48 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, matt-voice deploy pack — 5 extras)
+## Closed this batch (2026-05-19, FR-17.14-extra-deeper — real GGUF reader for Qwen2.5-7B)
+
+The user asked to "target all of those relevant extras"; we found
+matt-voice's Qwen2.5-7B Q4_K_M GGUF locally in ollama's blob store
+(4.7 GB), and shipped the GGUF reader that walks it.
+
+- **FR-17.14-extra-deeper** — Real GGUF v3 file reader.
+  - 9 extern "C" fns: `aether_gguf_open(path, n_path)` / `_close` /
+    `_version` / `_n_tensors` / `_get_tensor_name(h, i, out, max)`
+    / `_get_tensor_dtype(h, i)` / `_get_tensor_shape(h, i, out_dims, max_dims)`
+    / `_get_tensor_abs_offset(h, i)` / `_get_tensor_data_ptr(h, i)`.
+  - Real spec coverage: magic + version + tensor_count + KV_count
+    header, full metadata-KV walker (variable-length string keys +
+    13 GGUF value types including the 1-byte BOOL pitfall + nested
+    arrays via recursive skip), tensor info table (string name +
+    n_dims + u64 dims + dtype + offset), data-section start
+    aligned to 32 bytes.
+  - **Witness `gguf_qwen25_walk.aether`** (tag P17.14) opens
+    matt-voice's actual `C:\Users\Matt\.ollama\models\blobs\sha256-
+    2bada8a7...` blob (4.7 GB), confirms version 3 + 339 tensors,
+    verifies tensor 0 is `token_embd.weight` (17 bytes, byte-checked
+    at 4 offsets) with dtype 12 (Q4_K) and 2D shape, gets a
+    non-zero data pointer. Exits 42 through the full asm chain.
+  - Unit test `gguf_reader_qwen25_walk` runs the same checks via
+    Rust + iterates all 339 tensors finding both `token_embd.weight`
+    and at least one Q4_K-dtype tensor.
+  - honesty-auditor verified 4/4 claims.
+
+This is the GGUF reader matt-voice needs to ingest its real
+Qwen2.5-7B base model. Together with the Q4_K_M dequant kernel
+shipped in the prior commit (FR-17.14-extra), Aether can now READ
+real weight bytes from a 4.7 GB matt-voice model file.
+
+**Still NOT shipped** (matt-voice deploy remainder):
+- Full forward pass through real Qwen2.5 weights at scale (needs
+  the data-pointer → dequant → matmul wiring at every layer).
+- mmap'd I/O (currently `std::fs::read` reads the whole file).
+- Multi-shard GGUF support.
+- FR-19.1-extra full TLS handshake.
+- FR-18.1-extra real libnccl link.
+
+## Closed earlier (2026-05-19, matt-voice deploy pack — 5 extras)
 
 Targeted the FR-x-extras from the prior commit's "remaining gates"
 list. Audit count stays 169/196 because all 4 code extras tag

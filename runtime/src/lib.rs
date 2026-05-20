@@ -6017,6 +6017,254 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
     ((iters as f64) / elapsed) as f32
 }
 
+// =====================================================================
+// FR-17.14-extra-deeper — Full GGUF v3 reader.
+//
+// Real GGUF reader matt-voice uses to ingest Qwen2.5-7B Q4_K_M. The
+// file format (per ggml docs):
+//   bytes 0..4   : magic "GGUF"
+//   bytes 4..8   : u32 version (3)
+//   bytes 8..16  : u64 tensor_count
+//   bytes 16..24 : u64 metadata_kv_count
+//   then metadata_kv_count KV pairs:
+//       u64 key_len + key_bytes
+//       u32 value_type (0..12 — see GgufValueType below)
+//       value (variable; for ARRAY: u32 elem_type + u64 len + N elems)
+//   then tensor_count tensor info entries:
+//       u64 name_len + name_bytes
+//       u32 n_dims
+//       n_dims × u64 dims[]
+//       u32 dtype (GGML_TYPE_* enum; 12 = Q4_K)
+//       u64 offset into the data section
+//   then padding to align (usually 32) bytes
+//   then tensor data
+//
+// We load the full blob into memory (mmap is a future op). For
+// matt-voice's 4.7 GB Qwen2.5-7B this is fine on a 32+ GB host.
+// =====================================================================
+
+struct GgufTensorInfo {
+    name: String,
+    dtype: u32,
+    shape: Vec<i64>,
+    offset_in_data: u64,
+}
+struct GgufFile {
+    blob: Vec<u8>,
+    version: u32,
+    tensor_count: u64,
+    metadata_kv_count: u64,
+    tensors: Vec<GgufTensorInfo>,
+    data_section_start: u64,
+}
+struct GgufCell(UnsafeCell<Vec<Option<Box<GgufFile>>>>);
+unsafe impl Sync for GgufCell {}
+static GGUF_TABLE: GgufCell = GgufCell(UnsafeCell::new(Vec::new()));
+unsafe fn gguf_table() -> &'static mut Vec<Option<Box<GgufFile>>> {
+    &mut *GGUF_TABLE.0.get()
+}
+
+fn gguf_read_u32(b: &[u8], off: &mut usize) -> Option<u32> {
+    if *off + 4 > b.len() { return None; }
+    let v = u32::from_le_bytes(b[*off..*off + 4].try_into().ok()?);
+    *off += 4; Some(v)
+}
+fn gguf_read_u64(b: &[u8], off: &mut usize) -> Option<u64> {
+    if *off + 8 > b.len() { return None; }
+    let v = u64::from_le_bytes(b[*off..*off + 8].try_into().ok()?);
+    *off += 8; Some(v)
+}
+fn gguf_read_string(b: &[u8], off: &mut usize) -> Option<String> {
+    let n = gguf_read_u64(b, off)? as usize;
+    if *off + n > b.len() { return None; }
+    let s = std::str::from_utf8(&b[*off..*off + n]).ok()?.to_string();
+    *off += n; Some(s)
+}
+/// Skip over a metadata value of the given type. Returns Some(()) on
+/// success, None on truncation or unknown type.
+fn gguf_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<()> {
+    match vtype {
+        0 | 1 | 7 => { *off += 1; }                          // u8 / i8 / bool
+        2 | 3 => { *off += 2; }                              // u16 / i16
+        4 | 5 | 6 => { *off += 4; }                          // u32/i32/f32
+        10 | 11 | 12 => { *off += 8; }                       // u64/i64/f64
+        8 => {                                               // STRING
+            let _ = gguf_read_string(b, off)?;
+        }
+        9 => {                                               // ARRAY
+            let elem_type = gguf_read_u32(b, off)?;
+            let count = gguf_read_u64(b, off)? as usize;
+            for _ in 0..count { gguf_skip_value(b, off, elem_type)?; }
+        }
+        _ => return None,
+    }
+    if *off > b.len() { return None; }
+    Some(())
+}
+
+/// Open a GGUF file. Returns a handle ≥ 0 on success, -1 on file
+/// read error, -2 on bad magic, -3 on malformed metadata, -4 on
+/// malformed tensor table.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_open(
+    path: i64, n_path: c_int,
+) -> i64 {
+    if path == 0 || n_path <= 0 { return -1; }
+    let path_bytes = std::slice::from_raw_parts(path as *const u8, n_path as usize);
+    let Ok(path_str) = std::str::from_utf8(path_bytes) else { return -1; };
+    let Ok(blob) = std::fs::read(path_str) else { return -1; };
+    let b = &blob[..];
+    if b.len() < 24 || &b[..4] != b"GGUF" { return -2; }
+    let mut off = 4usize;
+    let Some(version) = gguf_read_u32(b, &mut off) else { return -2; };
+    let Some(tensor_count) = gguf_read_u64(b, &mut off) else { return -2; };
+    let Some(metadata_kv_count) = gguf_read_u64(b, &mut off) else { return -2; };
+    let meta_kv_count = metadata_kv_count;
+    // Walk metadata, skipping all values.
+    for _ in 0..meta_kv_count {
+        let _key = match gguf_read_string(b, &mut off) {
+            Some(s) => s, None => return -3,
+        };
+        let vtype = match gguf_read_u32(b, &mut off) { Some(t) => t, None => return -3, };
+        if gguf_skip_value(b, &mut off, vtype).is_none() { return -3; }
+    }
+    // Walk tensor info table.
+    let mut tensors = Vec::with_capacity(tensor_count as usize);
+    for _ in 0..tensor_count {
+        let name = match gguf_read_string(b, &mut off) {
+            Some(s) => s, None => return -4,
+        };
+        let n_dims = match gguf_read_u32(b, &mut off) { Some(n) => n, None => return -4, };
+        let mut shape = Vec::with_capacity(n_dims as usize);
+        for _ in 0..n_dims {
+            let d = match gguf_read_u64(b, &mut off) { Some(d) => d, None => return -4, };
+            shape.push(d as i64);
+        }
+        let dtype = match gguf_read_u32(b, &mut off) { Some(t) => t, None => return -4, };
+        let offset = match gguf_read_u64(b, &mut off) { Some(o) => o, None => return -4, };
+        tensors.push(GgufTensorInfo { name, dtype, shape, offset_in_data: offset });
+    }
+    // Align to 32-byte boundary (the default GGUF alignment).
+    let align = 32u64;
+    let data_section_start = ((off as u64) + align - 1) / align * align;
+    let g = GgufFile {
+        blob, version, tensor_count, metadata_kv_count, tensors,
+        data_section_start,
+    };
+    let tbl = gguf_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(g)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(g)));
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_close(handle: i64) -> c_int {
+    if handle < 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    tbl[h] = None;
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_version(handle: i64) -> c_int {
+    if handle < 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    g.version as c_int
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_n_tensors(handle: i64) -> c_int {
+    if handle < 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    g.tensor_count as c_int
+}
+
+/// Copy tensor `i`'s name into `out` (UTF-8, NOT NUL-terminated).
+/// Returns bytes written, or -1 on bad index / overflow.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_tensor_name(
+    handle: i64, i: c_int, out: i64, max_out: c_int,
+) -> c_int {
+    if handle < 0 || i < 0 || out == 0 || max_out <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    if (i as usize) >= g.tensors.len() { return -1; }
+    let bytes = g.tensors[i as usize].name.as_bytes();
+    if bytes.len() > max_out as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, max_out as usize);
+    o[..bytes.len()].copy_from_slice(bytes);
+    bytes.len() as c_int
+}
+
+/// Return tensor `i`'s GGML dtype enum (12 = Q4_K, etc.); -1 on bad index.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_tensor_dtype(
+    handle: i64, i: c_int,
+) -> c_int {
+    if handle < 0 || i < 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    if (i as usize) >= g.tensors.len() { return -1; }
+    g.tensors[i as usize].dtype as c_int
+}
+
+/// Write tensor `i`'s shape into `out_dims` as i64; return n_dims.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_tensor_shape(
+    handle: i64, i: c_int, out_dims: i64, max_dims: c_int,
+) -> c_int {
+    if handle < 0 || i < 0 || out_dims == 0 || max_dims <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    if (i as usize) >= g.tensors.len() { return -1; }
+    let shape = &g.tensors[i as usize].shape;
+    if shape.len() > max_dims as usize { return -1; }
+    let o = std::slice::from_raw_parts_mut(out_dims as *mut i64, max_dims as usize);
+    for (k, &d) in shape.iter().enumerate() { o[k] = d; }
+    shape.len() as c_int
+}
+
+/// Tensor `i`'s absolute byte offset within the GGUF file (== data
+/// section start + per-tensor relative offset). Caller can use this
+/// to mmap-style read the raw block bytes directly.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_tensor_abs_offset(
+    handle: i64, i: c_int,
+) -> i64 {
+    if handle < 0 || i < 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    if (i as usize) >= g.tensors.len() { return -1; }
+    (g.data_section_start + g.tensors[i as usize].offset_in_data) as i64
+}
+
+/// Return a pointer into the GGUF blob at the given absolute offset.
+/// Caller can pass this to any of the dequant kernels (e.g.
+/// aether_dequant_q4_k_m for Q4_K_M tensors).
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_tensor_data_ptr(
+    handle: i64, i: c_int,
+) -> i64 {
+    if handle < 0 || i < 0 { return 0; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    let Some(g) = tbl[h].as_ref() else { return 0; };
+    if (i as usize) >= g.tensors.len() { return 0; }
+    let abs = g.data_section_start + g.tensors[i as usize].offset_in_data;
+    if (abs as usize) >= g.blob.len() { return 0; }
+    g.blob.as_ptr().add(abs as usize) as i64
+}
+
 /// Copy a NUL-terminated C string (the form `Expr::StrLit` lowers to
 /// in the asm backend) into a heap buffer. Returns the byte count
 /// written (length up to but not including the NUL). Useful for
@@ -6808,6 +7056,60 @@ mod conv2d_tests {
                 let expect = if j < k { g[i * n + j] } else { 0.0 };
                 assert_eq!(r[i * n + j], expect, "[{},{}] mismatch", i, j);
             }
+        }
+    }
+
+    /// FR-17.14-extra-deeper — GGUF reader walks Qwen2.5-7B's blob and
+    /// verifies the header/tensor table parse against the known counts.
+    /// Skipped if the local ollama blob isn't present.
+    #[test]
+    fn gguf_reader_qwen25_walk() {
+        let qwen_path = "C:\\Users\\Matt\\.ollama\\models\\blobs\\sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730";
+        if !std::path::Path::new(qwen_path).exists() {
+            eprintln!("[skip] Qwen2.5-7B GGUF not present at {}", qwen_path);
+            return;
+        }
+        unsafe {
+            let h = aether_gguf_open(
+                qwen_path.as_ptr() as i64, qwen_path.len() as c_int,
+            );
+            assert!(h >= 0, "open returned {}", h);
+            assert_eq!(aether_gguf_version(h), 3);
+            // Qwen2.5-7B-Instruct GGUF has exactly 339 tensors.
+            let n = aether_gguf_n_tensors(h);
+            assert_eq!(n, 339, "expected 339 tensors, got {}", n);
+            // First tensor: typically the embedding (`token_embd.weight`),
+            // dtype Q4_K (=12).
+            let mut name_buf = [0u8; 256];
+            let n_name = aether_gguf_get_tensor_name(
+                h, 0, name_buf.as_mut_ptr() as i64, name_buf.len() as c_int,
+            );
+            assert!(n_name > 0);
+            let first_name = std::str::from_utf8(&name_buf[..n_name as usize]).unwrap();
+            eprintln!("[gguf] tensor 0 = {}", first_name);
+            // Don't hard-fail on the name (different GGUF tools sort
+            // differently); just verify SOME tensor is the token embedding
+            // and SOME tensor is Q4_K_M-encoded.
+            let mut found_embd = false;
+            let mut found_q4k = false;
+            for i in 0..n {
+                let mut nb = [0u8; 256];
+                let nn = aether_gguf_get_tensor_name(h, i, nb.as_mut_ptr() as i64, 256);
+                if nn > 0 {
+                    let nm = std::str::from_utf8(&nb[..nn as usize]).unwrap();
+                    if nm == "token_embd.weight" { found_embd = true; }
+                }
+                let dt = aether_gguf_get_tensor_dtype(h, i);
+                if dt == 12 { found_q4k = true; }
+            }
+            assert!(found_embd, "expected a token_embd.weight tensor");
+            assert!(found_q4k, "expected at least one Q4_K (=12) dtype tensor");
+            // Tensor offsets should be in the data section.
+            let abs0 = aether_gguf_get_tensor_abs_offset(h, 0);
+            assert!(abs0 >= 24, "offset {} too low", abs0);
+            let ptr0 = aether_gguf_get_tensor_data_ptr(h, 0);
+            assert!(ptr0 != 0);
+            aether_gguf_close(h);
         }
     }
 

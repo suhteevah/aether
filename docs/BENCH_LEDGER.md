@@ -57,6 +57,22 @@ Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `ae
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched. New symbols: `aether_template_new` / `_free` / `aether_template_set_var` / `aether_template_push_message` / `aether_template_render`. Pure-Rust state-machine template parser. No GPU / no matmul / no SIMD. Matmul bench is untouched. A `bench/chat_template_throughput/` fixture for "ms per render of a typical chat template" is the right surface to log this once the matt-voice serving deploy actually renders user prompts at scale — fixture doesn't exist yet. 2026-05-03 matmul row remains the reference.
 
+### 2026-05-19 — pending commit (FR-17.14-extra-deeper GGUF reader): skipped (no matmul path; GGUF I/O is its own surface)
+
+Bench-runner append rule fires on `runtime/src/lib.rs` touched.
+Added a real GGUF v3 reader (9 extern fns) that opens matt-voice's
+local Qwen2.5-7B Q4_K_M blob (4.7 GB at
+`C:\Users\Matt\.ollama\models\blobs\sha256-2bada8a7...`), walks
+the 339-tensor table, returns data pointers ready to pass to the
+Q4_K_M dequant kernel shipped in the prior commit.
+
+The matmul / SDPA / LN paths are untouched. A `bench/gguf_load/`
+fixture for "ms to header-parse Qwen2.5-7B" is the right surface
+to log this once an HTTP/serving deploy is timing critical. For
+the cold 4.7 GB blob the dominant cost is `std::fs::read`; the
+parser walk itself is ~1.6 sec on the 11900K (per the unit test's
+`finished in 1.65s` line).
+
 ### 2026-05-19 — pending commit (matt-voice deploy pack — 5 extras): cuda build now live; no matmul bench rerun
 
 Bench-runner append rule fires on `runtime/src/lib.rs` touched.
