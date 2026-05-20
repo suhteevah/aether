@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (matt-voice blockers continued: forward-chain witness through real Qwen2.5-7B weights + cuBLAS routing + GPU-resident weights bench at ~690 tok/s)
+2026-05-19 (FR-18.1-extra LANDED: real cross-card NCCL on cnc 2× P100; data-parallel training-step witness verified end-to-end)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -170,32 +170,69 @@ None on the kokonoe-local side. Remaining gates are:
 - **FR-18.1-extra real libnccl** — needs the cnc 2× P100 box
   (kokonoe is single-GPU).
 
+## FR-18.1-extra — Real libnccl cross-card (LANDED)
+
+Aether's runtime now supports REAL cross-GPU NCCL collectives,
+verified end-to-end on cnc-server's 2× P100 box.
+
+New surface (gated `--features nccl`):
+- `runtime/src/nccl_real.rs` — `aether_nccl_real_init_multi_gpu(n)`
+  wraps `ncclCommInitAll`; `_get_handle(rank)` / `_all_reduce_f32` /
+  `_comm_world_size` / `_comm_rank` / `_finalize` round out the
+  surface. Plus a Rust-side `comm_at(i)` accessor for integration
+  tests that need to drive cudarc's typed API directly.
+- `runtime/tests/nccl_dual_gpu.rs` — `Comm::from_devices(2)`,
+  group_start/end, all_reduce sum: rank 0 sends 1.0s, rank 1 sends
+  2.0s, both ranks see 3.0s. Verified on 2× P100.
+- `runtime/tests/nccl_dual_gpu_dp_step.rs` — data-parallel
+  training step: each rank computes gradient on its own shard
+  (rank 0=1.0, rank 1=3.0), all_reduce sum, divide by ws → mean=2.0,
+  identical SGD update on both ranks. The matt-voice unlock shape.
+
+nvidia-smi confirmation: a single test process appears on BOTH GPU
+UUIDs simultaneously (`bb77bda0...` first P100, `17bd0d20...` second
+P100) with ~260+318 MiB allocations — physically proving cross-card
+data exchange.
+
+NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
+(Pascal) kernels and fails with "named symbol not found" on the
+P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
+fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
+in NEXT-UP.
+
 ## What's Next
 
 Items 1 + 2 from the prior "What's Next" + the GPU-resident
-weights variant all shipped this session. Remaining matt-voice
-deploy work:
+weights variant + FR-18.1-extra all shipped this session. Remaining
+matt-voice deploy work:
 
-1. **All ops on device** (FR-19.16-extra deepest). LN / SDPA / SiLU
+1. **Multi-rank training-loop bringup** on the new NCCL surface. The
+   FR-18.1-extra witnesses prove all_reduce + per-rank gradient
+   exchange work; the next step is plugging that into the trainer
+   crate so `cargo run --bin aether-train --features nccl` actually
+   trains a model across both P100s. Need: multi-process spawn (one
+   process per rank) OR a single-process multi-stream variant.
+   Simplest first cut: data-parallel mode + AdamW + the train_tiny
+   shape from existing CPU witnesses.
+2. **Pipeline-parallel 1F1B real impl** (matt-voice §FR-18.6).
+   Today's `aether_pp_simulate_2stage_forward_f32` is in-process.
+   Real PP needs send/recv between adjacent ranks via the
+   `Comm::send` / `Comm::recv` surface in cudarc::nccl. Foundation
+   shipped; scheduling is the remaining work.
+3. **All ops on device** (FR-19.16-extra deepest). LN / SDPA / SiLU
    still run CPU-side and drive the per-iter h2d/d2h pattern in
    `aether_llm_inference_bench_tps_cuda_resident`. Route those
-   through cuda.rs's existing device-kernel variants
-   (`aether_op_layer_norm_f32_cuda`, etc.) to eliminate 3 d2h + 1
-   h2d per layer-iter. Net gain depends on kernel-launch overhead
-   vs PCIe bandwidth.
-2. **Forward-pass over a whole transformer block on real Qwen2.5
-   weights**. The one-block witness (`qwen25_forward_chain.aether`)
-   proves the dequant → matmul chain composes. Next is iterating
-   the chain through Q/K/V/O matmuls + attention + MLP for one
-   full block of real Qwen2.5 (~30 tensor reads, all from
-   `aether_gguf_get_tensor_data_ptr`).
-3. **Llama-1B-scale dims** (d=2048, ff=5504, 16 layers). At those
-   dims cuBLAS sgemm dominates and the 2.4× headline number from
-   the resident bench grows much larger. Gated on real-weight
-   loading or synthetic-large init.
-4. **Phase 15 leftovers**: FR-15.7 (SWP), FR-15.10 (hand-asm gate
+   through cuda.rs's existing device-kernel variants.
+4. **Forward-pass over a whole transformer block on real Qwen2.5
+   weights**. The one-block witness proves dequant → matmul
+   composes. Next is iterating the chain through Q/K/V/O matmuls +
+   attention + MLP for one full block.
+5. **Llama-1B-scale dims** (d=2048, ff=5504, 16 layers). At those
+   dims cuBLAS sgemm dominates and the resident bench headline
+   grows much larger.
+6. **Phase 15 leftovers**: FR-15.7 (SWP), FR-15.10 (hand-asm gate
    for the v4 SHIP perf claim).
-5. **Phase 16 leftovers**: proc-macros, Drop, slice/str primitives.
+7. **Phase 16 leftovers**: proc-macros, Drop, slice/str primitives.
 
 NOTE on TCP test flake: `tests::tcp_send_recv_loopback` at
 `runtime/src/lib.rs:3492` fails ~1/3 runs with "accept returned -1"

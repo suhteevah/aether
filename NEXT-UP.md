@@ -9,7 +9,72 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, matt-voice GPU-resident weights variant)
+## Closed this batch (2026-05-19, FR-18.1-extra REAL libnccl cross-card)
+
+User asked to "finish all of those we need the dual p100 training"
+after the GPU-resident weights work landed. **The hardware-binding
+item from §2 PARKED moved out of parked status** — Aether's runtime
+now does real cross-GPU NCCL on cnc's 2× P100 box.
+
+- **FR-18.1-extra / P18.1** — Real libnccl FFI surface. New
+  `nccl` cargo feature (chains to `cuda` + cudarc/nccl). New
+  `runtime/src/nccl_real.rs` (180 LOC) wraps cudarc's safe NCCL
+  API in C-ABI shape:
+  - `aether_nccl_real_init_multi_gpu(n)` → `ncclCommInitAll`
+  - `aether_nccl_real_get_handle(rank)` → opaque comm handle
+  - `aether_nccl_real_all_reduce_f32` (FFI) + `comm_at(i)` (Rust)
+  - `aether_nccl_real_comm_world_size` / `_comm_rank` / `_finalize`
+  - Plus `runtime/src/cuda.rs::bufs()` promoted to `pub(crate)` so
+    nccl_real can take/put device-buffer ownership.
+
+- **FR-18.2-extra / P18.2** — Two real multi-rank Rust integration
+  tests on cnc 2× P100:
+  - `runtime/tests/nccl_dual_gpu.rs`: 16-elem all_reduce sum,
+    rank 0→1.0s, rank 1→2.0s, both ranks see 3.0s. 3 consecutive
+    passes, NCCL_DEBUG=INFO confirms ncclCommInitAll + SHM/direct
+    P2P channels between busId 1000 (P100-12GB) and busId 2000
+    (P100-16GB).
+  - `runtime/tests/nccl_dual_gpu_dp_step.rs`: data-parallel
+    training step shape — rank 0 grad=1.0, rank 1 grad=3.0,
+    all_reduce sum, /world_size → mean=2.0, SGD update consistent
+    across ranks. **The matt-voice unlock shape.**
+
+- **NCCL Pascal-compat note** — ollama's bundled libnccl 2.29
+  dropped sm_60 kernels around v2.20 and fails with "named symbol
+  not found" on P100s. Aether links against libnccl 2.21.5+cuda12.4
+  via `/usr/local/lib/libnccl.so.2` → fish-speech venv's
+  nvidia-nccl pip wheel. This is a `ldconfig` setup detail, not a
+  code dependency; documented in HANDOFF.
+
+- **nvidia-smi smoking gun** — single test PID appears on BOTH GPU
+  UUIDs simultaneously: PID 1955276 → 260 MiB on `bb77bda0...`
+  (first P100) + 318 MiB on `17bd0d20...` (second P100). Real
+  cross-card data exchange, not single-card simulation.
+
+- **Cross-platform fix** — Aether's runtime previously had hardcoded
+  `#[link(name = "kernel32")]` calls for the JIT exec-memory
+  primitives. Now gated `#[cfg(windows)]` (VirtualAlloc/Free) vs
+  `#[cfg(unix)]` (mmap/munmap). Aether's runtime crate builds and
+  tests cleanly on Linux now.
+
+**Still PARKED** (need hardware Aether doesn't have):
+- FR-18.10: Multi-host RDMA (only 1 cnc host)
+- FR-18.11: 8-GPU Llama-7B (only 2× P100s)
+
+**Still NOT shipped** (real multi-rank algorithms — all foundation
+NCCL now exists):
+- FR-18.4 real FSDP across ranks (only sim today)
+- FR-18.5 real Tensor Parallel matmul split (only sim)
+- FR-18.6 real Pipeline Parallel 1F1B with send/recv between ranks
+  (only sim) — **the matt-voice deploy target**
+- FR-18.7 real ZeRO-1/2/3 sharding
+- FR-18.8 real compute/comm overlap via cuda streams
+- FR-18.9 real PowerSGD gradient compression
+
+All of those are now incremental work on top of the verified NCCL
+foundation. None are blocked on hardware anymore.
+
+## Closed earlier (2026-05-19, matt-voice GPU-resident weights variant)
 
 User asked to "do gpu-resident weights across iter loop" right
 after the prior matt-voice batch landed. Closes the §1 item from
