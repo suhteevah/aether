@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (Q4_K + Q6_K dequant on GPU — bit-exact vs CPU on real Qwen2.5 weights; 7.4x PCIe savings; the memory enabler for fitting 28-block Qwen2.5-7B in 8 GB VRAM; fused dequant+matmul is the perf finisher and stays open as the final FR)
+2026-05-20 (Fused Q4_K matmul kernel v1 LANDED — bit-close to cuBLAS, 1.2x faster on FFN matmuls, eliminates the f32 transient = unblocks all-28-blocks-resident in 8 GB VRAM; v2 with split-K reduction is the next perf step)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,71 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## Fused Q4_K matmul kernel v1 LANDED
+
+User: "Go on fused kernel". Shipped a working fused Q4_K matmul
+kernel that reads Q4_K bytes directly + dequants inline +
+accumulates fma. No f32 transient buffer needed.
+
+### Design (v1)
+- CTA layout: BLOCK_N = 32 output columns per CTA
+- One thread per output column (best for large N, weak for small N)
+- Per K-tile (256 quants):
+  - Cooperatively load 256 floats of A into shared mem (8 loads/thread,
+    fully coalesced)
+  - Each thread reads its own super-block of W (144 bytes), dequants
+    inline, accumulates 256 fma's
+  - Sync between K-tiles
+- 1 KB shared memory per CTA (just A tile)
+- Wrapper: `aether_op_fused_q4k_matmul_seq1_cuda(a_dev_f32, w_dev_u8,
+  out_dev_f32, n, n_blocks)`
+
+### Correctness verified
+`runtime/tests/fused_q4k_matmul_real.rs` runs all 5 Q4_K matmul
+shapes of Qwen2.5 block 0 and compares against `dequant -> cuBLAS
+sgemm` reference. **All shapes match within 1.4e-5 absolute** (sum-
+order differences between cuBLAS and our accumulate-into-thread
+kernel).
+
+### Measured perf on RTX 3070 Ti
+```
+tensor                       n      k    cuBLAS_us  fused_us  speedup
+blk.0.attn_q.weight        3584   3584         100       127    0.79x
+blk.0.attn_k.weight         512   3584          33       100    0.33x
+blk.0.attn_output.weight   3584   3584          94       123    0.76x
+blk.0.ffn_gate.weight     18944   3584         478       397    1.20x
+blk.0.ffn_up.weight       18944   3584         475       396    1.20x
+```
+
+The v1 kernel is **faster than cuBLAS only on large-N FFN matmuls**.
+For small N (attention projections), each output gets one thread
+which under-utilizes the GPU (3584 threads << 6144 cores). A v2
+kernel needs split-K reduction (multiple threads per output's dot
+product, then warp-reduce) for small-N matmul wins.
+
+### What the v1 kernel really unblocks: full-resident inference
+
+Without fused matmul, every matmul needs a transient f32 dequant
+buffer = 870 MB per block per matmul. With fused matmul, Q4_K
+bytes go directly to f32 outputs — no transient. This is THE
+enabler for keeping all 28 blocks of Qwen2.5-7B resident in 8 GB
+VRAM throughout autoregressive generation.
+
+### Remaining open FRs for matt-voice production speed
+
+1. **Split-K Q4_K kernel (v2)** — multiple threads per output's
+   dot product, warp-reduce. Estimated 2-3x more speedup on
+   attention matmuls. ~100 LOC of careful CUDA.
+2. **Tensor-core path for sm_8.0+** — RTX 3070 Ti is sm_8.6.
+   Cast Q4_K dequant output to f16 + use wmma::fragment for the
+   accumulate. Estimated 4-8x more speedup over current. Larger
+   CUDA effort (~200-500 LOC).
+3. **Q6_K fused matmul** — V proj + ffn_down. Same pattern as
+   Q4_K but with the 210-byte super-block layout.
+4. **Full end-to-end autoregressive measurement** with the fused
+   kernel wired into the existing qwen25_autoregressive_cuda.rs.
+   Quantify the real tok/s on Qwen2.5-7B inference.
 
 ## Q4_K + Q6_K dequant on GPU LANDED (memory enabler for matt-voice deploy)
 

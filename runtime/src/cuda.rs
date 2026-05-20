@@ -62,6 +62,7 @@ struct CudaCtx {
     bias_add:          CudaFunction,
     dequant_q4_k_m_gpu:CudaFunction,
     dequant_q6_k_gpu:  CudaFunction,
+    fused_q4k_matmul_seq1: CudaFunction,
 }
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
@@ -590,6 +591,81 @@ extern "C" __global__ void dequant_q4_k_m(
 //     y[l + 64 + 128*n_outer] = d * sc[is +  4 + 8*n_outer] * q3
 //     y[l + 96 + 128*n_outer] = d * sc[is +  6 + 8*n_outer] * q4
 //   where is = l/16
+// matt-voice / FR-17.14-extra-deepest — FUSED Q4_K dequant + matmul.
+//
+// Computes out[n] = sum_k a[k] * dequant(w_q4k)[n, k] for one row of A
+// (seq=1, the autoregressive-generation case).
+//
+// W layout: GGUF natural order. Each output column ni corresponds to
+// row ni of w_q4k (n_blocks super-blocks of 144 bytes each). Row stride
+// in W is `n_blocks * 144` bytes.
+//
+// CTA design (one CTA per BLOCK_N output columns):
+//   - threadIdx.x in [0, BLOCK_N)
+//   - Per K-tile (256 quants = one super-block):
+//     * All BLOCK_N threads cooperatively load 256 floats of A into
+//       shared memory (8 loads per thread, fully coalesced).
+//     * Each thread reads its OWN super-block of W from global memory,
+//       dequants inline, and accumulates fma into a per-thread float.
+//   - Each thread writes one output element at the end.
+//
+// Shared mem: 256 * 4 = 1 KB for A tile.
+// Per-thread work: n_blocks * (144 bytes read from W + 256 fma).
+extern "C" __global__ void fused_q4k_matmul_seq1(
+    const float*         __restrict__ a,           // [k]
+    const unsigned char* __restrict__ w,           // n rows of (n_blocks * 144) bytes
+    float*               __restrict__ out,         // [n]
+    int n, int n_blocks)                           // k = n_blocks * 256
+{
+    const int BLOCK_N = 32;
+    __shared__ float a_tile[256];
+
+    int ni = blockIdx.x * BLOCK_N + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // Cooperatively load 256 floats of A: each of 32 threads loads 8.
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            int kk = p * BLOCK_N + threadIdx.x;
+            a_tile[kk] = a[bi * 256 + kk];
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            // Dequant THIS thread's super-block of W and accumulate.
+            const unsigned char* base = w + (size_t)ni * n_blocks * 144 + (size_t)bi * 144;
+            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* scales = base + 4;
+            const unsigned char* qs     = base + 16;
+
+            #pragma unroll
+            for (int sub = 0; sub < 8; sub++) {
+                int j = sub >> 1;
+                int is_hi = sub & 1;
+                unsigned int sc = q4k_get_scale(sub, scales);
+                unsigned int mn = q4k_get_min(sub, scales);
+                float d_eff = d * (float)sc;
+                float m_eff = dmin * (float)mn;
+                int qs_off = j * 32;
+                #pragma unroll 8
+                for (int l = 0; l < 32; l++) {
+                    unsigned char byte = qs[qs_off + l];
+                    unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+                    float w_val = d_eff * (float)nibble - m_eff;
+                    acc += a_tile[sub * 32 + l] * w_val;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (ni < n) out[ni] = acc;
+}
+
 extern "C" __global__ void dequant_q6_k(
     const unsigned char* __restrict__ blocks,
     float*               __restrict__ out,
@@ -696,7 +772,7 @@ fn ctx() -> &'static CudaCtx {
               // matt-voice deploy kernels
               "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
-              "dequant_q4_k_m", "dequant_q6_k"])
+              "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -722,6 +798,7 @@ fn ctx() -> &'static CudaCtx {
         let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
         let dequant_q4_k_m_gpu    = device.get_func("aether_kernels", "dequant_q4_k_m").unwrap();
         let dequant_q6_k_gpu      = device.get_func("aether_kernels", "dequant_q6_k").unwrap();
+        let fused_q4k_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
@@ -729,7 +806,7 @@ fn ctx() -> &'static CudaCtx {
                   add_layer_norm_fwd,
                   rms_norm_fwd, rope_apply, gqa_repeat_kv,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
-                  dequant_q4_k_m_gpu, dequant_q6_k_gpu }
+                  dequant_q4_k_m_gpu, dequant_q6_k_gpu, fused_q4k_matmul_seq1 }
     })
 }
 
@@ -1662,6 +1739,48 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().dequant_q4_k_m_gpu.clone()
             .launch(cfg, (bv, ov, n_blocks))
             .expect("launch dequant_q4_k_m");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest -- FUSED Q4_K matmul for seq=1.
+///
+/// out[n] = a[k] @ dequant(w_q4k)[n, k]
+///
+/// Args:
+///   a_dev_f32 : f32 device handle, length k = n_blocks * 256
+///   w_dev_u8  : u8 device handle, length n * n_blocks * 144 (GGUF
+///               natural order: each row is one output column's
+///               worth of n_blocks super-blocks)
+///   out_dev_f32: f32 device handle, length n
+///   n, n_blocks: matmul dims (k = n_blocks * 256)
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_matmul_seq1_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    // CTA size = 32 (BLOCK_N matches the kernel constant). Grid covers
+    // n output columns in chunks of 32.
+    let block_n = 32u32;
+    let grid_x = ((n as u32) + block_n - 1) / block_n;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (block_n, 1, 1),
+        shared_mem_bytes: 0,  // a_tile is __shared__ static
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q4k_matmul_seq1.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q4k_matmul_seq1");
     }
     0
 }

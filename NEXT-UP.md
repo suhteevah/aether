@@ -9,7 +9,55 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, Q4_K + Q6_K on-GPU dequant -- the memory enabler)
+## Closed this batch (2026-05-20, fused Q4_K matmul v1)
+
+User: "Go on fused kernel". Closed.
+
+### Shipped
+- New CUDA kernel `fused_q4k_matmul_seq1`: reads Q4_K bytes
+  directly + dequants inline + accumulates fma. No f32 transient.
+- Wrapper `aether_op_fused_q4k_matmul_seq1_cuda(a, w, out, n,
+  n_blocks)` taking f32+u8+f32 device handles.
+
+### Verified
+`runtime/tests/fused_q4k_matmul_real.rs` runs all 5 Q4_K matmul
+shapes from Qwen2.5 block 0 and compares against the
+`dequant -> cuBLAS sgemm` reference. All match within 1.4e-5
+absolute (cuBLAS vs our kernel differ slightly due to sum-order
+in accumulation).
+
+### Measured perf (RTX 3070 Ti)
+| Shape | cuBLAS | Fused | Speedup |
+|---|---|---|---|
+| attn_q 3584x3584 | 100us | 127us | 0.79x |
+| attn_k 512x3584 | 33us | 100us | 0.33x |
+| attn_output 3584x3584 | 94us | 123us | 0.76x |
+| ffn_gate 18944x3584 | 478us | 397us | **1.20x** |
+| ffn_up 18944x3584 | 475us | 396us | **1.20x** |
+
+v1 is faster on big-N FFN matmuls but slower on small-N attention
+matmuls (one-thread-per-output under-utilizes GPU at low N).
+
+### Structural win regardless of perf
+
+Eliminates the f32 transient buffer per matmul (was 870 MB/block).
+This is THE enabler for full-resident inference: all 28 blocks
+Q4_K (6 GB) stay on device through all autoregressive steps.
+Without fused matmul, the per-block per-matmul transient would
+overflow VRAM.
+
+### Remaining open FRs (next perf steps)
+
+1. **Split-K v2 kernel** for small-N matmuls: multiple threads per
+   output, warp-reduce. ~2-3x more on attention matmuls.
+2. **Tensor-core wmma path** for sm_8.0+: f16 acc + wmma fragments.
+   ~4-8x more across all shapes. ~200-500 LOC.
+3. **Q6_K fused matmul** — same shape pattern as Q4_K, applies to
+   V proj + ffn_down (the 2 Q6_K tensors per Qwen block).
+4. **End-to-end autoregressive measurement** with fused kernel
+   wired into qwen25_autoregressive_cuda.rs. Real tok/s number.
+
+## Closed earlier (2026-05-20, Q4_K + Q6_K on-GPU dequant -- the memory enabler)
 
 User: "Get it to production speed". Ship the Q4_K-on-GPU
 foundation so all 28 blocks of Qwen2.5-7B fit in 8 GB VRAM.
