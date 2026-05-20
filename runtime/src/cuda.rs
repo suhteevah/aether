@@ -68,6 +68,9 @@ struct CudaCtx {
     fused_q4k_ffn_gate_up_silu_mul: CudaFunction,
     fused_q4k_matmul_seq1_v3: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
+    rope_apply_devarg: CudaFunction,
+    append_kv_devarg: CudaFunction,
+    attention_seq1_devarg: CudaFunction,
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
 }
@@ -408,6 +411,37 @@ extern "C" __global__ void rope_apply(
     int seq, int n_heads, int head_dim,
     float base, int pos_start)
 {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hd_half = head_dim / 2;
+    int total = seq * n_heads * hd_half;
+    if (idx >= total) return;
+    int t = idx / (n_heads * hd_half);
+    int rem = idx - t * (n_heads * hd_half);
+    int h = rem / hd_half;
+    int i = rem - h * hd_half;
+    int base_off = (t * n_heads + h) * head_dim;
+    float pos = (float)(t + pos_start);
+    float exp = -2.0f * (float)i / (float)head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float x0 = x[i0], x1 = x[i1];
+    x[i0] = x0 * c - x1 * s;
+    x[i1] = x0 * s + x1 * c;
+}
+
+// FR-17.14-extra-deepest-graph -- rope_apply variant that reads pos
+// from device memory instead of taking it as an immediate launch arg.
+// Lets the autoregressive forward pass be captured into a single CUDA
+// graph that's reused for every decode step (only the per-step args
+// buffer needs to be updated by h2d each step). step_args[0] = pos.
+extern "C" __global__ void rope_apply_devarg(
+    float*       __restrict__ x,
+    int seq, int n_heads, int head_dim,
+    float base, const int* __restrict__ step_args)
+{
+    int pos_start = step_args[0];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int hd_half = head_dim / 2;
     int total = seq * n_heads * hd_half;
@@ -1057,6 +1091,22 @@ extern "C" __global__ void append_kv(
     v_cache[(size_t)pos * d_kv + tid] = v_new[tid];
 }
 
+// FR-17.14-extra-deepest-graph -- append_kv variant reading pos from
+// device memory (step_args[0]).
+extern "C" __global__ void append_kv_devarg(
+    const float* __restrict__ k_new,
+    const float* __restrict__ v_new,
+    float*       __restrict__ k_cache,
+    float*       __restrict__ v_cache,
+    int d_kv, const int* __restrict__ step_args)
+{
+    int pos = step_args[0];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= d_kv) return;
+    k_cache[(size_t)pos * d_kv + tid] = k_new[tid];
+    v_cache[(size_t)pos * d_kv + tid] = v_new[tid];
+}
+
 // matt-voice / FR-17.13-extra — single-step attention for seq=1
 // autoregressive generation with on-device KV cache.
 //
@@ -1144,6 +1194,98 @@ extern "C" __global__ void attention_seq1(
     __syncwarp();
 
     // === Pass 3: aggregate V_cache by softmax weights ===
+    float out_local[8] = {0.0f};
+    for (int t = 0; t < cur_seq; t++) {
+        float w = scores[t];
+        const float* v_ptr = v_cache + (size_t)t * d_kv + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) out_local[i] += w * v_ptr[lane * per_lane + i];
+        }
+    }
+
+    float* out_ptr = attn_out + head * head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) out_ptr[lane * per_lane + i] = out_local[i];
+    }
+}
+
+// FR-17.14-extra-deepest-graph -- attention_seq1 variant reading cur_seq
+// from device memory (step_args[1]). Allows the autoregressive forward
+// pass to be captured into ONE CUDA graph: per step we update step_args
+// via h2d and replay the graph. dyn shmem is launched at max_seq * 4
+// bytes (we just don't use the tail beyond cur_seq).
+extern "C" __global__ void attention_seq1_devarg(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float*       __restrict__ attn_out,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    float scale, const int* __restrict__ step_args)
+{
+    int cur_seq = step_args[1];
+    extern __shared__ float scores[];
+
+    int head    = blockIdx.x;
+    int lane    = threadIdx.x;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head = head / kv_per_q;
+    int d_kv    = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;
+
+    const float* q_ptr = q + head * head_dim;
+
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane * per_lane + i];
+    }
+
+    for (int t = 0; t < cur_seq; t++) {
+        const float* k_ptr = k_cache + (size_t)t * d_kv + kv_head * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane * per_lane + i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncwarp();
+
+    float local_max = __int_as_float(0xFF800000u);
+    for (int t = lane; t < cur_seq; t += 32) {
+        float s = scores[t];
+        if (s > local_max) local_max = s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    float max_val = __shfl_sync(0xFFFFFFFFu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int t = lane; t < cur_seq; t += 32) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, off);
+    }
+    float sum_val = __shfl_sync(0xFFFFFFFFu, local_sum, 0);
+    float inv_sum = 1.0f / sum_val;
+    for (int t = lane; t < cur_seq; t += 32) {
+        scores[t] *= inv_sum;
+    }
+    __syncwarp();
+
     float out_local[8] = {0.0f};
     for (int t = 0; t < cur_seq; t++) {
         float w = scores[t];
@@ -1350,7 +1492,10 @@ unsafe fn u8_bufs() -> &'static mut Vec<Option<CudaSlice<u8>>> { &mut *U8_BUFFER
 
 fn ctx() -> &'static CudaCtx {
     CTX.get_or_init(|| {
-        let device = CudaDevice::new(0).expect("CudaDevice::new(0)");
+        // FR-17.14-extra-deepest-graph: use non-default stream so we can
+        // CUDA-graph-capture launches. Default stream is the legacy null
+        // stream which cuStreamBeginCapture_v2 rejects.
+        let device = CudaDevice::new_with_stream(0).expect("CudaDevice::new_with_stream(0)");
         let blas = CudaBlas::new(device.clone()).expect("CudaBlas::new");
         // JIT-compile the small custom kernels via nvrtc.
         let ptx = compile_ptx(KERNEL_SRC).expect("compile_ptx");
@@ -1367,6 +1512,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
               "fused_q4k_ffn_gate_up_silu_mul",
               "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
+              "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
@@ -1399,6 +1545,9 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_ffn_gate_up_silu_mul = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul").unwrap();
         let fused_q4k_matmul_seq1_v3 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v3").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
+        let rope_apply_devarg = device.get_func("aether_kernels", "rope_apply_devarg").unwrap();
+        let append_kv_devarg = device.get_func("aether_kernels", "append_kv_devarg").unwrap();
+        let attention_seq1_devarg = device.get_func("aether_kernels", "attention_seq1_devarg").unwrap();
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
@@ -1412,6 +1561,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2,
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
+                  rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1 }
     })
 }
@@ -2185,6 +2335,106 @@ fn libm_powf(base: f32, n: f32) -> f32 {
 }
 
 // =====================================================================
+// FR-17.14-extra-deepest-graph -- CUDA graph capture / instantiate / launch.
+//
+// Builds on cudarc 0.13's raw driver sys bindings to record the
+// per-token autoregressive forward into a graph that's reused for
+// every decode step. Only the device-side step_args (pos, cur_seq)
+// needs to change between launches; the graph itself is fixed.
+//
+// Trades:
+//  - one-time capture cost (~few ms)
+// for
+//  - per-step ~3 ms of host-side launch overhead saved (370 kernels x ~8 us each)
+//
+// Process model:
+//  - One graph + one exec per process.
+//  - aether_dev_graph_begin() puts the device stream into capture mode.
+//  - aether_dev_graph_end() ends capture and instantiates the graph.
+//  - aether_dev_graph_launch() replays it.
+//  - aether_dev_graph_destroy() releases both handles.
+// =====================================================================
+
+struct GraphHandles {
+    graph: Option<cudarc::driver::sys::CUgraph>,
+    exec:  Option<cudarc::driver::sys::CUgraphExec>,
+}
+struct GraphState(UnsafeCell<GraphHandles>);
+unsafe impl Sync for GraphState {}
+static GRAPH_STATE: GraphState = GraphState(UnsafeCell::new(GraphHandles { graph: None, exec: None }));
+unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get() }
+
+/// Put the device stream into thread-local capture mode. All subsequent
+/// kernel launches up to `aether_dev_graph_end` are recorded into a
+/// CUDA graph. Returns 0 on success.
+#[no_mangle] pub extern "C" fn aether_dev_graph_begin() -> c_int {
+    let stream = *ctx().device.cu_stream();
+    unsafe {
+        let lib = cudarc::driver::sys::lib();
+        let rc = lib.cuStreamBeginCapture_v2(
+            stream,
+            cudarc::driver::sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        );
+        if rc != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[aether_dev_graph_begin] cuStreamBeginCapture_v2 -> {:?}", rc);
+            return -1;
+        }
+    }
+    0
+}
+
+/// End capture, instantiate the graph into an executable graph, and
+/// store the handles globally. Returns 0 on success.
+#[no_mangle] pub extern "C" fn aether_dev_graph_end() -> c_int {
+    let stream = *ctx().device.cu_stream();
+    unsafe {
+        let lib = cudarc::driver::sys::lib();
+        let mut g: cudarc::driver::sys::CUgraph = std::ptr::null_mut();
+        let rc = lib.cuStreamEndCapture(stream, &mut g);
+        if rc != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS || g.is_null() { return -1; }
+
+        let mut exec: cudarc::driver::sys::CUgraphExec = std::ptr::null_mut();
+        let rc = lib.cuGraphInstantiateWithFlags(&mut exec, g, 0);
+        if rc != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS || exec.is_null() {
+            let _ = lib.cuGraphDestroy(g);
+            return -2;
+        }
+        let st = graph_state();
+        // Destroy any previously held handles.
+        if let Some(old_exec) = st.exec.take() { let _ = lib.cuGraphExecDestroy(old_exec); }
+        if let Some(old_graph) = st.graph.take() { let _ = lib.cuGraphDestroy(old_graph); }
+        st.graph = Some(g);
+        st.exec  = Some(exec);
+    }
+    0
+}
+
+/// Replay the captured graph on the device stream. Async w.r.t. the host;
+/// caller is responsible for sync if a result is needed before next launch.
+#[no_mangle] pub extern "C" fn aether_dev_graph_launch() -> c_int {
+    let stream = *ctx().device.cu_stream();
+    unsafe {
+        let lib = cudarc::driver::sys::lib();
+        let st = graph_state();
+        let Some(exec) = st.exec else { return -1; };
+        let rc = lib.cuGraphLaunch(exec, stream);
+        if rc != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS { return -2; }
+    }
+    0
+}
+
+/// Free the captured graph + exec. Safe to call multiple times.
+#[no_mangle] pub extern "C" fn aether_dev_graph_destroy() -> c_int {
+    unsafe {
+        let lib = cudarc::driver::sys::lib();
+        let st = graph_state();
+        if let Some(exec) = st.exec.take() { let _ = lib.cuGraphExecDestroy(exec); }
+        if let Some(g) = st.graph.take() { let _ = lib.cuGraphDestroy(g); }
+    }
+    0
+}
+
+// =====================================================================
 // matt-voice deploy — Qwen forward kernels on device. The non-matmul
 // ops (RMSNorm / RoPE / GQA / SiLU / element-wise mul + add / bias_add)
 // run entirely on the GPU, so the per-block forward only crosses PCIe
@@ -2229,6 +2479,100 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().rope_apply.clone()
             .launch(cfg, (xv, seq, n_heads, head_dim, base, pos_start))
             .expect("launch rope_apply");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest-graph — rope_apply variant reading pos from a
+/// device-side step_args[0]. Used inside the captured CUDA graph for
+/// autoregressive decoding -- only the step_args buffer needs to be
+/// h2d-updated per step; the graph itself is reused.
+#[no_mangle] pub extern "C" fn aether_op_rope_apply_devarg_f32_cuda(
+    x: i64, seq: c_int, n_heads: c_int, head_dim: c_int,
+    base: f32, step_args_i32: i64,
+) -> c_int {
+    let Some(ix) = handle_to_idx(x) else { return -1; };
+    let Some(is) = handle_to_i32_idx(step_args_i32) else { return -1; };
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let s_p = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let total = (seq * n_heads * (head_dim / 2)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let xv = &mut *x_p; let sv = &*s_p;
+        ctx().rope_apply_devarg.clone()
+            .launch(cfg, (xv, seq, n_heads, head_dim, base, sv))
+            .expect("launch rope_apply_devarg");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest-graph — append_kv variant reading pos from step_args[0].
+#[no_mangle] pub extern "C" fn aether_op_append_kv_devarg_f32_cuda(
+    k_new_dev: i64, v_new_dev: i64,
+    k_cache_dev: i64, v_cache_dev: i64,
+    d_kv: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_kn) = handle_to_idx(k_new_dev) else { return -1; };
+    let Some(i_vn) = handle_to_idx(v_new_dev) else { return -1; };
+    let Some(i_kc) = handle_to_idx(k_cache_dev) else { return -1; };
+    let Some(i_vc) = handle_to_idx(v_cache_dev) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if d_kv <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let kn = bs[i_kn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vn = bs[i_vn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kc = bs[i_kc].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let vc = bs[i_vc].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let cfg = LaunchConfig::for_num_elems(d_kv as u32);
+    unsafe {
+        let knr = &*kn; let vnr = &*vn;
+        let kcm = &mut *kc; let vcm = &mut *vc;
+        let sv = &*sp;
+        ctx().append_kv_devarg.clone()
+            .launch(cfg, (knr, vnr, kcm, vcm, d_kv, sv))
+            .expect("launch append_kv_devarg");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest-graph — attention_seq1 variant reading cur_seq
+/// from step_args[1]. Launched with max_shmem bytes (max_seq * 4); the
+/// kernel only uses cur_seq * 4 of them. Graph-safe.
+#[no_mangle] pub extern "C" fn aether_op_attention_seq1_devarg_f32_cuda(
+    q_dev: i64, k_cache: i64, v_cache: i64, attn_out: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
+    scale: f32, max_seq: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kc) = handle_to_idx(k_cache) else { return -1; };
+    let Some(i_vc) = handle_to_idx(v_cache) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kc_p = bs[i_kc].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vc_p = bs[i_vc].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp  = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let shmem = (max_seq as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kcv = &*kc_p; let vcv = &*vc_p; let ov = &mut *o_p;
+        let sv = &*sp;
+        ctx().attention_seq1_devarg.clone()
+            .launch(cfg, (qv, kcv, vcv, ov, n_q_heads, n_kv_heads, head_dim, scale, sv))
+            .expect("launch attention_seq1_devarg");
     }
     0
 }
