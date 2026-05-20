@@ -16,5 +16,13 @@ path = "src/bin/infer.rs"
 name = "aether-prepare"
 path = "src/bin/prepare.rs"
 
+[features]
+default = []
+# `nccl`: enable the data-parallel training loop in `dp.rs`. Forwards
+# the same-named feature to aether_rt so libnccl is linked. Without
+# this feature the trainer is single-rank CPU only.
+nccl = ["aether_rt/nccl", "dep:cudarc"]
+
 [dependencies]
 aether_rt = { path = "../runtime" }
+cudarc = { version = "0.13", optional = true, default-features = false, features = ["cuda-12060", "driver", "nccl"] }

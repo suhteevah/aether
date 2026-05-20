@@ -19,6 +19,7 @@ struct Cli {
     log_every: usize,
     config: String,
     synth_bytes: usize,
+    world_size: usize,
 }
 
 fn parse_cli() -> Cli {
@@ -33,6 +34,7 @@ fn parse_cli() -> Cli {
         log_every: 10,
         config: "nano".into(),
         synth_bytes: 64 * 1024,
+        world_size: 1,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -47,8 +49,10 @@ fn parse_cli() -> Cli {
             "--log-every" => cli.log_every = it.next().unwrap().parse().unwrap(),
             "--config" => cli.config = it.next().unwrap(),
             "--synth-bytes" => cli.synth_bytes = it.next().unwrap().parse().unwrap(),
+            "--world-size" => cli.world_size = it.next().unwrap().parse().unwrap(),
             "-h" | "--help" => {
-                eprintln!("aether-train [--data PATH] [--out PATH] [--config nano|tiny] [--steps N] [--batch N] [--seq N] [--lr F] [--seed N] [--log-every N]");
+                eprintln!("aether-train [--data PATH] [--out PATH] [--config nano|tiny] [--steps N] [--batch N] [--seq N] [--lr F] [--seed N] [--log-every N] [--world-size N]");
+                eprintln!("  --world-size N>1 enables data-parallel training across N GPUs via NCCL (requires --features nccl).");
                 std::process::exit(0);
             }
             other => {
@@ -92,6 +96,21 @@ fn main() {
             ByteDataset::synthetic(cli.synth_bytes, cfg.seq_len)
         }
     };
+
+    // Dispatch to the data-parallel loop when --world-size > 1.
+    #[cfg(feature = "nccl")]
+    if cli.world_size > 1 {
+        eprintln!("[aether-train] data-parallel world_size={} (NCCL)", cli.world_size);
+        let _trace = trainer::dp::train_dp(cfg.clone(), train.clone(), cli.world_size, dataset)
+            .expect("dp training failed");
+        eprintln!("[aether-train] dp training done");
+        return;
+    }
+    #[cfg(not(feature = "nccl"))]
+    if cli.world_size > 1 {
+        eprintln!("[aether-train] --world-size > 1 requires building with --features nccl");
+        std::process::exit(2);
+    }
 
     let mut model = Model::new(cfg.clone(), train.seed);
     eprintln!("[aether-train] arena: {} f32 floats ({} MB)",
