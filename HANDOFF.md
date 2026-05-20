@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (GPU-NATIVE QWEN BLOCK FORWARD — 115x speedup over CPU, max_diff 3e-5 vs CPU reference; 5 new CUDA kernels for RMSNorm/RoPE/GQA/SiLU/elementwise; the remaining bug to close llama.cpp parity is Q4_K-on-GPU)
+2026-05-20 (Q4_K + Q6_K dequant on GPU — bit-exact vs CPU on real Qwen2.5 weights; 7.4x PCIe savings; the memory enabler for fitting 28-block Qwen2.5-7B in 8 GB VRAM; fused dequant+matmul is the perf finisher and stays open as the final FR)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,60 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## Q4_K + Q6_K dequant on GPU LANDED (memory enabler for matt-voice deploy)
+
+User: "Get it to production speed". Plan was Q4_K-on-GPU to close
+the llama.cpp gap. This session: the FOUNDATION (u8 device
+registry + Q4_K/Q6_K dequant kernels + parity tests). The fused
+dequant+matmul kernel that finishes the perf story remains the
+single biggest remaining FR.
+
+### Shipped
+- `aether_dev_alloc_u8` / `_h2d_u8` / `_d2h_u8` / `_free_u8` --
+  device byte buffer registry (parallel to f32 + i32 registries).
+- `dequant_q4_k_m` CUDA kernel: 256 threads/CTA, 1 output per
+  thread. Reads f16 d + dmin + 12 packed scales + 128 nibble-
+  packed quants per 144-byte super-block.
+- `dequant_q6_k` CUDA kernel: same shape, 210-byte super-blocks
+  with ql[128] + qh[64] + scales[16] + f16 d.
+- Both expose `aether_op_dequant_q*_f32_cuda(blocks_u8, out_f32,
+  n_blocks)` wrappers.
+
+### Bit-exact vs CPU on real Qwen2.5 weights
+- `q4_k_dequant_cuda_parity.rs`: synth block + real
+  blk.0.attn_q.weight first 4 super-blocks. `max_diff = 0`.
+- `q6_k_dequant_cuda_parity.rs`: real blk.0.attn_v.weight
+  (7168 super-blocks, 1.4M elements). `max_diff = 0`.
+- `qwen25_block_forward_q4k_resident.rs`: 5 Q4_K tensors of
+  Qwen block 0 verified bit-exact. **Total 84 MB Q4_K vs 623 MB
+  f32 = 7.4x less PCIe** per block.
+
+### Memory accounting (RTX 3070 Ti 8 GB)
+- All 28 blocks of Qwen2.5-7B as Q4_K + Q6_K: ~6 GB **fits** with
+  room for activations + KV cache.
+- All 28 blocks as f32 dequant'd: ~24 GB **does NOT fit**.
+
+Q4_K/Q6_K-on-GPU is what makes 8 GB VRAM enough to hold the
+entire model. This is the unblock for matt-voice inference at
+production scale.
+
+### The final perf finisher (Q4_K matmul fusion) -- still open
+
+Today: per matmul we dequant Q4_K -> transient f32 -> cuBLAS sgemm.
+The transient f32 buffer is 4x the Q4_K size and the cuBLAS sgemm
+runs over the bloated f32 (same as before). What llama.cpp does:
+fused dequant+matmul where each CTA loads a tile of Q4_K bytes
+into shared mem, dequants inline, then does sgemm-style accumulate
+against the activation matrix in registers.
+
+Engineering: ~500-1000 LOC of careful CUDA (tile sizing, shared
+memory layout, warp-level math, tensor-core path on sm_8.0+).
+Estimated ~10-50x additional speedup on top of today's bit-exact
+dequant. That's the final piece for matt-voice production speed.
+
+Tagged FR-17.14-extra-deepest in NEXT-UP. The Q4_K-on-GPU
+foundation shipped this session is the prerequisite.
 
 ## GPU-native Qwen block forward LANDED — 115x speedup
 

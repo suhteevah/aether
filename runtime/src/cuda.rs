@@ -60,6 +60,8 @@ struct CudaCtx {
     mul_inplace:       CudaFunction,
     add_inplace:       CudaFunction,
     bias_add:          CudaFunction,
+    dequant_q4_k_m_gpu:CudaFunction,
+    dequant_q6_k_gpu:  CudaFunction,
 }
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
@@ -483,6 +485,166 @@ extern "C" __global__ void bias_add(
     int c = idx % cols;
     x[idx] += bias[c];
 }
+
+// matt-voice / FR-17.14-extra-deepest — Q4_K_M dequant on GPU.
+// 144 bytes per 256-quant super-block: f16 d + f16 dmin + 12 packed
+// scales/mins + 128 nibble-packed quants. Mirrors aether_dequant_q4_k_m
+// in ops::lib.rs, parallelised one-thread-per-output.
+//
+// Per output qi in [0, 256):
+//   sub = qi / 32              (sub-block 0..7)
+//   l   = qi % 32              (offset within sub-block)
+//   j   = sub / 2              (byte cluster, 0..4)
+//   is_hi = sub & 1            (low or high nibble)
+//   byte = qs[j*32 + l]
+//   nibble = is_hi ? (byte >> 4) & 0xF : byte & 0xF
+//   sc, mn = q4k_get_scale_min(sub) from the 12 scales bytes
+//   value = d * sc * nibble - dmin * mn
+
+extern "C" __device__ float aether_f16_to_f32_dev(unsigned short h) {
+    unsigned int sign = (h >> 15) & 1u;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign << 31; return __int_as_float(bits); }
+        // Subnormal: normalise the mantissa by shifting left until bit 10
+        // is set, decrementing the exponent for each shift. Matches the
+        // CPU `aether_f16_to_f32` reference (runtime/src/lib.rs).
+        unsigned int m = mant;
+        int e = -14;
+        while ((m & 0x0400u) == 0u) { m <<= 1; e -= 1; }
+        m &= 0x03FFu;
+        bits = (sign << 31) | ((unsigned int)(e + 127) << 23) | (m << 13);
+        return __int_as_float(bits);
+    }
+    if (exp == 0x1Fu) {
+        bits = (sign << 31) | (0xFFu << 23) | (mant << 13);
+        return __int_as_float(bits);
+    }
+    unsigned int f32_exp  = (exp - 15u + 127u) << 23;
+    unsigned int f32_mant = mant << 13;
+    bits = (sign << 31) | f32_exp | f32_mant;
+    return __int_as_float(bits);
+}
+
+// q4k_get_scale_min: decode sub-block sub's (scale_low6, min_low6)
+// from the 12-byte scales array. See ggml-quants.c::get_scale_min_k4.
+extern "C" __device__ unsigned int q4k_get_scale(int sub, const unsigned char* sc) {
+    if (sub < 4) return sc[sub] & 63u;
+    return (sc[sub + 4] & 0xFu) | (((unsigned int)(sc[sub - 4] >> 6)) << 4);
+}
+extern "C" __device__ unsigned int q4k_get_min(int sub, const unsigned char* sc) {
+    if (sub < 4) return sc[sub + 4] & 63u;
+    return (sc[sub + 4] >> 4) | (((unsigned int)(sc[sub] >> 6)) << 4);
+}
+
+extern "C" __global__ void dequant_q4_k_m(
+    const unsigned char* __restrict__ blocks,
+    float*               __restrict__ out,
+    int n_blocks)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_blocks * 256;
+    if (idx >= total) return;
+    int bi = idx / 256;
+    int qi = idx % 256;
+    int sub = qi / 32;
+    int l   = qi % 32;
+    int j   = sub / 2;
+    int is_hi = sub & 1;
+
+    const unsigned char* base = blocks + bi * 144;
+    unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+    unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+    float d    = aether_f16_to_f32_dev(d_bits);
+    float dmin = aether_f16_to_f32_dev(dmin_bits);
+
+    const unsigned char* scales = base + 4;
+    unsigned int sc = q4k_get_scale(sub, scales);
+    unsigned int mn = q4k_get_min(sub, scales);
+
+    const unsigned char* qs = base + 16;
+    unsigned char byte = qs[j * 32 + l];
+    unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+
+    out[idx] = d * (float)sc * (float)nibble - dmin * (float)mn;
+}
+
+// matt-voice / FR-17.14-extra-deepest — Q6_K dequant on GPU.
+// 210 bytes per 256-quant super-block:
+//   bytes 0..128   : ql[128]   -- low 4 bits of each quant
+//   bytes 128..192 : qh[64]    -- high 2 bits of each quant
+//   bytes 192..208 : scales[16] -- i8 sub-block scales
+//   bytes 208..210 : d         -- f16 super-block scale
+// Mirrors aether_dequant_q6_k in lib.rs. One thread per output f32.
+//
+// Layout (per ggml-quants.c::dequantize_row_q6_K):
+//   For each l in 0..32, for each n_outer (0..2):
+//     q1 = ((ql[l +  0 + 64*n_outer] & 0xF) | ((qh[l + 32*n_outer] >> 0) & 3) << 4) - 32
+//     q2 = ((ql[l + 32 + 64*n_outer] & 0xF) | ((qh[l + 32*n_outer] >> 2) & 3) << 4) - 32
+//     q3 = ((ql[l +  0 + 64*n_outer]  >> 4) | ((qh[l + 32*n_outer] >> 4) & 3) << 4) - 32
+//     q4 = ((ql[l + 32 + 64*n_outer]  >> 4) | ((qh[l + 32*n_outer] >> 6) & 3) << 4) - 32
+//     y[l +  0 + 128*n_outer] = d * sc[is +  0 + 8*n_outer] * q1
+//     y[l + 32 + 128*n_outer] = d * sc[is +  2 + 8*n_outer] * q2
+//     y[l + 64 + 128*n_outer] = d * sc[is +  4 + 8*n_outer] * q3
+//     y[l + 96 + 128*n_outer] = d * sc[is +  6 + 8*n_outer] * q4
+//   where is = l/16
+extern "C" __global__ void dequant_q6_k(
+    const unsigned char* __restrict__ blocks,
+    float*               __restrict__ out,
+    int n_blocks)
+{
+    // 256 threads per CTA, n_blocks CTAs. Each thread = one output f32.
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_blocks * 256;
+    if (idx >= total) return;
+    int bi = idx / 256;
+    int qi = idx % 256;
+    // Which n_outer half (0 or 1) and which of the 4 sub-positions
+    // (0..32, 32..64, 64..96, 96..128) within that half.
+    int n_outer = qi / 128;            // 0 or 1
+    int qi_local = qi % 128;
+    int sub_pos = qi_local / 32;       // 0..3 within the half
+    int l = qi_local % 32;
+
+    const unsigned char* base = blocks + bi * 210;
+    const unsigned char* ql = base;                      // 128 bytes
+    const unsigned char* qh = base + 128;                // 64 bytes
+    const signed char*   sc = (const signed char*)(base + 192);  // 16 bytes signed
+    unsigned short d_bits = ((unsigned short)base[209] << 8) | (unsigned short)base[208];
+    float d = aether_f16_to_f32_dev(d_bits);
+
+    int ql_off  = n_outer * 64;
+    int qh_off  = n_outer * 32;
+    int sc_off  = n_outer * 8;
+
+    unsigned char ql_lo = ql[ql_off + l];
+    unsigned char ql_hi = ql[ql_off + l + 32];
+    unsigned char qh_byte = qh[qh_off + l];
+
+    int q;
+    int sc_idx;
+    switch (sub_pos) {
+        case 0:
+            q = (int)((ql_lo & 0xFu) | (((qh_byte >> 0) & 3u) << 4)) - 32;
+            sc_idx = sc_off + (l / 16) + 0;
+            break;
+        case 1:
+            q = (int)((ql_hi & 0xFu) | (((qh_byte >> 2) & 3u) << 4)) - 32;
+            sc_idx = sc_off + (l / 16) + 2;
+            break;
+        case 2:
+            q = (int)(((ql_lo >> 4) & 0xFu) | (((qh_byte >> 4) & 3u) << 4)) - 32;
+            sc_idx = sc_off + (l / 16) + 4;
+            break;
+        default:
+            q = (int)(((ql_hi >> 4) & 0xFu) | (((qh_byte >> 6) & 3u) << 4)) - 32;
+            sc_idx = sc_off + (l / 16) + 6;
+            break;
+    }
+    out[idx] = d * (float)sc[sc_idx] * (float)q;
+}
 "#;
 
 static CTX: OnceLock<CudaCtx> = OnceLock::new();
@@ -509,6 +671,16 @@ static I32_BUFFERS: I32Registry = I32Registry(UnsafeCell::new(Vec::new()));
 #[inline]
 unsafe fn i32_bufs() -> &'static mut Vec<Option<CudaSlice<i32>>> { &mut *I32_BUFFERS.0.get() }
 
+/// Registry for u8 device buffers — used for quantised weight blocks
+/// (Q4_K, Q6_K) that stay in their compact form on device. Avoids the
+/// 4× host->device PCIe blowup of dequantising to f32 before upload.
+struct U8Registry(UnsafeCell<Vec<Option<CudaSlice<u8>>>>);
+unsafe impl Sync for U8Registry {}
+static U8_BUFFERS: U8Registry = U8Registry(UnsafeCell::new(Vec::new()));
+
+#[inline]
+unsafe fn u8_bufs() -> &'static mut Vec<Option<CudaSlice<u8>>> { &mut *U8_BUFFERS.0.get() }
+
 fn ctx() -> &'static CudaCtx {
     CTX.get_or_init(|| {
         let device = CudaDevice::new(0).expect("CudaDevice::new(0)");
@@ -523,7 +695,8 @@ fn ctx() -> &'static CudaCtx {
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
-              "silu_inplace", "mul_inplace", "add_inplace", "bias_add"])
+              "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
+              "dequant_q4_k_m", "dequant_q6_k"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -547,13 +720,16 @@ fn ctx() -> &'static CudaCtx {
         let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
         let add_inplace           = device.get_func("aether_kernels", "add_inplace").unwrap();
         let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
+        let dequant_q4_k_m_gpu    = device.get_func("aether_kernels", "dequant_q4_k_m").unwrap();
+        let dequant_q6_k_gpu      = device.get_func("aether_kernels", "dequant_q6_k").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
                   softmax_f32, softmax_bwd, softmax_bwd_scaled, scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
                   rms_norm_fwd, rope_apply, gqa_repeat_kv,
-                  silu_inplace, mul_inplace, add_inplace, bias_add }
+                  silu_inplace, mul_inplace, add_inplace, bias_add,
+                  dequant_q4_k_m_gpu, dequant_q6_k_gpu }
     })
 }
 
@@ -587,6 +763,52 @@ fn handle_to_i32_idx(h: i64) -> Option<usize> {
     let bs = i32_bufs();
     let buf = bs[i].as_mut().expect("freed i32 buf");
     ctx().device.htod_sync_copy_into(host_slice, buf).expect("h2d i32");
+    0
+}
+
+// === u8 device buffers (FR-17.14-extra-deepest: Q4_K-on-GPU) ===
+
+fn handle_to_u8_idx(h: i64) -> Option<usize> {
+    if h <= 0 { None } else { Some((h - 1) as usize) }
+}
+
+/// Allocate `n` bytes on the device, zero-initialised. Returns an
+/// opaque i64 handle (1-based, separate from f32 / i32 registries).
+#[no_mangle] pub extern "C" fn aether_dev_alloc_u8(n: c_int) -> i64 {
+    if n <= 0 { return 0; }
+    let buf = ctx().device.alloc_zeros::<u8>(n as usize).expect("cudaMalloc u8");
+    let bs = unsafe { u8_bufs() };
+    bs.push(Some(buf));
+    bs.len() as i64
+}
+
+#[no_mangle] pub extern "C" fn aether_dev_free_u8(handle: i64) -> c_int {
+    if let Some(i) = handle_to_u8_idx(handle) {
+        let bs = unsafe { u8_bufs() };
+        if i < bs.len() { bs[i] = None; }
+    }
+    0
+}
+
+/// Host → device copy of `n` bytes. Used to upload Q4_K / Q6_K block
+/// data without the f32 dequant blowup.
+#[no_mangle] pub unsafe extern "C" fn aether_dev_h2d_u8(host: i64, dev: i64, n: c_int) -> c_int {
+    let Some(i) = handle_to_u8_idx(dev) else { return -1; };
+    if host == 0 || n <= 0 { return -1; }
+    let host_slice = std::slice::from_raw_parts(host as *const u8, n as usize);
+    let bs = u8_bufs();
+    let buf = bs[i].as_mut().expect("freed u8 buf");
+    ctx().device.htod_sync_copy_into(host_slice, buf).expect("h2d u8");
+    0
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_dev_d2h_u8(dev: i64, host: i64, n: c_int) -> c_int {
+    let Some(i) = handle_to_u8_idx(dev) else { return -1; };
+    if host == 0 || n <= 0 { return -1; }
+    let host_slice = std::slice::from_raw_parts_mut(host as *mut u8, n as usize);
+    let bs = u8_bufs();
+    let buf = bs[i].as_ref().expect("freed u8 buf");
+    ctx().device.dtoh_sync_copy_into(buf, host_slice).expect("d2h u8");
     0
 }
 
@@ -1410,6 +1632,61 @@ fn libm_powf(base: f32, n: f32) -> f32 {
     unsafe {
         let xv = &mut *x_p; let bv = &*b_p;
         ctx().bias_add.clone().launch(cfg, (xv, bv, rows, cols)).expect("launch bias_add");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest — dequant `n_blocks` Q4_K_M super-blocks
+/// on device. `blocks_u8` is a u8 device handle pointing to
+/// `n_blocks * 144` raw bytes; `out_f32` is an f32 device handle of
+/// length `n_blocks * 256`.
+///
+/// Threading: 256 threads per block; n_blocks total CTAs. Each thread
+/// produces ONE dequantised f32. Mirrors the CPU
+/// `aether_dequant_q4_k_m` exactly byte-for-byte (verified by the
+/// parity test).
+#[no_mangle] pub extern "C" fn aether_op_dequant_q4_k_m_f32_cuda(
+    blocks_u8: i64, out_f32: i64, n_blocks: c_int,
+) -> c_int {
+    let Some(i_blk) = handle_to_u8_idx(blocks_u8) else { return -1; };
+    let Some(i_out) = handle_to_idx(out_f32) else { return -1; };
+    if n_blocks <= 0 { return -1; }
+    let bs_u8 = unsafe { u8_bufs() };
+    let bs_f32 = unsafe { bufs() };
+    let b_p = bs_u8[i_blk].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs_f32[i_out].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (n_blocks * 256) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let bv = &*b_p; let ov = &mut *o_p;
+        ctx().dequant_q4_k_m_gpu.clone()
+            .launch(cfg, (bv, ov, n_blocks))
+            .expect("launch dequant_q4_k_m");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest (Q6_K) — dequant `n_blocks` Q6_K super-blocks
+/// on device. `blocks_u8` is `n_blocks * 210` raw bytes; `out_f32` is
+/// `n_blocks * 256` f32. Mirrors the CPU `aether_dequant_q6_k` and
+/// matches it byte-for-byte (verified by the parity test).
+#[no_mangle] pub extern "C" fn aether_op_dequant_q6_k_f32_cuda(
+    blocks_u8: i64, out_f32: i64, n_blocks: c_int,
+) -> c_int {
+    let Some(i_blk) = handle_to_u8_idx(blocks_u8) else { return -1; };
+    let Some(i_out) = handle_to_idx(out_f32) else { return -1; };
+    if n_blocks <= 0 { return -1; }
+    let bs_u8 = unsafe { u8_bufs() };
+    let bs_f32 = unsafe { bufs() };
+    let b_p = bs_u8[i_blk].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs_f32[i_out].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (n_blocks * 256) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let bv = &*b_p; let ov = &mut *o_p;
+        ctx().dequant_q6_k_gpu.clone()
+            .launch(cfg, (bv, ov, n_blocks))
+            .expect("launch dequant_q6_k");
     }
     0
 }

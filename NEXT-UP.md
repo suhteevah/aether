@@ -9,7 +9,52 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, GPU-native Qwen block forward + Q4_K gap doc)
+## Closed this batch (2026-05-20, Q4_K + Q6_K on-GPU dequant -- the memory enabler)
+
+User: "Get it to production speed". Ship the Q4_K-on-GPU
+foundation so all 28 blocks of Qwen2.5-7B fit in 8 GB VRAM.
+
+### Shipped
+- `aether_dev_alloc_u8` / `_h2d_u8` / `_d2h_u8` / `_free_u8` --
+  device byte buffer registry, parallel to existing f32 + i32.
+- CUDA `dequant_q4_k_m` kernel (144-byte super-block, 256
+  outputs per CTA, one thread per output). Mirrors CPU exactly.
+- CUDA `dequant_q6_k` kernel (210-byte super-block, same shape).
+- Wrappers: `aether_op_dequant_q4_k_m_f32_cuda` +
+  `aether_op_dequant_q6_k_f32_cuda` taking u8 in/f32 out handles.
+
+### Bit-exact verification (max_diff = 0)
+- `q4_k_dequant_cuda_parity.rs` -- synth + real Qwen W_q
+- `q6_k_dequant_cuda_parity.rs` -- real Qwen W_v (Q6_K dtype)
+- `qwen25_block_forward_q4k_resident.rs` -- all 5 Q4_K tensors
+  in Qwen block 0 verified GPU == CPU. **84 MB Q4_K vs 623 MB
+  f32 = 7.4x less PCIe** per block.
+
+### Memory unblock for 8 GB VRAM
+- 28 blocks of Q4_K+Q6_K weights: ~6 GB -- **fits in 8 GB**
+- 28 blocks dequant'd to f32: ~24 GB -- does NOT fit
+
+Without Q4_K-on-GPU, you'd have to dequant + stream blocks per
+forward pass, which kills perf. With Q4_K-on-GPU, all weights
+stay resident across all generation steps.
+
+### NEW open FR: fused dequant+matmul (the perf finisher)
+
+Today's matmul pipeline: dequant Q4_K -> transient f32 -> cuBLAS
+sgemm. The f32 transient is 4x the Q4_K + sgemm is on bloated f32.
+
+The llama.cpp-style fused kernel: each CTA loads a tile of Q4_K
+bytes to shared memory, dequants inline, sgemm-accumulates in
+registers. Estimated 10-50x additional speedup on top of
+on-device dequant; brings matt-voice to ~30 tok/s = llama.cpp
+parity on the same RTX 3070 Ti.
+
+Tagged FR-17.14-extra-deepest. ~500-1000 LOC of careful CUDA
+(tile sizing + shared memory layout + warp math + optional
+tensor-core path on sm_8.0+). The Q4_K-on-GPU foundation shipped
+here is the prerequisite.
+
+## Closed earlier (2026-05-20, GPU-native Qwen block forward + Q4_K gap doc)
 
 User said: "address major inference on gpu bugs/fr to bring to
 parity with llama.cpp". Profiled the existing cuBLAS-routed path
