@@ -1506,6 +1506,36 @@ unsafe fn tcp_streams() -> &'static mut Vec<Option<Box<std::net::TcpStream>>> {
     }
 }
 
+/// FR-18.10 — connect to an arbitrary `host:port`. `host_bytes` is a
+/// caller buffer with hostname/IP (any form resolvable via std's
+/// TcpStream::connect, including hostnames + IPv4/IPv6 literals).
+/// Returns stream handle or -1.
+#[no_mangle] pub unsafe extern "C" fn aether_tcp_connect_host(
+    host: i64, host_len: c_int, port: i64,
+) -> i64 {
+    if host == 0 || host_len <= 0 || !(0..=65535).contains(&port) { return -1; }
+    let host_bytes = std::slice::from_raw_parts(host as *const u8, host_len as usize);
+    let Ok(host_str) = std::str::from_utf8(host_bytes) else { return -1; };
+    let addr = format!("{}:{}", host_str, port);
+    match std::net::TcpStream::connect(&addr) {
+        Ok(s) => {
+            // 30s read/write timeout so a stuck peer doesn't wedge the rank.
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+            let v = tcp_streams();
+            for (i, slot) in v.iter_mut().enumerate() {
+                if slot.is_none() { *slot = Some(Box::new(s)); return i as i64; }
+            }
+            v.push(Some(Box::new(s)));
+            (v.len() - 1) as i64
+        }
+        Err(e) => {
+            eprintln!("[tcp_connect_host] {}: {}", addr, e);
+            -1
+        }
+    }
+}
+
 /// Send `n` bytes from `buf` over `stream`. Returns bytes written, or -1 on err.
 #[no_mangle] pub unsafe extern "C" fn aether_tcp_send(stream: i64, buf: i64, n: i64) -> i64 {
     use std::io::Write;

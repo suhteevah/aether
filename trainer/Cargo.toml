@@ -20,6 +20,10 @@ path = "src/bin/prepare.rs"
 name = "aether-serve"
 path = "src/bin/serve.rs"
 
+[[bin]]
+name = "aether-allreduce"
+path = "src/bin/allreduce.rs"
+
 [features]
 default = []
 # `nccl`: enable the data-parallel training loop in `dp.rs`. Forwards
