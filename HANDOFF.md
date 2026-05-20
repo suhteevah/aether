@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (stable **27.22 tok/s** on RTX 3070 Ti / Qwen2.5-7B — **91% of llama.cpp's ~30 tok/s** — after per-block dtype dispatch fix + FFN fusion. Generated IDs `[358, 2776, 264, 220, 17]` match the cuBLAS reference exactly. Byte-once v3 matmul kernel landed as alt but was actually slower due to register pressure; v2 stays on the hot path. Per-op breakdown shows FFN matmuls dominate at 57% of token time, attn QKV at 28%, attention itself only 4%.)
+2026-05-20 (**37.35 tok/s** on RTX 3070 Ti / Qwen2.5-7B = **124% of llama.cpp's ~30 tok/s** via CUDA graph capture. The per-token forward gets recorded into one CUDA graph at first decode step and replayed for every subsequent step — ~370 kernel launches per token compressed into one `cuGraphLaunch`. Device-arg variants of rope/append_kv/attention read step args from a 4-int device buffer that's h2d-updated per step. Generated IDs `[358, 2776, 264, 220, 17]` still bit-identical to cuBLAS reference.)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's

@@ -254,16 +254,18 @@ chain. Measured wall-clock over 5 generate-only tokens after a
 | 2026-05-20 | 399718e |  25.5 | per-block Q4_K/Q6_K dtype dispatch fix (was NaN'ing)   |
 | 2026-05-20 | 9b5a21e |  26.0 | fused gate+up+silu+mul kernel (4 launches -> 1)         |
 | 2026-05-20 | 859745d |  27.2 | thermal-stable 5-run mean (no logic change)            |
+| 2026-05-20 | 7e1804f |  37.4 | **CUDA graphs**: capture per-step forward, replay each step |
 
 llama.cpp reference on the same hardware: ~30 tok/s.
-Aether at commit 859745d is at **91% of llama.cpp** with matching
-generated IDs.
+Aether at commit 7e1804f is at **124% of llama.cpp** with matching
+generated IDs — i.e., Aether is now FASTER than llama.cpp on this
+model/hardware while producing the same outputs.
 
-The split: 57% of token time is FFN matmuls (gate+up+down), 28%
-QKV proj, 4% attention itself, ~8% kernel launch overhead (370
-launches/token x ~8 us each). CUDA Graphs would compress launch
-overhead to one launch per step; closing the ~3 ms launch budget
-would put Aether at ~96% of llama.cpp throughput.
+The launch overhead was much larger than the per-op profiler
+suggested (~10 ms/token of overhead was actually saved, vs ~3 ms
+estimated). Recording into a graph collapses ~370 host-side kernel
+launches into one cuGraphLaunch call; the only host work left per
+step is updating a 4-int step_args device buffer.
 
 ## bench/training_throughput — steps/sec (planned, gates on P8.3)
 

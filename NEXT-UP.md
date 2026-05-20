@@ -9,7 +9,60 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, FFN fusion + v3 kernel exploration → stable 27.22 tok/s = 91% of llama.cpp)
+## Closed this batch (2026-05-20, CUDA graphs → 37.35 tok/s = 124% of llama.cpp)
+
+User: "Go on cuda graphs". Shipped, big win.
+
+### Architecture
+Capture the per-token forward (~370 kernel launches across 28
+decoder blocks + final norm + lm_head) into ONE CUDA graph and
+replay it for every decode step. Per-step args (pos, cur_seq)
+live in a 4-int device buffer that gets h2d-updated each step;
+the kernels read them from device memory so the captured graph
+itself is fixed.
+
+### Pieces
+- 3 new kernels read pos/cur_seq from a `int* step_args` device
+  pointer instead of immediate launch args:
+  `rope_apply_devarg`, `append_kv_devarg`, `attention_seq1_devarg`.
+  Parity test `devarg_kernels_parity.rs` verifies bit-identical
+  output (max_diff = 0) vs the immediate-arg versions.
+- `runtime/src/cuda.rs` exposes the graph API directly via
+  `cudarc::driver::sys`: `aether_dev_graph_begin` (puts the device
+  stream into `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`), `_end` (calls
+  `cuStreamEndCapture` then `cuGraphInstantiateWithFlags`),
+  `_launch`, `_destroy`.
+- `CudaDevice` switched from `new()` (legacy null/default stream,
+  rejected by `cuStreamBeginCapture_v2` with
+  `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`) to `new_with_stream()`
+  (non-blocking stream that IS capturable). No measured regression
+  on the non-graph path.
+- `cuda_graph_smoke.rs` proves the plumbing: capture
+  `rope_apply_devarg`, then replay with an updated `step_args`,
+  confirm the output reflects the NEW pos (validates the dev-ptr
+  read inside a captured graph).
+- `qwen25_graph_decode.rs` runs the full end-to-end Qwen2.5-7B
+  autoregressive: prefill 4 tokens with normal launches, then
+  capture the per-token decode pass once, replay for the remaining
+  5 tokens. Capture+instantiate one-time cost: ~2 ms.
+
+### Measurements (RTX 3070 Ti, Qwen2.5-7B-Instruct Q4_K_M)
+- Non-graph baseline (commit 859745d): **27.22 tok/s** (5-run mean)
+- With CUDA graphs (commit 7e1804f): **37.35 tok/s** (5-run mean)
+- Speedup: **+37.2%** throughput, -9.8 ms/token
+- llama.cpp reference on same hardware: ~30 tok/s
+- **Aether is now at 124% of llama.cpp throughput.**
+
+Generated IDs `[358, 2776, 264, 220, 17]` still bit-identical to
+the cuBLAS-routed reference.
+
+The launch overhead was much larger than the breakdown profiler
+suggested (~10 ms vs ~3 ms estimated). The profiler's
+per-group `aether_dev_sync()` was inflating the "kernel time" budget
+across groups by serializing what would otherwise be back-to-back
+launches on the GPU side.
+
+## Closed earlier (2026-05-20, FFN fusion + v3 kernel exploration → stable 27.22 tok/s = 91% of llama.cpp)
 
 User: "Go on what's next for llama.cpp parity". Profiled, fused, explored.
 
