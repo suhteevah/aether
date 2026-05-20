@@ -9,7 +9,67 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, GPU-routed inference + tokenizer decode)
+## Closed this batch (2026-05-20, FR-18.10 UNPARKED via 3-host TCP all-reduce)
+
+User said "we need 18.10 and 18.11" after enumerating the three
+machines on the LAN. Three-host pool verified:
+
+| Host | OS | LAN IP | GPU | VRAM |
+|---|---|---|---|---|
+| kokonoe | Windows | 192.168.168.121 | RTX 3070 Ti | 8 GB |
+| cnc-server | Linux | 192.168.168.100 | 2× P100 | 12+16 GB |
+| satibook | Windows | 192.168.168.200 | RTX 3050 | 6 GB |
+
+Total: **4 GPUs, ~42 GB combined VRAM, 3 hosts**.
+
+### FR-18.10 UNPARKED — multi-host all-reduce over TCP/IP
+
+- New `aether_tcp_listen_addr(addr, n_addr, port)`: bind to any
+  interface ("0.0.0.0" for all-interfaces).
+- New `aether_tcp_connect_host(host, n_host, port)`: connect to
+  any host (not just 127.0.0.1).
+- New `trainer/src/bin/allreduce.rs`: `aether-allreduce` binary,
+  rank 0 = rendezvous server, ranks 1..N-1 = clients. Per call:
+  collect each peer's buffer, sum, broadcast back. All ranks see
+  identical reduced result.
+
+**Verified 3-host run:**
+- kokonoe rank 0 (value=1.0, listening 0.0.0.0:28080)
+- cnc rank 1 (value=2.0)  -- RTT 158 ms
+- satibook rank 2 (value=4.0) -- RTT 25 ms
+- All 3 ranks received [7.0, 7.0, ..., 7.0] (sum=1+2+4 = 7)
+
+This is REAL cross-host distributed working via Aether's runtime,
+no NCCL needed. IB/RoCE would be a future transport upgrade
+(replace TCP send/recv with libfabric or RDMA verbs); the
+protocol structure is unchanged.
+
+### FR-18.11 partial — 4-GPU scope-shape demonstrated, 8-GPU still hardware-gated
+
+The full FR-18.11 spec is "8-GPU Llama-7B training". We have only
+4 GPUs across the 3-host pool. The PROTOCOL components needed for
+the 8-GPU shape are all proven:
+
+- Multi-host all-reduce (above)
+- Per-host data-parallel training (`nccl_dual_gpu_dp_step`,
+  `nccl_dual_gpu_resident`)
+- KV cache + autoregressive (`qwen25_autoregressive_cuda`)
+- Block-streaming weight load (`qwen25_full_inference`)
+
+Combining them into a 4-host run that simultaneously trains is
+matt-voice's next-session work. The 8-card claim stays parked
+until 4 more GPUs appear.
+
+### Operational notes
+
+- Windows hosts (kokonoe, satibook) need explicit firewall rules
+  for the listen port: `netsh advfirewall firewall add rule ...`
+- Cross-platform binary deploy: scp the .exe between Windows
+  hosts; rebuild on Linux for cnc.
+- Memory: `three_host_pool_setup.md` documents the inventory +
+  firewall fix + per-host build commands.
+
+## Closed earlier (2026-05-20, GPU-routed inference + tokenizer decode)
 
 User asked to "Go on 4 then 1" -- the GPU-resident inference path
 and the tokenizer integration. Both landed.
@@ -986,8 +1046,8 @@ when access opens up; they don't gate anything in §1.
 
 | FR | What's blocked | Hardware needed |
 |---|---|---|
-| FR-18.10 | Multi-host RDMA (InfiniBand/RoCE) | 2+ hosts, IB switch |
-| FR-18.11 | 8-GPU Llama-7B training | 8× CUDA capable GPUs |
+| ~~FR-18.10~~ | ~~Multi-host RDMA (InfiniBand/RoCE)~~ | **UNPARKED 2026-05-20** — TCP variant shipped via aether-allreduce binary, verified across kokonoe+cnc+satibook. Real IB is still a transport upgrade FR. |
+| FR-18.11 (partial) | 8-GPU Llama-7B training | **4/8 GPUs available** across kokonoe (3070Ti) + cnc (2× P100) + satibook (3050). Protocol shape demonstrated by the multi-host all-reduce + per-host DP training; full 8-GPU witness needs 4 more GPUs. |
 | FR-21.4 | ROCm runtime (AMD) | AMD GPU (e.g. 7900 XTX) |
 | FR-21.5 | Metal Performance Shaders | Apple Silicon Mac |
 | FR-21.8 | Mobile export (CoreML / NNAPI) | iOS or Android dev environment |

@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (HTTP server binary + LoRA apply LANDED — aether-serve responds with OpenAI JSON; LoRA delta verified on real Qwen W_q; full matt-voice deploy chain is now ALL shipped except final Qwen-forward integration in serve binary)
+2026-05-20 (FR-18.10 UNPARKED — 3-host TCP/IP all-reduce across kokonoe+cnc+satibook produces correct sum on all 3 ranks; multi-host distributed real, no longer hardware-blocked)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,57 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## FR-18.10 UNPARKED — 3-host TCP/IP all-reduce works
+
+User said "we need 18.10 and 18.11" with kokonoe + cnc + satibook
+available. All 3 hosts on 192.168.168.x LAN + Tailscale.
+
+**Hardware pool:**
+| Host | OS | LAN IP | GPU | VRAM |
+|---|---|---|---|---|
+| kokonoe | Windows | 192.168.168.121 | RTX 3070 Ti | 8 GB |
+| cnc-server | Linux | 192.168.168.100 | 2× P100 | 12+16 GB |
+| satibook | Windows | 192.168.168.200 | RTX 3050 Laptop | 6 GB |
+
+Total **4 GPUs across 3 hosts, ~42 GB combined**.
+
+**Shipped:**
+- `aether_tcp_listen_addr(addr, n_addr, port)` -- bind to any
+  interface (was 127.0.0.1-only).
+- `aether_tcp_connect_host(host, n_host, port)` -- connect to any
+  host (was 127.0.0.1-only).
+- `trainer/src/bin/allreduce.rs` -- new `aether-allreduce` binary.
+  Rank 0 = rendezvous server (listens 0.0.0.0), ranks 1..N-1 =
+  clients. Per all-reduce: rank 0 collects buffers from each peer,
+  computes sum, broadcasts.
+
+**3-host run verified:**
+```
+kokonoe rank 0 (value=1) -> received [7.0, 7.0, ...]
+cnc     rank 1 (value=2) -> received [7.0, 7.0, ...], RTT 158 ms
+satibook rank 2 (value=4) -> received [7.0, 7.0, ...], RTT 25 ms
+Sum: 1 + 2 + 4 = 7 ✓ across all ranks
+```
+
+**Operational notes documented in memory:**
+- `three_host_pool_setup.md` -- inventory, firewall fix
+  (`netsh advfirewall firewall add rule name="aether-N"
+  dir=in action=allow protocol=TCP localport=N`), build commands
+  per host.
+
+## FR-18.11 partial — 4-GPU shape, 8-GPU still gated by hardware
+
+The original FR-18.11 spec is "8-GPU Llama-7B training". With 4
+GPUs in the pool, the full 8-card witness can't run. But all
+PROTOCOL components are proven:
+- Multi-host all-reduce (above)
+- Per-host data-parallel (`nccl_dual_gpu_dp_step`, `_resident`)
+- KV cache + autoregressive (`qwen25_autoregressive_cuda`)
+- Block-streaming weight load (`qwen25_full_inference`)
+
+Combining into a 4-host distributed training run that trains
+matt-voice across all 4 GPUs is the next-session bridge.
 
 ## aether-serve HTTP binary + LoRA apply LANDED
 
