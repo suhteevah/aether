@@ -44,24 +44,29 @@ const ROPE_BASE: f32 = 1_000_000.0;
 const NORM_EPS: f32 = 1e-6;
 
 /// Device handles for one decoder block's weights, all resident.
+/// Each weight tensor carries its GGUF dtype (12 = Q4_K, 14 = Q6_K)
+/// so block_forward can dispatch the right fused matmul kernel.
+/// In Qwen2.5-7B Q4_K_M, V proj and ffn_down are mixed-precision:
+/// some blocks use Q4_K, others Q6_K. The rest are uniformly Q4_K.
 struct BlockGpu {
     // Norms (F32, small)
     attn_norm_g: i64,
     ffn_norm_g: i64,
-    // Q4_K weights (raw bytes on device)
+    // Q4_K weights (always)
     w_q: i64, w_k: i64, w_o: i64, w_gate: i64, w_up: i64,
-    // Q6_K weights (raw bytes on device)
-    w_v: i64, w_down: i64,
+    // V and Down: dtype varies per block
+    w_v: i64,    dt_v: i32,
+    w_down: i64, dt_down: i32,
     // Biases (F32, small)
     b_q: i64, b_k: i64, b_v: i64,
     // n_blocks shapes
-    nb_qo: usize,    // d_model rows × 14 blocks each = 50176
-    nb_kv: usize,    // d_kv rows × 14 blocks each = 7168
-    nb_gate_up: usize,  // d_ff rows × 14 blocks each = 265216
-    nb_down: usize,  // d_model rows × 74 blocks each (k=d_ff=18944) = 265216
+    nb_qo: usize,
+    nb_kv: usize,
+    nb_gate_up: usize,
+    nb_down: usize,
 }
 
-unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize) {
+unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
     let needle = name.as_bytes();
     let idx = aether_gguf_find_tensor_by_name(h, needle.as_ptr() as i64, needle.len() as c_int);
     assert!(idx >= 0, "{} not found", name);
@@ -73,7 +78,7 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize) {
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
     let d_handle = aether_dev_alloc_u8(n_bytes as c_int);
     aether_dev_h2d_u8(dptr, d_handle, n_bytes as c_int);
-    (d_handle, n_blocks)
+    (d_handle, n_blocks, dt)
 }
 
 unsafe fn upload_f32_tensor(h: i64, name: &str) -> i64 {
@@ -91,17 +96,18 @@ unsafe fn load_block_to_device(h: i64, block_idx: usize) -> BlockGpu {
     let prefix = format!("blk.{}.", block_idx);
     let attn_norm_g = upload_f32_tensor(h, &format!("{}attn_norm.weight", prefix));
     let ffn_norm_g  = upload_f32_tensor(h, &format!("{}ffn_norm.weight", prefix));
-    let (w_q,    nb_qo)      = upload_tensor_u8(h, &format!("{}attn_q.weight", prefix));
-    let (w_k,    nb_kv)      = upload_tensor_u8(h, &format!("{}attn_k.weight", prefix));
-    let (w_v,    _)          = upload_tensor_u8(h, &format!("{}attn_v.weight", prefix));
-    let (w_o,    _)          = upload_tensor_u8(h, &format!("{}attn_output.weight", prefix));
-    let (w_gate, nb_gate_up) = upload_tensor_u8(h, &format!("{}ffn_gate.weight", prefix));
-    let (w_up,   _)          = upload_tensor_u8(h, &format!("{}ffn_up.weight", prefix));
-    let (w_down, nb_down)    = upload_tensor_u8(h, &format!("{}ffn_down.weight", prefix));
+    let (w_q,    nb_qo,      _)       = upload_tensor_u8(h, &format!("{}attn_q.weight", prefix));
+    let (w_k,    nb_kv,      _)       = upload_tensor_u8(h, &format!("{}attn_k.weight", prefix));
+    let (w_v,    _,          dt_v)    = upload_tensor_u8(h, &format!("{}attn_v.weight", prefix));
+    let (w_o,    _,          _)       = upload_tensor_u8(h, &format!("{}attn_output.weight", prefix));
+    let (w_gate, nb_gate_up, _)       = upload_tensor_u8(h, &format!("{}ffn_gate.weight", prefix));
+    let (w_up,   _,          _)       = upload_tensor_u8(h, &format!("{}ffn_up.weight", prefix));
+    let (w_down, nb_down,    dt_down) = upload_tensor_u8(h, &format!("{}ffn_down.weight", prefix));
     let b_q = upload_f32_tensor(h, &format!("{}attn_q.bias", prefix));
     let b_k = upload_f32_tensor(h, &format!("{}attn_k.bias", prefix));
     let b_v = upload_f32_tensor(h, &format!("{}attn_v.bias", prefix));
-    BlockGpu { attn_norm_g, ffn_norm_g, w_q, w_k, w_o, w_gate, w_up, w_v, w_down,
+    BlockGpu { attn_norm_g, ffn_norm_g, w_q, w_k, w_o, w_gate, w_up,
+               w_v, dt_v, w_down, dt_down,
                b_q, b_k, b_v, nb_qo, nb_kv, nb_gate_up, nb_down }
 }
 
@@ -170,27 +176,69 @@ unsafe fn alloc_kv_caches() -> Vec<KvCacheGpu> {
 /// on-device KV cache attention. `pos` is the absolute token position
 /// (0-indexed). `cur_seq = pos + 1` is the valid length in the cache
 /// after appending this step's K/V.
+/// Probe magnitude of a device buffer (debug helper).
+unsafe fn probe(label: &str, handle: i64, n: usize, enabled: bool) {
+    if !enabled { return; }
+    aether_dev_sync();
+    let mut host = vec![0.0f32; n];
+    aether_dev_d2h_f32(handle, host.as_mut_ptr() as i64, n as c_int);
+    let mut max_abs = 0.0f32;
+    let mut any_nan = false;
+    let mut any_inf = false;
+    let mut sum = 0.0f32;
+    let mut nonzero = 0;
+    for &v in &host {
+        if v.is_nan() { any_nan = true; continue; }
+        if v.is_infinite() { any_inf = true; continue; }
+        let a = v.abs();
+        if a > max_abs { max_abs = a; }
+        if a > 1e-10 { nonzero += 1; }
+        sum += v;
+    }
+    eprintln!("    [{:<14}] max_abs={:.3e} sum={:.3e} nonzero={}/{} nan={} inf={}",
+        label, max_abs, sum, nonzero, n, any_nan, any_inf);
+}
+
 unsafe fn block_forward_step(
     bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, pos: i32,
 ) {
+    block_forward_step_debug(bw, act, kv, pos, false);
+}
+
+unsafe fn block_forward_step_debug(
+    bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, pos: i32, dbg: bool,
+) {
+    if dbg { probe("x (block in)", act.x, D_MODEL, dbg); }
     // attn_norm
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
+    if dbg { probe("attn_norm out", act.x_norm, D_MODEL, dbg); }
     // Q proj (Q4_K v2) + bias
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_q, act.q,
         D_MODEL as c_int, (bw.nb_qo / D_MODEL) as c_int);
+    if dbg { probe("Q proj", act.q, D_MODEL, dbg); }
     aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, D_MODEL as c_int);
+    if dbg { probe("Q + bias", act.q, D_MODEL, dbg); }
     // K proj (Q4_K v2) + bias
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_k, act.k_step,
         D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
     aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, D_KV as c_int);
-    // V proj (Q6_K v2) + bias
-    aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
-        D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
+    if dbg { probe("K + bias", act.k_step, D_KV, dbg); }
+    // V proj (Q4_K or Q6_K depending on block) + bias
+    if bw.dt_v == 14 {
+        aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
+            D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
+    } else {
+        aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
+            D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
+    }
     aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, D_KV as c_int);
+    if dbg { probe("V + bias", act.v_step, D_KV, dbg); }
     // RoPE on Q and K_step (K_step is the per-kv-head K we'll cache;
     // Q has full n_q_heads expanded already from the proj).
     aether_op_rope_apply_f32_cuda(act.q,      1, N_Q_HEADS  as c_int, HEAD_DIM as c_int, ROPE_BASE, pos);
     aether_op_rope_apply_f32_cuda(act.k_step, 1, N_KV_HEADS as c_int, HEAD_DIM as c_int, ROPE_BASE, pos);
+    if dbg { probe("Q after RoPE", act.q, D_MODEL, dbg); }
+    if dbg { probe("K after RoPE", act.k_step, D_KV, dbg); }
     // Append K_step / V_step to per-block KV cache at position `pos`.
     aether_op_append_kv_f32_cuda(act.k_step, act.v_step, kv.k_cache, kv.v_cache,
         pos, D_KV as c_int);
@@ -201,25 +249,40 @@ unsafe fn block_forward_step(
         pos + 1, N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int,
         scale,
     );
+    if dbg { probe("attn_out", act.attn_out, D_MODEL, dbg); }
     // O proj (Q4_K v2)
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.attn_out, bw.w_o, act.proj,
         D_MODEL as c_int, (bw.nb_qo / D_MODEL) as c_int);
+    if dbg { probe("O proj", act.proj, D_MODEL, dbg); }
     // Residual
     aether_op_add_inplace_f32_cuda(act.x, act.proj, D_MODEL as c_int);
+    if dbg { probe("x after res1", act.x, D_MODEL, dbg); }
     // ffn_norm
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
+    if dbg { probe("ffn_norm out", act.x_norm, D_MODEL, dbg); }
     // gate + up (Q4_K v2) -- silu(gate) * up
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_gate, act.gate,
         D_FF as c_int, (bw.nb_gate_up / D_FF) as c_int);
+    if dbg { probe("gate", act.gate, D_FF, dbg); }
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_up, act.up,
         D_FF as c_int, (bw.nb_gate_up / D_FF) as c_int);
+    if dbg { probe("up", act.up, D_FF, dbg); }
     aether_op_silu_f32_cuda(act.gate, D_FF as c_int);
+    if dbg { probe("silu(gate)", act.gate, D_FF, dbg); }
     aether_op_mul_inplace_f32_cuda(act.gate, act.up, D_FF as c_int);
-    // down (Q6_K v2)
-    aether_op_fused_q6k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
-        D_MODEL as c_int, (bw.nb_down / D_MODEL) as c_int);
+    if dbg { probe("silu*up", act.gate, D_FF, dbg); }
+    // down (Q4_K or Q6_K depending on block)
+    if bw.dt_down == 14 {
+        aether_op_fused_q6k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
+            D_MODEL as c_int, (bw.nb_down / D_MODEL) as c_int);
+    } else {
+        aether_op_fused_q4k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
+            D_MODEL as c_int, (bw.nb_down / D_MODEL) as c_int);
+    }
+    if dbg { probe("down", act.down, D_MODEL, dbg); }
     // Residual
     aether_op_add_inplace_f32_cuda(act.x, act.down, D_MODEL as c_int);
+    if dbg { probe("x (block out)", act.x, D_MODEL, dbg); }
 }
 
 #[test]
@@ -240,7 +303,8 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
         eprintln!("[upload all 28 blocks] {:.2}s", t.elapsed().as_secs_f32());
 
         let final_norm_g = upload_f32_tensor(h, "output_norm.weight");
-        let (lm_head, lm_n_blocks) = upload_tensor_u8(h, "output.weight");
+        let (lm_head, lm_n_blocks, lm_dt) = upload_tensor_u8(h, "output.weight");
+        eprintln!("[lm_head dtype] {}", lm_dt);
         eprintln!("[upload output_norm + lm_head] {:.2}s",
             t.elapsed().as_secs_f32());
 
@@ -263,7 +327,9 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             let emb_host = dequant_embd_rows(h, &[t_id]);
             aether_dev_h2d_f32(emb_host.as_ptr() as i64, act.x, D_MODEL as c_int);
             for b in 0..N_LAYERS {
-                block_forward_step(&blocks[b], &act, &kvs[b], step as c_int);
+                let dbg = step == 0 && b == 3;
+                if dbg { eprintln!("\n  === DEBUG: block {} forward (step=0) ===", b); }
+                block_forward_step_debug(&blocks[b], &act, &kvs[b], step as c_int, dbg);
             }
         }
         aether_dev_sync();
@@ -299,8 +365,13 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             // Final RMSNorm
             aether_op_rms_norm_f32_cuda(act.x, final_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
             // lm_head (Q6_K v2): act.x_norm @ output.weight -> logits[VOCAB]
-            aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, lm_head, act.logits,
-                VOCAB as c_int, (lm_n_blocks / VOCAB) as c_int);
+            if lm_dt == 14 {
+                aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, lm_head, act.logits,
+                    VOCAB as c_int, (lm_n_blocks / VOCAB) as c_int);
+            } else {
+                aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, lm_head, act.logits,
+                    VOCAB as c_int, (lm_n_blocks / VOCAB) as c_int);
+            }
 
             aether_dev_sync();
             // Argmax on host (small d2h)

@@ -9,7 +9,58 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, attention_seq1 + KV cache on device + NaN diagnostic)
+## Closed this batch (2026-05-20, NaN bisected + fixed via per-block dtype dispatch)
+
+User: "Bisect the kernels and find the overflow op". Did exactly that.
+
+### Bisection result
+Per-op magnitude probes inside block 3 forward isolated the failing
+op to `[V + bias] max_abs=2.192e9 nan=true`. Diagnostic test
+`q6k_blk3_diagnose.rs` then surfaced the actual cause:
+
+```
+assertion `left == right` failed: not Q6_K
+  left: 12  (= Q4_K)
+  right: 14 (= Q6_K)
+```
+
+**`blk.3.attn_v.weight` is Q4_K, not Q6_K.** Qwen2.5-7B Q4_K_M is
+**mixed-precision** — V proj and ffn_down switch between Q4_K and
+Q6_K per layer. Hardcoding the Q6_K kernel based on block 0's dtype
+made the Q4_K-V-proj blocks read garbage (Q4_K's 144 B super-block
+layout vs Q6_K's 210 B layout).
+
+`qwen25_per_block_dtypes.rs` enumerates the full dtype-per-block
+table:
+- V proj Q6_K on [0,1,2,5,9,11,14,17,20,23,24,25,26,27], Q4_K else.
+- ffn_down Q6_K on [0,1,2,5,7,12,14,17,20,23,24,25,26,27], Q4_K else.
+- lm_head Q6_K on this model.
+
+### Fix shipped
+`BlockGpu` now carries `dt_v: i32` and `dt_down: i32`; the upload
+helper `upload_tensor_u8` returns `(i64, usize, i32)` (handle,
+n_blocks, dtype). The forward pass dispatches:
+
+```rust
+if bw.dt_v == 14 { aether_op_fused_q6k_matmul_seq1_v2_cuda(...); }
+else             { aether_op_fused_q4k_matmul_seq1_v2_cuda(...); }
+```
+
+Same pattern for ffn_down on `bw.dt_down` and lm_head on `lm_dt`.
+
+### End-to-end verification (just ran)
+- Block 3 V + bias now `max_abs=1.688e0` (was 2.19e9 NaN).
+- All 28 blocks finite throughout the forward pass.
+- Generated IDs `[358, 2776, 264, 220, 17]` — **matches the
+  cuBLAS-routed reference exactly**.
+- **25.53 tok/s sustained** (39.2 ms/token) on RTX 3070 Ti.
+- llama.cpp reports ~30 tok/s for the same model on the same GPU
+  → Aether is at **85% of llama.cpp throughput with sane outputs**.
+
+The matt-voice correctness gap is closed. Pitfall captured in
+memory at `qwen25_q4km_mixed_precision_per_block_dtype.md`.
+
+## Closed earlier (2026-05-20, attention_seq1 + KV cache on device + NaN diagnostic)
 
 User: "Go on attention correctness". Shipped the kernels + KV cache.
 Speed is at llama.cpp parity (25 tok/s). End-to-end has a NaN

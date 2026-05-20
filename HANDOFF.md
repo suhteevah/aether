@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (on-device KV cache + GPU attention_seq1 kernel LANDED, individually bit-close to CPU — end-to-end chain still NaN-out at block 3; speed 25 tok/s; root-cause is FP accumulation / overflow in the matmul/attention composition, not a kernel logic bug)
+2026-05-20 (end-to-end Qwen2.5-7B autoregressive at 25.5 tok/s on RTX 3070 Ti — NaN bisected to per-block dtype mismatch on V proj and ffn_down; Q4_K_M is mixed-precision and the wrong fused kernel reads weight bytes as the wrong super-block layout; fix is to dispatch on stored dt_v/dt_down per block; generated IDs [358, 2776, 264, 220, 17] match the cuBLAS reference)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -224,35 +224,59 @@ matches CPU reference within **max_diff = 7.15e-7**.
 GPU attention kernel + per-block KV cache (MAX_SEQ=32 device
 buffers per block, 28 caches). Speed: **25 tok/s**.
 
-### Known issue: NaN enters at block 3
+### NaN at block 3: ROOT-CAUSED + FIXED
 
-Diagnostic ran with per-block magnitude prints (now disabled):
+Bisecting per-op magnitudes inside block 3 revealed
+`[V + bias] max_abs=2.192e9 nan=true` — V proj's output was garbage,
+not "FP drift accumulating across blocks".
+
+`q6k_blk3_diagnose.rs` failed with `assertion left==right: 12 vs 14`:
+**`blk.3.attn_v.weight` is Q4_K (12), not Q6_K (14)**. Qwen2.5-7B
+Q4_K_M is **mixed-precision** — V proj and ffn_down switch between
+Q4_K and Q6_K per layer:
+
+- V proj Q6_K on blocks [0,1,2,5,9,11,14,17,20,23,24,25,26,27],
+  Q4_K on the rest.
+- ffn_down Q6_K on [0,1,2,5,7,12,14,17,20,23,24,25,26,27],
+  Q4_K on the rest.
+- Q/K/O/gate/up always Q4_K; lm_head Q6_K.
+
+`qwen25_per_block_dtypes.rs` enumerates the full table.
+
+The fused Q4_K and Q6_K kernels have **different super-block
+layouts** (144 B vs 210 B per 256-elem block) — dispatching to the
+wrong one reads completely garbled weights, hence the 2.19e9 / NaN.
+
+**Fix** (commit pending): `BlockGpu` now stores `dt_v: i32` and
+`dt_down: i32` captured from `aether_gguf_get_tensor_dtype` at
+upload time; `upload_tensor_u8` returns the dtype as a 3rd element.
+The forward pass dispatches V proj and ffn_down matmul on the
+stored dtype:
+
+```rust
+if bw.dt_v == 14 {
+    aether_op_fused_q6k_matmul_seq1_v2_cuda(...);
+} else {
+    aether_op_fused_q4k_matmul_seq1_v2_cuda(...);
+}
 ```
-[blk 0] max_abs=3.727  -- normal
-[blk 1] max_abs=8.398  -- growing
-[blk 2] max_abs=1.076e1 -- growing
-[blk 3] max_abs=0.0, sum=NaN  -- BLOW UP
-[blk 4+] NaN propagates
-```
 
-Generated IDs are all 152063 (PAD) because final logits are all NaN
-and argmax with NaN ties picks the last index.
+Same dispatch for ffn_down on `bw.dt_down` and for lm_head on `lm_dt`.
 
-**Root-cause analysis (not yet shipped fix):**
-- Q4_K v2 fused matmul: max_diff vs cuBLAS = 8.6e-6 (verified)
-- Q6_K v2 fused matmul: max_diff vs cuBLAS = 9.3e-5 (verified)
-- attention_seq1: max_diff vs CPU = 7.15e-7 (verified)
-- Each kernel individually correct. The activation magnitude
-  growing 3.7 → 8.4 → 10.8 → NaN across 3 blocks suggests
-  accumulating FP drift that eventually overflows in SiLU or
-  similar non-linear op.
-- Possible fixes: route ONE matmul through cuBLAS to localize;
-  add f64 accumulation in fused kernel; check if the
-  bias_add->RoPE order interacts badly.
+**Result** (verified locally just now):
+- Block 3 V + bias now `max_abs=1.688e0` (sane, was 2.19e9).
+- All 28 blocks produce finite activations end-to-end.
+- Generated IDs `[358, 2776, 264, 220, 17]` — matches the
+  cuBLAS-routed reference exactly.
+- Speed sustained at **25.53 tok/s** (39.2 ms/token, 5 decoded
+  tokens after a 4-token prefill at 37.9 ms/token).
 
-This is the LAST gap. Speed is at llama.cpp parity (25 tok/s vs
-~30); correctness in isolation is bit-close; the cascade composition
-has a numerical issue tracked as FR-17.14-extra-deepest-correctness.
+llama.cpp's Q4_K_M dispatch table for the same model reports
+~30 tok/s on a 3070 Ti; Aether is at **85% of llama.cpp throughput
+with sane outputs**. Correctness gap is closed.
+
+Pitfall captured in memory at
+`memory/qwen25_q4km_mixed_precision_per_block_dtype.md`.
 
 ## End-to-end fused autoregressive: 24 tok/s MEASURED on RTX 3070 Ti
 
