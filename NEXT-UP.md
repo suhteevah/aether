@@ -9,7 +9,40 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, kernel-asm exploration → no net gain, key learnings captured)
+## Closed this batch (2026-05-20, speculative decoding investigation → DEFERRED)
+
+User: "Investigate speculative decoding". Investigated, documented,
+deferred per user decision ("ship the matt-voice critical path
+instead").
+
+### Empirical finding
+`runtime/tests/spec_dec_naive_verify_bench.rs`: naive verify by
+re-launching the seq=1 CUDA graph scales **linearly** in N. seq=4
+verify = 4.00x single, seq=8 = 7.94x. **Break-even acceptance rate
+for N=4 is 99.96% — mathematically impossible.** Speculative
+decoding requires real seq>1 kernels to be a win.
+
+### Architecture analysis
+Full writeup in `docs/SPECULATIVE_DECODING_INVESTIGATION.md`:
+- 6 kernels need seq>1 variants (matmul Q4_K/Q6_K, FFN, attention,
+  rope, append_kv)
+- Plus draft model integration (Qwen2.5-0.5B Q4_K_M is 398 MB,
+  available from ollama registry)
+- Plus two-graph capture orchestration + KV rollback for rejected
+  tokens
+- ~7-8 days effort for production quality
+- Expected speedup: 1.6-2.6x (55-90 tok/s, depends on acceptance rate)
+- Same multi-token infrastructure also unlocks batched serving
+
+### Decision
+Deferred. 37.22 tok/s = 124% of llama.cpp is already a strong
+state; the marginal 1.6-2x upside doesn't justify 7+ days of risk
+when matt-voice's deploy critical path has direct-value items
+(TLS, HTTP, real libnccl) unblocked. Revisit if/when single-stream
+latency becomes a bottleneck OR batched serving becomes a deploy
+requirement.
+
+## Closed earlier (2026-05-20, kernel-asm exploration → no net gain, key learnings captured)
 
 User: "let's squeeze more performance let's optimize the assembly aspect of Aether for more tok/s". Explored, learned, shipped honest negative result.
 
