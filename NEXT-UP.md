@@ -9,7 +9,60 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, CUDA graphs → 37.35 tok/s = 124% of llama.cpp)
+## Closed this batch (2026-05-20, kernel-asm exploration → no net gain, key learnings captured)
+
+User: "let's squeeze more performance let's optimize the assembly aspect of Aether for more tok/s". Explored, learned, shipped honest negative result.
+
+### Diagnostic first: per-shape matmul bench
+`matmul_per_shape_bench.rs` measured each Qwen2.5 matmul kernel call
+in isolation:
+
+  Shape                       Time    GB/s   % peak
+  Q/O proj (3584x3584)       56 us  128.7    21%
+  K/V proj  (512x3584)       40 us   25.9     4%   <-- way under
+  FFN gate+up (18944x3584)  321 us  237.6    39%   <-- dominant
+  down (3584x18944)         218 us  175.4    29%
+  lm_head Q6_K              1584 us 282.2    46%
+
+### Attempts (all reverted)
+- **smallN matmul kernels** (32-thread CTA, 1 warp = 1 output): in
+  isolation 1.32x faster on K/V proj. End-to-end: SLOWER by ~6% via
+  nvrtc unit pressure regressing the FFN. Reverted.
+- **Interleaved FFN gate+up FMA**: in isolation 1.02x faster (348 us
+  -> 340 us). End-to-end: noise/regression. Reverted.
+- **Byte-once v3 matmul**: explored earlier, also slower in real path.
+
+### The unifying insight
+Adding `__global__` kernels to `KERNEL_SRC` (the nvrtc JIT unit)
+**regresses the existing active kernels** via shared register/codegen
+analysis across the unit. The smallN kernels regressed the FFN
+**321 us -> 343 us = -7%** even when never called.
+
+The other gotcha: **GPU boost clock cold-start**. First run after
+idle is 5% slow while clocks ramp 210 -> 1950 MHz. A naive 5-run
+mean biases down 1-2%. Warm before measuring.
+
+Both insights captured in memory.
+
+### Where we are
+- **37.22 tok/s** warm on RTX 3070 Ti / Qwen2.5-7B Q4_K_M
+- 124% of llama.cpp's ~30 tok/s
+- Generated IDs `[358, 2776, 264, 220, 17]` still bit-identical
+- Capture+instantiate one-time cost: ~2 ms
+- The per-shape bench + fused-vs-separate bench remain as diagnostics
+
+### Real remaining levers (if/when pursued)
+- FFN is 39% of peak BW. Going from 39% -> 60% would save ~3 ms/token
+  -> 44 tok/s. The level of optimization required (PTX/SASS inline,
+  reorganizing weight memory layout) is XL effort with high risk of
+  the same isolation-vs-end-to-end mismatch we hit here.
+- Tensor cores (f16 path): would require restructuring dequant +
+  accumulator chain. XL+ effort. Theoretical ~4x but mostly orthogonal
+  to current path.
+- Speculative decoding / parallel sampling: orthogonal to single-stream
+  tok/s, but the right direction for matt-voice deployment.
+
+## Closed earlier (2026-05-20, CUDA graphs → 37.35 tok/s = 124% of llama.cpp)
 
 User: "Go on cuda graphs". Shipped, big win.
 

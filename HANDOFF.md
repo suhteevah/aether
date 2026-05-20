@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (**37.35 tok/s** on RTX 3070 Ti / Qwen2.5-7B = **124% of llama.cpp's ~30 tok/s** via CUDA graph capture. The per-token forward gets recorded into one CUDA graph at first decode step and replayed for every subsequent step — ~370 kernel launches per token compressed into one `cuGraphLaunch`. Device-arg variants of rope/append_kv/attention read step args from a 4-int device buffer that's h2d-updated per step. Generated IDs `[358, 2776, 264, 220, 17]` still bit-identical to cuBLAS reference.)
+2026-05-20 (**37.22 tok/s warm** = 124% of llama.cpp on RTX 3070 Ti / Qwen2.5-7B. CUDA graph capture is the standing win. Attempted further kernel-level optimization (smallN 32-thread CTAs for K/V proj; interleaved gate+up FMA in FFN) — both were faster in isolation, both regressed end-to-end via shared nvrtc unit pressure. Reverted; the unused kernel definitions were dragging the FFN by 7%. KERNEL_SRC is load-bearing; treat additions to it the way you'd treat additions to a tight loop.)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's

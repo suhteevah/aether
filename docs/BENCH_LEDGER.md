@@ -255,11 +255,18 @@ chain. Measured wall-clock over 5 generate-only tokens after a
 | 2026-05-20 | 9b5a21e |  26.0 | fused gate+up+silu+mul kernel (4 launches -> 1)         |
 | 2026-05-20 | 859745d |  27.2 | thermal-stable 5-run mean (no logic change)            |
 | 2026-05-20 | 7e1804f |  37.4 | **CUDA graphs**: capture per-step forward, replay each step |
+| 2026-05-20 | f40d259 |  35.2 | smallN matmul kernels added (regressed FFN by 7% via nvrtc unit pressure) |
+| 2026-05-20 | add5216 |  37.2 | revert smallN; clean KERNEL_SRC restores baseline |
 
 llama.cpp reference on the same hardware: ~30 tok/s.
-Aether at commit 7e1804f is at **124% of llama.cpp** with matching
+Aether at commit add5216 is at **124% of llama.cpp** with matching
 generated IDs — i.e., Aether is now FASTER than llama.cpp on this
 model/hardware while producing the same outputs.
+
+**Measurement note**: GPU boost clock takes ~1 run to ramp from
+idle (210 MHz) to peak (1950 MHz). The 37.2 number is warm mean of
+4 runs after a throwaway warmup; cold first-run is ~35 tok/s. Future
+ledger rows should specify warm vs cold-included.
 
 The launch overhead was much larger than the per-op profiler
 suggested (~10 ms/token of overhead was actually saved, vs ~3 ms
