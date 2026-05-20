@@ -456,6 +456,18 @@ pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
     0
 }
 
+/// FR-17.17-extra / matt-voice — apply a LoRA update in place to a
+/// matmul-layout weight. See `ops::apply_lora_f32` for math + layout.
+#[no_mangle] pub unsafe extern "C" fn aether_op_apply_lora_f32(
+    w: *mut c_void, lora_a: *const c_void, lora_b: *const c_void,
+    scale: f32, d_in: c_int, d_out: c_int, rank: c_int,
+) -> c_int {
+    if d_in <= 0 || d_out <= 0 || rank <= 0 { return 1; }
+    ops::apply_lora_f32(w as _, lora_a as _, lora_b as _, scale,
+        d_in as _, d_out as _, rank as _);
+    0
+}
+
 #[no_mangle] pub unsafe extern "C" fn aether_op_sdpa_causal_f32(
     q: *const c_void, k: *const c_void, v: *const c_void,
     out: *mut c_void, attn_out: *mut c_void,

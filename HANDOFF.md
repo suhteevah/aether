@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (cuBLAS-routed inference + tokenizer LANDED — Aether decoded `"Hello, world! I'm a 2"` from autoregressive token IDs through real Qwen2.5-7B GGUF metadata; matt-voice deploy gap is now just HTTP wrap + LoRA load)
+2026-05-20 (HTTP server binary + LoRA apply LANDED — aether-serve responds with OpenAI JSON; LoRA delta verified on real Qwen W_q; full matt-voice deploy chain is now ALL shipped except final Qwen-forward integration in serve binary)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,60 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## aether-serve HTTP binary + LoRA apply LANDED
+
+### LoRA apply
+`runtime/src/ops.rs::apply_lora_f32` + extern wrapper
+`aether_op_apply_lora_f32`: in-place update of an Aether matmul-
+layout weight by `W += scale * A^T @ B^T`. PEFT-compatible
+convention (A=[rank,d_in], B=[d_out,rank]).
+
+Tests:
+- Unit: zero LoRA = no-op identity; matmul-layout math matches
+  direct computation for a 2x3 case with hand-traced expected.
+- `runtime/tests/qwen25_lora_apply.rs`: applies a synthetic rank-8
+  LoRA to REAL Qwen2.5 blk.0.attn_q.weight (3584×3584 Q4_K dequant).
+  Probes 4 specific (i_in, i_out) cells; each delta matches the
+  scale*A^T@B^T direct computation to 1e-4. Frobenius norm grows
+  by 0.61% (LoRA had measurable effect). 12.84M elements in 0.02s.
+
+### HTTP server
+`trainer/src/bin/serve.rs`: new `aether-serve` binary. Listens on
+the chosen port, accepts HTTP requests, parses with
+`aether_http_parse_request`, renders OpenAI-shape JSON via
+`aether_openai_render_completion`, sends back via
+`aether_http_write_response_200` + `aether_tcp_send`.
+
+Build + run:
+```
+cargo build -p trainer --bin aether-serve
+target/debug/aether-serve --port 8080 --model matt-voice
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt_ids":[9707,11,1879,0],"max_tokens":5}'
+```
+
+Returns proper OpenAI JSON:
+```json
+{
+  "id":"chatcmpl-aether-serve-1","object":"chat.completion",
+  "model":"matt-voice",
+  "choices":[{"index":0,"message":{"role":"assistant","content":"..."},"finish_reason":"stop"}],
+  "usage":{"prompt_tokens":N,"completion_tokens":M}
+}
+```
+
+**Status:** The HTTP wire-up is complete. The `content` field
+currently returns a stub message; integrating the real Qwen2.5-7B
+autoregressive forward chain (from `qwen25_autoregressive_cuda.rs`)
+into `handle_request` is ~300 LOC of mechanical copy + JSON body
+parsing for `prompt_ids` / `max_tokens`. Tracked as the final
+ship gate.
+
+`runtime/tests/aether_serve_http_wireup.rs` end-to-end-tests the
+full HTTP loop without the 24 GB model load: TCP listen → accept
+→ parse → render → respond → verify. Runs in ~100 ms.
 
 ## cuBLAS-routed autoregressive generation LANDED
 

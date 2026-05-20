@@ -399,6 +399,43 @@ pub unsafe fn gqa_repeat_kv_f32(
     }
 }
 
+/// FR-17.17-extra / matt-voice — apply a LoRA update in place to a
+/// weight matrix in Aether matmul layout.
+///
+/// Conventions:
+/// - `w` is the base weight stored as `[d_in, d_out]` (Aether matmul
+///   layout, where `out = X @ W` reads W as `[d_in_k, d_out_n]`).
+/// - `lora_a` is PEFT-style `[rank, d_in]` (rank rows, d_in cols).
+/// - `lora_b` is PEFT-style `[d_out, rank]`.
+/// - `scale` is `alpha / rank`.
+///
+/// In PEFT math the effective forward weight is `W_eff = W_math +
+/// scale * B @ A`, where `W_math` is `[d_out, d_in]`. Our matmul
+/// layout stores `W = W_math^T`, so we add `scale * (B @ A)^T =
+/// scale * A^T @ B^T = scale * sum_r A[r, i_in] * B[i_out, r]`
+/// into `w[i_in, i_out]` for each (i_in, i_out).
+///
+/// Total work: O(d_in * d_out * rank). Typical matt-voice LoRA
+/// rank is 8-32; on Qwen2.5-7B's d=3584 that's ~100M-400M ops --
+/// fast enough to apply at load time, not in the hot loop.
+pub unsafe fn apply_lora_f32(
+    w: *mut f32, lora_a: *const f32, lora_b: *const f32,
+    scale: f32, d_in: usize, d_out: usize, rank: usize,
+) {
+    let w = sm(w, d_in * d_out);
+    let a = s(lora_a, rank * d_in);
+    let b = s(lora_b, d_out * rank);
+    for i_in in 0..d_in {
+        for i_out in 0..d_out {
+            let mut delta = 0.0f32;
+            for r in 0..rank {
+                delta += a[r * d_in + i_in] * b[i_out * rank + r];
+            }
+            w[i_in * d_out + i_out] += scale * delta;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- attention
 
 /// Causal scaled-dot-product attention.
@@ -1113,6 +1150,42 @@ mod tests {
         let norm_out: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm_in - norm_out).abs() < 1e-5,
             "RoPE must preserve L2 norm: {} -> {}", norm_in, norm_out);
+    }
+
+    #[test]
+    fn apply_lora_zero_is_noop() {
+        // LoRA with all-zero A and B should leave W unchanged.
+        let mut w = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];  // [d_in=2, d_out=3]
+        let w_orig = w.clone();
+        let a = vec![0.0f32; 2 * 2];  // [rank=2, d_in=2]
+        let b = vec![0.0f32; 3 * 2];  // [d_out=3, rank=2]
+        unsafe { apply_lora_f32(w.as_mut_ptr(), a.as_ptr(), b.as_ptr(), 1.0, 2, 3, 2); }
+        assert_eq!(w, w_orig);
+    }
+
+    #[test]
+    fn apply_lora_matches_direct_math() {
+        // d_in=2, d_out=3, rank=2, scale=0.5
+        // A = [[1, 2], [3, 4]]   (rank x d_in)
+        // B = [[1, 0], [0, 1], [1, 1]]   (d_out x rank)
+        // BA = B @ A in math notation = [d_out, d_in]:
+        //   BA[0] = 1*A[0] + 0*A[1] = [1, 2]
+        //   BA[1] = 0*A[0] + 1*A[1] = [3, 4]
+        //   BA[2] = 1*A[0] + 1*A[1] = [4, 6]
+        // BA = [[1, 2], [3, 4], [4, 6]]
+        // In matmul layout we add scale * BA^T to W [d_in, d_out]:
+        //   BA^T[0] = [1, 3, 4]      <- d_in=0 row, d_out 0..3
+        //   BA^T[1] = [2, 4, 6]      <- d_in=1 row, d_out 0..3
+        // Starting W = [[0, 0, 0], [0, 0, 0]] (in matmul layout):
+        // Result: W = scale * [[1, 3, 4], [2, 4, 6]] = [[0.5, 1.5, 2.0], [1.0, 2.0, 3.0]]
+        let mut w = vec![0.0f32; 2 * 3];
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0];
+        unsafe { apply_lora_f32(w.as_mut_ptr(), a.as_ptr(), b.as_ptr(), 0.5, 2, 3, 2); }
+        let expected = vec![0.5f32, 1.5, 2.0, 1.0, 2.0, 3.0];
+        for (i, (a, e)) in w.iter().zip(expected.iter()).enumerate() {
+            assert!(f32_close(*a, *e, 1e-5), "[{}] {} != {}", i, a, e);
+        }
     }
 
     #[test]

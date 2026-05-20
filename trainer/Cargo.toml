@@ -16,6 +16,10 @@ path = "src/bin/infer.rs"
 name = "aether-prepare"
 path = "src/bin/prepare.rs"
 
+[[bin]]
+name = "aether-serve"
+path = "src/bin/serve.rs"
+
 [features]
 default = []
 # `nccl`: enable the data-parallel training loop in `dp.rs`. Forwards
