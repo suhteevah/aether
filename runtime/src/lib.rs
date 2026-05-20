@@ -14,6 +14,9 @@ pub mod ops;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "nccl")]
+pub mod nccl_real;
+
 // Single-threaded tape for the bootstrap runtime. Originally `thread_local!`
 // — the TLS init hook for that drags Rust's `std::thread` machinery into the
 // cdylib's DllMain, which in turn calls `bcryptprimitives.dll!ProcessPrng`

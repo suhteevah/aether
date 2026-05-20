@@ -22,6 +22,13 @@ default = []
 # time. Without the feature, the runtime stays the pure-Rust f32 CPU path
 # that ships in the base build.
 cuda = ["dep:cudarc"]
+# `nccl`: link real libnccl for cross-GPU collectives. Implies `cuda`.
+# Without this feature, `aether_nccl_*` symbols stay as the single-host
+# fallback (world_size=1 only). With it, they dispatch through
+# cudarc::nccl::safe::Comm + libnccl ncclAllReduce / ncclCommInitRank
+# for actual cross-card communication. Verified on cnc-server's 2× P100
+# (see tests/nccl_dual_gpu.rs).
+nccl = ["cuda", "cudarc/nccl"]
 
 [dependencies]
 cudarc = { version = "0.13", optional = true, default-features = false, features = ["cuda-12060", "driver", "cublas", "nvrtc"] }

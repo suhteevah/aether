@@ -377,7 +377,7 @@ unsafe impl Sync for BufferRegistry {}
 static BUFFERS: BufferRegistry = BufferRegistry(UnsafeCell::new(Vec::new()));
 
 #[inline]
-unsafe fn bufs() -> &'static mut Vec<Option<CudaSlice<f32>>> { &mut *BUFFERS.0.get() }
+pub(crate) unsafe fn bufs() -> &'static mut Vec<Option<CudaSlice<f32>>> { &mut *BUFFERS.0.get() }
 
 /// Parallel registry for i32 device buffers — labels for cross-entropy.
 /// Same single-threaded reasoning as `BUFFERS`.
