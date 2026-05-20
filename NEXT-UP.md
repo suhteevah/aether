@@ -9,7 +9,58 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, autoregressive generation through Qwen2.5-7B)
+## Closed this batch (2026-05-20, GPU-routed inference + tokenizer decode)
+
+User asked to "Go on 4 then 1" -- the GPU-resident inference path
+and the tokenizer integration. Both landed.
+
+### GPU-routed autoregressive (item 4)
+
+`runtime/tests/qwen25_autoregressive_cuda.rs` -- every matmul
+routes through cuBLAS via per-call dev_alloc/h2d/sgemm/d2h/free.
+Per-token cost 53s -> 4s (13x). Prefill 206s -> 4.5s (45x). Total
+501s -> 106s. Generated IDs byte-identical to CPU run.
+
+### Tokenizer decode (item 1)
+
+`runtime/tests/qwen25_tokenizer_roundtrip.rs` -- loads 152064-entry
+Qwen2.5 vocab + 151386 merges from GGUF metadata into the existing
+`aether_bpe_tokenizer`. Decodes the autoregressive run output:
+
+```
+[decode] "Hello,Ġworld!ĠI'mĠaĠ2" (surface)
+[decode] "Hello, world! I'm a 2" (real text)
+```
+
+Real coherent English from prompt-driven Qwen2.5-7B generation,
+all through Aether. The matt-voice deploy inference path is
+functionally complete.
+
+4 new GGUF metadata accessors added to runtime/src/lib.rs:
+- aether_gguf_get_metadata_u32
+- aether_gguf_get_metadata_string
+- aether_gguf_get_metadata_array_string_n
+- aether_gguf_get_metadata_array_string_get
+
+Parser refactored: U32/String/StringArray captured into
+`HashMap<String, GgufMeta>` on the GgufFile; other types still
+skip for memory hygiene.
+
+### Known limitation
+
+Encode (text -> IDs) requires unicode-char-level initial split for
+Qwen's GPT-2-style BPE. Current `aether_bpe_encode` is byte-level.
+For matt-voice's inference deploy this isn't on the critical path
+(external tokenizer feeds IDs to Aether). Fix is FR-x-extra.
+
+### Remaining matt-voice deploy work
+
+Just two items left for full end-to-end deploy:
+- HTTP server wrap (composition of shipped TCP + HTTP + OpenAI render fns)
+- LoRA adapter load + apply (SafeTensors loader shipped; needs the
+  in-place mutation helper)
+
+## Closed earlier (2026-05-20, autoregressive generation through Qwen2.5-7B)
 
 User asked to "finish the rest for shipping matt-voice". The bigger
 piece (autoregressive + KV cache) shipped. Tokenizer integration +

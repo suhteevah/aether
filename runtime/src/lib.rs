@@ -6475,12 +6475,26 @@ struct GgufTensorInfo {
     shape: Vec<i64>,
     offset_in_data: u64,
 }
+
+/// Captured metadata values. Only the GGUF value types we actually
+/// need for tokenizer integration are stored; everything else is
+/// skipped as before (saves memory across hundreds of unused
+/// scalar metadata entries).
+enum GgufMeta {
+    U32(u32),
+    String(String),
+    /// Array of strings — used for `tokenizer.ggml.tokens` (152064
+    /// entries on Qwen2.5) and `_merges`.
+    StringArray(Vec<String>),
+}
+
 struct GgufFile {
     blob: Vec<u8>,
     version: u32,
     tensor_count: u64,
     metadata_kv_count: u64,
     tensors: Vec<GgufTensorInfo>,
+    metadata: std::collections::HashMap<String, GgufMeta>,
     data_section_start: u64,
 }
 struct GgufCell(UnsafeCell<Vec<Option<Box<GgufFile>>>>);
@@ -6528,6 +6542,41 @@ fn gguf_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<()> {
     Some(())
 }
 
+/// Read a metadata value of the given type. For the types we capture
+/// (U32 = 4, String = 8, StringArray = 9 with elem_type 8) returns the
+/// parsed value. For all other types skips the value and returns
+/// `Some(None)` to signal "captured nothing, position advanced".
+fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Option<GgufMeta>> {
+    match vtype {
+        4 => {  // u32 -- captured
+            let v = gguf_read_u32(b, off)?;
+            Some(Some(GgufMeta::U32(v)))
+        }
+        8 => {  // string -- captured
+            let s = gguf_read_string(b, off)?;
+            Some(Some(GgufMeta::String(s)))
+        }
+        9 => {  // array
+            let elem_type = gguf_read_u32(b, off)?;
+            let count = gguf_read_u64(b, off)? as usize;
+            if elem_type == 8 {  // string array -- captured
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(gguf_read_string(b, off)?);
+                }
+                Some(Some(GgufMeta::StringArray(items)))
+            } else {
+                for _ in 0..count { gguf_skip_value(b, off, elem_type)?; }
+                Some(None)
+            }
+        }
+        _ => {
+            gguf_skip_value(b, off, vtype)?;
+            Some(None)
+        }
+    }
+}
+
 /// Open a GGUF file. Returns a handle ≥ 0 on success, -1 on file
 /// read error, -2 on bad magic, -3 on malformed metadata, -4 on
 /// malformed tensor table.
@@ -6545,13 +6594,18 @@ fn gguf_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<()> {
     let Some(tensor_count) = gguf_read_u64(b, &mut off) else { return -2; };
     let Some(metadata_kv_count) = gguf_read_u64(b, &mut off) else { return -2; };
     let meta_kv_count = metadata_kv_count;
-    // Walk metadata, skipping all values.
+    // Walk metadata, capturing U32/String/StringArray values.
+    let mut metadata: std::collections::HashMap<String, GgufMeta> = std::collections::HashMap::new();
     for _ in 0..meta_kv_count {
-        let _key = match gguf_read_string(b, &mut off) {
+        let key = match gguf_read_string(b, &mut off) {
             Some(s) => s, None => return -3,
         };
         let vtype = match gguf_read_u32(b, &mut off) { Some(t) => t, None => return -3, };
-        if gguf_skip_value(b, &mut off, vtype).is_none() { return -3; }
+        match gguf_read_or_skip_value(b, &mut off, vtype) {
+            Some(Some(v)) => { metadata.insert(key, v); }
+            Some(None) => { /* captured nothing, but advanced */ }
+            None => return -3,
+        }
     }
     // Walk tensor info table.
     let mut tensors = Vec::with_capacity(tensor_count as usize);
@@ -6574,6 +6628,7 @@ fn gguf_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<()> {
     let data_section_start = ((off as u64) + align - 1) / align * align;
     let g = GgufFile {
         blob, version, tensor_count, metadata_kv_count, tensors,
+        metadata,
         data_section_start,
     };
     let tbl = gguf_table();
@@ -6723,6 +6778,105 @@ fn gguf_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<()> {
     let Some(g) = tbl[h].as_ref() else { return -1; };
     if (i as usize) >= g.tensors.len() { return -1; }
     g.tensors[i as usize].shape.iter().fold(1i64, |acc, &d| acc * d)
+}
+
+// =====================================================================
+// FR-19.9-extra-deeper — GGUF metadata accessors for tokenizer
+// integration. Qwen2.5-7B's embedded tokenizer lives in the metadata
+// KV table as `tokenizer.ggml.tokens` (string-array of 152064
+// entries), `_merges` (string-array), and `_bos/eos/padding_token_id`
+// (u32). These accessors expose them to callers via the same
+// `(buf, len)` pattern used elsewhere.
+// =====================================================================
+
+/// Read a u32 metadata value. Returns the value cast to i64 on success,
+/// -1 on missing key or wrong type.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_u32(
+    handle: i64, key: i64, key_len: c_int,
+) -> i64 {
+    if handle < 0 || key == 0 || key_len <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::U32(v)) => *v as i64,
+        _ => -1,
+    }
+}
+
+/// Read a string metadata value into a caller-allocated buffer. Returns
+/// the byte length written on success, -1 on missing key / wrong type,
+/// -2 if the output buffer is too small.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_string(
+    handle: i64, key: i64, key_len: c_int, out: i64, max: c_int,
+) -> c_int {
+    if handle < 0 || key == 0 || key_len <= 0 || out == 0 || max <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::String(s)) => {
+            let n = s.len();
+            if n > max as usize { return -2; }
+            let dst = std::slice::from_raw_parts_mut(out as *mut u8, n);
+            dst.copy_from_slice(s.as_bytes());
+            n as c_int
+        }
+        _ => -1,
+    }
+}
+
+/// Return the length of a string-array metadata value. Returns -1 on
+/// missing key / wrong type.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_array_string_n(
+    handle: i64, key: i64, key_len: c_int,
+) -> c_int {
+    if handle < 0 || key == 0 || key_len <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::StringArray(v)) => v.len() as c_int,
+        _ => -1,
+    }
+}
+
+/// Read one element from a string-array metadata value into a
+/// caller-allocated buffer. Returns the byte length written on success,
+/// -1 on bad args / wrong type, -2 if the output buffer is too small.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_array_string_get(
+    handle: i64, key: i64, key_len: c_int, idx: c_int, out: i64, max: c_int,
+) -> c_int {
+    if handle < 0 || key == 0 || key_len <= 0 || idx < 0 || out == 0 || max <= 0 {
+        return -1;
+    }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::StringArray(v)) => {
+            if (idx as usize) >= v.len() { return -1; }
+            let s = &v[idx as usize];
+            let n = s.len();
+            if n > max as usize { return -2; }
+            let dst = std::slice::from_raw_parts_mut(out as *mut u8, n);
+            dst.copy_from_slice(s.as_bytes());
+            n as c_int
+        }
+        _ => -1,
+    }
 }
 
 /// Copy a NUL-terminated C string (the form `Expr::StrLit` lowers to

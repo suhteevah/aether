@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (AUTOREGRESSIVE GENERATION LANDED — 4-tok prompt + 5 generated tokens via KV cache through real Qwen2.5-7B at ~53s/token; matt-voice deploy gap is now just tokenizer + HTTP wrap)
+2026-05-20 (cuBLAS-routed inference + tokenizer LANDED — Aether decoded `"Hello, world! I'm a 2"` from autoregressive token IDs through real Qwen2.5-7B GGUF metadata; matt-voice deploy gap is now just HTTP wrap + LoRA load)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -200,6 +200,61 @@ P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
 
+## cuBLAS-routed autoregressive generation LANDED
+
+`runtime/tests/qwen25_autoregressive_cuda.rs` -- same shape as the
+CPU autoregressive test but every matmul routes through cuBLAS via
+a per-call host-pointer wrapper (`matmul_via_cublas`: dev_alloc /
+h2d / sgemm / d2h / free).
+
+Per-token cost: **53s (CPU) -> 4s (cuBLAS) -- 13x speedup**.
+Prefill: 206s -> 4.5s -- 45x. Total 4 prompt + 5 generated:
+501s -> 106s.
+
+CORRECTNESS: generated IDs are byte-identical between CPU and
+cuBLAS runs: [9707, 11, 1879, 0, 358, 2776, 264, 220, 17]. Same
+logits to 3 decimals. Strong determinism signal across backends.
+
+Non-matmul ops (RMSNorm/RoPE/GQA/SiLU/attention) stay on CPU.
+Routing all of them through GPU would be FR-x-extra-deeper but the
+13x matmul-only speedup is already enough to make Aether-Qwen
+inference usable for matt-voice serving.
+
+## Tokenizer integration LANDED (decode side)
+
+`runtime/tests/qwen25_tokenizer_roundtrip.rs` -- loads Qwen2.5's
+embedded tokenizer (152064 vocab + 151386 merges + BOS/EOS ids)
+from GGUF metadata into `aether_bpe_tokenizer`. Decodes the
+autoregressive output to actual coherent English:
+
+```
+[decode] "Hello,Ġworld!ĠI'mĠaĠ2" (surface)
+[decode] "Hello, world! I'm a 2" (real text)
+```
+
+Token IDs from the autoregressive run, when decoded with the
+GPT-2 byte fixup, produce **real coherent text**. This is the
+matt-voice deploy proof: real prompt -> real Qwen inference -> real
+generated text, all through Aether's runtime.
+
+New runtime surface (4 GGUF metadata accessors):
+- `aether_gguf_get_metadata_u32(handle, key, key_len) -> i64`
+- `aether_gguf_get_metadata_string(handle, key, key_len, out, max) -> i32`
+- `aether_gguf_get_metadata_array_string_n(handle, key, key_len) -> i32`
+- `aether_gguf_get_metadata_array_string_get(handle, key, key_len, idx, out, max) -> i32`
+
+GGUF parser refactor: previously the metadata KV table was SKIPPED
+during parse. Now U32, String, and StringArray values are captured
+into a `HashMap<String, GgufMeta>` on the GgufFile struct. All
+other types still skip (memory hygiene).
+
+**Known limitation: encode** (text -> IDs) requires unicode-char-
+level initial split because Qwen uses GPT-2 BPE with the bytes-to-
+unicode mapping. Aether's `aether_bpe_encode` does byte-level
+initial split. For matt-voice's inference deploy this is fine
+(user tokenizes externally; Aether takes IDs); but full in-Aether
+text-in-text-out requires extending the encoder. FR-x-extra.
+
 ## Autoregressive generation LANDED
 
 `runtime/tests/qwen25_autoregressive_gen.rs` produces multi-token
@@ -243,36 +298,27 @@ cargo test -p aether_rt --release --test qwen25_autoregressive_gen \
 
 ## What's still left for shipping matt-voice end-to-end
 
-Remaining gap from "Aether-runs-Qwen2.5-7B-autoregressively" (DONE)
-to "matt-voice end-user serves a prompt and gets text back":
+Two items from the prior 4-item list LANDED this session (GPU-
+routed inference + tokenizer decode). Remaining gap:
 
-1. **Tokenizer integration** -- text ↔ token IDs round-trip. The
-   GGUF metadata KV table (parsed but not exposed today) contains
-   `tokenizer.ggml.tokens` (152064 entries) + `_merges` +
-   `_bos/eos_token_id`. Need: extend GGUF reader to capture string
-   + string-array values, then wire into the existing
-   `aether_bpe_tokenizer` + `aether_tokenizer_json_load` surface
-   (already shipped in Phase 19).
-2. **HTTP server wrap** -- combine the existing
-   `aether_tcp_listen/accept`, `aether_http_parse_request`,
-   `aether_openai_render_completion` (all shipped) with the
-   generation loop. The OpenAI shape is one POST handler. Best
-   structure: a new `trainer/src/bin/serve.rs` binary.
-3. **LoRA adapter loading** -- matt-voice's actual adapter trained
-   in candle. Each layer's W becomes W + (B @ A) * scale. The
-   SafeTensors loader (`aether_safetensors_*`, shipped) reads the
-   adapter file; runtime needs a "apply lora to block weights"
-   helper that mutates the resident block weights in place after
-   load.
-4. **GPU-resident inference** -- the current path runs on CPU,
-   500s for 9 tokens. On the RTX 3070 Ti with cuBLAS the per-token
-   cost should drop to single-digit seconds. Requires routing the
-   block_forward_kv through `cuda::aether_op_*_cuda` symbols and
-   keeping KV cache on device. Re-uses the GPU-resident DP
-   infrastructure already shipped on cnc.
+1. **(DONE)** Tokenizer integration -- 152064 vocab + 151386 merges
+   loaded from GGUF metadata; decode verified producing real
+   English ("Hello, world! I'm a 2"). Encode side has a known
+   limitation (unicode-char-level BPE not yet wired); FR-x-extra.
+2. **HTTP server wrap** -- new `trainer/src/bin/serve.rs` that
+   loops `accept -> parse_request -> tokenize_external_or_skip ->
+   forward_loop -> render_completion`. The TCP + HTTP + OpenAI
+   render fns are all shipped. Mostly composition.
+3. **LoRA adapter loading** -- matt-voice's adapter from candle.
+   Each block's W becomes W + (B @ A) * (alpha/rank). SafeTensors
+   loader is shipped; needs an "apply lora" helper that mutates
+   loaded block weights in-place.
+4. **(DONE)** GPU-routed inference -- cuBLAS for every matmul,
+   13x speedup, byte-identical IDs. Full-GPU (all ops on device)
+   is FR-x-extra-deeper.
 
-None of those are blocked on Aether language work; they're all
-runtime+wiring. Likely 2-3 focused sessions of work.
+So the remaining matt-voice ship work is: HTTP server binary + LoRA
+adapter loader + (optionally) full-text encoder. ~1 focused session.
 
 ## Full Qwen2.5-7B inference LANDED
 
