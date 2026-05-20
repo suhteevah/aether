@@ -17,6 +17,17 @@ The closure-of-the-list gate is **OpenClaw cnc-local fleet running 100% on aethe
 
 ## Critical path (gates phase 0 of OpenClaw rollout)
 
+### ⛔ BLOCKER: aether-serve model-forward wiring
+
+This is the only FR that strictly blocks any aether-based OpenClaw deployment. Filed 2026-05-20 after `aether-serve` was built on cnc and confirmed to return the hardcoded stub string `"[aether-serve stub: integrate qwen25_autoregressive_cuda forward here]"` (see `trainer/src/bin/serve.rs:88-94`).
+
+- [ ] **FR-19-extra-serve-forward-wire** — Wire the qwen25_autoregressive_cuda forward chain into `trainer/src/bin/serve.rs::handle_request()`. All pieces exist in tree:
+  - `runtime/tests/qwen25_autoregressive_cuda.rs` is the reference impl (37.35 tok/s with CUDA graphs per commit `7e1804f`, NaN-fix per per-block dtype dispatch landed today)
+  - GGUF reader + Q4_K_M dequant + per-block dtype dispatch + KV cache + sampling + tokenizer all shipped
+  - HTTP scaffold + OpenAI-compat JSON rendering exists in serve.rs today
+  - The work is: parse `prompt_ids` + `max_tokens` from the request body, load GGUF model at startup (`--model` flag is already wired to the CLI), call the same forward routine that the test exercises, decode generated IDs back to text, return through `aether_openai_render_completion`.
+  - **Witness:** `aether-serve --model /path/to/qwen2.5-7b-q4_k_m.gguf --port 18080` accepts `POST /v1/chat/completions` and returns real generated tokens (not the stub string). Round-trip `curl` against a fixed prompt produces output bit-identical to the cuBLAS reference test, at ≥ 80% of the 37.35 tok/s standalone benchmark. **Blocking until this lands; OpenClaw cnc rollout cannot proceed.**
+
 ### Big-model kernel validation
 
 - [ ] **FR-17-extra-14b-e2e** — Qwen2.5-14B-Q4_K_M end-to-end autoregressive with per-block dtype dispatch + generated-token parity vs cuBLAS reference. The Qwen-7B NaN-at-block-3 bug (per `NEXT-UP.md`, fixed via per-block dtype dispatch on 2026-05-20) demonstrated that mixed-precision GGUFs surface composition bugs only at depth. 14B has 48 decoder blocks (vs 7B's 28) — needs the same dtype-enumeration + parity test. **Witness:** `qwen25_14b_per_block_dtypes.rs` enumerates the dtype table; `qwen25_14b_autoregressive_e2e.rs` generates 16 tokens with all blocks finite + token-ID-identical to cuBLAS-routed reference.
@@ -84,8 +95,9 @@ Mark `[done]` + commit hash when shipped. Aggregate count goes in spec §"Aether
 
 | Section | Total | Done |
 |---|---|---|
+| **BLOCKER** | **1** | **0** |
 | Critical path | 9 | 0 |
 | QoL | 4 | 0 |
-| **Total** | **13** | **0** |
+| **Total** | **14** | **0** |
 
-When `Critical path` hits 9/9, OpenClaw can flip phase 0 from llama.cpp to aether-serve as the sustained-load test target. When QoL hits 4/4, the design's nice-to-haves are all native.
+When the BLOCKER ships, OpenClaw rollout can begin phase 0 (which actually exercises aether-serve under real load). When `Critical path` hits 9/9, OpenClaw can fully flip phase 0 from llama.cpp parity-floor to aether-serve as the production target. When QoL hits 4/4, the design's nice-to-haves are all native.
