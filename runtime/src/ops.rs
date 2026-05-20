@@ -312,6 +312,93 @@ pub unsafe fn layer_norm_backward_f32(
     }
 }
 
+/// RMSNorm forward. `y = x * gamma / sqrt(mean(x^2) + eps)`. No beta
+/// (Qwen / Llama don't use one). `rows × d` activations, `gamma` is
+/// `[d]`. In-place by passing `x == out`.
+pub unsafe fn rms_norm_f32(
+    x: *const f32, gamma: *const f32, eps: f32,
+    out: *mut f32, rows: usize, d: usize,
+) {
+    let x = s(x, rows * d);
+    let gamma = s(gamma, d);
+    let out = sm(out, rows * d);
+    for r in 0..rows {
+        let off = r * d;
+        let mut sumsq = 0.0f32;
+        for i in 0..d { sumsq += x[off + i] * x[off + i]; }
+        let inv_rms = 1.0 / (sumsq / d as f32 + eps).sqrt();
+        for i in 0..d { out[off + i] = x[off + i] * inv_rms * gamma[i]; }
+    }
+}
+
+/// RoPE (rotary positional embeddings) applied in place on a contiguous
+/// `[seq, n_heads, head_dim]` buffer at the given starting position. For
+/// each pair of dims `(2i, 2i+1)` within a head, multiplies by the
+/// rotation matrix at angle `theta = pos * base^(-2i/head_dim)`.
+///
+/// `head_dim` must be even. `base` is typically `10000.0` (Llama) or
+/// `1000000.0` (Qwen2.5). `pos_start` is the position of the first
+/// token in this batch (for inference batches that aren't prefilling
+/// from scratch). For a one-shot forward pass starting at the BOS pad,
+/// `pos_start = 0`.
+pub unsafe fn rope_apply_f32(
+    x: *mut f32, seq: usize, n_heads: usize, head_dim: usize,
+    base: f32, pos_start: usize,
+) {
+    let total = seq * n_heads * head_dim;
+    let x = sm(x, total);
+    assert!(head_dim % 2 == 0, "RoPE needs even head_dim");
+    let hd_half = head_dim / 2;
+    for t in 0..seq {
+        let pos = (pos_start + t) as f32;
+        for h in 0..n_heads {
+            let base_off = (t * n_heads + h) * head_dim;
+            for i in 0..hd_half {
+                // theta_i = pos * base^(-2i/head_dim)
+                let exp = -2.0 * i as f32 / head_dim as f32;
+                let theta = pos * base.powf(exp);
+                let (sin, cos) = theta.sin_cos();
+                let i0 = base_off + i;
+                let i1 = base_off + i + hd_half;
+                // Llama-style "half-half" interleave: pair (i, i+hd/2)
+                // is the rotation pair, NOT (2i, 2i+1).
+                let x0 = x[i0];
+                let x1 = x[i1];
+                x[i0] = x0 * cos - x1 * sin;
+                x[i1] = x0 * sin + x1 * cos;
+            }
+        }
+    }
+}
+
+/// Grouped-query attention helper: broadcast a key/value tensor of
+/// shape `[seq, n_kv_heads, head_dim]` to `[seq, n_q_heads, head_dim]`
+/// by repeating each KV head `n_q_heads / n_kv_heads` times.
+///
+/// Used between K/V projection (which produces `n_kv_heads`-wide output
+/// in GQA) and the SDPA kernel (which expects K and V at full
+/// `n_q_heads` width).
+pub unsafe fn gqa_repeat_kv_f32(
+    kv_in: *const f32, kv_out: *mut f32,
+    seq: usize, n_kv_heads: usize, head_dim: usize, n_q_heads: usize,
+) {
+    assert!(n_q_heads % n_kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads");
+    let g = n_q_heads / n_kv_heads;  // group size
+    let kv_in = s(kv_in, seq * n_kv_heads * head_dim);
+    let kv_out = sm(kv_out, seq * n_q_heads * head_dim);
+    for t in 0..seq {
+        for kh in 0..n_kv_heads {
+            let src_off = (t * n_kv_heads + kh) * head_dim;
+            for repeat in 0..g {
+                let dst_h = kh * g + repeat;
+                let dst_off = (t * n_q_heads + dst_h) * head_dim;
+                kv_out[dst_off..dst_off + head_dim]
+                    .copy_from_slice(&kv_in[src_off..src_off + head_dim]);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- attention
 
 /// Causal scaled-dot-product attention.
@@ -972,5 +1059,71 @@ mod tests {
                 0.1, 0.9, 0.999, 1e-8, 0.0, 1, 3);
         }
         assert!(p[0] < 1.0); assert!(p[1] < 2.0); assert!(p[2] < 3.0);
+    }
+
+    #[test]
+    fn rms_norm_identity_gamma_unit_input() {
+        // x = [1, 1, 1, 1], gamma = [1, 1, 1, 1]:
+        //   mean(x^2) = 1.0, inv_rms = 1/sqrt(1+eps) ~ 1.0
+        //   out_i = x_i * 1.0 * gamma_i ~ x_i
+        let x = vec![1.0f32; 4];
+        let g = vec![1.0f32; 4];
+        let mut out = vec![0.0f32; 4];
+        unsafe { rms_norm_f32(x.as_ptr(), g.as_ptr(), 1e-5, out.as_mut_ptr(), 1, 4); }
+        for v in &out { assert!(f32_close(*v, 1.0, 1e-3)); }
+    }
+
+    #[test]
+    fn rms_norm_normalizes_magnitude() {
+        // x = [2, 0, 0, 0]: mean(x^2) = 1.0, inv_rms ~ 1.0
+        //   out = [2, 0, 0, 0]
+        // x = [4, 0, 0, 0]: mean(x^2) = 4.0, inv_rms ~ 0.5
+        //   out = [2, 0, 0, 0]
+        // So out is the same regardless of input magnitude (scale-invariant).
+        let mut o1 = vec![0.0f32; 4];
+        let mut o2 = vec![0.0f32; 4];
+        let g = vec![1.0f32; 4];
+        unsafe {
+            rms_norm_f32([2.0f32, 0.0, 0.0, 0.0].as_ptr(), g.as_ptr(),
+                1e-5, o1.as_mut_ptr(), 1, 4);
+            rms_norm_f32([4.0f32, 0.0, 0.0, 0.0].as_ptr(), g.as_ptr(),
+                1e-5, o2.as_mut_ptr(), 1, 4);
+        }
+        for i in 0..4 { assert!(f32_close(o1[i], o2[i], 1e-3),
+            "RMSNorm should be scale-invariant: o1[{}]={} vs o2[{}]={}", i, o1[i], i, o2[i]); }
+    }
+
+    #[test]
+    fn rope_pos_zero_is_identity() {
+        // At position 0, theta = 0 so sin = 0, cos = 1 -- identity rotation.
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let orig = x.clone();
+        unsafe { rope_apply_f32(x.as_mut_ptr(), 1, 1, 8, 10000.0, 0); }
+        for (a, b) in x.iter().zip(orig.iter()) {
+            assert!(f32_close(*a, *b, 1e-5), "RoPE at pos 0 should be identity: {} != {}", a, b);
+        }
+    }
+
+    #[test]
+    fn rope_norm_preserved() {
+        // RoPE rotates pairs; ||x|| must be preserved.
+        let mut x = vec![1.0f32, 0.5, -0.3, 0.8];
+        let norm_in: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        unsafe { rope_apply_f32(x.as_mut_ptr(), 1, 1, 4, 10000.0, 3); }
+        let norm_out: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm_in - norm_out).abs() < 1e-5,
+            "RoPE must preserve L2 norm: {} -> {}", norm_in, norm_out);
+    }
+
+    #[test]
+    fn gqa_repeat_broadcasts() {
+        // seq=1, n_kv_heads=2, head_dim=3, n_q_heads=4 -> g=2:
+        //   kv_in = [[1,2,3], [4,5,6]]
+        //   kv_out = [[1,2,3], [1,2,3], [4,5,6], [4,5,6]]
+        let kv_in = vec![1.0f32, 2.0, 3.0,  4.0, 5.0, 6.0];
+        let mut kv_out = vec![0.0f32; 12];
+        unsafe { gqa_repeat_kv_f32(kv_in.as_ptr(), kv_out.as_mut_ptr(), 1, 2, 3, 4); }
+        let expected = vec![1.0, 2.0, 3.0,  1.0, 2.0, 3.0,  4.0, 5.0, 6.0,  4.0, 5.0, 6.0];
+        assert_eq!(kv_out, expected);
     }
 }

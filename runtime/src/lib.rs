@@ -419,6 +419,43 @@ pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
     0
 }
 
+/// FR-17.5-extra (Qwen/Llama) — RMSNorm forward.
+/// `y[r, i] = x[r, i] * gamma[i] / sqrt(mean(x[r, :]^2) + eps)`.
+#[no_mangle] pub unsafe extern "C" fn aether_op_rms_norm_f32(
+    x: *const c_void, gamma: *const c_void, eps: f32,
+    out: *mut c_void, rows: c_int, d: c_int,
+) -> c_int {
+    ops::rms_norm_f32(x as _, gamma as _, eps, out as _, rows as _, d as _);
+    0
+}
+
+/// FR-17.13-extra (Qwen/Llama) — RoPE applied in place on `[seq, n_heads, head_dim]`.
+/// `base` is the rotary base (Qwen2.5 uses 1_000_000.0; Llama uses 10_000.0).
+/// `pos_start` is the token-position of the first row -- 0 for a forward pass
+/// from scratch, `kv_cache_len` for a prefill that resumes mid-stream.
+#[no_mangle] pub unsafe extern "C" fn aether_op_rope_apply_f32(
+    x: *mut c_void, seq: c_int, n_heads: c_int, head_dim: c_int,
+    base: f32, pos_start: c_int,
+) -> c_int {
+    ops::rope_apply_f32(x as _, seq as _, n_heads as _, head_dim as _,
+        base, pos_start as _);
+    0
+}
+
+/// FR-17.13-extra (Qwen/Llama GQA) — broadcast K/V from `n_kv_heads`
+/// to `n_q_heads` by repeating each KV head `n_q_heads / n_kv_heads`
+/// times. Required before feeding to the SDPA kernel under grouped-
+/// query attention (Qwen2.5-7B: 28 Q heads, 4 KV heads -> 7x repeat).
+#[no_mangle] pub unsafe extern "C" fn aether_op_gqa_repeat_kv_f32(
+    kv_in: *const c_void, kv_out: *mut c_void,
+    seq: c_int, n_kv_heads: c_int, head_dim: c_int, n_q_heads: c_int,
+) -> c_int {
+    if (n_q_heads % n_kv_heads) != 0 { return 1; }
+    ops::gqa_repeat_kv_f32(kv_in as _, kv_out as _,
+        seq as _, n_kv_heads as _, head_dim as _, n_q_heads as _);
+    0
+}
+
 #[no_mangle] pub unsafe extern "C" fn aether_op_sdpa_causal_f32(
     q: *const c_void, k: *const c_void, v: *const c_void,
     out: *mut c_void, attn_out: *mut c_void,
@@ -6654,6 +6691,40 @@ fn gguf_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<()> {
     g.blob.as_ptr().add(abs as usize) as i64
 }
 
+/// FR-17.14-extra-deeper-deeper — find a tensor by name. Returns the
+/// tensor index suitable for the other `aether_gguf_get_tensor_*`
+/// accessors, or -1 if not found. `name` and `name_len` describe the
+/// caller's byte buffer holding the lookup key (NOT NUL-terminated).
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_find_tensor_by_name(
+    handle: i64, name: i64, name_len: c_int,
+) -> c_int {
+    if handle < 0 || name == 0 || name_len <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let needle = std::slice::from_raw_parts(name as *const u8, name_len as usize);
+    let Ok(needle_str) = std::str::from_utf8(needle) else { return -1; };
+    for (i, t) in g.tensors.iter().enumerate() {
+        if t.name == needle_str { return i as c_int; }
+    }
+    -1
+}
+
+/// FR-17.14-extra-deeper-deeper — total element count (product of dims)
+/// for tensor `i`. Returns -1 on error.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_tensor_n_elems(
+    handle: i64, i: c_int,
+) -> i64 {
+    if handle < 0 || i < 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    if (i as usize) >= g.tensors.len() { return -1; }
+    g.tensors[i as usize].shape.iter().fold(1i64, |acc, &d| acc * d)
+}
+
 /// Copy a NUL-terminated C string (the form `Expr::StrLit` lowers to
 /// in the asm backend) into a heap buffer. Returns the byte count
 /// written (length up to but not including the NUL). Useful for
@@ -6880,6 +6951,87 @@ fn q4k_get_scale_min(j: usize, scales: &[u8]) -> (u8, u8) {
                 let out_hi_idx = bi * 256 + ((2 * j + 1) * 32 + l) as isize;
                 *o.offset(out_lo_idx) = d1 * lo - m1;
                 *o.offset(out_hi_idx) = d2 * hi - m2;
+            }
+        }
+    }
+    0
+}
+
+// =====================================================================
+// FR-17.14-extra-deeper-deeper — Q6_K dequantisation.
+//
+// Q6_K super-block layout (210 bytes per 256 quants), ported directly
+// from ggml's reference decoder:
+//   bytes 0..128   : ql[128]   -- low 4 bits of each quant
+//   bytes 128..192 : qh[64]    -- high 2 bits of each quant
+//   bytes 192..208 : scales[16] -- i8 sub-block scales (one per 16 quants)
+//   bytes 208..210 : d         -- f16 super-block scale
+//
+// Decode: quants are arranged in 2 halves of 128. For quant index `l`
+// in the first half (l = 0..127):
+//   q_lo = ql[l] & 0x0F
+//   q_hi = (qh[l & 63] >> ((l >> 5) * 2)) & 0x03
+//   q = (q_lo | (q_hi << 4)) - 32     -- signed range [-32, 31]
+//   scale_idx = l / 16
+//   value = d * scales[scale_idx] * q
+// For quant index `l` in the second half (l = 128..255):
+//   q_lo = ql[l - 128] >> 4
+//   (high bits shifted differently per ggml's bit-mapping)
+//
+// Used for Qwen2.5-7B's V projection + down_proj weights (dtype 14).
+// =====================================================================
+
+/// Dequantise `n_blocks` Q6_K super-blocks (each 210 bytes = 256 quants)
+/// into `out` (length `n_blocks * 256` f32 elements).
+#[no_mangle] pub unsafe extern "C" fn aether_dequant_q6_k(
+    blocks: *const c_void,
+    out: *mut c_void,
+    n_blocks: c_int,
+) -> c_int {
+    if blocks.is_null() || out.is_null() { return 1; }
+    if n_blocks <= 0 { return 2; }
+    let n = n_blocks as isize;
+    let b = blocks as *const u8;
+    let o = out as *mut f32;
+    for bi in 0..n {
+        let base = b.offset(bi * 210);
+        // d (f16) lives in the LAST 2 bytes of the super-block.
+        let d_bits = u16::from_le_bytes([*base.offset(208), *base.offset(209)]);
+        let d_f32 = aether_f16_to_f32(d_bits as i32);
+        // Iterate 4 sub-halves of 64 quants each (= 2 sets of 128 in
+        // ggml's "ql + qh" layout). Reference: ggml-quants.c::dequantize_row_q6_K.
+        let ql = base;             // 0..128
+        let qh = base.offset(128); // 128..192
+        let scales = base.offset(192); // 192..208 (16 signed bytes)
+        for n_outer in 0..2isize {
+            // n_outer 0 -> quants 0..128 (low-half byte indexing)
+            // n_outer 1 -> quants 128..256
+            let ql_base = n_outer * 64;
+            let qh_base = n_outer * 32; // qh advances 32 per 128-quant half (ggml's `qh += 32`)
+            let sc_base = n_outer * 8;
+            for l in 0..32isize {
+                // Each iteration fills 4 output quants at strides {0, 32, 64, 96}
+                // within this 128-quant half. Matches ggml's 4-way unroll.
+                let ql_lo = *ql.offset(ql_base + l) as u32;
+                let ql_hi = *ql.offset(ql_base + l + 32) as u32;
+                let qh_byte = *qh.offset(qh_base + l) as u32;
+
+                let q0 = ((ql_lo & 0x0F) | ((qh_byte & 0x03) << 4)) as i32 - 32;
+                let q1 = ((ql_hi & 0x0F) | (((qh_byte >> 2) & 0x03) << 4)) as i32 - 32;
+                let q2 = ((ql_lo >> 4) | (((qh_byte >> 4) & 0x03) << 4)) as i32 - 32;
+                let q3 = ((ql_hi >> 4) | (((qh_byte >> 6) & 0x03) << 4)) as i32 - 32;
+
+                let s0 = *(scales.offset(sc_base + l / 16)) as i8 as i32;
+                let s1 = *(scales.offset(sc_base + l / 16 + 2)) as i8 as i32;
+                let s2 = *(scales.offset(sc_base + l / 16 + 4)) as i8 as i32;
+                let s3 = *(scales.offset(sc_base + l / 16 + 6)) as i8 as i32;
+
+                // Output positions inside this 128-quant half.
+                let out_base = bi * 256 + n_outer * 128;
+                *o.offset(out_base + l +  0) = d_f32 * (s0 as f32) * (q0 as f32);
+                *o.offset(out_base + l + 32) = d_f32 * (s1 as f32) * (q1 as f32);
+                *o.offset(out_base + l + 64) = d_f32 * (s2 as f32) * (q2 as f32);
+                *o.offset(out_base + l + 96) = d_f32 * (s3 as f32) * (q3 as f32);
             }
         }
     }
@@ -7546,6 +7698,45 @@ mod conv2d_tests {
             assert!((scalar[0] - raw_sum).abs() < 1e-2 * raw_sum.abs().max(1.0),
                 "matmul {} != sum {}", scalar[0], raw_sum);
             eprintln!("[chain] qwen2.5 super-block 0: sum={:.6e} matmul={:.6e}", raw_sum, scalar[0]);
+            aether_gguf_close(h);
+        }
+    }
+
+    /// FR-17.14-extra-deeper-deeper -- Q6_K dequant produces finite,
+    /// reasonable values on real Qwen2.5-7B weights.
+    /// Tests against the first super-block of `blk.0.attn_v.weight`
+    /// (a Q6_K-dtype tensor in matt-voice's actual model).
+    #[test]
+    fn q6_k_dequant_on_real_qwen25() {
+        let qwen_path = "C:\\Users\\Matt\\.ollama\\models\\blobs\\sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730";
+        if !std::path::Path::new(qwen_path).exists() {
+            eprintln!("[skip] Qwen2.5-7B GGUF not present");
+            return;
+        }
+        unsafe {
+            let h = aether_gguf_open(qwen_path.as_ptr() as i64, qwen_path.len() as c_int);
+            assert!(h >= 0);
+            let needle = b"blk.0.attn_v.weight";
+            let idx = aether_gguf_find_tensor_by_name(h, needle.as_ptr() as i64, needle.len() as c_int);
+            assert!(idx >= 0, "expected blk.0.attn_v.weight");
+            assert_eq!(aether_gguf_get_tensor_dtype(h, idx), 14, "expected Q6_K dtype");
+            let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
+            assert!(dptr != 0);
+            // Dequant first super-block (256 quants -> 256 f32 values).
+            let mut deq = vec![0.0f32; 256];
+            let rc = aether_dequant_q6_k(
+                dptr as *const c_void,
+                deq.as_mut_ptr() as *mut c_void,
+                1,
+            );
+            assert_eq!(rc, 0);
+            // Real trained weights: sum is finite, non-zero, bounded.
+            let sum: f32 = deq.iter().sum();
+            let max_abs: f32 = deq.iter().map(|v| v.abs()).fold(0.0, f32::max);
+            assert!(sum.is_finite(), "Q6_K dequant sum not finite: {}", sum);
+            assert!(max_abs > 1e-6, "Q6_K dequant all zeros? max_abs = {}", max_abs);
+            assert!(max_abs < 100.0, "Q6_K dequant out of range: max_abs = {}", max_abs);
+            eprintln!("[q6_k] blk.0.attn_v.weight super-block 0: sum={:.6e}, max_abs={:.6e}", sum, max_abs);
             aether_gguf_close(h);
         }
     }

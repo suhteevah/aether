@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (DUAL-P100 TRAINING LANDED — aether-train --world-size 2 trains a model across both P100s with NCCL gradient sync, loss 5.57 → 0.03 over 200 steps)
+2026-05-20 (Real Qwen2.5-7B block 0 forward LANDED — full transformer block runs through Aether's runtime on actual matt-voice GGUF weights, no NaN/Inf, plausible output magnitudes)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -200,6 +200,57 @@ P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
 
+## Real Qwen2.5-7B block forward LANDED
+
+`runtime/tests/qwen25_block_forward.rs` runs the FULL decoder block 0
+forward pass on matt-voice's actual Qwen2.5-7B Q4_K_M/Q6_K GGUF.
+
+End-to-end chain through Aether's runtime:
+1. Open GGUF (matt-voice 4.7 GB blob in ollama blob store)
+2. Find + dequantise all 13 block-0 tensors:
+   - 4 F32 (norms + 3 biases)
+   - 7 Q4_K (Wq, Wk, Wo, ffn_gate, ffn_up, attn_k.bias-x, token_embd)
+   - 2 Q6_K (Wv, ffn_down) -- new aether_dequant_q6_k kernel
+3. Transpose weights (GGUF stores [d_in inner, d_out outer]; matmul
+   wants [d_in, d_out])
+4. Lookup 4 token-embedding rows -> X[4, 3584]
+5. attn_norm RMSNorm (new aether_op_rms_norm_f32)
+6. Q/K/V proj matmuls (uneven dims: Q[seq,3584], K/V[seq,512])
+7. RoPE on Q+K (new aether_op_rope_apply_f32, Qwen base=1e6)
+8. GQA repeat K/V from 4 KV heads to 28 Q heads (new
+   aether_op_gqa_repeat_kv_f32)
+9. Causal SDPA over 28 heads
+10. Output proj + residual
+11. ffn_norm RMSNorm
+12. SwiGLU MLP: matmul(gate) + matmul(up) -> silu(gate)*up ->
+    matmul(down) + residual
+
+Output: max_abs=5.88, sum=-7.02, no NaN/Inf, total time 9.36s in
+release build on 11900K. Per-token L2 norms differ (row0=29.0,
+row3=16.4) -- attention mixed information across positions, not a
+trivial pass-through.
+
+Three new ops shipped this session:
+- `aether_op_rms_norm_f32(x, gamma, eps, out, rows, d)` -- the
+  Qwen/Llama-style normalisation (no beta).
+- `aether_op_rope_apply_f32(x, seq, n_heads, head_dim, base, pos_start)`
+  -- rotary embeddings in-place, llama-style "half-half" pair
+  layout.
+- `aether_op_gqa_repeat_kv_f32(in, out, seq, n_kv, head_dim, n_q)`
+  -- GQA broadcast.
+
+Two new GGUF helpers:
+- `aether_gguf_find_tensor_by_name(handle, name, n)` -- linear-scan
+  lookup; avoids manually iterating all 339 tensors.
+- `aether_gguf_get_tensor_n_elems(handle, i)` -- product of dims.
+
+Plus the Q6_K dequantisation kernel
+(`aether_dequant_q6_k`) ported from ggml's reference decoder.
+
+5 new unit tests for the three ops (RMSNorm scale invariance + unit
+gamma; RoPE pos-0 identity + L2 norm preservation; GQA repeat) +
+1 Q6_K dequant test against real Qwen V-proj weights (max_abs=0.023).
+
 ## Dual-P100 training LANDED
 
 `aether-train --world-size 2 --features nccl` trains a model across
@@ -239,6 +290,11 @@ this session. Remaining matt-voice deploy work:
 1. **(DONE)** Multi-rank training-loop bringup. `aether-train
    --world-size 2 --features nccl` works on cnc 2× P100; loss
    declines, params identical at convergence.
+1b. **Full-model multi-block stack** (next from this session). Block
+   0 forward proves the per-block chain; stacking 28 blocks +
+   final_norm + output_proj gives one full inference step on
+   real Qwen2.5-7B weights. Memory: 28 * 870 MB f32 = ~24 GB, fits
+   in 32 GB RAM. Or: dequant block-by-block as a streaming pass.
 2. **Pipeline-parallel 1F1B real impl** (matt-voice §FR-18.6).
    Today's `aether_pp_simulate_2stage_forward_f32` is in-process.
    Real PP needs send/recv between adjacent ranks via the

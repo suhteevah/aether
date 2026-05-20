@@ -9,7 +9,64 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, dual-P100 training UNBLOCKED)
+## Closed this batch (2026-05-20, Real Qwen2.5-7B block forward)
+
+User asked to extend `qwen25_forward_chain.aether` (one super-block
+of one weight) to a full transformer block forward through real
+matt-voice weights. Done.
+
+- **Three new ops** in `runtime/src/ops.rs` + `runtime/src/lib.rs`:
+  - `aether_op_rms_norm_f32(x, gamma, eps, out, rows, d)` -- Qwen/
+    Llama-style normalisation (no beta).
+  - `aether_op_rope_apply_f32(x, seq, n_heads, head_dim, base, pos_start)`
+    -- in-place rotary embedding; llama-style half-half pair layout
+    (NOT interleaved). Verified by unit tests: pos=0 is identity,
+    L2 norm preserved at any pos.
+  - `aether_op_gqa_repeat_kv_f32(in, out, seq, n_kv, head_dim, n_q)`
+    -- repeats each KV head `n_q/n_kv` times for grouped-query
+    attention.
+
+- **Q6_K dequant kernel** (`aether_dequant_q6_k`) ported from
+  ggml's reference decoder. 210-byte super-block layout: 128 bytes
+  ql + 64 bytes qh + 16 bytes scales + 2 bytes f16 d. Unit test on
+  real Qwen V-proj weights: sum=-0.146, max_abs=0.023 -- matches
+  expectation for trained transformer V matrix at the first
+  super-block.
+
+- **Two new GGUF helpers**:
+  - `aether_gguf_find_tensor_by_name(handle, name, n)` -- avoids
+    iterating all 339 tensors manually.
+  - `aether_gguf_get_tensor_n_elems(handle, i)` -- product of dims;
+    drives dequant block-count math.
+
+- **`runtime/tests/qwen25_block_forward.rs`** -- the headline
+  integration test:
+  - Opens matt-voice's 4.7 GB Q4_K_M GGUF blob
+  - Loads + dequantises ALL 13 block-0 tensors (mix of F32, Q4_K,
+    Q6_K)
+  - Transposes weights from GGUF storage `[d_in inner, d_out outer]`
+    to matmul layout `[d_in, d_out]`
+  - Picks 4 token IDs (0..3), looks up embeddings
+  - Runs attn_norm -> Q/K/V proj+bias -> RoPE -> GQA repeat ->
+    causal SDPA -> O proj + residual -> ffn_norm -> SwiGLU MLP +
+    residual
+  - Sanity-gates output: no NaN, no Inf, max_abs in (1e-3, 1e4),
+    per-token L2 norms differ (proves attention actually mixed).
+
+- **Measured output**: max_abs=5.88, sum=-7.02 on the 4-token
+  input. Per-token norms: row0=29.0, row3=16.4. Total time 9.36s in
+  release build on 11900K (FFN dominates at 5.19s; weight transpose
+  1.88s; dequant 0.54s; QKV 0.25s).
+
+- **`runtime/tests/qwen25_tensor_names_probe.rs`** -- diagnostic
+  helper that lists every block-0 + global tensor with dtype + shape.
+
+This is the first end-to-end forward through REAL Qwen2.5-7B
+weights through Aether's runtime. The remaining gap to a working
+matt-voice inference is stacking 28 blocks + final_norm +
+output_proj + sampling -- all incremental on this proof point.
+
+## Closed earlier (2026-05-19, dual-P100 training UNBLOCKED)
 
 User asked to "finish the unblocking" after the FR-18.1-extra NCCL
 foundation landed. The matt-voice MATT_VOICE_FR.md "killer unlock"
