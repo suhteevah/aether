@@ -9,7 +9,57 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, fused Q4_K matmul v1)
+## Closed this batch (2026-05-20, fused Q4_K matmul v2 -- split-K warp-reduce)
+
+User: "Go on the v2 kernel". Closed.
+
+### Shipped
+New CUDA kernel `fused_q4k_matmul_seq1_v2` with split-K warp-reduce:
+- CTA = 256 threads = 8 warps. Each warp owns one output column.
+- 32 lanes cooperatively process K dim (8 quants per lane per
+  super-block).
+- `__shfl_down_sync` warp-reduce, lane 0 writes output.
+- A tile loaded once per K-tile via shared mem, 8 warps share.
+
+Wrapper: `aether_op_fused_q4k_matmul_seq1_v2_cuda(a, w, out, n, n_blocks)`
+
+### Verified perf vs v1 + cuBLAS
+| Shape | cuBLAS | v1 | v2 | v2 speedup vs cuBLAS |
+|---|---|---|---|---|
+| attn_q 3584x3584 | 97us | 131us | 53us | **1.83x** |
+| attn_k 512x3584 | 20us | 100us | 38us | 0.53x (small N) |
+| attn_output 3584x3584 | 95us | 124us | 51us | **1.86x** |
+| ffn_gate 18944x3584 | 500us | 396us | 184us | **2.72x** |
+| ffn_up 18944x3584 | 479us | 397us | 182us | **2.63x** |
+
+v2 beats cuBLAS on 4 of 5 shapes. Loses only on tiny n=512 attn_k
+where cuBLAS launch overhead dominates. Accuracy: max_diff = 4.9e-6
+(better than v1's 1.4e-5 -- tree-order summation).
+
+### Per-block / per-token extrapolation
+- Per-block matmul cost (Qwen2.5 block 0):
+  - cuBLAS: 1.78 ms
+  - v2: 1.04 ms (42% reduction)
+- Per-token full forward estimate:
+  - Prior: ~4 sec/token
+  - v2 fused: **~89 ms/token = ~11 tok/s** (45x speedup)
+- llama.cpp reference on same RTX 3070 Ti: ~30 tok/s
+- Remaining gap: ~3x
+
+### Remaining open FRs for full llama.cpp parity
+
+1. **Q6_K fused matmul** -- V proj + ffn_down + lm_head all use Q6_K.
+   Same kernel pattern as Q4_K v2, just 210-byte super-block layout.
+   Estimated 1.5-2x more on those matmuls.
+2. **Tensor-core wmma path (sm_8.0+)** -- cast dequant output to f16,
+   use wmma fragments for the accumulate. Estimated 2-3x across.
+3. **Flash attention** -- fused softmax+matmul attention.
+   Estimated 1.5x for long sequences.
+4. **End-to-end autoregressive measurement** wiring v2 into the
+   existing qwen25_autoregressive_cuda.rs to get the REAL tok/s
+   number (not just per-matmul extrapolation).
+
+## Closed earlier (2026-05-20, fused Q4_K matmul v1)
 
 User: "Go on fused kernel". Closed.
 

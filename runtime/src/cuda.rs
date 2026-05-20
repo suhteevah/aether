@@ -63,6 +63,7 @@ struct CudaCtx {
     dequant_q4_k_m_gpu:CudaFunction,
     dequant_q6_k_gpu:  CudaFunction,
     fused_q4k_matmul_seq1: CudaFunction,
+    fused_q4k_matmul_seq1_v2: CudaFunction,
 }
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
@@ -666,6 +667,91 @@ extern "C" __global__ void fused_q4k_matmul_seq1(
     if (ni < n) out[ni] = acc;
 }
 
+// matt-voice / FR-17.14-extra-deepest — FUSED Q4_K matmul v2 (split-K).
+//
+// Each WARP owns one output column. Within a warp, the 32 lanes
+// cooperatively process the K dim, then warp-reduce via __shfl_down_sync.
+//
+// CTA = 8 warps = 256 threads. Each CTA processes 8 output columns.
+// At N=512 (Qwen W_k), that's 64 CTAs = 16K threads -- saturates the
+// GPU. v1 was 16 CTAs * 32 threads = 512 threads at N=512 (under-uses).
+//
+// Per K-tile (256 quants, one super-block):
+//   - CTA cooperatively loads 256 floats of A into shared mem
+//     (1 element per thread, perfectly coalesced)
+//   - Per warp: each of 32 lanes handles 8 quants of the 256
+//     - lane l owns sub-block (l/4), sub_offset (l%4)*8
+//     - reads 8 bytes of qs, dequants 8 nibbles, fmas with 8 floats of A
+//   - At the END (after all K-tiles), warp-reduce the 32 partials.
+//   - Lane 0 writes the output.
+//
+// Branch divergence per warp: only 2-way (lanes 0..3 + 8..11 + ... take
+// is_hi=0; lanes 4..7 + 12..15 + ... take is_hi=1). NVCC predicates this
+// efficiently. No __syncthreads inside the warp loop -- only one
+// sync per K-tile to coordinate the shared A load.
+extern "C" __global__ void fused_q4k_matmul_seq1_v2(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks)
+{
+    __shared__ float a_tile[256];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc = 0.0f;
+
+    // Per-lane sub-block assignment (constant across K-tiles)
+    int sub      = lane >> 2;       // 0..7
+    int sub_off  = (lane & 3) << 3; // 0, 8, 16, 24
+    int j        = sub >> 1;
+    int is_hi    = sub & 1;
+    int qs_off   = j * 32 + sub_off;
+    int a_off    = sub * 32 + sub_off;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // CTA-wide cooperative load of A tile (256 floats).
+        a_tile[threadIdx.x] = a[bi * 256 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w
+                + (size_t)ni * n_blocks * 144
+                + (size_t)bi * 144;
+            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* scales = base + 4;
+            const unsigned char* qs     = base + 16;
+            unsigned int sc = q4k_get_scale(sub, scales);
+            unsigned int mn = q4k_get_min(sub, scales);
+            float d_eff = d * (float)sc;
+            float m_eff = dmin * (float)mn;
+
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                unsigned char byte = qs[qs_off + p];
+                unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+                float w_val = d_eff * (float)nibble - m_eff;
+                acc += a_tile[a_off + p] * w_val;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Warp-reduce 32 partial sums into lane 0.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+    }
+    if (lane == 0 && ni < n) {
+        out[ni] = acc;
+    }
+}
+
 extern "C" __global__ void dequant_q6_k(
     const unsigned char* __restrict__ blocks,
     float*               __restrict__ out,
@@ -772,7 +858,8 @@ fn ctx() -> &'static CudaCtx {
               // matt-voice deploy kernels
               "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
-              "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1"])
+              "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1",
+              "fused_q4k_matmul_seq1_v2"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -799,6 +886,7 @@ fn ctx() -> &'static CudaCtx {
         let dequant_q4_k_m_gpu    = device.get_func("aether_kernels", "dequant_q4_k_m").unwrap();
         let dequant_q6_k_gpu      = device.get_func("aether_kernels", "dequant_q6_k").unwrap();
         let fused_q4k_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1").unwrap();
+        let fused_q4k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v2").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
@@ -806,7 +894,8 @@ fn ctx() -> &'static CudaCtx {
                   add_layer_norm_fwd,
                   rms_norm_fwd, rope_apply, gqa_repeat_kv,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
-                  dequant_q4_k_m_gpu, dequant_q6_k_gpu, fused_q4k_matmul_seq1 }
+                  dequant_q4_k_m_gpu, dequant_q6_k_gpu,
+                  fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2 }
     })
 }
 
@@ -1781,6 +1870,42 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().fused_q4k_matmul_seq1.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks))
             .expect("launch fused_q4k_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest v2 -- split-K fused Q4_K matmul for seq=1.
+///
+/// Same interface as `aether_op_fused_q4k_matmul_seq1_cuda` but with
+/// 32 threads per output (warp-per-output split-K). Closes the
+/// small-N under-utilization gap of v1.
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_matmul_seq1_v2_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    // 256 threads per CTA (8 warps * 32 threads). 8 outputs per CTA.
+    let cta_threads = 256u32;
+    let outputs_per_cta = 8u32;
+    let grid_x = ((n as u32) + outputs_per_cta - 1) / outputs_per_cta;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (cta_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q4k_matmul_seq1_v2.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q4k_matmul_seq1_v2");
     }
     0
 }

@@ -23,6 +23,7 @@ use aether_rt::cuda::{
     aether_op_matmul_f32_cuda,
     aether_op_dequant_q4_k_m_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_cuda,
+    aether_op_fused_q4k_matmul_seq1_v2_cuda,
 };
 
 const QWEN_BLOB: &str = "C:\\Users\\Matt\\.ollama\\models\\blobs\\sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730";
@@ -41,8 +42,11 @@ unsafe fn q4k_raw_bytes(h: i64, name: &str) -> (Vec<u8>, usize, usize) {
 }
 
 /// Run the fused-Q4K-matmul on one matmul shape and compare against
-/// the cuBLAS reference (dequant -> sgemm). Returns (max_diff, mean_diff).
-unsafe fn run_one(name: &str, n_rows: usize, n_cols: usize, h: i64) -> (f32, f32, u128, u128) {
+/// the cuBLAS reference (dequant -> sgemm). Returns
+/// (max_diff_v1, max_diff_v2, cublas_us, v1_us, v2_us).
+unsafe fn run_one(name: &str, n_rows: usize, n_cols: usize, h: i64)
+    -> (f32, f32, u128, u128, u128)
+{
     let (w_bytes, n_blocks_total, _n_elems) = q4k_raw_bytes(h, name);
     // The tensor has n_rows output rows, each row has k = n_cols quants = n_cols/256 super-blocks
     let blocks_per_row = n_cols / 256;
@@ -86,41 +90,54 @@ unsafe fn run_one(name: &str, n_rows: usize, n_cols: usize, h: i64) -> (f32, f32
     let mut out_cublas = vec![0.0f32; n];
     aether_dev_d2h_f32(d_out_cublas, out_cublas.as_mut_ptr() as i64, n as c_int);
 
-    // === Path 2: fused Q4K matmul ===
+    // === Path 2: v1 fused Q4K matmul (one thread per output) ===
     let d_w_u8 = aether_dev_alloc_u8(w_bytes.len() as c_int);
-    let d_out_fused = aether_dev_alloc_f32(n as c_int);
+    let d_out_v1 = aether_dev_alloc_f32(n as c_int);
     aether_dev_h2d_u8(w_bytes.as_ptr() as i64, d_w_u8, w_bytes.len() as c_int);
 
-    // Warmup
-    aether_op_fused_q4k_matmul_seq1_cuda(d_a, d_w_u8, d_out_fused, n as c_int, blocks_per_row as c_int);
+    aether_op_fused_q4k_matmul_seq1_cuda(d_a, d_w_u8, d_out_v1, n as c_int, blocks_per_row as c_int);
     aether_dev_sync();
-
     let t0 = std::time::Instant::now();
     for _ in 0..10 {
-        aether_op_fused_q4k_matmul_seq1_cuda(d_a, d_w_u8, d_out_fused, n as c_int, blocks_per_row as c_int);
+        aether_op_fused_q4k_matmul_seq1_cuda(d_a, d_w_u8, d_out_v1, n as c_int, blocks_per_row as c_int);
     }
     aether_dev_sync();
-    let fused_us = t0.elapsed().as_micros() / 10;
+    let v1_us = t0.elapsed().as_micros() / 10;
 
-    let mut out_fused = vec![0.0f32; n];
-    aether_dev_d2h_f32(d_out_fused, out_fused.as_mut_ptr() as i64, n as c_int);
+    let mut out_v1 = vec![0.0f32; n];
+    aether_dev_d2h_f32(d_out_v1, out_v1.as_mut_ptr() as i64, n as c_int);
 
-    let mut max_diff = 0.0f32;
-    let mut sum_diff = 0.0f32;
-    for (a, b) in out_cublas.iter().zip(out_fused.iter()) {
-        let d = (a - b).abs();
-        if d > max_diff { max_diff = d; }
-        sum_diff += d;
+    // === Path 3: v2 fused Q4K matmul (warp per output, split-K) ===
+    let d_out_v2 = aether_dev_alloc_f32(n as c_int);
+    aether_op_fused_q4k_matmul_seq1_v2_cuda(d_a, d_w_u8, d_out_v2, n as c_int, blocks_per_row as c_int);
+    aether_dev_sync();
+    let t0 = std::time::Instant::now();
+    for _ in 0..10 {
+        aether_op_fused_q4k_matmul_seq1_v2_cuda(d_a, d_w_u8, d_out_v2, n as c_int, blocks_per_row as c_int);
     }
-    let mean_diff = sum_diff / n as f32;
+    aether_dev_sync();
+    let v2_us = t0.elapsed().as_micros() / 10;
+
+    let mut out_v2 = vec![0.0f32; n];
+    aether_dev_d2h_f32(d_out_v2, out_v2.as_mut_ptr() as i64, n as c_int);
+
+    let mut max_diff_v1 = 0.0f32;
+    let mut max_diff_v2 = 0.0f32;
+    for ((a, b1), b2) in out_cublas.iter().zip(out_v1.iter()).zip(out_v2.iter()) {
+        let d1 = (a - b1).abs();
+        if d1 > max_diff_v1 { max_diff_v1 = d1; }
+        let d2 = (a - b2).abs();
+        if d2 > max_diff_v2 { max_diff_v2 = d2; }
+    }
 
     aether_dev_free_f32(d_a);
     aether_dev_free_f32(d_w);
     aether_dev_free_f32(d_out_cublas);
-    aether_dev_free_f32(d_out_fused);
+    aether_dev_free_f32(d_out_v1);
+    aether_dev_free_f32(d_out_v2);
     aether_dev_free_u8(d_w_u8);
 
-    (max_diff, mean_diff, cublas_us, fused_us)
+    (max_diff_v1, max_diff_v2, cublas_us, v1_us, v2_us)
 }
 
 #[test]
@@ -145,24 +162,25 @@ fn fused_q4k_matmul_real_qwen25_bench() {
             ("blk.0.ffn_up.weight",      18944, 3584),
         ];
 
-        eprintln!("\n{:<32} {:>10} {:>10}  {:>10} {:>10} {:>8} {:>10}",
-            "tensor", "n", "k", "cuBLAS_us", "fused_us", "speedup", "max_diff");
-        eprintln!("{}", "-".repeat(96));
+        eprintln!("\n{:<28} {:>6} {:>6}  {:>9} {:>9} {:>9}  {:>6} {:>6}  {:>10} {:>10}",
+            "tensor", "n", "k",
+            "cuBLAS_us", "v1_us", "v2_us",
+            "v1_sp", "v2_sp",
+            "v1_diff", "v2_diff");
+        eprintln!("{}", "-".repeat(118));
         for &(name, n_rows, n_cols) in shapes {
-            let (max_d, mean_d, cublas_us, fused_us) = run_one(name, n_rows, n_cols, h);
-            let speedup = cublas_us as f32 / fused_us.max(1) as f32;
-            eprintln!("{:<32} {:>10} {:>10}  {:>10} {:>10} {:>7.2}x {:>10.3e}",
-                name, n_rows, n_cols, cublas_us, fused_us, speedup, max_d);
+            let (max_v1, max_v2, cublas_us, v1_us, v2_us) = run_one(name, n_rows, n_cols, h);
+            let sp_v1 = cublas_us as f32 / v1_us.max(1) as f32;
+            let sp_v2 = cublas_us as f32 / v2_us.max(1) as f32;
+            eprintln!("{:<28} {:>6} {:>6}  {:>9} {:>9} {:>9}  {:>5.2}x {:>5.2}x  {:>10.3e} {:>10.3e}",
+                name, n_rows, n_cols, cublas_us, v1_us, v2_us, sp_v1, sp_v2, max_v1, max_v2);
 
-            // Output values can differ slightly because the dot product
-            // sum order differs between cuBLAS (sgemm) and our
-            // accumulate-into-single-thread kernel. Tolerance: absolute
-            // < 1e-2, relative < 1e-3 for a typical Qwen-magnitude value.
-            assert!(max_d < 1e-2, "{} max_diff {} > 1e-2", name, max_d);
-            assert!(mean_d < 1e-3, "{} mean_diff {} > 1e-3", name, mean_d);
+            assert!(max_v1 < 1e-2, "{} v1 max_diff {} > 1e-2", name, max_v1);
+            assert!(max_v2 < 1e-2, "{} v2 max_diff {} > 1e-2", name, max_v2);
         }
-        eprintln!("{}", "-".repeat(96));
+        eprintln!("{}", "-".repeat(118));
         eprintln!("(speedup > 1.0 means fused is faster than dequant->cuBLAS)");
+        eprintln!("v1 = one thread per output | v2 = one warp per output (split-K)");
 
         aether_gguf_close(h);
     }

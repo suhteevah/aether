@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (Fused Q4_K matmul kernel v1 LANDED — bit-close to cuBLAS, 1.2x faster on FFN matmuls, eliminates the f32 transient = unblocks all-28-blocks-resident in 8 GB VRAM; v2 with split-K reduction is the next perf step)
+2026-05-20 (Fused Q4_K matmul v2 LANDED — split-K warp-reduce; 2.7x faster than cuBLAS on FFN, 1.85x on attention; per-block matmul cost 1.78ms -> 1.04ms; estimated 45x speedup vs prior 4s/token = ~11 tok/s, closes most of the gap to llama.cpp's ~30 tok/s)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,65 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## Fused Q4_K matmul v2 LANDED — split-K warp-reduce, 2.7x cuBLAS
+
+User: "Go on the v2 kernel". Closed.
+
+### Design
+- CTA = 8 warps × 32 threads = 256 threads. Processes 8 output cols.
+- Each WARP owns one output. 32 lanes cooperatively process the K
+  dimension (each lane = 8 quants of the 256-quant super-block).
+- After all K-tiles: `__shfl_down_sync` warp-reduce the 32 partials,
+  lane 0 writes the output.
+- A tile (256 f32) loaded once per K-tile via shared mem, all 8 warps
+  share the same A.
+- 2-way branch divergence (is_hi=0 lanes 0-3, is_hi=1 lanes 4-7,
+  alternating) -- NVCC predicates with SEL, no penalty.
+
+### Measured perf (RTX 3070 Ti, release)
+```
+tensor                       n      k    cuBLAS    v1    v2    v2_sp
+blk.0.attn_q.weight       3584   3584      97us  131us   53us  1.83x
+blk.0.attn_k.weight        512   3584      20us  100us   38us  0.53x
+blk.0.attn_output.weight  3584   3584      95us  124us   51us  1.86x
+blk.0.ffn_gate.weight    18944   3584     500us  396us  184us  2.72x
+blk.0.ffn_up.weight      18944   3584     479us  397us  182us  2.63x
+```
+
+- v2 beats cuBLAS on 4 of 5 shapes (loses only on tiny attn_k where
+  cuBLAS sgemm launch overhead is already at the floor).
+- v2 is 2-2.5x faster than v1 across the board.
+- v2 is **MORE accurate than v1**: max_diff 4.9e-6 vs v1's 1.4e-5.
+  Warp-reduce sums in tree order which is numerically tighter than
+  v1's sequential accumulate.
+
+### Per-block matmul cost on Qwen2.5
+| Path | Per-block cost |
+|---|---|
+| pure CPU | 5790 ms |
+| cuBLAS dequant+sgemm | 1.78 ms |
+| v1 fused | ~1.6 ms |
+| **v2 fused (split-K)** | **1.04 ms** |
+
+Per-block reduction with v2: 42% vs cuBLAS. Per-token extrapolation
+(28 blocks + lm_head + misc):
+- Prior cuBLAS-routed: ~4 sec/token
+- v2 fused estimated: **~89 ms/token = 11 tok/s**
+- That's **45× faster** than prior baseline
+- Remaining gap to llama.cpp's ~30 tok/s: **2.7×**
+
+### Remaining gap to llama.cpp parity
+
+| Gap | Estimated speedup |
+|---|---|
+| Q6_K fused matmul (V proj + ffn_down + lm_head) | 1.5-2× |
+| Tensor-core wmma path (sm_8.0+) | 2-3× |
+| Flash attention (long seq) | 1.5× |
+| Better tiling at small N | 1.2× |
+| **Composite remaining gap** | **~3×** |
+
+Closing the rest is incremental CUDA tuning, not new system design.
 
 ## Fused Q4_K matmul kernel v1 LANDED
 
