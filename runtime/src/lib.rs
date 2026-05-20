@@ -2655,6 +2655,27 @@ fn write_f32(buf: &mut [u8], v: f32, decimals: u32) -> usize {
     s.iter().sum()
 }
 
+/// Fill `n` f32 slots at `p` with value `v`. Pairs with `aether_alloc_bytes`
+/// for witnesses that need a constant input vector without writing 256
+/// per-element `aether_store_f32` calls in .aether source.
+#[no_mangle] pub unsafe extern "C" fn aether_fill_f32(p: i64, n: c_int, v: f32) {
+    if p == 0 || n <= 0 { return; }
+    let s = std::slice::from_raw_parts_mut(p as *mut f32, n as usize);
+    for slot in s.iter_mut() { *slot = v; }
+}
+
+/// Return 42 if `v` is finite (not NaN, not infinite) and `|v| > eps_lo`
+/// and `|v| < eps_hi`. Sanity-band gate for witnesses that ingest real
+/// model weights — the exact value depends on the file, but it must be
+/// in a finite, non-degenerate range.
+#[no_mangle] pub extern "C" fn aether_f32_in_band_exit(
+    v: f32, eps_lo: f32, eps_hi: f32,
+) -> c_int {
+    if !v.is_finite() { return 1; }
+    let a = v.abs();
+    if a > eps_lo && a < eps_hi { 42 } else { 1 }
+}
+
 // =====================================================================
 // Test-only FFI surface — exercises the asm backend's f32 / f64 / cast /
 // FFI-arg pipelines from compiled Aether. Real ops never go through here.
@@ -5918,6 +5939,33 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
 //     vLLM-shape multiplier on top, which is FR-19.5-extra wiring.
 //
 // Returns achieved tok/s as f32. On any error returns 0.0.
+//
+// FR-19.16-extra (cuda routing): under `--features cuda`, every matmul
+// call inside the iteration loop is routed through cuBLAS sgemm via
+// the `cuda_matmul_through` helper below — host pointer in, host pointer
+// out, per-call upload + gemm + download. The other ops (LayerNorm,
+// SDPA, SiLU) stay on CPU; a full GPU-resident bench is a bigger
+// refactor tracked by FR-19.16-extra (deeper).
+#[cfg(feature = "cuda")]
+unsafe fn cuda_matmul_through(
+    a: *const f32, b: *const f32, out: *mut f32,
+    m: usize, k: usize, n: usize,
+) {
+    let total_a = (m * k) as c_int;
+    let total_b = (k * n) as c_int;
+    let total_o = (m * n) as c_int;
+    let da = crate::cuda::aether_dev_alloc_f32(total_a);
+    let db = crate::cuda::aether_dev_alloc_f32(total_b);
+    let dout = crate::cuda::aether_dev_alloc_f32(total_o);
+    crate::cuda::aether_dev_h2d_f32(a as i64, da, total_a);
+    crate::cuda::aether_dev_h2d_f32(b as i64, db, total_b);
+    crate::cuda::aether_op_matmul_f32_cuda(da, db, dout, m as c_int, k as c_int, n as c_int);
+    crate::cuda::aether_dev_d2h_f32(dout, out as i64, total_o);
+    crate::cuda::aether_dev_free_f32(da);
+    crate::cuda::aether_dev_free_f32(db);
+    crate::cuda::aether_dev_free_f32(dout);
+}
+
 #[no_mangle] pub unsafe extern "C" fn aether_llm_inference_bench_tps(
     n_iters: c_int, d_model: c_int, n_layers: c_int, ff: c_int, seq_len: c_int,
 ) -> f32 {
@@ -5977,6 +6025,24 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
     let mut mean_buf = vec![0.0f32; s];
     let mut inv_std_buf = vec![0.0f32; s];
 
+    // Pick the matmul backend: cuBLAS through host pointers (cuda feature)
+    // or the CPU ops::matmul_f32. The closure is a `fn`-style indirection
+    // so the dispatch happens at build time, not per-call.
+    #[cfg(feature = "cuda")]
+    let matmul = |a: *const f32, b: *const f32, o: *mut f32, m: usize, k: usize, n: usize| {
+        unsafe { cuda_matmul_through(a, b, o, m, k, n); }
+    };
+    #[cfg(not(feature = "cuda"))]
+    let matmul = |a: *const f32, b: *const f32, o: *mut f32, m: usize, k: usize, n: usize| {
+        unsafe { ops::matmul_f32(a, b, o, m, k, n); }
+    };
+    #[cfg(feature = "cuda")]
+    {
+        // Warm the cuda context out of the timed region so the first
+        // matmul doesn't pay JIT / cublas-handle init.
+        crate::cuda::aether_dev_init();
+    }
+
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
         for layer in &layers {
@@ -5987,9 +6053,9 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
                 s, d,
             );
             // Q / K / V projections
-            ops::matmul_f32(ln_out.as_ptr(), layer.wq.as_ptr(), q.as_mut_ptr(), s, d, d);
-            ops::matmul_f32(ln_out.as_ptr(), layer.wk.as_ptr(), k.as_mut_ptr(), s, d, d);
-            ops::matmul_f32(ln_out.as_ptr(), layer.wv.as_ptr(), v.as_mut_ptr(), s, d, d);
+            matmul(ln_out.as_ptr(), layer.wq.as_ptr(), q.as_mut_ptr(), s, d, d);
+            matmul(ln_out.as_ptr(), layer.wk.as_ptr(), k.as_mut_ptr(), s, d, d);
+            matmul(ln_out.as_ptr(), layer.wv.as_ptr(), v.as_mut_ptr(), s, d, d);
             // Causal SDPA
             ops::sdpa_causal_f32(
                 q.as_ptr(), k.as_ptr(), v.as_ptr(),
@@ -5997,7 +6063,7 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
                 1, s, d,
             );
             // Wo + residual
-            ops::matmul_f32(attn_out.as_ptr(), layer.wo.as_ptr(), proj.as_mut_ptr(), s, d, d);
+            matmul(attn_out.as_ptr(), layer.wo.as_ptr(), proj.as_mut_ptr(), s, d, d);
             for i in 0..s*d { x[i] += proj[i]; }
             // LN2
             ops::layer_norm_f32(
@@ -6006,9 +6072,9 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
                 s, d,
             );
             // MLP: up → SiLU → down + residual
-            ops::matmul_f32(ln_out.as_ptr(), layer.w_up.as_ptr(), up.as_mut_ptr(), s, d, f);
+            matmul(ln_out.as_ptr(), layer.w_up.as_ptr(), up.as_mut_ptr(), s, d, f);
             ops::silu_f32(up.as_mut_ptr(), s * f);
-            ops::matmul_f32(up.as_ptr(), layer.w_down.as_ptr(), down.as_mut_ptr(), s, f, d);
+            matmul(up.as_ptr(), layer.w_down.as_ptr(), down.as_mut_ptr(), s, f, d);
             for i in 0..s*d { x[i] += down[i]; }
         }
     }
@@ -7109,6 +7175,54 @@ mod conv2d_tests {
             assert!(abs0 >= 24, "offset {} too low", abs0);
             let ptr0 = aether_gguf_get_tensor_data_ptr(h, 0);
             assert!(ptr0 != 0);
+            aether_gguf_close(h);
+        }
+    }
+
+    /// FR-17.14-extra-deeper-deeper — Forward-pass chain over real
+    /// Qwen2.5-7B weights: GGUF data ptr → Q4_K_M dequant → matmul.
+    /// Skipped if the local ollama blob isn't present.
+    #[test]
+    fn qwen25_forward_chain_one_block() {
+        let qwen_path = "C:\\Users\\Matt\\.ollama\\models\\blobs\\sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730";
+        if !std::path::Path::new(qwen_path).exists() {
+            eprintln!("[skip] Qwen2.5-7B GGUF not present at {}", qwen_path);
+            return;
+        }
+        unsafe {
+            let h = aether_gguf_open(
+                qwen_path.as_ptr() as i64, qwen_path.len() as c_int,
+            );
+            assert!(h >= 0);
+            assert_eq!(aether_gguf_get_tensor_dtype(h, 0), 12, "tensor 0 not Q4_K");
+            let dptr = aether_gguf_get_tensor_data_ptr(h, 0);
+            assert!(dptr != 0);
+            // Dequantise one 144-byte super-block -> 256 f32.
+            let mut deq = vec![0.0f32; 256];
+            let rc_dq = aether_dequant_q4_k_m(
+                dptr as *const c_void,
+                deq.as_mut_ptr() as *mut c_void,
+                1,
+            );
+            assert_eq!(rc_dq, 0);
+            // Real trained embedding values are not all-zero.
+            let raw_sum: f32 = deq.iter().sum();
+            assert!(raw_sum.is_finite(), "dequant sum not finite: {}", raw_sum);
+            assert!(raw_sum.abs() > 1e-5, "dequant sum too small ({}): never read real weights?", raw_sum);
+            assert!(raw_sum.abs() < 1e3, "dequant sum too large ({}): scale overflow?", raw_sum);
+            // ones[1,256] @ deq[256,1] -> scalar must equal sum(deq).
+            let input = vec![1.0f32; 256];
+            let mut scalar = [0.0f32; 1];
+            let rc_mm = aether_op_matmul_f32(
+                input.as_ptr() as *const c_void,
+                deq.as_ptr() as *const c_void,
+                scalar.as_mut_ptr() as *mut c_void,
+                1, 256, 1,
+            );
+            assert_eq!(rc_mm, 0);
+            assert!((scalar[0] - raw_sum).abs() < 1e-2 * raw_sum.abs().max(1.0),
+                "matmul {} != sum {}", scalar[0], raw_sum);
+            eprintln!("[chain] qwen2.5 super-block 0: sum={:.6e} matmul={:.6e}", raw_sum, scalar[0]);
             aether_gguf_close(h);
         }
     }

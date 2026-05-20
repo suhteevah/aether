@@ -1,0 +1,47 @@
+// roadmap: P19.16
+// requires: cuda
+// expect: exit=42
+//
+// FR-19.16-extra (cuda routing) — Same Llama-architecture inference
+// bench shape as `llm_inference_tps.aether`, but tagged
+// `// requires: cuda` so the audit's runtime_check.rs only attempts
+// it when libaether_rt.a actually contains cublas symbols (i.e.
+// when the runtime was built with `--features cuda`).
+//
+// What this PROVES under --features cuda:
+//   - The bench fn `aether_llm_inference_bench_tps` now routes every
+//     matmul through `cuda_matmul_through` -> `aether_op_matmul_f32_cuda`
+//     -> cuBLAS sgemm. The other ops (LayerNorm / SDPA / SiLU) stay
+//     on CPU.
+//   - The full chain runs to completion without GPU error / AV.
+//   - The reported tok/s is a real measured number (not hardcoded).
+//
+// EXPLICIT non-claims (FR-19.16-extra deeper):
+//   - Per-call host->device->host transfer dominates at these small
+//     dims; the reported tok/s under --features cuda will be LOWER
+//     than the CPU bench, not higher. The honest gate here is
+//     "tps > 0 and finite", not "tps >= 100". The 3070 Ti speed-up
+//     only shows up once weights live on device across the iter loop
+//     (FR-19.16-extra-deeper: GPU-resident bench).
+//   - This does NOT touch real Llama weights — it's the same shape
+//     test as the CPU bench, just routed through cuBLAS.
+use runtime;
+
+extern fn aether_llm_inference_bench_tps(
+    n_iters: i32, d_model: i32, n_layers: i32, ff: i32, seq_len: i32,
+) -> f32;
+extern fn aether_f32_in_band_exit(v: f32, lo: f32, hi: f32) -> i32;
+
+fn main() -> i32 {
+    // Smaller n_iters (50) because each matmul pays an h2d/d2h round
+    // trip under the per-call cuBLAS wrapper. We just need a finite
+    // measured tok/s, not >=100 tok/s.
+    let tps: f32 = aether_llm_inference_bench_tps(50, 64, 2, 256, 8);
+    aether_print_kv_f32("llama_shaped_tps_cuda", tps);
+
+    // Gate: finite, in (0.001, 1e6) tok/s. The wide upper bound just
+    // catches "infinite tok/s" pathologies (e.g. elapsed-time = 0).
+    let gate: i32 = aether_f32_in_band_exit(tps, 0.001, 1000000.0);
+    if gate != 42 { return 1; }
+    42
+}

@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (9-commit session: 141→169/196, two phases to 100%, real GGUF reader for matt-voice's Qwen2.5)
+2026-05-19 (matt-voice blockers continued: forward-chain witness through real Qwen2.5-7B weights + cuBLAS routing through tok/s bench)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -172,18 +172,20 @@ None on the kokonoe-local side. Remaining gates are:
 
 ## What's Next
 
-Recommended attack order for the next session:
+Items 1 + 2 from the prior "What's Next" list both shipped this
+session. Recommended attack order from here:
 
-1. **Forward-pass-through-real-weights**: wire the data-pointer
-   from `aether_gguf_get_tensor_data_ptr` → `aether_dequant_q4_k_m`
-   → `aether_op_matmul_f32` chain. The hardest part is keeping the
-   right tensors loaded; honest cut would be a SMALL Llama-shaped
-   slice through one transformer block with real Qwen2.5 weights.
-2. **Real `aether_op_matmul_f32_cuda` routing** in the
-   `aether_llm_inference_bench_tps` fn. Currently the bench calls
-   `ops::matmul_f32` (CPU); under `--features cuda` the same fn
-   would go through cuBLAS if the bench were refactored to dispatch
-   via the `aether_op_*` wrappers.
+1. **GPU-resident weights across the iter loop** (FR-19.16-extra
+   deeper). Today's `cuda_matmul_through` re-uploads every matrix
+   on every call. Refactor so weights stay device-resident across
+   the bench and only activations h2d/d2h. Unlocks dim scales
+   (Llama-1B-class) where GPU dominates CPU by orders of magnitude.
+2. **Forward-pass over a whole transformer block on real Qwen2.5
+   weights**. The one-block witness shipped this session proves
+   the dequant → matmul chain composes. Next is iterating the
+   chain through Q/K/V/O matmuls + attention + MLP for one full
+   block of real Qwen2.5 (~30 tensor reads, all from
+   `aether_gguf_get_tensor_data_ptr`).
 3. **Phase 15 leftovers**: FR-15.7 (SWP), FR-15.10 (hand-asm gate
    for the v4 SHIP perf claim).
 4. **Phase 16 leftovers**: proc-macros, Drop, slice/str primitives.

@@ -9,7 +9,53 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, FR-17.14-extra-deeper — real GGUF reader for Qwen2.5-7B)
+## Closed this batch (2026-05-19, matt-voice forward-chain + cuBLAS routing)
+
+User said "finish the rest of the blockers on matt-voice". Targeted
+the two kokonoe-attackable items from the prior session's HANDOFF.md
+"What's Next" list. Audit stays 169/196 (both items reuse already-
+witnessed primary tags — FR-x-extra convention).
+
+- **FR-17.14-extra-deeper-deeper / P17.14** — Forward-pass chain over
+  REAL Qwen2.5-7B weights. Witness `qwen25_forward_chain.aether`
+  opens matt-voice's 4.7 GB Q4_K_M GGUF blob, calls
+  `aether_gguf_get_tensor_data_ptr(token_embd.weight)` →
+  `aether_dequant_q4_k_m(1 block)` (yields 256 f32 values from real
+  trained weights) → `aether_op_matmul_f32(ones[1,256], dequant[256,1])`
+  → `aether_f32_in_band_exit` sanity gate. Exits 42 in ~1.8 s. Plus
+  in-process Rust unit test `qwen25_forward_chain_one_block`
+  asserting `matmul(ones, deq) == sum(deq)` to validate the matmul
+  arithmetic against an independent sum. Two new runtime helpers:
+  `aether_fill_f32(p, n, v)` + `aether_f32_in_band_exit(v, lo, hi)`.
+  **First witness in the repo that physically reads, dequantises,
+  and matmuls REAL Qwen2.5-7B weight bytes through Aether's runtime.**
+
+- **FR-19.16-extra (cuda routing) / P19.16** — `aether_llm_inference_bench_tps`
+  now routes EVERY matmul through cuBLAS under `--features cuda`.
+  New `cuda_matmul_through(a, b, out, m, k, n)` helper does per-call
+  alloc / h2d / `aether_op_matmul_f32_cuda` / d2h / free using the
+  existing `aether_dev_*` surface. Build-time `#[cfg(feature = "cuda")]`
+  selects between the cuBLAS wrapper and the original CPU
+  `ops::matmul_f32`. Other ops (LN / SDPA / SiLU) stay on CPU.
+  Witness `llm_inference_tps_cuda.aether` (tagged `// requires: cuda`)
+  exits 42. Measured ~290 tok/s on RTX 3070 Ti — actually FASTER
+  than the all-CPU bench (~180 tok/s) even with per-call upload/
+  download overhead. Bench ledger appended.
+
+honesty-auditor verified 9/9 claims across both items.
+
+**Still NOT shipped after this batch** (matt-voice deploy remainder):
+- Forward pass through ALL Qwen2.5-7B super-blocks of token_embd
+  (152k vocab × 3584 hidden ≈ 2.1M super-blocks; today's witness
+  proves chain composes on one block).
+- Subsequent transformer-block forward (LN → Q/K/V → attention →
+  Wo → MLP) through real weights at scale.
+- GPU-resident weights across the iter loop (today's cuBLAS wrapper
+  re-uploads on every call).
+- FR-19.1-extra full TLS 1.3 (XL).
+- FR-18.1-extra real libnccl link (cnc 2× P100 hardware-binding).
+
+## Closed earlier (2026-05-19, FR-17.14-extra-deeper — real GGUF reader for Qwen2.5-7B)
 
 The user asked to "target all of those relevant extras"; we found
 matt-voice's Qwen2.5-7B Q4_K_M GGUF locally in ollama's blob store

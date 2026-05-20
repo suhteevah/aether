@@ -151,6 +151,44 @@ The full FR-19.16 spec demands all three. This partial closes the
 P19.16 audit slot honestly via the explicit per-witness scope
 documentation in `tests/runtime/llm_inference_tps.aether:5-32`.
 
+### 2026-05-19 — Llama-shape cuBLAS-routed bench (FR-19.16-extra, partial)
+
+Witness: `tests/runtime/llm_inference_tps_cuda.aether`
+Runtime fn: same `aether_llm_inference_bench_tps`, now with a
+`#[cfg(feature = "cuda")]` closure that routes every matmul through
+the new `cuda_matmul_through` helper (per-call alloc / h2d / cuBLAS
+sgemm / d2h / free using `aether_op_matmul_f32_cuda`).
+Hardware: kokonoe 11900K + RTX 3070 Ti 8GB
+Build: `cargo build -p aether_rt --features cuda` then aether-bin link
+
+Dimensions: d=64, n_layers=2, ff=256, seq=8. Iterations: 50.
+
+| Run | tok/s (cuBLAS-routed matmul) |
+|---|---|
+| 1   | 281.57 |
+| 2   | 295.38 |
+| 3   | 293.80 |
+| 4   | 300.09 |
+
+Result: ~290 tok/s sustained — well over the FR-19.16 ≥100 gate.
+At these dims the per-call h2d/d2h overhead is comparable to the
+gemm cost itself, but cuBLAS sgemm is still fast enough that the
+fully-routed path beats the all-CPU number (~180 tok/s) by ~1.6×.
+
+PARTIAL SCOPE — still NOT shipped (FR-19.16-extra deeper):
+- **GPU-resident weights across the iter loop**. Today's wrapper
+  re-uploads every matrix on every call. A real serving deploy
+  would keep weights resident on device and only h2d activations,
+  which would unlock dim scales where GPU dominates CPU by orders
+  of magnitude (Llama-1B-class). The wrapper is the correctness
+  artefact, not the perf artefact.
+- **Real Llama weights**. Still synthetic Gaussian; the chain
+  composes with FR-17.19-extra (SafeTensors / GGUF weight load)
+  but isn't end-to-end wired yet.
+- **All ops routed**. LayerNorm/SDPA/SiLU remain on CPU (cuda.rs
+  has GPU versions but they take device handles; full routing is
+  the same refactor as keeping weights resident).
+
 
 
 ## bench/training_throughput — steps/sec (planned, gates on P8.3)

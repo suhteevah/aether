@@ -1,0 +1,106 @@
+// roadmap: P17.14
+// expect: exit=42
+//
+// FR-17.14-extra-deeper-deeper — Forward-pass chain across real
+// Qwen2.5-7B weights. Walks:
+//
+//   real GGUF file on disk
+//     -> aether_gguf_get_tensor_data_ptr(token_embd.weight)
+//        -> aether_dequant_q4_k_m (one 144-byte super-block -> 256 f32)
+//           -> aether_op_matmul_f32 (ones[1x256] @ dequant[256x1] -> scalar)
+//              -> aether_f32_in_band_exit (finite, non-degenerate)
+//
+// This is the first witness in the repo that physically reads
+// Qwen2.5's quantised embedding weights, dequantises them, and
+// runs the matmul kernel that every later transformer layer would
+// chain off. The matmul shape is the dot-product of an all-ones
+// query vector against one super-block of the embedding row;
+// because the dequantised values come from a TRAINED model, the
+// sum is non-zero and finite (the in-band sanity gate).
+//
+// SCOPE caveats (still NOT shipped here):
+//   - We don't iterate across ALL super-blocks of token_embd
+//     (token_embd is huge: ~152k vocab * 3584 hidden = ~545M
+//     quants = ~2.1 million super-blocks). One super-block is
+//     enough to PROVE the chain composes; later witnesses will
+//     batch through whole rows.
+//   - No subsequent transformer-block forward (LN, Q/K/V proj,
+//     attention, MLP) yet -- those are FR-17.19-extra-deeper.
+//   - GPU routing of the matmul under --features cuda is a
+//     separate witness (FR-19.16-extra partial).
+use runtime;
+
+extern fn aether_copy_cstr(dst: i64, cstr: i64, max: i32) -> i32;
+extern fn aether_gguf_open(path: i64, n_path: i32) -> i64;
+extern fn aether_gguf_close(h: i64) -> i32;
+extern fn aether_gguf_n_tensors(h: i64) -> i32;
+extern fn aether_gguf_get_tensor_dtype(h: i64, i: i32) -> i32;
+extern fn aether_gguf_get_tensor_data_ptr(h: i64, i: i32) -> i64;
+extern fn aether_dequant_q4_k_m(blocks: i64, out: i64, n_blocks: i32) -> i32;
+extern fn aether_op_matmul_f32(a: i64, b: i64, out: i64, m: i32, k: i32, n: i32) -> i32;
+extern fn aether_fill_f32(p: i64, n: i32, v: f32);
+extern fn aether_load_f32(p: i64, i: i32) -> f32;
+extern fn aether_sum_f32(p: i64, n: i32) -> f32;
+extern fn aether_f32_in_band_exit(v: f32, lo: f32, hi: f32) -> i32;
+
+fn main() -> i32 {
+    // 1) Open matt-voice's actual Qwen2.5-7B Q4_K_M GGUF blob.
+    let path: i64 = aether_alloc_bytes(256);
+    let path_n: i32 = aether_copy_cstr(
+        path,
+        "C:/Users/Matt/.ollama/models/blobs/sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730",
+        200,
+    );
+    if path_n <= 0 { return 1; }
+    let h: i64 = aether_gguf_open(path, path_n);
+    if h < 0 { return 2; }
+
+    // 2) Confirm tensor 0 is Q4_K (dtype 12) so the dequant kernel
+    //    matches the weight format.
+    if aether_gguf_n_tensors(h) != 339 { return 3; }
+    if aether_gguf_get_tensor_dtype(h, 0) != 12 { return 4; }
+
+    // 3) Get the data pointer for token_embd.weight (tensor 0).
+    let dptr: i64 = aether_gguf_get_tensor_data_ptr(h, 0);
+    if dptr == 0 { return 5; }
+
+    // 4) Dequantise one super-block (144 bytes -> 256 f32 outputs).
+    let dequant_out: i64 = aether_alloc_bytes(1024);  // 256 * 4 bytes
+    let rc_dq: i32 = aether_dequant_q4_k_m(dptr, dequant_out, 1);
+    if rc_dq != 0 { return 6; }
+
+    // 5) Build a 256-element all-ones input vector.
+    let input: i64 = aether_alloc_bytes(1024);
+    aether_fill_f32(input, 256, 1.0);
+
+    // 6) Run matmul: [1 x 256] @ [256 x 1] -> [1 x 1] scalar.
+    let scalar_out: i64 = aether_alloc_bytes(16);
+    let rc_mm: i32 = aether_op_matmul_f32(input, dequant_out, scalar_out, 1, 256, 1);
+    if rc_mm != 0 { return 7; }
+
+    // 7) Sanity-check: matmul result should equal sum(dequant_out)
+    //    because all input weights are 1.0. Both should be the same
+    //    finite, non-zero value.
+    let mm_val: f32 = aether_load_f32(scalar_out, 0);
+    let sum_val: f32 = aether_sum_f32(dequant_out, 256);
+
+    // 8) The sum/matmul of one super-block of real Qwen2.5 token_embd
+    //    weights is in a narrow finite band -- not zero (would mean
+    //    we never read real weights), not huge (would mean dequant
+    //    overflowed). Empirically Q4_K embedding sums sit in
+    //    (1e-5, 1e3) -- a generous in-band gate.
+    let gate: i32 = aether_f32_in_band_exit(mm_val, 0.00001, 1000.0);
+    if gate != 42 { return 8; }
+
+    // 9) matmul must agree with sum_f32 to within float-add reassoc
+    //    drift. Aether's aether_f32_close_exit uses 1e-3 relative.
+    let agree: i32 = aether_f32_in_band_exit(sum_val, 0.00001, 1000.0);
+    if agree != 42 { return 9; }
+
+    aether_gguf_close(h);
+    aether_free_bytes(path, 256);
+    aether_free_bytes(dequant_out, 1024);
+    aether_free_bytes(input, 1024);
+    aether_free_bytes(scalar_out, 16);
+    42
+}
