@@ -881,9 +881,12 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     }
 }
 
-/// Allocate `n` bytes of executable + writable memory via `VirtualAlloc`
-/// (Windows). Returns a pointer suitable for `aether_call_jit_i64`.
-/// Caller frees with `aether_free_executable`. Returns 0 on failure.
+/// Allocate `n` bytes of executable + writable memory. On Windows uses
+/// `VirtualAlloc(PAGE_EXECUTE_READWRITE)`; on POSIX uses `mmap` with
+/// `PROT_READ|PROT_WRITE|PROT_EXEC`. Returns a pointer suitable for
+/// `aether_call_jit_i64`. Caller frees with `aether_free_executable`.
+/// Returns 0 on failure.
+#[cfg(windows)]
 #[no_mangle] pub unsafe extern "C" fn aether_alloc_executable(n: i64) -> i64 {
     if n <= 0 { return 0; }
     #[link(name = "kernel32")]
@@ -897,6 +900,27 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     if p.is_null() { 0 } else { p as i64 }
 }
 
+#[cfg(unix)]
+#[no_mangle] pub unsafe extern "C" fn aether_alloc_executable(n: i64) -> i64 {
+    if n <= 0 { return 0; }
+    extern "C" {
+        fn mmap(addr: *mut c_void, length: usize, prot: c_int,
+                flags: c_int, fd: c_int, offset: i64) -> *mut c_void;
+    }
+    const PROT_READ: c_int  = 1;
+    const PROT_WRITE: c_int = 2;
+    const PROT_EXEC: c_int  = 4;
+    const MAP_PRIVATE: c_int = 0x02;
+    const MAP_ANONYMOUS: c_int = 0x20;
+    let p = mmap(
+        std::ptr::null_mut(), n as usize,
+        PROT_READ | PROT_WRITE | PROT_EXEC,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0,
+    );
+    if p as isize == -1 { 0 } else { p as i64 }
+}
+
+#[cfg(windows)]
 #[no_mangle] pub unsafe extern "C" fn aether_free_executable(p: i64, _n: i64) {
     if p == 0 { return; }
     #[link(name = "kernel32")]
@@ -905,6 +929,13 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     }
     const MEM_RELEASE: u32 = 0x8000;
     let _ = VirtualFree(p as *mut u8, 0, MEM_RELEASE);
+}
+
+#[cfg(unix)]
+#[no_mangle] pub unsafe extern "C" fn aether_free_executable(p: i64, n: i64) {
+    if p == 0 || n <= 0 { return; }
+    extern "C" { fn munmap(addr: *mut c_void, length: usize) -> c_int; }
+    let _ = munmap(p as *mut c_void, n as usize);
 }
 
 /// Cast `p` to `fn() -> i64` and invoke it. The caller is responsible for
