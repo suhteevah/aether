@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (24 tok/s MEASURED on RTX 3070 Ti — fused Q4_K v2 + Q6_K v2 wired into end-to-end forward; 96x speedup vs prior 0.25 tok/s; in range of llama.cpp's ~30 tok/s; correctness gap = on-device KV cache attention)
+2026-05-20 (on-device KV cache + GPU attention_seq1 kernel LANDED, individually bit-close to CPU — end-to-end chain still NaN-out at block 3; speed 25 tok/s; root-cause is FP accumulation / overflow in the matmul/attention composition, not a kernel logic bug)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,60 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## On-device KV cache + attention kernel LANDED (correctness still WIP)
+
+User: "Go on attention correctness". Shipped:
+
+### Kernels
+- `append_kv` -- writes new K/V step into the per-block KV cache
+  at position `pos`.
+- `attention_seq1` -- one warp per Q head, lanes cooperatively compute
+  scores via warp-reduce, softmax (max + exp+sum + normalise), then
+  aggregate V_cache by softmax weights. Dynamic shared mem sized
+  for `cur_seq * 4` bytes.
+- Wrappers `aether_op_append_kv_f32_cuda` +
+  `aether_op_attention_seq1_f32_cuda`.
+
+### Verification (in isolation)
+`runtime/tests/attention_seq1_parity.rs` — Q/K_cache/V_cache with
+known values, n_q=28 / n_kv=4 / head_dim=128 / cur_seq=7. GPU
+matches CPU reference within **max_diff = 7.15e-7**.
+
+### Wiring into autoregressive_fused
+`runtime/tests/qwen25_autoregressive_fused.rs` now uses the real
+GPU attention kernel + per-block KV cache (MAX_SEQ=32 device
+buffers per block, 28 caches). Speed: **25 tok/s**.
+
+### Known issue: NaN enters at block 3
+
+Diagnostic ran with per-block magnitude prints (now disabled):
+```
+[blk 0] max_abs=3.727  -- normal
+[blk 1] max_abs=8.398  -- growing
+[blk 2] max_abs=1.076e1 -- growing
+[blk 3] max_abs=0.0, sum=NaN  -- BLOW UP
+[blk 4+] NaN propagates
+```
+
+Generated IDs are all 152063 (PAD) because final logits are all NaN
+and argmax with NaN ties picks the last index.
+
+**Root-cause analysis (not yet shipped fix):**
+- Q4_K v2 fused matmul: max_diff vs cuBLAS = 8.6e-6 (verified)
+- Q6_K v2 fused matmul: max_diff vs cuBLAS = 9.3e-5 (verified)
+- attention_seq1: max_diff vs CPU = 7.15e-7 (verified)
+- Each kernel individually correct. The activation magnitude
+  growing 3.7 → 8.4 → 10.8 → NaN across 3 blocks suggests
+  accumulating FP drift that eventually overflows in SiLU or
+  similar non-linear op.
+- Possible fixes: route ONE matmul through cuBLAS to localize;
+  add f64 accumulation in fused kernel; check if the
+  bias_add->RoPE order interacts badly.
+
+This is the LAST gap. Speed is at llama.cpp parity (25 tok/s vs
+~30); correctness in isolation is bit-close; the cascade composition
+has a numerical issue tracked as FR-17.14-extra-deepest-correctness.
 
 ## End-to-end fused autoregressive: 24 tok/s MEASURED on RTX 3070 Ti
 

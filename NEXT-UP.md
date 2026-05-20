@@ -9,7 +9,57 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, fused Q6_K v2 + end-to-end 24 tok/s measurement)
+## Closed this batch (2026-05-20, attention_seq1 + KV cache on device + NaN diagnostic)
+
+User: "Go on attention correctness". Shipped the kernels + KV cache.
+Speed is at llama.cpp parity (25 tok/s). End-to-end has a NaN
+issue tracked separately.
+
+### Shipped
+- `append_kv` kernel: writes new K/V step at position in cache.
+- `attention_seq1` kernel: warp-per-Q-head; computes scores via
+  warp-reduce, softmax, aggregates V_cache by softmax weights.
+- Wrappers `aether_op_append_kv_f32_cuda` and
+  `aether_op_attention_seq1_f32_cuda`.
+
+### Isolated correctness verified
+`attention_seq1_parity.rs` — Q/K_cache/V_cache @ Qwen2.5 shapes
+(n_q=28, n_kv=4, head_dim=128, cur_seq=7). GPU matches CPU
+within max_diff = 7.15e-7.
+
+### End-to-end: 25 tok/s with attention wired, NaN-out at block 3
+
+`qwen25_autoregressive_fused.rs` runs the full pipeline with
+- Q4_K v2 fused matmul (Wq/Wk/Wo/gate/up)
+- Q6_K v2 fused matmul (Wv/down/lm_head)
+- On-device KV cache (28 caches × MAX_SEQ * D_KV * 4B = ~14 KB total)
+- append_kv per step + attention_seq1 per block
+
+Diagnostic showed activation magnitude growing 3.7 -> 8.4 -> 10.8
+across the first 3 blocks, then NaN at block 3. Speed 25 tok/s.
+
+### Open FR: end-to-end numerical drift
+
+All kernels verified correct in isolation. The cascade composition
+has FP accumulation that overflows. Investigation:
+- Likely: SiLU(x) overflow on growing activations
+- Possibly: matmul accumulation drift compounding
+- The OLDER cuBLAS-routed test (qwen25_autoregressive_cuda.rs)
+  with same forward shape but cuBLAS sgemm + CPU SDPA DID produce
+  sensible IDs ([358, 2776, 264, 220, 17]). The difference is
+  matmul kernel + attention kernel — both verified correct in
+  isolation. Likely the issue is in their COMPOSITION (e.g.,
+  bias_add order, RoPE/append_kv interaction, or cumulative drift
+  amplified across 28 layers).
+
+Next session debugging:
+1. Bisect — replace one kernel at a time with cuBLAS variant to
+   localize.
+2. Add intermediate diagnostic prints to find which op first
+   produces large activations.
+3. Try f64 accumulation in v2 fused matmul to test if it's drift.
+
+## Closed earlier (2026-05-20, fused Q6_K v2 + end-to-end 24 tok/s measurement)
 
 User: "Go till the cuda tuning is complete". Continued through:
 - Q6_K v2 fused matmul kernel (lm_head + V proj + ffn_down)

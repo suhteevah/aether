@@ -65,6 +65,8 @@ struct CudaCtx {
     fused_q4k_matmul_seq1: CudaFunction,
     fused_q4k_matmul_seq1_v2: CudaFunction,
     fused_q6k_matmul_seq1_v2: CudaFunction,
+    append_kv: CudaFunction,
+    attention_seq1: CudaFunction,
 }
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
@@ -753,6 +755,125 @@ extern "C" __global__ void fused_q4k_matmul_seq1_v2(
     }
 }
 
+// matt-voice / FR-17.13-extra — append new K/V step to the on-device
+// KV cache at position `pos`. Simple memcpy-shaped kernel.
+extern "C" __global__ void append_kv(
+    const float* __restrict__ k_new,
+    const float* __restrict__ v_new,
+    float*       __restrict__ k_cache,
+    float*       __restrict__ v_cache,
+    int pos, int d_kv)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= d_kv) return;
+    k_cache[(size_t)pos * d_kv + tid] = k_new[tid];
+    v_cache[(size_t)pos * d_kv + tid] = v_new[tid];
+}
+
+// matt-voice / FR-17.13-extra — single-step attention for seq=1
+// autoregressive generation with on-device KV cache.
+//
+// One warp per Q head. CTA = 32 threads (one warp). Each of the 32
+// lanes handles head_dim/32 = 4 elements (for Qwen2.5 head_dim=128).
+//
+// Math per Q head h (kv_head = h / (n_q_heads/n_kv_heads)):
+//   scores[t] = (Q_h · K_cache[t, kv_head]) * scale     for t in 0..cur_seq
+//   softmax over scores[0..cur_seq]
+//   attn_out[h, d] = sum_t softmax[t] * V_cache[t, kv_head, d]
+//
+// Shared memory: cur_seq * 4 bytes per CTA. Sized at launch time via
+// dynamic shared mem.
+extern "C" __global__ void attention_seq1(
+    const float* __restrict__ q,         // [n_q_heads * head_dim]
+    const float* __restrict__ k_cache,   // [max_seq, n_kv_heads * head_dim]
+    const float* __restrict__ v_cache,   // [max_seq, n_kv_heads * head_dim]
+    float*       __restrict__ attn_out,  // [n_q_heads * head_dim]
+    int cur_seq, int n_q_heads, int n_kv_heads, int head_dim,
+    float scale)
+{
+    extern __shared__ float scores[];
+
+    int head    = blockIdx.x;
+    int lane    = threadIdx.x;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head = head / kv_per_q;
+    int d_kv    = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;     // head_dim / 32 (Qwen2.5: 4)
+
+    const float* q_ptr = q + head * head_dim;
+
+    // Load this head's Q row into registers (4 elements per lane).
+    float q_local[8];  // up to head_dim=256
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane * per_lane + i];
+    }
+
+    // === Pass 1: compute scores[t] = Q · K_cache[t, kv_head] * scale ===
+    for (int t = 0; t < cur_seq; t++) {
+        const float* k_ptr = k_cache + (size_t)t * d_kv + kv_head * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane * per_lane + i];
+        }
+        // Warp-reduce
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncwarp();
+
+    // === Pass 2: softmax (max, exp+sum, normalize) ===
+    float local_max = __int_as_float(0xFF800000u);  // -inf (nvrtc has no INFINITY macro)
+    for (int t = lane; t < cur_seq; t += 32) {
+        float s = scores[t];
+        if (s > local_max) local_max = s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    float max_val = __shfl_sync(0xFFFFFFFFu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int t = lane; t < cur_seq; t += 32) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, off);
+    }
+    float sum_val = __shfl_sync(0xFFFFFFFFu, local_sum, 0);
+    float inv_sum = 1.0f / sum_val;
+    for (int t = lane; t < cur_seq; t += 32) {
+        scores[t] *= inv_sum;
+    }
+    __syncwarp();
+
+    // === Pass 3: aggregate V_cache by softmax weights ===
+    float out_local[8] = {0.0f};
+    for (int t = 0; t < cur_seq; t++) {
+        float w = scores[t];
+        const float* v_ptr = v_cache + (size_t)t * d_kv + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) out_local[i] += w * v_ptr[lane * per_lane + i];
+        }
+    }
+
+    float* out_ptr = attn_out + head * head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) out_ptr[lane * per_lane + i] = out_local[i];
+    }
+}
+
 // matt-voice / FR-17.14-extra-deepest — FUSED Q6_K matmul v2 for seq=1.
 //
 // Same pattern as fused_q4k_matmul_seq1_v2 but reading 210-byte
@@ -956,7 +1077,8 @@ fn ctx() -> &'static CudaCtx {
               "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1",
-              "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2"])
+              "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
+              "append_kv", "attention_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -985,6 +1107,8 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1").unwrap();
         let fused_q4k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v2").unwrap();
         let fused_q6k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_v2").unwrap();
+        let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
+        let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
@@ -994,7 +1118,7 @@ fn ctx() -> &'static CudaCtx {
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu,
                   fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2,
-                  fused_q6k_matmul_seq1_v2 }
+                  fused_q6k_matmul_seq1_v2, append_kv, attention_seq1 }
     })
 }
 
@@ -2005,6 +2129,80 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().fused_q4k_matmul_seq1_v2.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks))
             .expect("launch fused_q4k_matmul_seq1_v2");
+    }
+    0
+}
+
+/// FR-17.13-extra — append new K/V step into the on-device KV cache
+/// at position `pos`. `k_new_dev` / `v_new_dev` are f32 device handles
+/// of length `d_kv`. `k_cache_dev` / `v_cache_dev` are f32 device
+/// handles allocated for `max_seq * d_kv` floats.
+#[no_mangle] pub extern "C" fn aether_op_append_kv_f32_cuda(
+    k_new_dev: i64, v_new_dev: i64,
+    k_cache_dev: i64, v_cache_dev: i64,
+    pos: c_int, d_kv: c_int,
+) -> c_int {
+    let Some(i_kn) = handle_to_idx(k_new_dev) else { return -1; };
+    let Some(i_vn) = handle_to_idx(v_new_dev) else { return -1; };
+    let Some(i_kc) = handle_to_idx(k_cache_dev) else { return -1; };
+    let Some(i_vc) = handle_to_idx(v_cache_dev) else { return -1; };
+    if pos < 0 || d_kv <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let kn = bs[i_kn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vn = bs[i_vn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kc = bs[i_kc].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let vc = bs[i_vc].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(d_kv as u32);
+    unsafe {
+        let knr = &*kn; let vnr = &*vn;
+        let kcm = &mut *kc; let vcm = &mut *vc;
+        ctx().append_kv.clone()
+            .launch(cfg, (knr, vnr, kcm, vcm, pos, d_kv))
+            .expect("launch append_kv");
+    }
+    0
+}
+
+/// FR-17.13-extra — single-step causal attention with on-device KV cache.
+///
+/// Args:
+///   q_dev      : f32 [n_q_heads * head_dim]
+///   k_cache    : f32 [max_seq, n_kv_heads * head_dim]
+///   v_cache    : f32 [max_seq, n_kv_heads * head_dim]
+///   attn_out   : f32 [n_q_heads * head_dim]
+///   cur_seq    : current valid length in cache (incl. just-appended)
+///   n_q_heads, n_kv_heads, head_dim: GQA / shape config
+///   scale      : 1/sqrt(head_dim) typically
+///
+/// Launches one warp per Q head. Shared mem sized for cur_seq * 4 bytes.
+#[no_mangle] pub extern "C" fn aether_op_attention_seq1_f32_cuda(
+    q_dev: i64, k_cache: i64, v_cache: i64, attn_out: i64,
+    cur_seq: c_int,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
+    scale: f32,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kc) = handle_to_idx(k_cache) else { return -1; };
+    let Some(i_vc) = handle_to_idx(v_cache) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    if cur_seq <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    let bs = unsafe { bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kc_p = bs[i_kc].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vc_p = bs[i_vc].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let shmem = (cur_seq as u32) * 4;  // bytes for scores[cur_seq]
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, 1, 1),  // one warp per head
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kcv = &*kc_p; let vcv = &*vc_p; let ov = &mut *o_p;
+        ctx().attention_seq1.clone()
+            .launch(cfg, (qv, kcv, vcv, ov, cur_seq, n_q_heads, n_kv_heads, head_dim, scale))
+            .expect("launch attention_seq1");
     }
     0
 }

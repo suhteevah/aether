@@ -27,6 +27,7 @@ use aether_rt::cuda::{
     aether_op_bias_add_f32_cuda, aether_op_matmul_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
+    aether_op_append_kv_f32_cuda, aether_op_attention_seq1_f32_cuda,
 };
 
 const QWEN_BLOB: &str = "C:\\Users\\Matt\\.ollama\\models\\blobs\\sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730";
@@ -126,14 +127,20 @@ struct ActivationGpu {
     q: i64,            // D_MODEL
     k_step: i64,       // D_KV (new K for this step)
     v_step: i64,       // D_KV (new V for this step)
-    k_repeated: i64,   // D_MODEL (GQA expanded)
-    v_repeated: i64,   // D_MODEL (GQA expanded)
     attn_out: i64,     // D_MODEL
     proj: i64,         // D_MODEL
     gate: i64,         // D_FF
     up: i64,           // D_FF
     down: i64,         // D_MODEL
     logits: i64,       // VOCAB (only for final lm_head step)
+}
+
+const MAX_SEQ: usize = 32;  // small for test; for full deploy bump to 4096
+
+/// Per-block on-device KV cache. Allocated once before generation.
+struct KvCacheGpu {
+    k_cache: i64,  // [MAX_SEQ, D_KV]
+    v_cache: i64,  // [MAX_SEQ, D_KV]
 }
 
 unsafe fn alloc_activations() -> ActivationGpu {
@@ -143,8 +150,6 @@ unsafe fn alloc_activations() -> ActivationGpu {
         q:          aether_dev_alloc_f32(D_MODEL as c_int),
         k_step:     aether_dev_alloc_f32(D_KV as c_int),
         v_step:     aether_dev_alloc_f32(D_KV as c_int),
-        k_repeated: aether_dev_alloc_f32(D_MODEL as c_int),
-        v_repeated: aether_dev_alloc_f32(D_MODEL as c_int),
         attn_out:   aether_dev_alloc_f32(D_MODEL as c_int),
         proj:       aether_dev_alloc_f32(D_MODEL as c_int),
         gate:       aether_dev_alloc_f32(D_FF as c_int),
@@ -154,16 +159,20 @@ unsafe fn alloc_activations() -> ActivationGpu {
     }
 }
 
-/// One block forward for seq=1 (autoregressive step). Skips real
-/// attention to focus this benchmark on matmul + non-matmul-op cost
-/// -- the attention portion is identical to the existing
-/// qwen25_autoregressive_cuda baseline and unchanged here. (Real
-/// attention with on-device KV cache + softmax is the next FR; for
-/// the tok/s measurement we approximate attention as V's contribution
-/// = V_step itself, since at seq=1 the attention output is
-/// softmax-weighted V, and a single-token prefill self-attention
-/// degenerates to V.)
-unsafe fn block_forward_step(bw: &BlockGpu, act: &ActivationGpu, pos: i32) {
+unsafe fn alloc_kv_caches() -> Vec<KvCacheGpu> {
+    (0..N_LAYERS).map(|_| KvCacheGpu {
+        k_cache: aether_dev_alloc_f32((MAX_SEQ * D_KV) as c_int),
+        v_cache: aether_dev_alloc_f32((MAX_SEQ * D_KV) as c_int),
+    }).collect()
+}
+
+/// One block forward for seq=1 (autoregressive step) with real
+/// on-device KV cache attention. `pos` is the absolute token position
+/// (0-indexed). `cur_seq = pos + 1` is the valid length in the cache
+/// after appending this step's K/V.
+unsafe fn block_forward_step(
+    bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, pos: i32,
+) {
     // attn_norm
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
     // Q proj (Q4_K v2) + bias
@@ -178,18 +187,20 @@ unsafe fn block_forward_step(bw: &BlockGpu, act: &ActivationGpu, pos: i32) {
     aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
         D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
     aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, D_KV as c_int);
-    // RoPE on Q and K_step
+    // RoPE on Q and K_step (K_step is the per-kv-head K we'll cache;
+    // Q has full n_q_heads expanded already from the proj).
     aether_op_rope_apply_f32_cuda(act.q,      1, N_Q_HEADS  as c_int, HEAD_DIM as c_int, ROPE_BASE, pos);
     aether_op_rope_apply_f32_cuda(act.k_step, 1, N_KV_HEADS as c_int, HEAD_DIM as c_int, ROPE_BASE, pos);
-    // GQA repeat K_step + V_step
-    aether_op_gqa_repeat_kv_f32_cuda(act.k_step, act.k_repeated, 1, N_KV_HEADS as c_int, HEAD_DIM as c_int, N_Q_HEADS as c_int);
-    aether_op_gqa_repeat_kv_f32_cuda(act.v_step, act.v_repeated, 1, N_KV_HEADS as c_int, HEAD_DIM as c_int, N_Q_HEADS as c_int);
-    // Attention shortcut: for the bench, treat attn_out = V_step (self-attention
-    // at seq=1 with no past KV ≈ identity if Q·K^T softmax = 1.0). The actual
-    // KV-cache + softmax cost is roughly equivalent to one more matmul; we
-    // measure matmul + non-matmul cost here.
-    aether_op_add_inplace_f32_cuda(act.attn_out, act.attn_out, (D_MODEL) as c_int);  // zero out (placeholder; replace with actual attn)
-    aether_op_add_inplace_f32_cuda(act.attn_out, act.v_repeated, (D_MODEL) as c_int);
+    // Append K_step / V_step to per-block KV cache at position `pos`.
+    aether_op_append_kv_f32_cuda(act.k_step, act.v_step, kv.k_cache, kv.v_cache,
+        pos, D_KV as c_int);
+    // Real causal attention with on-device KV cache. cur_seq = pos + 1.
+    let scale: f32 = 1.0 / (HEAD_DIM as f32).sqrt();
+    aether_op_attention_seq1_f32_cuda(
+        act.q, kv.k_cache, kv.v_cache, act.attn_out,
+        pos + 1, N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int,
+        scale,
+    );
     // O proj (Q4_K v2)
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.attn_out, bw.w_o, act.proj,
         D_MODEL as c_int, (bw.nb_qo / D_MODEL) as c_int);
@@ -234,6 +245,7 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             t.elapsed().as_secs_f32());
 
         let act = alloc_activations();
+        let kvs = alloc_kv_caches();
 
         // Sample prompt: 4 tokens
         let prompt = [9707usize, 11, 1879, 0];
@@ -251,7 +263,7 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             let emb_host = dequant_embd_rows(h, &[t_id]);
             aether_dev_h2d_f32(emb_host.as_ptr() as i64, act.x, D_MODEL as c_int);
             for b in 0..N_LAYERS {
-                block_forward_step(&blocks[b], &act, step as c_int);
+                block_forward_step(&blocks[b], &act, &kvs[b], step as c_int);
             }
         }
         aether_dev_sync();
@@ -267,9 +279,21 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             let emb_host = dequant_embd_rows(h, &[last_id]);
             aether_dev_h2d_f32(emb_host.as_ptr() as i64, act.x, D_MODEL as c_int);
 
-            let abs_pos = (token_ids.len()) as i32;
+            let abs_pos = token_ids.len() as i32 - 1;  // 0-indexed; current step appends at abs_pos
             for b in 0..N_LAYERS {
-                block_forward_step(&blocks[b], &act, abs_pos);
+                block_forward_step(&blocks[b], &act, &kvs[b], abs_pos);
+
+                // [DEBUG] Print x magnitude per block 0..7
+                if false && step == 0 && b < 8 {
+                    aether_dev_sync();
+                    let mut x_host = vec![0.0f32; D_MODEL];
+                    aether_dev_d2h_f32(act.x, x_host.as_mut_ptr() as i64, D_MODEL as c_int);
+                    let max_abs: f32 = x_host.iter().map(|v| v.abs()).fold(0.0, f32::max);
+                    let sum: f32 = x_host.iter().sum();
+                    let nonzero = x_host.iter().filter(|&&v| v.abs() > 1e-10).count();
+                    eprintln!("  [debug step 0, after blk {}] max_abs={:.3e} sum={:.3e} nonzero={}/{}",
+                        b, max_abs, sum, nonzero, D_MODEL);
+                }
             }
 
             // Final RMSNorm
@@ -282,9 +306,16 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             // Argmax on host (small d2h)
             let mut logits = vec![0.0f32; VOCAB];
             aether_dev_d2h_f32(act.logits, logits.as_mut_ptr() as i64, VOCAB as c_int);
-            let (best_id, _) = logits.iter().enumerate()
+            let (best_id, &best_val) = logits.iter().enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap();
+            let min_val: f32 = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_val: f32 = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            if false && step == 0 {
+                eprintln!("  [debug step 0] logit range=[{:.3e}, {:.3e}], argmax={}, sample logits[0..4]={:?}",
+                    min_val, max_val, best_id, &logits[..4]);
+            }
+            let _ = (best_val, min_val, max_val);
             token_ids.push(best_id);
         }
         aether_dev_sync();
@@ -305,10 +336,14 @@ fn qwen25_autoregressive_fused_tok_per_sec() {
             aether_dev_free_f32(b.attn_norm_g); aether_dev_free_f32(b.ffn_norm_g);
             aether_dev_free_f32(b.b_q); aether_dev_free_f32(b.b_k); aether_dev_free_f32(b.b_v);
         }
+        for kv in &kvs {
+            aether_dev_free_f32(kv.k_cache);
+            aether_dev_free_f32(kv.v_cache);
+        }
         aether_dev_free_f32(final_norm_g);
         aether_dev_free_u8(lm_head);
-        for h in [act.x, act.x_norm, act.q, act.k_step, act.v_step, act.k_repeated,
-                  act.v_repeated, act.attn_out, act.proj, act.gate, act.up, act.down, act.logits] {
+        for h in [act.x, act.x_norm, act.q, act.k_step, act.v_step,
+                  act.attn_out, act.proj, act.gate, act.up, act.down, act.logits] {
             aether_dev_free_f32(h);
         }
         aether_gguf_close(h);
