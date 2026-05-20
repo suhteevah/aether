@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (Real Qwen2.5-7B block 0 forward LANDED — full transformer block runs through Aether's runtime on actual matt-voice GGUF weights, no NaN/Inf, plausible output magnitudes)
+2026-05-20 (Both v4 incremental proof points LANDED — full 28-block Qwen2.5-7B inference produces argmax predictions; GPU-resident DP on dual P100 converges loss to 0)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -200,6 +200,62 @@ P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
 
+## Full Qwen2.5-7B inference LANDED
+
+`runtime/tests/qwen25_full_inference.rs` stacks the block-0 forward
+28 times via a streaming-dequant loop. End-to-end inference through
+Aether's runtime: tokens → 28 blocks → final_norm → lm_head → argmax.
+
+Measured 270s total on 11900K release-build for a 4-token forward:
+- 28 blocks × ~9s each (FFN-dominated)
+- lm_head load + transpose: 5.2s
+- lm_head matmul [4, 3584] @ [3584, 152064]: 14.8s
+
+Argmax predictions for input [9707, 11, 1879, 0] ("Hello, world!"-ish):
+```
+pos 0 (token 9707) -> argmax 358, logit 8.04  (range -18.98..8.04)
+pos 1 (token 11)   -> argmax 358, logit 10.11
+pos 2 (token 1879) -> argmax 2219, logit 13.33
+pos 3 (token 0)    -> argmax 358, logit 10.26
+```
+
+All logits finite, no NaN/Inf, argmax IDs in vocab. Token 358 is
+"" I"" in Qwen's BPE -- a very common next-token prediction.
+
+Test is `#[ignore]`d by default; explicit invocation:
+```
+cargo test -p aether_rt --release --test qwen25_full_inference -- --ignored --nocapture
+```
+
+## GPU-resident DP step LANDED
+
+`runtime/tests/nccl_dual_gpu_resident.rs` proves that weights live
+on each P100's device across N optimization steps -- the matt-voice
+training-deploy shape minus QMatMul.
+
+Per step (W never touches host):
+1. compute_grad kernel on device: `grad = 2 * (W - target)`
+2. NCCL all_reduce across ranks (already device-resident)
+3. sgd_step kernel on device: `W -= (lr / world_size) * grad`
+4. (Loss d2h only every 10 steps for logging, NOT training-critical)
+
+Verified on cnc 2× P100:
+```
+[gpu-resident-dp ws=2] step=   0 loss=0.056009
+[gpu-resident-dp ws=2] step=  10 loss=0.000646
+[gpu-resident-dp ws=2] step=  20 loss=0.000007
+[gpu-resident-dp ws=2] step=  30 loss=0.000000
+[gpu-resident-dp] W on device for 50 steps, ranks byte-identical
+```
+
+nvidia-smi: PID 2560518 on BOTH GPU UUIDs at 368 MiB each.
+
+Three CUDA kernels (compute_grad, sgd_step, sq_diff) JIT-compiled
+via cudarc's nvrtc per device. Note: cudarc's nvrtc binding wants
+`libnvrtc-builtins.so.12.1` even when the system CUDA is 12.8 --
+symlink from torch's nvidia-cuda-nvrtc pip wheel. Documented in
+`memory/cnc_nvrtc_builtins_path.md`.
+
 ## Real Qwen2.5-7B block forward LANDED
 
 `runtime/tests/qwen25_block_forward.rs` runs the FULL decoder block 0
@@ -290,11 +346,12 @@ this session. Remaining matt-voice deploy work:
 1. **(DONE)** Multi-rank training-loop bringup. `aether-train
    --world-size 2 --features nccl` works on cnc 2× P100; loss
    declines, params identical at convergence.
-1b. **Full-model multi-block stack** (next from this session). Block
-   0 forward proves the per-block chain; stacking 28 blocks +
-   final_norm + output_proj gives one full inference step on
-   real Qwen2.5-7B weights. Memory: 28 * 870 MB f32 = ~24 GB, fits
-   in 32 GB RAM. Or: dequant block-by-block as a streaming pass.
+1b. **(DONE)** Full-model multi-block stack -- 28 decoder blocks +
+   final_norm + lm_head ship in `qwen25_full_inference.rs`. Streaming
+   dequant (~870 MB peak). Argmax predictions verified.
+1c. **(DONE)** GPU-resident DP step -- W on device across iters,
+   loss converges to 0 on cnc 2× P100. The matt-voice training-
+   deploy shape minus QMatMul.
 2. **Pipeline-parallel 1F1B real impl** (matt-voice §FR-18.6).
    Today's `aether_pp_simulate_2stage_forward_f32` is in-process.
    Real PP needs send/recv between adjacent ranks via the

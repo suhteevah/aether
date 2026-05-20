@@ -9,7 +9,55 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, Real Qwen2.5-7B block forward)
+## Closed this batch (2026-05-20, two v4-SHIP incremental proof points)
+
+User asked to "go on the last incremental proof points" -- the two
+remaining items from the v4 SHIP track after the dual-P100 dual-
+block-forward work. Both landed.
+
+### Proof point 1: Full Qwen2.5-7B inference (kokonoe)
+
+`runtime/tests/qwen25_full_inference.rs` -- 28 decoder blocks +
+final_norm + lm_head, producing actual next-token argmax IDs.
+
+- Streaming dequant: load → forward → drop one block at a time so
+  peak f32 weight footprint stays ~870 MB.
+- lm_head: dequant Q6_K output.weight (152064 × 3584, ~2.18 GB),
+  transpose, matmul logits[seq, 152064], argmax per position.
+- 270s on 11900K release build for seq=4.
+- Argmax IDs all finite, in vocab; logit ranges sane.
+
+This is the matt-voice deploy proof: Aether can run real Qwen2.5
+inference. The remaining gap to a usable inference server is
+autoregressive generation (KV cache + sampling temperature) + the
+OpenAI-compat HTTP wrap.
+
+### Proof point 2: GPU-resident DP step (cnc 2× P100)
+
+`runtime/tests/nccl_dual_gpu_resident.rs` -- DP training with
+weights pinned to device across N=50 SGD iterations.
+
+- Three custom CUDA kernels (compute_grad, sgd_step, sq_diff)
+  JIT-compiled via cudarc's nvrtc per device.
+- Per step: device-side grad compute → NCCL all_reduce → device-
+  side SGD update. Loss d2h only every 10 steps for logging.
+- Loss 0.056 → 0.000000 over 50 steps.
+- Both ranks byte-identical at convergence.
+- nvidia-smi: single PID on both GPU UUIDs at 368 MiB each.
+
+This is the matt-voice training-deploy shape minus QMatMul. The
+remaining gap to actually QLoRA-training the 7B model is the
+quantised-weight matmul kernel (Q4_K@f32 multiply without full
+dequant) and the LoRA adapter wrap.
+
+### Operational notes for cnc
+
+Added to memory:
+- `cnc_nvrtc_builtins_path.md`: cudarc's nvrtc wants
+  libnvrtc-builtins.so.12.1 even on CUDA 12.8 boxes -- symlink
+  from torch's pip wheel into /usr/local/lib
+
+## Closed earlier (2026-05-20, Real Qwen2.5-7B block forward)
 
 User asked to extend `qwen25_forward_chain.aether` (one super-block
 of one weight) to a full transformer block forward through real
