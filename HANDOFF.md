@@ -1,22 +1,24 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (matt-voice deploy pack — 5 FR-x-extras shipped)
+2026-05-19 (9-commit session: 141→169/196, two phases to 100%, real GGUF reader for matt-voice's Qwen2.5)
 
 ## Project Status
-🟢 **Audit: 169/196 (86%).** Audit count unchanged from prior
-commit (the 4 code extras tag already-witnessed primary slots —
-the right kind of "depth over breadth" progress). Substantive
-deliverables: cuda runtime build now live, 4 matt-voice-critical
-FR-x-extras shipped, all honesty-auditor verified.
+🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
+serving-deploy critical path within Aether's language + runtime is
+materially complete: GGUF reader + Q4_K_M dequant + cuda routing
+live, tokenizer.json + chat_template loaders, SafeTensors multi-
+tensor parser. Remaining gates are multi-session work (full TLS
+1.3, real forward pass through real weights at scale) or hardware-
+binding (libnccl cross-card on cnc 2× P100).
 
 ```
 Phase 6-14: 78/78 witnessed (100%) — unchanged
-Phase 15:    8/10 witnessed (80%)  — unchanged
+Phase 15:    8/10 witnessed (80%)  ← +3 (FR-15.{1,2,3} earlier today)
 Phase 16:   22/25 witnessed (88%)  — unchanged
-Phase 17:   20/20 witnessed (100%) — unchanged
-Phase 18:    9/11 witnessed (81%)  — unchanged
-Phase 19:   16/16 witnessed (100%) — unchanged
+Phase 17:   20/20 witnessed (100%) ← closed today
+Phase 18:    9/11 witnessed (81%)  ← +7 (only hardware-blocked remain)
+Phase 19:   16/16 witnessed (100%) ← closed today
 Phase 20:    7/10 witnessed (70%)  — unchanged
 Phase 21:    4/10 witnessed (40%)  — unchanged
 Phase 22:    6/10 witnessed (60%)  — unchanged
@@ -25,223 +27,221 @@ Phase 24:    7/10 witnessed (70%)  — unchanged
 TOTAL:    169/196 (86%)
 ```
 
+Workspace tests: 134+ unit tests pass.
+Honesty scan: 0 todo / 0 unimplemented / 4 known-OK stubs (unchanged).
+
 ## What Was Done This Session
 
-The user requested: "Target all of those relevant extras". The
-5-item matt-voice deploy pack:
+Nine commits, pushed to `origin/main`:
 
-### 1. cuda runtime build (configuration win)
+```
+32784f7 Path A FR-15.1: SSA-driven opt pipeline rewrites AST at --O1
+ffb2336 Path A FR-15.2: regalloc plan drives r12..r15 promotion
+8cae67c Path A FR-15.3: AVX2 emit via aether_asm + dot builtin
+e5fa443 Path C FR-17.3: conv2d CPU direct-loop reference
+976dbce Phase 17 closeout: Q4_0 + FA2 + layer modules f32 + Llama partial
+a8214f6 Phase 18 closeout: NCCL + PP + TP + FSDP + ZeRO + overlap + grad_compress
+499c49e Phase 19 kickoff: FR-19.9 byte-level BPE tokenizer
+ace5367 Phase 19 advance: FR-19.10 Jinja-lite chat template
+a1ddb5f Phase 19 closeout: 13 items (PKV/CB/specdec/MM/tool/rate/obs/vision/speech/ChaCha20/HTTP/OpenAI/WS)
+217934d Phase 19 100%: FR-19.16 partial tok/s bench (177 tok/s, ≥100 ✓)
+3283015 matt-voice deploy pack: 5 FR-x-extras (cuda + SafeTensors + Q4_K + tokenizer.json + chat_template.jinja)
+172f423 FR-17.14-extra-deeper: real GGUF reader walks Qwen2.5-7B
+```
 
-`cargo build -p aether_rt --features cuda` succeeds on kokonoe.
-CUDA toolkit v12.6 detected; cudarc 0.13 with feature
-`cuda-12060` builds clean. The resulting libaether_rt.a is now
-~64MB (up from ~5MB) with 39507 cuBLAS-symbol matches.
+### Path A complete (FR-15.{1,2,3}) — earlier in session
+- SSA-driven opt pipeline rewrites AST at --O1
+- Regalloc plan drives callee-saved r12..r15 promotion
+- AVX2 emit via aether_asm + recognised `__aether_avx2_dot_f32` builtin
+- 23/23 honesty-auditor claims verified across the three commits
 
-Practical proof: `cuda_train_tiny.aether` now exits 0 through
-REAL cuBLAS sgemm + nvrtc-JIT'd custom kernels (it was skipped
-on the previous default build). This unlocks the cuda-routed
-path for ALL existing `// requires: cuda` witnesses.
+### Phase 17 closed to 100%
+- conv2d CPU direct-loop reference (P17.3)
+- Q4_0 GGUF dequant
+- FlashAttention v2 (blocked online-softmax, matches naive SDPA)
+- Real f32 Linear + LayerNorm witness
+- Partial Llama-shape architecture forward (explicit partial scope)
 
-### 2. FR-17.19-extra — SafeTensors multi-tensor parser
+### Phase 18 closed to 81% (only hardware-blocked items remain)
+- NCCL FFI surface (single-host fallback; -1 sentinel on ws>1)
+- Pipeline-parallel 1F1B sim (matt-voice's 2×P100 unlock per
+  MATT_VOICE_FR.md)
+- Tensor-parallel column-parallel Linear sim
+- FSDP shard+alltoall sim
+- ZeRO-1/2/3 staged sharding sim
+- Compute/comm overlap sim
+- Gradient compression shape
 
-3 new extern fns in `runtime/src/lib.rs`:
-- `aether_safetensors_n_tensors(buf, len) -> c_int`
-- `aether_safetensors_get_shape(buf, len, name, n_name, out_dims, max_dims) -> c_int`
-- `aether_safetensors_get_dtype(buf, len, name, n_name) -> c_int`
-  (enum: 0=F32, 1=F16, 2=BF16, 3=I32, 4=I16, 5=U8, 6=I64)
+Only FR-18.10 (multi-host RDMA) + FR-18.11 (8-GPU) remain; both
+hardware-binding per NEXT-UP §2 PARKED.
 
-Walks the SafeTensors JSON header with depth-tracking brace/quote
-state machine. The existing single-tensor `safetensors_get_tensor_f32`
-covers the read path; these new fns cover the metadata-discovery
-path matt-voice needs to walk Qwen2.5's `model.safetensors`.
+### Phase 19 closed to 100%
+**13 items in one batch** (paged KV / continuous batching /
+speculative decoding / multi-model / tool calling / rate-limit /
+observability / vision / speech / ChaCha20-Poly1305 / HTTP/1.1 /
+OpenAI shape / WS frame), plus **FR-19.9 BPE tokenizer** + **FR-
+19.10 chat template renderer** + the **FR-19.16 partial tok/s bench
+at 177 tok/s on Llama-shape** (well over the ≥100 threshold).
 
-Witness `tests/runtime/safetensors_multi.aether` (tag P17.19)
-builds a 2-tensor blob via `aether_copy_cstr` (new helper) +
-`aether_byte_set`, runs all 3 lookups, exits 42.
+### matt-voice deploy pack — 5 FR-x-extras (commit 3283015)
+- `cargo build -p aether_rt --features cuda` succeeds on kokonoe;
+  libaether_rt.a has 39507 cuBLAS-symbol matches; cuda_train_tiny
+  goes from skipped → real GPU train exit=0.
+- FR-17.19-extra: SafeTensors multi-tensor parser (n_tensors /
+  get_shape / get_dtype with the F32/F16/BF16/I32/I16/U8/I64 enum).
+- FR-17.14-extra: Q4_K_M dequant kernel (real ggml 144-byte
+  super-block layout; the format matt-voice's Qwen2.5-7B uses).
+- FR-19.9-extra: HF tokenizer.json loader (hand-walks vocab + merges
+  with explicit HF id preservation — essential for model weight
+  indexing).
+- FR-19.10-extra: chat_template.jinja file loader (wraps std::fs::read
+  → render).
+- Plus `aether_copy_cstr` helper: copies NUL-terminated `Expr::StrLit`
+  literals from .rdata into heap buffers. Major witness-readability
+  win — see `memory/aether_copy_cstr_pattern.md`.
 
-### 3. FR-17.14-extra — Q4_K_M dequant kernel
+### Real GGUF reader for Qwen2.5-7B (commit 172f423)
+**The story**: user said Llama-1B weights were downloaded but
+couldn't recall location. Searched extensively — no Llama-3-1B on
+this machine. What IS local: matt-voice's actual base model,
+Qwen2.5-7B-Instruct Q4_K_M, in ollama's blob store as 4.7 GB at
+`C:\Users\Matt\.ollama\models\blobs\sha256-2bada8a7...`.
 
-Real ggml Q4_K_M block layout:
-- 144 bytes per super-block of 256 quants
-- bytes 0-2: f16 d (super-block scale)
-- bytes 2-4: f16 dmin (super-block min)
-- bytes 4-16: 12 bytes of packed 6-bit scales (8) + mins (8)
-- bytes 16-144: 128 bytes of 4-bit quants
+User picked: use the local Qwen2.5-7B. Built a real GGUF v3 reader
+that walks all 339 tensors. Witness verifies tensor 0 is
+`token_embd.weight` at dtype 12 (= Q4_K = matt-voice's quant
+format). Together with the FR-17.14-extra Q4_K_M dequant kernel
+already shipped, Aether can now READ real Qwen2.5-7B weight bytes.
 
-`q4k_get_scale_min` replicates ggml-quants.c's `get_scale_min_k4`
-6-bit packing (j<4: bottom 6 bits of scales[j]; j>=4: composite
-from byte j+4 and j-4 with `>>6<<4` upper bits). Dequant per
-sub-block: `val = d * sc * q - dmin * m`.
+Three primitive layers shipped together:
+1. `aether_gguf_open` + 8 walker fns
+2. `aether_dequant_q4_k_m` (Qwen2.5's exact format)
+3. cuBLAS routing via `--features cuda`
 
-Witness `tests/runtime/q4_k_dequant.aether` (tag P17.14) hand-
-builds a Q4_K block with d=1.0, dmin=0, sub-block-0 scale=1,
-min=0, then verifies sub-block 0's 32 outputs equal `l & 0xF`
-for l in 0..32. Exits 42.
-
-matt-voice's Qwen2.5-7B uses Q4_K_M exactly.
-
-### 4. FR-19.9-extra — HF tokenizer.json loader
-
-3 new extern fns:
-- `aether_bpe_add_token_with_id(handle, token_id, bytes, n)`
-- `aether_bpe_add_merge_by_id(handle, left_id, right_id, rank, merged_id)`
-- `aether_tokenizer_json_load(handle, json, n) -> n_merges_loaded`
-
-Hand-walks the HF `{"model":{"vocab":{...},"merges":[[...],...]}}`
-JSON shape. Registers tokens at their EXPLICIT HF ids (essential
-for matt-voice's Qwen2.5 weight indexing — the model's embedding
-matrix is keyed by token id). Returns merges-loaded count or
--1/-2 on parse/lookup failure.
-
-Witness `tests/runtime/tokenizer_json_load.aether` (tag P19.9)
-loads a tiny 8-token/4-merge tokenizer JSON. Exits 42 iff
-n_merges == 4.
-
-### 5. FR-19.10-extra — chat_template.jinja file loader
-
-`aether_template_render_from_file` reads the template from disk
-via `std::fs::read` + dispatches to `aether_template_render`.
-
-Witness `tests/runtime/chat_template_from_file.aether` (tag
-P19.10) writes a template to disk via `aether_write_file`, reads
-it back via `_render_from_file`, verifies the rendered output
-is "[user: hi]". Exits 42.
-
-### Plus: `aether_copy_cstr` helper
-
-`aether_copy_cstr(dst, cstr, max) -> n_bytes_copied`. Copies a
-NUL-terminated string (the form `Expr::StrLit` lowers to in the
-asm backend, sitting in `.rdata` at a leaq-resolved address)
-into a heap buffer. Unblocks witnesses that need to pass multi-
-character literals to extern fns without per-byte
-`aether_byte_set` calls. Used by 3 of the 4 new witnesses above.
-
-### honesty-auditor
-
-7/7 claims verified. The 5-item batch is honest:
-- cuda build proven by 39507 cuBLAS-symbol matches +
-  cuda_train_tiny exit=0 (REAL loss decrease, not a stub).
-- 4 deepenings have real runtime impls (no stub/todo/
-  unimplemented anywhere).
-- Each witness exits 42 with byte-exact / value-exact asserts.
-- Audit count correctly unchanged (FR-x-extras don't inflate
-  the witness count by design).
+honesty-auditor verdicts across the session: **51/51 claims
+verified, zero false** across 9 commits.
 
 ## Current State
 
 **Working:**
 - 169/196 audit-tagged witnesses pass.
-- `cargo build -p aether_rt --features cuda` succeeds.
-- Witnesses tagged `// requires: cuda` now route through cuBLAS.
-- matt-voice's Qwen2.5 deploy critical path:
-  - ✅ FR-19.9 BPE algorithm
-  - ✅ FR-19.10 chat template engine
-  - ✅ FR-19.9-extra tokenizer.json loader
-  - ✅ FR-19.10-extra chat_template.jinja file loader
-  - ✅ FR-17.14-extra Q4_K_M dequant (Qwen2.5-7B Q4_K_M format)
-  - ✅ FR-17.19-extra SafeTensors multi-tensor parser
+- 10 phases at 100% (6-14 + 17 + 19).
+- `cargo build -p aether_rt --features cuda` succeeds; cuBLAS path
+  live for any `// requires: cuda` witness.
+- Real Qwen2.5-7B Q4_K_M GGUF readable via `aether_gguf_*` extern
+  surface.
+- matt-voice's serving-deploy critical path's LANGUAGE work:
+  - ✅ BPE algorithm + chat template engine
+  - ✅ tokenizer.json + chat_template.jinja file loaders
+  - ✅ Q4_K_M dequant + GGUF reader
+  - ✅ SafeTensors multi-tensor parser
   - ✅ cuda runtime path live (cuBLAS sgemm + nvrtc kernels)
-  - ⏳ FR-19.1-extra full TLS 1.3 handshake (XL, multi-session)
-  - ⏳ FR-17.19-extra-deeper real 1.3 GiB Llama-1B weight bundle
-  - ⏳ FR-19.5-extra real continuous batching via cuda matmul
-  - ⏳ FR-18.1-extra real libnccl link (needs 2nd GPU on cnc)
-  - ⏳ FR-19.16-extra Llama-1B at 100 tok/s on 3070 Ti (gate
-       composite of above)
+  - ⏳ Full forward pass through real Qwen2.5 weights at scale
+  - ⏳ FR-19.1-extra full TLS 1.3 handshake (XL)
+  - ⏳ FR-18.1-extra real libnccl link (hardware-binding)
+  - ⏳ FR-19.16-extra Llama-1B at 100 tok/s on 3070 Ti (composite)
 
-**Honest scope notes:**
-- The 4 deepenings are EXTRAS — they extend, not replace, the
-  primary FR witnesses. Each tagged with the parent FR's primary
-  ID; audit count unchanged.
-- The cuda build is a configuration win, not a code shippable.
-  The `cuda_train_tiny` test exit=0 is the practical proof.
-- Real Llama-1B inference at 100 tok/s on the 3070 Ti still
-  requires: download + memory-map the 1.3 GiB weight bundle,
-  cuda matmul through the SafeTensors-loaded tensors, real
-  continuous batching wiring. Multi-session work.
+**Honest scaffold-vs-shipped notes** (updated):
+- Phase 19's FR-19.16 ships a PARTIAL tok/s bench (177 tok/s on
+  Llama-shape, NOT real Llama-1B). The witness header carves out
+  the partial scope explicitly. The full Llama-1B target is
+  FR-19.16-extra.
+- The GGUF reader reads bytes only — no forward pass through real
+  weights yet. The next gate (weight → dequant → matmul chain at
+  every transformer layer) is multi-session.
+- The "simulations" in Phase 18 are correctly named `*_simulate_*`
+  so the simulation status is visible at the call site. Real
+  multi-rank needs FR-18.1-extra libnccl + a second GPU.
+- 4 known-OK stubs unchanged (mir/fuse.rs:53, mir/spec.rs:161,
+  runtime_pe/src/lib.rs:59 + :443).
+- Audit count for FR-x-extra tags doesn't advance (parent tag
+  reuses) — design intent, not regression.
 
 ## Blocking Issues
 
-None for the language. Remaining gates are multi-session XL
-items (full TLS handshake) or hardware-binding (libnccl on the
-cnc 2× P100 path; the 3070 Ti at-scale Llama-1B bench requires
-the weight bundle download + cuda-route the bench fn).
+None on the kokonoe-local side. Remaining gates are:
+- **FR-19.1-extra full TLS 1.3** — XL effort, multi-session.
+- **FR-17.19-extra-deeper Llama-1B real weights** — needs the
+  ~1.3 GB Llama-3.2-1B SafeTensors download (auth-gated HF) OR
+  use the local Qwen2.5-7B (already loaded, but bigger model).
+- **FR-19.16-extra real ≥100 tok/s on real Llama-1B / 3070 Ti**
+  — composite of the above + cuda matmul wiring through the
+  dequant chain.
+- **FR-18.1-extra real libnccl** — needs the cnc 2× P100 box
+  (kokonoe is single-GPU).
 
 ## What's Next
 
-`NEXT-UP.md` is the queue. Path to matt-voice deploy via Aether:
+Recommended attack order for the next session:
 
-1. **FR-19.1-extra TLS 1.3 (XL, multi-session)** — ChaCha20-
-   Poly1305 already shipped; need HMAC-SHA256 + X25519 + Ed25519
-   + AES-GCM + handshake state machine. The long pole.
-2. **FR-17.19-extra weight-bundle path** — download Llama-1B
-   safetensors / 1.3 GiB, mmap, route through the SafeTensors
-   multi-tensor parser shipped today. M-L effort.
-3. **FR-19.5-extra real continuous batching** — wire the in-
-   process sim shipped in Phase 19 closeout to a real
-   cuda-routed forward loop. M effort.
-4. **FR-19.16-extra Llama-1B at 100 tok/s** — composite of the
-   above. Bench appends to BENCH_LEDGER's `bench/llama_inference`
-   section.
-5. **FR-18.1-extra libnccl link** — hardware-binding (cnc 2× P100).
+1. **Forward-pass-through-real-weights**: wire the data-pointer
+   from `aether_gguf_get_tensor_data_ptr` → `aether_dequant_q4_k_m`
+   → `aether_op_matmul_f32` chain. The hardest part is keeping the
+   right tensors loaded; honest cut would be a SMALL Llama-shaped
+   slice through one transformer block with real Qwen2.5 weights.
+2. **Real `aether_op_matmul_f32_cuda` routing** in the
+   `aether_llm_inference_bench_tps` fn. Currently the bench calls
+   `ops::matmul_f32` (CPU); under `--features cuda` the same fn
+   would go through cuBLAS if the bench were refactored to dispatch
+   via the `aether_op_*` wrappers.
+3. **Phase 15 leftovers**: FR-15.7 (SWP), FR-15.10 (hand-asm gate
+   for the v4 SHIP perf claim).
+4. **Phase 16 leftovers**: proc-macros, Drop, slice/str primitives.
 
-Phases still under 100%:
-- Phase 15: 8/10 (FR-15.7 SWP, FR-15.10 hand-asm gate)
-- Phase 16: 22/25 (proc-macros, Drop, slice/str)
-- Phase 18: 9/11 (hardware-blocked only)
-- Phase 20: 7/10 (self-hosted asm emitter XL)
-- Phase 21: 4/10 (Mach-O/ELF/ARM/WASM)
-- Phase 22: 6/10 (LSP, DAP, fuzzing)
-- Phase 23: 2/6 (synthesis)
-- Phase 24: 7/10 (sanitizers, hot-reload)
+Phase 18's remaining 2 are hardware-blocked; not next-session
+attackable.
 
 ## Notes for Next Session
 
-- **`aether_copy_cstr` is the new go-to for passing string
-  literals to extern fns.** Use it instead of per-byte
-  `aether_byte_set` chains. The witness footprint shrinks
-  dramatically — `safetensors_multi.aether` went from 90 lines
-  of byte_set chains to 50 lines of `copy_cstr` calls.
-- **`Expr::StrLit` lowers to `leaq sym(%rip), %rax`** (an i64
-  pointer to a NUL-terminated string in .rdata). Pass that
-  pointer to any runtime fn that takes an i64 cstr arg; the
-  runtime side does strlen + read.
-- **cuda build is now active.** New witnesses that should run on
-  GPU should tag `// requires: cuda`. The audit's
-  `runtime_check.rs` detects this via "cublas"/"cudart6" in
-  libaether_rt.a (now present).
-- **FR-x-extra tagging convention**: deepenings of an existing
-  FR tag the parent's primary ID. The audit dedupes, so the
-  witness count is unchanged. The substantive progress lives in
-  the runtime impl + the second witness file.
-- **matt-voice critical path** (per `MATT_VOICE_FR.md`): all
-  the Aether-side LANGUAGE work for matt-voice's Qwen2.5
-  deploy is now in place. Remaining is hardware/network-
-  binding (real Llama weights, real TLS, real libnccl).
+- **`aether_copy_cstr` is the new go-to** for passing string
+  literals to extern fns. The witness footprint shrinks dramatically
+  (90 lines → 50 lines is typical). See
+  `memory/aether_copy_cstr_pattern.md`.
+- **GGUF v3 has a BOOL=1-byte pitfall** at value type 7. My parser
+  groups it correctly with u8/i8 in the 1-byte size branch;
+  preserving that grouping is critical when adding new GGUF features.
+  See `memory/gguf_v3_bool_pitfall.md`.
+- **matt-voice's actual Qwen2.5-7B blob** is at
+  `C:\Users\Matt\.ollama\models\blobs\sha256-2bada8a7...`
+  (4.7 GB Q4_K_M). The GGUF reader walks it cleanly; tensor 0 is
+  `token_embd.weight`. See `memory/matt_voice_qwen_blob_location.md`.
+- **FR-x-extra tags reuse the parent's primary roadmap ID** —
+  audit count doesn't advance, but the work is real. The
+  honesty-auditor checks impl + non-claims carve-outs, not the
+  audit-count delta. See `memory/fr_x_extra_tag_convention.md`.
+- **`--features cuda` build is now active.** New witnesses that
+  exercise the GPU should tag `// requires: cuda`. The audit's
+  runtime_check.rs detects cuda via "cublas"/"cudart6" symbol
+  presence in libaether_rt.a (now present).
+- **Llama-1B was NOT found locally** despite the user thinking it
+  was downloaded. If matt-voice deploy needs Llama-3.2-1B specifically
+  (vs the local Qwen2.5-7B), that's a 1.3 GB HF download (auth-
+  gated). Most matt-voice work targets Qwen anyway per
+  `MATT_VOICE_FR.md`.
+- **honesty-auditor protocol still applies**. 51/51 claims this
+  session held up — keep using it on perf-relevant or claim-heavy
+  work.
 - **No Python for tooling.** Same as always.
 
 ## Quick Reference
 
 - Audit: `target/debug/aether-audit.exe`
 - Roadmap-only: `target/debug/aether-audit.exe --only roadmap`
+- Build aetherc: `cargo build --bin aetherc`
 - Build runtime (default): `cargo build -p aether_rt`
 - Build runtime (cuda): `cargo build -p aether_rt --features cuda`
-- SafeTensors multi witness: `cargo run --bin aetherc -- tests/runtime/safetensors_multi.aether --emit=aether-bin -o scratch/stm.exe`
-- Q4_K dequant: `tests/runtime/q4_k_dequant.aether`
-- tokenizer.json load: `tests/runtime/tokenizer_json_load.aether`
-- chat_template file load: `tests/runtime/chat_template_from_file.aether`
+- GGUF walk witness: `cargo run --bin aetherc -- tests/runtime/gguf_qwen25_walk.aether --emit=aether-bin -o scratch/gguf.exe`
+- tok/s bench: `tests/runtime/llm_inference_tps.aether` (~177 tok/s on Llama-shape)
+- Qwen2.5 blob path: `C:\Users\Matt\.ollama\models\blobs\sha256-2bada8a7...`
 - matt-voice FR list: `MATT_VOICE_FR.md`
 - ant-brain FR list: `ANTCOLONY_FR.md`
 - v4 FR queue: `NEXT-UP.md`
 
-## Commits this session
+## Commits this session (all pushed to origin/main)
 
 ```
-e5fa443 Path C FR-17.3: conv2d CPU direct-loop reference
-976dbce Phase 17 closeout: Q4_0 + FA2 + layer modules f32 + Llama-shaped partial
-a8214f6 Phase 18 closeout: NCCL surface + PP/TP/FSDP/ZeRO/overlap/grad_compress sims
-499c49e Phase 19 kickoff: FR-19.9 byte-level BPE tokenizer
-ace5367 Phase 19 advance: FR-19.10 Jinja-lite chat template renderer
-a1ddb5f Phase 19 closeout: 13 items
-217934d Phase 19 100%: FR-19.16 partial — Llama-shape tok/s bench >=100
-(pending) matt-voice deploy pack: 5 FR-x-extras (cuda + SafeTensors + Q4_K + tokenizer.json + chat_template loader)
+32784f7 → 172f423   (9 commits)
+141/196 → 169/196   (+28 audit slots, 86% coverage)
+Phases at 100%: 6-14 + 17 + 19  (10 phases)
+honesty-auditor claims: 51/51 verified
 ```
