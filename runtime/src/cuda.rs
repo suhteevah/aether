@@ -65,6 +65,7 @@ struct CudaCtx {
     fused_q4k_matmul_seq1: CudaFunction,
     fused_q4k_matmul_seq1_v2: CudaFunction,
     fused_q6k_matmul_seq1_v2: CudaFunction,
+    fused_q4k_ffn_gate_up_silu_mul: CudaFunction,
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
 }
@@ -755,6 +756,111 @@ extern "C" __global__ void fused_q4k_matmul_seq1_v2(
     }
 }
 
+// matt-voice / FR-17.14-extra-deepest-v3 -- FUSED FFN gate+up+silu+mul.
+//
+// Replaces 4 separate kernels (gate matmul, up matmul, silu, mul_inplace)
+// with one. For each output index ni:
+//   gate[ni] = sum_k a[k] * W_gate[ni, k]   (Q4_K)
+//   up[ni]   = sum_k a[k] * W_up[ni, k]     (Q4_K)
+//   out[ni]  = silu(gate[ni]) * up[ni]
+//
+// Both gate and up share the same x_norm input -- loading it into shmem
+// once and using it for both halves of the FMA cuts a_tile traffic 2x.
+// Each warp computes BOTH gate[ni] and up[ni] in parallel by maintaining
+// two accumulators and reading both weight rows per K-tile.
+//
+// Same CTA layout as v2: 256 threads / 8 warps / 1 output per warp.
+extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_up,
+    float*               __restrict__ out,
+    int n, int n_blocks)
+{
+    __shared__ float a_tile[256];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+
+    int sub      = lane >> 2;
+    int sub_off  = (lane & 3) << 3;
+    int j        = sub >> 1;
+    int is_hi    = sub & 1;
+    int qs_off   = j * 32 + sub_off;
+    int a_off    = sub * 32 + sub_off;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        a_tile[threadIdx.x] = a[bi * 256 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            // --- gate row ---
+            {
+                const unsigned char* base = w_gate
+                    + (size_t)ni * n_blocks * 144
+                    + (size_t)bi * 144;
+                unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+                unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+                float d    = aether_f16_to_f32_dev(d_bits);
+                float dmin = aether_f16_to_f32_dev(dmin_bits);
+                const unsigned char* scales = base + 4;
+                const unsigned char* qs     = base + 16;
+                unsigned int sc = q4k_get_scale(sub, scales);
+                unsigned int mn = q4k_get_min(sub, scales);
+                float d_eff = d * (float)sc;
+                float m_eff = dmin * (float)mn;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    unsigned char byte = qs[qs_off + p];
+                    unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+                    float w_val = d_eff * (float)nibble - m_eff;
+                    acc_g += a_tile[a_off + p] * w_val;
+                }
+            }
+            // --- up row ---
+            {
+                const unsigned char* base = w_up
+                    + (size_t)ni * n_blocks * 144
+                    + (size_t)bi * 144;
+                unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+                unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+                float d    = aether_f16_to_f32_dev(d_bits);
+                float dmin = aether_f16_to_f32_dev(dmin_bits);
+                const unsigned char* scales = base + 4;
+                const unsigned char* qs     = base + 16;
+                unsigned int sc = q4k_get_scale(sub, scales);
+                unsigned int mn = q4k_get_min(sub, scales);
+                float d_eff = d * (float)sc;
+                float m_eff = dmin * (float)mn;
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    unsigned char byte = qs[qs_off + p];
+                    unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+                    float w_val = d_eff * (float)nibble - m_eff;
+                    acc_u += a_tile[a_off + p] * w_val;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    // Warp-reduce both partials.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc_g += __shfl_down_sync(0xFFFFFFFFu, acc_g, offset);
+        acc_u += __shfl_down_sync(0xFFFFFFFFu, acc_u, offset);
+    }
+    if (lane == 0 && ni < n) {
+        // silu(g) * u = (g / (1 + exp(-g))) * u
+        float silu_g = acc_g / (1.0f + expf(-acc_g));
+        out[ni] = silu_g * acc_u;
+    }
+}
+
 // matt-voice / FR-17.13-extra — append new K/V step to the on-device
 // KV cache at position `pos`. Simple memcpy-shaped kernel.
 extern "C" __global__ void append_kv(
@@ -1078,6 +1184,7 @@ fn ctx() -> &'static CudaCtx {
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1",
               "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
+              "fused_q4k_ffn_gate_up_silu_mul",
               "append_kv", "attention_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
@@ -1107,6 +1214,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1").unwrap();
         let fused_q4k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v2").unwrap();
         let fused_q6k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_v2").unwrap();
+        let fused_q4k_ffn_gate_up_silu_mul = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul").unwrap();
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
@@ -1118,7 +1226,8 @@ fn ctx() -> &'static CudaCtx {
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu,
                   fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2,
-                  fused_q6k_matmul_seq1_v2, append_kv, attention_seq1 }
+                  fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
+                  append_kv, attention_seq1 }
     })
 }
 
@@ -2129,6 +2238,43 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().fused_q4k_matmul_seq1_v2.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks))
             .expect("launch fused_q4k_matmul_seq1_v2");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest-v3 -- fused FFN: gate matmul + up matmul + silu + mul.
+///
+/// Replaces 4 kernel launches (gate, up, silu, mul_inplace) with 1.
+/// Reads x_norm into shmem once and uses it for both halves of the FMA.
+/// Each warp produces silu(gate[ni]) * up[ni] for its assigned output.
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
+    a_dev_f32: i64, w_gate_dev_u8: i64, w_up_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_wg) = handle_to_u8_idx(w_gate_dev_u8) else { return -1; };
+    let Some(i_wu) = handle_to_u8_idx(w_up_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p  = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let wg_p = bs_u8[i_wg].as_ref().unwrap() as *const CudaSlice<u8>;
+    let wu_p = bs_u8[i_wu].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p  = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cta_threads = 256u32;
+    let outputs_per_cta = 8u32;
+    let grid_x = ((n as u32) + outputs_per_cta - 1) / outputs_per_cta;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (cta_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wgv = &*wg_p; let wuv = &*wu_p; let ov = &mut *o_p;
+        ctx().fused_q4k_ffn_gate_up_silu_mul.clone()
+            .launch(cfg, (av, wgv, wuv, ov, n, n_blocks))
+            .expect("launch fused_q4k_ffn_gate_up_silu_mul");
     }
     0
 }

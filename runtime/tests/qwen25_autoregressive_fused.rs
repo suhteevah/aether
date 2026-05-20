@@ -27,6 +27,7 @@ use aether_rt::cuda::{
     aether_op_bias_add_f32_cuda, aether_op_matmul_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
+    aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_op_append_kv_f32_cuda, aether_op_attention_seq1_f32_cuda,
 };
 
@@ -260,17 +261,12 @@ unsafe fn block_forward_step_debug(
     // ffn_norm
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
     if dbg { probe("ffn_norm out", act.x_norm, D_MODEL, dbg); }
-    // gate + up (Q4_K v2) -- silu(gate) * up
-    aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_gate, act.gate,
+    // FUSED gate+up+silu+mul (1 kernel replaces 4): writes silu(gate)*up
+    // directly into act.gate.
+    aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
+        act.x_norm, bw.w_gate, bw.w_up, act.gate,
         D_FF as c_int, (bw.nb_gate_up / D_FF) as c_int);
-    if dbg { probe("gate", act.gate, D_FF, dbg); }
-    aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_up, act.up,
-        D_FF as c_int, (bw.nb_gate_up / D_FF) as c_int);
-    if dbg { probe("up", act.up, D_FF, dbg); }
-    aether_op_silu_f32_cuda(act.gate, D_FF as c_int);
-    if dbg { probe("silu(gate)", act.gate, D_FF, dbg); }
-    aether_op_mul_inplace_f32_cuda(act.gate, act.up, D_FF as c_int);
-    if dbg { probe("silu*up", act.gate, D_FF, dbg); }
+    if dbg { probe("silu*up (fused)", act.gate, D_FF, dbg); }
     // down (Q4_K or Q6_K depending on block)
     if bw.dt_down == 14 {
         aether_op_fused_q6k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
