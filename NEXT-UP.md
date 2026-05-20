@@ -9,7 +9,33 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, matt-voice forward-chain + cuBLAS routing)
+## Closed this batch (2026-05-19, matt-voice GPU-resident weights variant)
+
+User asked to "do gpu-resident weights across iter loop" right
+after the prior matt-voice batch landed. Closes the §1 item from
+HANDOFF.md's updated "What's Next".
+
+- **FR-19.16-extra-deeper / P19.16** — `aether_llm_inference_bench_tps_cuda_resident`
+  ships in `runtime/src/lib.rs`. Uploads every weight matrix
+  (6 per layer × n_layers) to device ONCE before the iter loop.
+  Allocates persistent device activation buffers (d_ln_out, d_q/k/v,
+  d_attn, d_proj, d_up, d_down) reused across all iters. Hot loop
+  does only 4 h2d + 6 d2h per layer-iter (activations only). Stub
+  variant under `#[cfg(not(feature = "cuda"))]` returns -1.0.
+- Witness `tests/runtime/llm_inference_tps_cuda_resident.aether`
+  tagged P19.16 + requires:cuda; rejects the -1.0 sentinel via
+  `aether_f32_close_exit(tps, -1.0)`; gates on a finite positive
+  band; exits 42.
+- **Measured ~690 tok/s** on RTX 3070 Ti at (d=64, n_layers=2,
+  ff=256, seq=8) over 100 iters. That's **2.4× faster** than the
+  per-call cuBLAS wrapper (~290 tok/s, prior commit) and **3.8×**
+  the all-CPU bench (~180 tok/s). 5 contention-free runs: 688/697/
+  695/697/674. BENCH_LEDGER row appended.
+
+honesty-auditor caught a real d2h miscount (5 → 6 in ledger +
+witness comment) — fixed before commit.
+
+## Closed earlier (2026-05-19, matt-voice forward-chain + cuBLAS routing)
 
 User said "finish the rest of the blockers on matt-voice". Targeted
 the two kokonoe-attackable items from the prior session's HANDOFF.md

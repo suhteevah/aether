@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (matt-voice blockers continued: forward-chain witness through real Qwen2.5-7B weights + cuBLAS routing through tok/s bench)
+2026-05-19 (matt-voice blockers continued: forward-chain witness through real Qwen2.5-7B weights + cuBLAS routing + GPU-resident weights bench at ~690 tok/s)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -172,23 +172,36 @@ None on the kokonoe-local side. Remaining gates are:
 
 ## What's Next
 
-Items 1 + 2 from the prior "What's Next" list both shipped this
-session. Recommended attack order from here:
+Items 1 + 2 from the prior "What's Next" + the GPU-resident
+weights variant all shipped this session. Remaining matt-voice
+deploy work:
 
-1. **GPU-resident weights across the iter loop** (FR-19.16-extra
-   deeper). Today's `cuda_matmul_through` re-uploads every matrix
-   on every call. Refactor so weights stay device-resident across
-   the bench and only activations h2d/d2h. Unlocks dim scales
-   (Llama-1B-class) where GPU dominates CPU by orders of magnitude.
+1. **All ops on device** (FR-19.16-extra deepest). LN / SDPA / SiLU
+   still run CPU-side and drive the per-iter h2d/d2h pattern in
+   `aether_llm_inference_bench_tps_cuda_resident`. Route those
+   through cuda.rs's existing device-kernel variants
+   (`aether_op_layer_norm_f32_cuda`, etc.) to eliminate 3 d2h + 1
+   h2d per layer-iter. Net gain depends on kernel-launch overhead
+   vs PCIe bandwidth.
 2. **Forward-pass over a whole transformer block on real Qwen2.5
-   weights**. The one-block witness shipped this session proves
-   the dequant → matmul chain composes. Next is iterating the
-   chain through Q/K/V/O matmuls + attention + MLP for one full
-   block of real Qwen2.5 (~30 tensor reads, all from
+   weights**. The one-block witness (`qwen25_forward_chain.aether`)
+   proves the dequant → matmul chain composes. Next is iterating
+   the chain through Q/K/V/O matmuls + attention + MLP for one
+   full block of real Qwen2.5 (~30 tensor reads, all from
    `aether_gguf_get_tensor_data_ptr`).
-3. **Phase 15 leftovers**: FR-15.7 (SWP), FR-15.10 (hand-asm gate
+3. **Llama-1B-scale dims** (d=2048, ff=5504, 16 layers). At those
+   dims cuBLAS sgemm dominates and the 2.4× headline number from
+   the resident bench grows much larger. Gated on real-weight
+   loading or synthetic-large init.
+4. **Phase 15 leftovers**: FR-15.7 (SWP), FR-15.10 (hand-asm gate
    for the v4 SHIP perf claim).
-4. **Phase 16 leftovers**: proc-macros, Drop, slice/str primitives.
+5. **Phase 16 leftovers**: proc-macros, Drop, slice/str primitives.
+
+NOTE on TCP test flake: `tests::tcp_send_recv_loopback` at
+`runtime/src/lib.rs:3492` fails ~1/3 runs with "accept returned -1"
+under Windows firewall / port contention. Unrelated to any 2026-05-19
+work. If the audit-agent protocol re-runs it during honesty-auditor
+and reports it as failing, it's a known flake.
 
 Phase 18's remaining 2 are hardware-blocked; not next-session
 attackable.

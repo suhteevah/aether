@@ -189,6 +189,57 @@ PARTIAL SCOPE — still NOT shipped (FR-19.16-extra deeper):
   has GPU versions but they take device handles; full routing is
   the same refactor as keeping weights resident).
 
+### 2026-05-19 — Llama-shape cuBLAS GPU-resident weights (FR-19.16-extra-deeper)
+
+Witness: `tests/runtime/llm_inference_tps_cuda_resident.aether`
+Runtime fn: `aether_llm_inference_bench_tps_cuda_resident`
+  — uploads all 6 weight matrices per layer (Wq, Wk, Wv, Wo, Wup,
+  Wdown) to device ONCE before the iter loop; allocates persistent
+  device activation buffers (d_ln_out, d_q/k/v, d_attn, d_proj,
+  d_up, d_down) reused across all iters. Per layer-iter: 4 h2d
+  (ln_out, attn_out, ln_out2, up_after_silu) + 6 d2h (q, k, v,
+  proj, up_before_silu, down) — all O(s*d) activation bytes, ZERO
+  weight uploads.
+Hardware: kokonoe 11900K + RTX 3070 Ti 8GB
+Build: `cargo build -p aether_rt --features cuda`
+
+Dimensions: d=64, n_layers=2, ff=256, seq=8. Iterations: 100.
+
+| Run | tok/s (GPU-resident) |
+|---|---|
+| 1   | 688.15 |
+| 2   | 697.23 |
+| 3   | 694.96 |
+| 4   | 696.66 |
+| 5   | 673.67 |
+
+**Headline**: ~690 tok/s sustained — **2.4× faster** than the
+per-call cuBLAS wrapper (~290 tok/s, prior row) and **3.8× faster**
+than the all-CPU bench (~180 tok/s). The win comes from
+eliminating both (a) the per-call weight upload (was ~5 × d*d
+floats × 4 bytes per matmul-iter), and (b) the per-call cudaMalloc
+/ cudaFree pair.
+
+Comparison at d=64 (small dim, matmul cost is small):
+
+| Variant | tok/s | h2d/iter | d2h/iter | Weight uploads/iter |
+|---|---|---|---|---|
+| CPU all-ops              | ~180 | 0 | 0 | 0 |
+| Per-call cuBLAS wrapper  | ~290 | 10 (5 wts + 5 acts) | 5 (outs) | 10 (5 mm × 2 in) |
+| GPU-resident this row    | ~690 | 4 | 6 | 0 (once at setup) |
+
+What "GPU-resident" still doesn't measure (FR-19.16-extra deepest):
+- **All ops on device**. LN/SDPA/SiLU run on CPU; the d2h after Q/K/V
+  exists only to feed CPU SDPA. Routing those through cuda.rs's
+  device-kernel variants would eliminate 3 d2h + 1 h2d per
+  layer-iter -- net gain depends on kernel-launch overhead vs
+  PCIe.
+- **Llama-1B dim scale (d=2048, ff=5504, 16 layers)**. At those
+  dims the cuBLAS sgemm is what matters and the activation
+  bandwidth becomes negligible -- the 2.4× headline becomes much
+  larger.
+- **Real weights**. Still synthetic Gaussian.
+
 
 
 ## bench/training_throughput — steps/sec (planned, gates on P8.3)

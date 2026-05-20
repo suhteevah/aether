@@ -6084,6 +6084,205 @@ unsafe fn cuda_matmul_through(
 }
 
 // =====================================================================
+// FR-19.16-extra-deeper — Llama-architecture inference bench with
+// GPU-RESIDENT weights across the iter loop. cuBLAS-only build.
+//
+// The plain `aether_llm_inference_bench_tps` (above) routes matmul
+// through a per-call wrapper that uploads weights every iteration.
+// At small dims that's fast enough; at Llama-1B-class dims it would
+// drown the cuBLAS sgemm itself in PCIe traffic.
+//
+// This variant pre-uploads every weight matrix ONCE before the iter
+// loop, allocates persistent device buffers for shared activations
+// (ln_out, q, k, v, attn_out, proj, up, down), and only h2d/d2h
+// activations around the CPU-side ops (LN / SDPA / SiLU / residual).
+//
+// What's still on CPU (could move device-side in follow-up):
+//   - LayerNorm forward
+//   - Causal SDPA forward
+//   - SiLU forward
+//   - Residual adds
+//
+// Returns achieved tok/s. On any error returns 0.0.
+//
+// Under `--features cuda` ONLY — without the feature, this fn returns
+// -1.0 so the witness can branch on "cuda not available".
+#[cfg(feature = "cuda")]
+#[no_mangle] pub unsafe extern "C" fn aether_llm_inference_bench_tps_cuda_resident(
+    n_iters: c_int, d_model: c_int, n_layers: c_int, ff: c_int, seq_len: c_int,
+) -> f32 {
+    if n_iters <= 0 || d_model <= 0 || n_layers <= 0 || ff <= 0 || seq_len <= 0 {
+        return 0.0;
+    }
+    let d = d_model as usize;
+    let n = n_layers as usize;
+    let f = ff as usize;
+    let s = seq_len as usize;
+    let iters = n_iters as usize;
+
+    crate::cuda::aether_dev_init();
+
+    // Deterministic small-scale init (splitmix64-driven), shared with
+    // the CPU variant so loss-curve / output traces line up.
+    let mut rng_state: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    let mut rand_f32 = || -> f32 {
+        rng_state = rng_state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        ((z & 0xFFFF) as f32 / 65536.0 - 0.5) * 0.02
+    };
+
+    // Per-layer host weights -- staged for the one-time h2d copy.
+    struct LayerHost {
+        ln1_g: Vec<f32>, ln1_b: Vec<f32>,
+        wq: Vec<f32>, wk: Vec<f32>, wv: Vec<f32>, wo: Vec<f32>,
+        ln2_g: Vec<f32>, ln2_b: Vec<f32>,
+        w_up: Vec<f32>, w_down: Vec<f32>,
+    }
+    let host_layers: Vec<LayerHost> = (0..n).map(|_| LayerHost {
+        ln1_g: (0..d).map(|_| 1.0_f32).collect(),
+        ln1_b: (0..d).map(|_| 0.0_f32).collect(),
+        wq: (0..d*d).map(|_| rand_f32()).collect(),
+        wk: (0..d*d).map(|_| rand_f32()).collect(),
+        wv: (0..d*d).map(|_| rand_f32()).collect(),
+        wo: (0..d*d).map(|_| rand_f32()).collect(),
+        ln2_g: (0..d).map(|_| 1.0_f32).collect(),
+        ln2_b: (0..d).map(|_| 0.0_f32).collect(),
+        w_up: (0..d*f).map(|_| rand_f32()).collect(),
+        w_down: (0..f*d).map(|_| rand_f32()).collect(),
+    }).collect();
+
+    // Device weight handles -- allocated + uploaded once, kept across
+    // every iter. Shape: 6 matmul-targeted weights per layer.
+    // (ln1_g/b, ln2_g/b stay on host -- LayerNorm runs CPU-side.)
+    struct LayerDev {
+        wq: i64, wk: i64, wv: i64, wo: i64, w_up: i64, w_down: i64,
+    }
+    let dev_layers: Vec<LayerDev> = host_layers.iter().map(|lh| {
+        let make = |host: &[f32]| -> i64 {
+            let h = crate::cuda::aether_dev_alloc_f32(host.len() as c_int);
+            crate::cuda::aether_dev_h2d_f32(host.as_ptr() as i64, h, host.len() as c_int);
+            h
+        };
+        LayerDev {
+            wq: make(&lh.wq), wk: make(&lh.wk), wv: make(&lh.wv),
+            wo: make(&lh.wo), w_up: make(&lh.w_up), w_down: make(&lh.w_down),
+        }
+    }).collect();
+
+    // Shared device activation buffers (reused across layers + iters).
+    let d_ln_out  = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+    let d_q       = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+    let d_k       = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+    let d_v       = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+    let d_attn    = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+    let d_proj    = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+    let d_up      = crate::cuda::aether_dev_alloc_f32((s * f) as c_int);
+    let d_down    = crate::cuda::aether_dev_alloc_f32((s * d) as c_int);
+
+    // Host-side state (residuals, CPU-op scratch).
+    let mut x: Vec<f32> = (0..s*d).map(|_| rand_f32()).collect();
+    let mut ln_out = vec![0.0f32; s * d];
+    let mut q = vec![0.0f32; s * d];
+    let mut k = vec![0.0f32; s * d];
+    let mut v = vec![0.0f32; s * d];
+    let mut attn_out = vec![0.0f32; s * d];
+    let mut attn_scratch = vec![0.0f32; s * s];
+    let mut proj = vec![0.0f32; s * d];
+    let mut up = vec![0.0f32; s * f];
+    let mut down = vec![0.0f32; s * d];
+    let mut mean_buf = vec![0.0f32; s];
+    let mut inv_std_buf = vec![0.0f32; s];
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for (li, dev) in dev_layers.iter().enumerate() {
+            let hl = &host_layers[li];
+            // LN1 (CPU)
+            ops::layer_norm_f32(
+                x.as_ptr(), hl.ln1_g.as_ptr(), hl.ln1_b.as_ptr(), 1e-5,
+                ln_out.as_mut_ptr(), mean_buf.as_mut_ptr(), inv_std_buf.as_mut_ptr(),
+                s, d,
+            );
+            // Upload ln_out once; reuse for wq, wk, wv.
+            crate::cuda::aether_dev_h2d_f32(ln_out.as_ptr() as i64, d_ln_out, (s * d) as c_int);
+            // Q / K / V on device, weights already resident.
+            crate::cuda::aether_op_matmul_f32_cuda(d_ln_out, dev.wq, d_q, s as c_int, d as c_int, d as c_int);
+            crate::cuda::aether_op_matmul_f32_cuda(d_ln_out, dev.wk, d_k, s as c_int, d as c_int, d as c_int);
+            crate::cuda::aether_op_matmul_f32_cuda(d_ln_out, dev.wv, d_v, s as c_int, d as c_int, d as c_int);
+            // Pull Q/K/V back for SDPA (CPU).
+            crate::cuda::aether_dev_d2h_f32(d_q, q.as_mut_ptr() as i64, (s * d) as c_int);
+            crate::cuda::aether_dev_d2h_f32(d_k, k.as_mut_ptr() as i64, (s * d) as c_int);
+            crate::cuda::aether_dev_d2h_f32(d_v, v.as_mut_ptr() as i64, (s * d) as c_int);
+            // SDPA (CPU)
+            ops::sdpa_causal_f32(
+                q.as_ptr(), k.as_ptr(), v.as_ptr(),
+                attn_out.as_mut_ptr(), attn_scratch.as_mut_ptr(),
+                1, s, d,
+            );
+            // Wo on device.
+            crate::cuda::aether_dev_h2d_f32(attn_out.as_ptr() as i64, d_attn, (s * d) as c_int);
+            crate::cuda::aether_op_matmul_f32_cuda(d_attn, dev.wo, d_proj, s as c_int, d as c_int, d as c_int);
+            crate::cuda::aether_dev_d2h_f32(d_proj, proj.as_mut_ptr() as i64, (s * d) as c_int);
+            // Residual (CPU)
+            for i in 0..s*d { x[i] += proj[i]; }
+            // LN2 (CPU)
+            ops::layer_norm_f32(
+                x.as_ptr(), hl.ln2_g.as_ptr(), hl.ln2_b.as_ptr(), 1e-5,
+                ln_out.as_mut_ptr(), mean_buf.as_mut_ptr(), inv_std_buf.as_mut_ptr(),
+                s, d,
+            );
+            // MLP up on device.
+            crate::cuda::aether_dev_h2d_f32(ln_out.as_ptr() as i64, d_ln_out, (s * d) as c_int);
+            crate::cuda::aether_op_matmul_f32_cuda(d_ln_out, dev.w_up, d_up, s as c_int, d as c_int, f as c_int);
+            crate::cuda::aether_dev_d2h_f32(d_up, up.as_mut_ptr() as i64, (s * f) as c_int);
+            // SiLU (CPU)
+            ops::silu_f32(up.as_mut_ptr(), s * f);
+            // MLP down on device.
+            crate::cuda::aether_dev_h2d_f32(up.as_ptr() as i64, d_up, (s * f) as c_int);
+            crate::cuda::aether_op_matmul_f32_cuda(d_up, dev.w_down, d_down, s as c_int, f as c_int, d as c_int);
+            crate::cuda::aether_dev_d2h_f32(d_down, down.as_mut_ptr() as i64, (s * d) as c_int);
+            // Residual (CPU)
+            for i in 0..s*d { x[i] += down[i]; }
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    // Tear down device buffers (graceful; the BUFFERS slot table just
+    // marks the slot None).
+    for dev in &dev_layers {
+        crate::cuda::aether_dev_free_f32(dev.wq);
+        crate::cuda::aether_dev_free_f32(dev.wk);
+        crate::cuda::aether_dev_free_f32(dev.wv);
+        crate::cuda::aether_dev_free_f32(dev.wo);
+        crate::cuda::aether_dev_free_f32(dev.w_up);
+        crate::cuda::aether_dev_free_f32(dev.w_down);
+    }
+    crate::cuda::aether_dev_free_f32(d_ln_out);
+    crate::cuda::aether_dev_free_f32(d_q);
+    crate::cuda::aether_dev_free_f32(d_k);
+    crate::cuda::aether_dev_free_f32(d_v);
+    crate::cuda::aether_dev_free_f32(d_attn);
+    crate::cuda::aether_dev_free_f32(d_proj);
+    crate::cuda::aether_dev_free_f32(d_up);
+    crate::cuda::aether_dev_free_f32(d_down);
+
+    if elapsed <= 0.0 { return 0.0; }
+    ((iters as f64) / elapsed) as f32
+}
+
+/// Stub when cuda feature isn't enabled -- returns -1.0 so the witness
+/// can detect "cuda not built" without crashing the link step.
+#[cfg(not(feature = "cuda"))]
+#[no_mangle] pub unsafe extern "C" fn aether_llm_inference_bench_tps_cuda_resident(
+    _n_iters: c_int, _d_model: c_int, _n_layers: c_int, _ff: c_int, _seq_len: c_int,
+) -> f32 {
+    -1.0
+}
+
+// =====================================================================
 // FR-17.14-extra-deeper — Full GGUF v3 reader.
 //
 // Real GGUF reader matt-voice uses to ingest Qwen2.5-7B Q4_K_M. The

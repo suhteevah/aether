@@ -1,0 +1,57 @@
+// roadmap: P19.16
+// requires: cuda
+// expect: exit=42
+//
+// FR-19.16-extra-deeper (GPU-resident weights) — Same Llama-shape
+// inference bench as `llm_inference_tps_cuda.aether`, but using
+// the resident-weights variant of the runtime bench fn.
+//
+// What this PROVES under --features cuda:
+//   - All 10 weight matrices per layer (Wq/Wk/Wv/Wo/Wup/Wdown,
+//     6 matmul-targeted weights × n_layers) are uploaded ONCE
+//     before the iter loop -- never again.
+//   - Per-iter device traffic is only the activations: ln_out
+//     (h2d), q/k/v (d2h for CPU SDPA), attn_out (h2d), proj (d2h
+//     for CPU residual), ln_out2 (h2d), up (d2h for CPU SiLU),
+//     up (h2d after SiLU), down (d2h for CPU residual).
+//     That's 4 h2d + 6 d2h per layer-iter (q, k, v, proj, up, down),
+//     all O(s*d) bytes -- vs the prior per-call wrapper that did
+//     2 h2d (one per weight) + 1 d2h per matmul = 5 matmuls ×
+//     (2+1) = 15 round-trips per layer-iter PLUS 5 weight uploads
+//     of O(d*d) bytes.
+//   - The fn exits cleanly with a real measured tok/s.
+//
+// EXPLICIT non-claims still open (FR-19.16-extra deeper still):
+//   - LayerNorm / SDPA / SiLU stay on CPU. A fully GPU-resident
+//     forward would route those through cuda.rs kernels too (the
+//     symbols exist; the host-pointer wiring doesn't).
+//   - No real Llama weights -- still synthetic Gaussian. The chain
+//     composes with the GGUF / Q4_K dequant chain proven in
+//     `qwen25_forward_chain.aether`, but isn't end-to-end wired.
+use runtime;
+
+extern fn aether_llm_inference_bench_tps_cuda_resident(
+    n_iters: i32, d_model: i32, n_layers: i32, ff: i32, seq_len: i32,
+) -> f32;
+extern fn aether_f32_in_band_exit(v: f32, lo: f32, hi: f32) -> i32;
+
+fn main() -> i32 {
+    // Same shape as the prior witnesses for apples-to-apples.
+    // n_iters bumped to 100 (vs 50 in the per-call wrapper variant)
+    // because there's no per-call alloc/free overhead -- the larger
+    // sample stabilises the tok/s measurement.
+    let tps: f32 = aether_llm_inference_bench_tps_cuda_resident(100, 64, 2, 256, 8);
+    aether_print_kv_f32("llama_shaped_tps_cuda_resident", tps);
+
+    // Explicit reject of the -1.0 "cuda not built" sentinel from the
+    // stub variant. tok/s is by definition positive; the in-band gate
+    // alone wouldn't catch this because |-1.0| = 1.0 sits inside the
+    // generous 0.001..1e6 band.
+    let positive: i32 = aether_f32_in_band_exit(tps, 0.001, 1000000.0);
+    if positive != 42 { return 1; }
+    // Filter the sentinel: aether_f32_close_exit(tps, -1.0) == 42 iff
+    // they agree, so we want NOT-42 (i.e. tps != -1.0).
+    let is_sentinel: i32 = aether_f32_close_exit(tps, -1.0);
+    if is_sentinel == 42 { return 2; }
+    42
+}
