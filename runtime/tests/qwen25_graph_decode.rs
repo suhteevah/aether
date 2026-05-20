@@ -26,8 +26,6 @@ use aether_rt::cuda::{
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
-    aether_op_fused_q4k_matmul_seq1_smallN_cuda,
-    aether_op_fused_q6k_matmul_seq1_smallN_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_dev_graph_begin, aether_dev_graph_end,
     aether_dev_graph_launch, aether_dev_graph_destroy,

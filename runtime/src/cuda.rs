@@ -68,8 +68,6 @@ struct CudaCtx {
     fused_q4k_ffn_gate_up_silu_mul: CudaFunction,
     fused_q4k_matmul_seq1_v3: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
-    fused_q4k_matmul_seq1_smallN: CudaFunction,
-    fused_q6k_matmul_seq1_smallN: CudaFunction,
     rope_apply_devarg: CudaFunction,
     append_kv_devarg: CudaFunction,
     attention_seq1_devarg: CudaFunction,
@@ -1078,132 +1076,6 @@ extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul_v2(
     }
 }
 
-// FR-17.14-extra-deepest-smallN -- Q4_K matmul tuned for SMALL output
-// dim (N <= ~1024). The v2 kernel uses 256-thread CTAs with 8 outputs
-// each; for N=512 (Qwen K/V proj) that only launches 64 CTAs to fill
-// 48 SMs = 1.3 CTAs/SM. Measured at 4.3% of peak BW (25.9 GB/s).
-//
-// This variant uses 32-thread CTAs (1 warp = 1 output). N=512 -> 512
-// CTAs / 48 SMs = 10.7 CTAs/SM, fully saturated. No CTA-shared shmem
-// for `a` because there's no warp-level cooperation to amortize; each
-// lane reads 8 contiguous floats of `a` directly from gmem (L1 cache
-// absorbs the redundancy across the K-tile iterations).
-extern "C" __global__ void fused_q4k_matmul_seq1_smallN(
-    const float*         __restrict__ a,
-    const unsigned char* __restrict__ w,
-    float*               __restrict__ out,
-    int n, int n_blocks)
-{
-    int lane = threadIdx.x;
-    int ni = blockIdx.x;
-    if (ni >= n) return;
-
-    float acc = 0.0f;
-
-    int sub      = lane >> 2;
-    int sub_off  = (lane & 3) << 3;
-    int j        = sub >> 1;
-    int is_hi    = sub & 1;
-    int qs_off   = j * 32 + sub_off;
-    int a_off    = sub * 32 + sub_off;
-
-    for (int bi = 0; bi < n_blocks; bi++) {
-        const unsigned char* base = w
-            + (size_t)ni * n_blocks * 144
-            + (size_t)bi * 144;
-        unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
-        unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
-        float d    = aether_f16_to_f32_dev(d_bits);
-        float dmin = aether_f16_to_f32_dev(dmin_bits);
-        const unsigned char* scales = base + 4;
-        const unsigned char* qs     = base + 16;
-        unsigned int sc = q4k_get_scale(sub, scales);
-        unsigned int mn = q4k_get_min(sub, scales);
-        float d_eff = d * (float)sc;
-        float m_eff = dmin * (float)mn;
-
-        // Load a slice from gmem (L1 cache hits across K-tiles since `a`
-        // is small and reused for every CTA).
-        const float* a_row = a + bi * 256 + a_off;
-        #pragma unroll
-        for (int p = 0; p < 8; p++) {
-            unsigned char byte = qs[qs_off + p];
-            unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
-            float w_val = d_eff * (float)nibble - m_eff;
-            acc += a_row[p] * w_val;
-        }
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
-    }
-    if (lane == 0) {
-        out[ni] = acc;
-    }
-}
-
-// Same shape but for Q6_K (V proj on certain blocks of Qwen2.5).
-extern "C" __global__ void fused_q6k_matmul_seq1_smallN(
-    const float*         __restrict__ a,
-    const unsigned char* __restrict__ w,
-    float*               __restrict__ out,
-    int n, int n_blocks)
-{
-    int lane = threadIdx.x;
-    int ni = blockIdx.x;
-    if (ni >= n) return;
-
-    float acc = 0.0f;
-
-    // Q6_K layout: 256 quants per 210-byte super-block.
-    //   ql[128]:  4-bit low bits (interleaved layout in ggml)
-    //   qh[64]:   2-bit high bits
-    //   scales[16]: int8 sub-scales
-    //   d[2]: f16 super-block scale (at offset 208)
-    //
-    // Lane mapping (matches existing fused_q6k_matmul_seq1_v2): each
-    // lane processes 8 quants per K-tile. Loop unrolled into 8 inner
-    // iterations across 2 outer halves * 4 sub_pos.
-    for (int bi = 0; bi < n_blocks; bi++) {
-        const unsigned char* base = w
-            + (size_t)ni * n_blocks * 210
-            + (size_t)bi * 210;
-        const unsigned char* ql_b = base;
-        const unsigned char* qh_b = base + 128;
-        const signed char*   sc_b = (const signed char*)(base + 192);
-        unsigned short d_bits = ((unsigned short)base[209] << 8) | (unsigned short)base[208];
-        float d = aether_f16_to_f32_dev(d_bits);
-
-        #pragma unroll
-        for (int n_outer = 0; n_outer < 2; n_outer++) {
-            #pragma unroll
-            for (int sub_pos = 0; sub_pos < 4; sub_pos++) {
-                int q_idx = n_outer * 128 + sub_pos * 32 + lane;
-                int sc_idx = n_outer * 8 + sub_pos * 2 + (lane >> 4);
-                int ql_byte_idx = (n_outer * 64) + (sub_pos & 1) * 32 + lane;
-                int ql_shift    = (sub_pos >> 1) * 4;
-                int qh_byte_idx = n_outer * 32 + lane;
-                int qh_shift    = sub_pos * 2;
-                int ql_v = (ql_b[ql_byte_idx] >> ql_shift) & 0xFu;
-                int qh_v = (qh_b[qh_byte_idx] >> qh_shift) & 0x3u;
-                int q = (qh_v << 4) | ql_v;
-                int sc_v = sc_b[sc_idx];
-                float w_val = d * (float)sc_v * (float)(q - 32);
-                acc += a[bi * 256 + q_idx] * w_val;
-            }
-        }
-    }
-
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
-    }
-    if (lane == 0) {
-        out[ni] = acc;
-    }
-}
-
 // matt-voice / FR-17.13-extra — append new K/V step to the on-device
 // KV cache at position `pos`. Simple memcpy-shaped kernel.
 extern "C" __global__ void append_kv(
@@ -1640,7 +1512,6 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
               "fused_q4k_ffn_gate_up_silu_mul",
               "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
-              "fused_q4k_matmul_seq1_smallN", "fused_q6k_matmul_seq1_smallN",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1"])
             .expect("load_ptx");
@@ -1674,8 +1545,6 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_ffn_gate_up_silu_mul = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul").unwrap();
         let fused_q4k_matmul_seq1_v3 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v3").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
-        let fused_q4k_matmul_seq1_smallN = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_smallN").unwrap();
-        let fused_q6k_matmul_seq1_smallN = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_smallN").unwrap();
         let rope_apply_devarg = device.get_func("aether_kernels", "rope_apply_devarg").unwrap();
         let append_kv_devarg = device.get_func("aether_kernels", "append_kv_devarg").unwrap();
         let attention_seq1_devarg = device.get_func("aether_kernels", "attention_seq1_devarg").unwrap();
@@ -1692,7 +1561,6 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2,
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
-                  fused_q4k_matmul_seq1_smallN, fused_q6k_matmul_seq1_smallN,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1 }
     })
@@ -3003,64 +2871,6 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_q4k_ffn_gate_up_silu_mul_v2.clone()
             .launch(cfg, (av, wgv, wuv, ov, n, n_blocks))
             .expect("launch fused_q4k_ffn_gate_up_silu_mul_v2");
-    }
-    0
-}
-
-/// FR-17.14-extra-deepest-smallN -- Q4_K matmul tuned for SMALL output
-/// dim. Launches with 32-thread CTAs (1 warp per output), so the grid
-/// is N CTAs instead of N/8. Saturates SMs when N is small.
-#[no_mangle] pub extern "C" fn aether_op_fused_q4k_matmul_seq1_smallN_cuda(
-    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
-    n: c_int, n_blocks: c_int,
-) -> c_int {
-    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
-    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
-    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
-    if n <= 0 || n_blocks <= 0 { return -1; }
-    let bs = unsafe { bufs() };
-    let bs_u8 = unsafe { u8_bufs() };
-    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
-    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
-    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
-    let cfg = LaunchConfig {
-        grid_dim:  (n as u32, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
-        ctx().fused_q4k_matmul_seq1_smallN.clone()
-            .launch(cfg, (av, wv, ov, n, n_blocks))
-            .expect("launch fused_q4k_matmul_seq1_smallN");
-    }
-    0
-}
-
-/// FR-17.14-extra-deepest-smallN -- Q6_K small-N variant. Same shape.
-#[no_mangle] pub extern "C" fn aether_op_fused_q6k_matmul_seq1_smallN_cuda(
-    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
-    n: c_int, n_blocks: c_int,
-) -> c_int {
-    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
-    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
-    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
-    if n <= 0 || n_blocks <= 0 { return -1; }
-    let bs = unsafe { bufs() };
-    let bs_u8 = unsafe { u8_bufs() };
-    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
-    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
-    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
-    let cfg = LaunchConfig {
-        grid_dim:  (n as u32, 1, 1),
-        block_dim: (32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
-        ctx().fused_q6k_matmul_seq1_smallN.clone()
-            .launch(cfg, (av, wv, ov, n, n_blocks))
-            .expect("launch fused_q6k_matmul_seq1_smallN");
     }
     0
 }
