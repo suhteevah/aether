@@ -66,6 +66,8 @@ struct CudaCtx {
     fused_q4k_matmul_seq1_v2: CudaFunction,
     fused_q6k_matmul_seq1_v2: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul: CudaFunction,
+    fused_q4k_matmul_seq1_v3: CudaFunction,
+    fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
 }
@@ -756,6 +758,94 @@ extern "C" __global__ void fused_q4k_matmul_seq1_v2(
     }
 }
 
+// matt-voice / FR-17.14-extra-deepest-v3 -- byte-once Q4_K matmul.
+//
+// The v2 kernel had 32 lanes × 8-byte reads = 256 byte-reads per warp
+// per K-tile, but each qs byte was actually read TWICE: sub=2g and
+// sub=2g+1 share the same 32 bytes of qs (low vs high nibble).
+//
+// v3 reads each byte ONCE per warp and uses BOTH nibbles within the
+// same lane. Each lane handles 1 byte per inner iteration with both
+// nibbles contributing to its accumulator. 4 inner iterations cover
+// the full 128-byte qs (32 lanes × 4 = 128). Reads per warp per
+// K-tile go from 256 to 128 → halves memory-instruction throughput,
+// closer to DRAM-BW-bound.
+//
+// FMA count is unchanged (256 quants × n_blocks per output). Lane
+// mapping is uniform within iter (sub_lo/sub_hi identical across all
+// lanes for a given i), so zero warp divergence.
+extern "C" __global__ void fused_q4k_matmul_seq1_v3(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks)
+{
+    __shared__ float a_tile[256];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    // Split accumulator to expose ILP: NVCC can interleave the two
+    // independent FMA chains rather than serializing through one acc.
+    float acc_lo = 0.0f;
+    float acc_hi = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        a_tile[threadIdx.x] = a[bi * 256 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w
+                + (size_t)ni * n_blocks * 144
+                + (size_t)bi * 144;
+            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* scales = base + 4;
+            const unsigned char* qs     = base + 16;
+
+            float d_eff[8], m_eff[8];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                unsigned int sc = q4k_get_scale(s, scales);
+                unsigned int mn = q4k_get_min(s, scales);
+                d_eff[s] = d * (float)sc;
+                m_eff[s] = dmin * (float)mn;
+            }
+
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int sub_lo = i * 2;
+                int sub_hi = i * 2 + 1;
+                unsigned char byte = qs[i * 32 + lane];
+                unsigned int nib_lo = ((unsigned int)byte) & 0xFu;
+                unsigned int nib_hi = (((unsigned int)byte) >> 4) & 0xFu;
+
+                float w_lo = d_eff[sub_lo] * (float)nib_lo - m_eff[sub_lo];
+                float w_hi = d_eff[sub_hi] * (float)nib_hi - m_eff[sub_hi];
+
+                int k_lo = sub_lo * 32 + lane;
+                int k_hi = sub_hi * 32 + lane;
+
+                acc_lo += a_tile[k_lo] * w_lo;
+                acc_hi += a_tile[k_hi] * w_hi;
+            }
+        }
+        __syncthreads();
+    }
+
+    float acc = acc_lo + acc_hi;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+    }
+    if (lane == 0 && ni < n) {
+        out[ni] = acc;
+    }
+}
+
 // matt-voice / FR-17.14-extra-deepest-v3 -- FUSED FFN gate+up+silu+mul.
 //
 // Replaces 4 separate kernels (gate matmul, up matmul, silu, mul_inplace)
@@ -856,6 +946,97 @@ extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul(
     }
     if (lane == 0 && ni < n) {
         // silu(g) * u = (g / (1 + exp(-g))) * u
+        float silu_g = acc_g / (1.0f + expf(-acc_g));
+        out[ni] = silu_g * acc_u;
+    }
+}
+
+// matt-voice / FR-17.14-extra-deepest-v3 -- FUSED FFN byte-once.
+//
+// Same byte-once layout as fused_q4k_matmul_seq1_v3 but computing
+// both gate[ni] and up[ni] simultaneously, then applying silu*mul.
+extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul_v2(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_up,
+    float*               __restrict__ out,
+    int n, int n_blocks)
+{
+    __shared__ float a_tile[256];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        a_tile[threadIdx.x] = a[bi * 256 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            // Two pointers, one per weight tensor.
+            const unsigned char* base_g = w_gate + (size_t)ni * n_blocks * 144 + (size_t)bi * 144;
+            const unsigned char* base_u = w_up   + (size_t)ni * n_blocks * 144 + (size_t)bi * 144;
+            unsigned short dg    = ((unsigned short)base_g[1] << 8) | (unsigned short)base_g[0];
+            unsigned short dmg   = ((unsigned short)base_g[3] << 8) | (unsigned short)base_g[2];
+            unsigned short du    = ((unsigned short)base_u[1] << 8) | (unsigned short)base_u[0];
+            unsigned short dmu   = ((unsigned short)base_u[3] << 8) | (unsigned short)base_u[2];
+            float d_g    = aether_f16_to_f32_dev(dg);
+            float dmin_g = aether_f16_to_f32_dev(dmg);
+            float d_u    = aether_f16_to_f32_dev(du);
+            float dmin_u = aether_f16_to_f32_dev(dmu);
+            const unsigned char* scales_g = base_g + 4;
+            const unsigned char* qs_g     = base_g + 16;
+            const unsigned char* scales_u = base_u + 4;
+            const unsigned char* qs_u     = base_u + 16;
+
+            // Hoist 8 (d_eff, m_eff) pairs per weight tensor.
+            float gd_eff[8], gm_eff[8], ud_eff[8], um_eff[8];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                unsigned int gsc = q4k_get_scale(s, scales_g);
+                unsigned int gmn = q4k_get_min  (s, scales_g);
+                unsigned int usc = q4k_get_scale(s, scales_u);
+                unsigned int umn = q4k_get_min  (s, scales_u);
+                gd_eff[s] = d_g    * (float)gsc;
+                gm_eff[s] = dmin_g * (float)gmn;
+                ud_eff[s] = d_u    * (float)usc;
+                um_eff[s] = dmin_u * (float)umn;
+            }
+
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int sub_lo = i * 2;
+                int sub_hi = i * 2 + 1;
+                unsigned char byte_g = qs_g[i * 32 + lane];
+                unsigned char byte_u = qs_u[i * 32 + lane];
+                unsigned int g_lo = ((unsigned int)byte_g) & 0xFu;
+                unsigned int g_hi = (((unsigned int)byte_g) >> 4) & 0xFu;
+                unsigned int u_lo = ((unsigned int)byte_u) & 0xFu;
+                unsigned int u_hi = (((unsigned int)byte_u) >> 4) & 0xFu;
+
+                int k_lo = sub_lo * 32 + lane;
+                int k_hi = sub_hi * 32 + lane;
+                float a_lo = a_tile[k_lo];
+                float a_hi = a_tile[k_hi];
+
+                acc_g += a_lo * (gd_eff[sub_lo] * (float)g_lo - gm_eff[sub_lo]);
+                acc_g += a_hi * (gd_eff[sub_hi] * (float)g_hi - gm_eff[sub_hi]);
+                acc_u += a_lo * (ud_eff[sub_lo] * (float)u_lo - um_eff[sub_lo]);
+                acc_u += a_hi * (ud_eff[sub_hi] * (float)u_hi - um_eff[sub_hi]);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc_g += __shfl_down_sync(0xFFFFFFFFu, acc_g, offset);
+        acc_u += __shfl_down_sync(0xFFFFFFFFu, acc_u, offset);
+    }
+    if (lane == 0 && ni < n) {
         float silu_g = acc_g / (1.0f + expf(-acc_g));
         out[ni] = silu_g * acc_u;
     }
@@ -1185,6 +1366,7 @@ fn ctx() -> &'static CudaCtx {
               "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1",
               "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
               "fused_q4k_ffn_gate_up_silu_mul",
+              "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
               "append_kv", "attention_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
@@ -1215,6 +1397,8 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v2").unwrap();
         let fused_q6k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_v2").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul").unwrap();
+        let fused_q4k_matmul_seq1_v3 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v3").unwrap();
+        let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
@@ -1227,6 +1411,7 @@ fn ctx() -> &'static CudaCtx {
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu,
                   fused_q4k_matmul_seq1, fused_q4k_matmul_seq1_v2,
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
+                  fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   append_kv, attention_seq1 }
     })
 }
@@ -2275,6 +2460,73 @@ fn libm_powf(base: f32, n: f32) -> f32 {
         ctx().fused_q4k_ffn_gate_up_silu_mul.clone()
             .launch(cfg, (av, wgv, wuv, ov, n, n_blocks))
             .expect("launch fused_q4k_ffn_gate_up_silu_mul");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest-v3 -- byte-once Q4_K matmul.
+///
+/// Same interface as v2 but reads each qs byte once per warp (uses both
+/// low and high nibbles within one lane) -> half the memory instructions.
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_matmul_seq1_v3_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cta_threads = 256u32;
+    let outputs_per_cta = 8u32;
+    let grid_x = ((n as u32) + outputs_per_cta - 1) / outputs_per_cta;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (cta_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q4k_matmul_seq1_v3.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q4k_matmul_seq1_v3");
+    }
+    0
+}
+
+/// FR-17.14-extra-deepest-v3 -- fused FFN with byte-once matmul.
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_ffn_gate_up_silu_mul_v2_cuda(
+    a_dev_f32: i64, w_gate_dev_u8: i64, w_up_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_wg) = handle_to_u8_idx(w_gate_dev_u8) else { return -1; };
+    let Some(i_wu) = handle_to_u8_idx(w_up_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p  = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let wg_p = bs_u8[i_wg].as_ref().unwrap() as *const CudaSlice<u8>;
+    let wu_p = bs_u8[i_wu].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p  = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cta_threads = 256u32;
+    let outputs_per_cta = 8u32;
+    let grid_x = ((n as u32) + outputs_per_cta - 1) / outputs_per_cta;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (cta_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wgv = &*wg_p; let wuv = &*wu_p; let ov = &mut *o_p;
+        ctx().fused_q4k_ffn_gate_up_silu_mul_v2.clone()
+            .launch(cfg, (av, wgv, wuv, ov, n, n_blocks))
+            .expect("launch fused_q4k_ffn_gate_up_silu_mul_v2");
     }
     0
 }
