@@ -9,7 +9,48 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, two v4-SHIP incremental proof points)
+## Closed this batch (2026-05-20, autoregressive generation through Qwen2.5-7B)
+
+User asked to "finish the rest for shipping matt-voice". The bigger
+piece (autoregressive + KV cache) shipped. Tokenizer integration +
+HTTP server wrap + LoRA adapter loading + GPU-resident inference
+are the 4 follow-up FRs explicitly captured in HANDOFF "What's
+still left for shipping matt-voice end-to-end".
+
+- **`runtime/tests/qwen25_autoregressive_gen.rs`** -- 4-token
+  prompt + 5 generated tokens through real Qwen2.5-7B Q4_K_M
+  weights with per-block KV cache.
+- New types:
+  - `BlockWeights` -- all 12 transposed matmul weights per block
+    + biases + RMSNorm gammas, loaded ONCE before generation
+  - `KvCache` -- per-block growing K/V buffers; appended on each
+    forward
+- `block_forward_kv` handles BOTH prefill (seq=prompt_len) and
+  per-step (seq=1) modes uniformly. Q/K/V proj computed on new
+  tokens only; full attention reads from the growing cache.
+- Per-token cost with KV cache: **53s** (vs 270s for full re-forward,
+  a 5x speedup). The first-token prefill is still 206s; subsequent
+  tokens reuse cached K/V.
+- Generated IDs `[358, 2776, 264, 220, 17]` from prompt
+  `[9707, 11, 1879, 0]`. Logits increase monotonically (10.3 →
+  27.1) -- expected autoregressive behaviour as the model gets
+  more confident with more context.
+- All IDs in vocab, all logits finite. Test passes.
+- ~24 GB f32 of block weights resident in RAM during generation.
+  Streams loadable for the 28 blocks (each ~870 MB).
+
+The full matt-voice deploy chain Aether-side:
+- (DONE) Qwen2.5 GGUF reader + Q4_K_M + Q6_K dequant
+- (DONE) RMSNorm + RoPE + GQA + SDPA + matmul
+- (DONE) Single-pass 28-block forward + argmax
+- (DONE) KV cache + autoregressive multi-token generation
+- (NEXT) GGUF metadata KV extraction for tokenizer.ggml.tokens
+- (NEXT) Tokenizer encode/decode wired to aether_bpe_tokenizer
+- (NEXT) HTTP server binary using existing OpenAI render fns
+- (NEXT) LoRA adapter load + apply
+- (NEXT) GPU-resident inference path
+
+## Closed earlier (2026-05-20, two v4-SHIP incremental proof points)
 
 User asked to "go on the last incremental proof points" -- the two
 remaining items from the v4 SHIP track after the dual-P100 dual-

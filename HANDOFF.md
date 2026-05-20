@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (Both v4 incremental proof points LANDED — full 28-block Qwen2.5-7B inference produces argmax predictions; GPU-resident DP on dual P100 converges loss to 0)
+2026-05-20 (AUTOREGRESSIVE GENERATION LANDED — 4-tok prompt + 5 generated tokens via KV cache through real Qwen2.5-7B at ~53s/token; matt-voice deploy gap is now just tokenizer + HTTP wrap)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,80 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## Autoregressive generation LANDED
+
+`runtime/tests/qwen25_autoregressive_gen.rs` produces multi-token
+generated output from a 4-token prompt through real Qwen2.5-7B
+with **per-block KV cache**.
+
+Architecture:
+- `BlockWeights`: all 12 matmul-targeted weights + biases per block
+  loaded + transposed ONCE before generation (~24 GB f32 total for
+  all 28 blocks).
+- `KvCache`: per-block `Vec<f32>` storage for past K and V
+  activations. Grows by `seq * D_KV` per call.
+- `block_forward_kv`: handles BOTH prefill (seq=prompt_len) and
+  per-step (seq=1) modes. Q/K/V projection on the new tokens only;
+  K/V appended to cache; attention reads from cache.
+
+End-to-end run:
+```
+[all blocks loaded]   71.74s -- 28 blocks * ~2.6s each
+[lm_head xpose]        6.62s
+[prefill]            206.00s -- 4 tokens through 28 blocks
+[gen 1/4]             53.04s -- next_id=2776 logit=13.374
+[gen 2/4]             53.83s -- next_id=264  logit=12.557
+[gen 3/4]             53.66s -- next_id=220  logit=15.310
+[gen 4/4]             54.27s -- next_id=17   logit=27.127
+[total]              501.61s
+Generated IDs: [9707, 11, 1879, 0, 358, 2776, 264, 220, 17]
+                 (prompt 4 tokens)  (5 generated)
+```
+
+Per-token cost dropped from 270s (full re-forward) to **53s** with
+KV cache -- a 5x speedup. The model produces increasingly confident
+predictions (logit 10.3 → 27.1) which is normal autoregressive
+behaviour as context extends.
+
+Test is `#[ignore]`d (~8 min run). Invoke explicitly:
+```
+cargo test -p aether_rt --release --test qwen25_autoregressive_gen \
+  -- --ignored --nocapture
+```
+
+## What's still left for shipping matt-voice end-to-end
+
+Remaining gap from "Aether-runs-Qwen2.5-7B-autoregressively" (DONE)
+to "matt-voice end-user serves a prompt and gets text back":
+
+1. **Tokenizer integration** -- text ↔ token IDs round-trip. The
+   GGUF metadata KV table (parsed but not exposed today) contains
+   `tokenizer.ggml.tokens` (152064 entries) + `_merges` +
+   `_bos/eos_token_id`. Need: extend GGUF reader to capture string
+   + string-array values, then wire into the existing
+   `aether_bpe_tokenizer` + `aether_tokenizer_json_load` surface
+   (already shipped in Phase 19).
+2. **HTTP server wrap** -- combine the existing
+   `aether_tcp_listen/accept`, `aether_http_parse_request`,
+   `aether_openai_render_completion` (all shipped) with the
+   generation loop. The OpenAI shape is one POST handler. Best
+   structure: a new `trainer/src/bin/serve.rs` binary.
+3. **LoRA adapter loading** -- matt-voice's actual adapter trained
+   in candle. Each layer's W becomes W + (B @ A) * scale. The
+   SafeTensors loader (`aether_safetensors_*`, shipped) reads the
+   adapter file; runtime needs a "apply lora to block weights"
+   helper that mutates the resident block weights in place after
+   load.
+4. **GPU-resident inference** -- the current path runs on CPU,
+   500s for 9 tokens. On the RTX 3070 Ti with cuBLAS the per-token
+   cost should drop to single-digit seconds. Requires routing the
+   block_forward_kv through `cuda::aether_op_*_cuda` symbols and
+   keeping KV cache on device. Re-uses the GPU-resident DP
+   infrastructure already shipped on cnc.
+
+None of those are blocked on Aether language work; they're all
+runtime+wiring. Likely 2-3 focused sessions of work.
 
 ## Full Qwen2.5-7B inference LANDED
 
