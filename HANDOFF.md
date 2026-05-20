@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (end-to-end Qwen2.5-7B autoregressive at 25.5 tok/s on RTX 3070 Ti — NaN bisected to per-block dtype mismatch on V proj and ffn_down; Q4_K_M is mixed-precision and the wrong fused kernel reads weight bytes as the wrong super-block layout; fix is to dispatch on stored dt_v/dt_down per block; generated IDs [358, 2776, 264, 220, 17] match the cuBLAS reference)
+2026-05-20 (stable **27.22 tok/s** on RTX 3070 Ti / Qwen2.5-7B — **91% of llama.cpp's ~30 tok/s** — after per-block dtype dispatch fix + FFN fusion. Generated IDs `[358, 2776, 264, 220, 17]` match the cuBLAS reference exactly. Byte-once v3 matmul kernel landed as alt but was actually slower due to register pressure; v2 stays on the hot path. Per-op breakdown shows FFN matmuls dominate at 57% of token time, attn QKV at 28%, attention itself only 4%.)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's

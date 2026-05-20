@@ -242,6 +242,29 @@ What "GPU-resident" still doesn't measure (FR-19.16-extra deepest):
 
 
 
+## bench/qwen25_7b_autoregressive — tok/s on RTX 3070 Ti (matt-voice)
+
+Tracks the full Qwen2.5-7B-Instruct Q4_K_M autoregressive throughput
+through the v2 fused matmul + on-device KV cache + attention_seq1
+chain. Measured wall-clock over 5 generate-only tokens after a
+4-token prefill.
+
+| date       | commit  | tok/s | what changed                                           |
+|------------|---------|------:|--------------------------------------------------------|
+| 2026-05-20 | 399718e |  25.5 | per-block Q4_K/Q6_K dtype dispatch fix (was NaN'ing)   |
+| 2026-05-20 | 9b5a21e |  26.0 | fused gate+up+silu+mul kernel (4 launches -> 1)         |
+| 2026-05-20 | 859745d |  27.2 | thermal-stable 5-run mean (no logic change)            |
+
+llama.cpp reference on the same hardware: ~30 tok/s.
+Aether at commit 859745d is at **91% of llama.cpp** with matching
+generated IDs.
+
+The split: 57% of token time is FFN matmuls (gate+up+down), 28%
+QKV proj, 4% attention itself, ~8% kernel launch overhead (370
+launches/token x ~8 us each). CUDA Graphs would compress launch
+overhead to one launch per step; closing the ~3 ms launch budget
+would put Aether at ~96% of llama.cpp throughput.
+
 ## bench/training_throughput — steps/sec (planned, gates on P8.3)
 
 Pending — fires once DataLoader lands. Today the closest proxy is `examples/aether_lm.aether` itself (100 steps in 122 ms = ~820 steps/sec on synthetic data with 16-token batch, single block).

@@ -9,7 +9,71 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, NaN bisected + fixed via per-block dtype dispatch)
+## Closed this batch (2026-05-20, FFN fusion + v3 kernel exploration → stable 27.22 tok/s = 91% of llama.cpp)
+
+User: "Go on what's next for llama.cpp parity". Profiled, fused, explored.
+
+### Per-op breakdown (qwen25_perf_breakdown.rs)
+On the Qwen2.5-7B autoregressive chain, group time per token:
+- 39.4% ffn_norm + gate/up + silu + mul (15.31 ms) — **dominates**
+- 28.2% attn_norm + Q/K/V proj + biases + RoPE (10.96 ms)
+- 17.9% down + residual (6.95 ms)
+- 5.4% O proj + residual (2.09 ms)
+- 4.5% final_norm + lm_head (1.74 ms)
+- 3.9% append_kv + attention (1.51 ms)
+- 0.8% argmax d2h + host (0.33 ms)
+- 38.9 ms TOTAL per token
+
+FFN matmuls (gate+up+down) = 57% of token time. Attention itself
+is only 4% — the on-device KV cache + attention_seq1 kernel are
+already cheap. **Matmul throughput is the lever**.
+
+### FFN fusion (gate+up+silu+mul in 1 kernel)
+The gate matmul and up matmul both read the same x_norm input.
+Fused them into one kernel that produces silu(gate[ni]) * up[ni]
+directly. Replaces 4 launches per layer (gate + up + silu +
+mul_inplace) with 1. **+7% throughput**: 25.5 → 27.2 tok/s mean
+over 5 runs.
+
+Parity test `fused_q4k_ffn_parity.rs` verifies bit-identical
+output vs the 4-kernel reference (max_diff=0).
+
+### Byte-once v3 matmul (alt, NOT promoted)
+Tried a layout where each warp reads each qs byte once per K-tile
+and uses both low+high nibbles within one lane (vs v2 where lanes
+0..3 + 4..7 both read the same 32 bytes, extracting different
+nibbles). Theory: halve memory instructions.
+
+Reality: end-to-end **24.0 tok/s, ~12% SLOWER than v2's 27.2**.
+Higher register pressure (d_eff[8] + m_eff[8] per lane spills
+or lowers occupancy) + 8 scale-lookup operations per K-tile (vs
+v2's single sub) outweigh the saved memory instructions. Even
+after hoisting scales outside the inner loop + splitting the
+accumulator to expose ILP, still slower.
+
+The v3 kernel + FFN v2 stay in the source (`fused_q4k_matmul_seq1_v3`,
+`fused_q4k_ffn_gate_up_silu_mul_v2`) for future shape-sweep
+profiling but are NOT on the hot path. Parity verified by
+`fused_q4k_v3_parity.rs`.
+
+### Where we are vs llama.cpp
+- Aether: **27.22 tok/s** (5-run mean, ±0.2)
+- llama.cpp on same hardware: ~30 tok/s
+- **91% of llama.cpp** with sane outputs
+
+The remaining ~9% gap is most likely from kernel launch overhead
+(~370 launches per token × ~8 us = ~3 ms = 7-8% of token time).
+CUDA Graphs would compress this to one launch per step — the
+biggest remaining single lever. L effort: needs cudarc graph API
+exposure via the runtime layer. Captured but not pursued in this
+session.
+
+Other levers tried but not promoted:
+- Vectorized weight loads (uint2) — NVCC already auto-vectorises;
+  no measured gain.
+- Byte-once layout (v3) — slower due to register pressure.
+
+## Closed earlier (2026-05-20, NaN bisected + fixed via per-block dtype dispatch)
 
 User: "Bisect the kernels and find the overflow op". Did exactly that.
 
