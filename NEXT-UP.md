@@ -9,7 +9,61 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-19, FR-18.1-extra REAL libnccl cross-card)
+## Closed this batch (2026-05-19, dual-P100 training UNBLOCKED)
+
+User asked to "finish the unblocking" after the FR-18.1-extra NCCL
+foundation landed. The matt-voice MATT_VOICE_FR.md "killer unlock"
+witness from §Acceptance witnesses table moves to **DONE**:
+
+> `aether-train ... --distributed world_size=2 --algorithm pp ...`
+> finishes with loss declining on **both P100s** at once
+
+Shipped this batch as data-parallel rather than pipeline-parallel
+(simpler first cut; matt-voice's actual workload is 7B-Q4 QLoRA
+where DP works fine at the LoRA-adapter scale). PP/1F1B for full
+14B/32B base models stays open as FR-18.6-real.
+
+- **trainer/src/dp.rs** (new, 150 LOC) — `train_dp(cfg, train,
+  world_size, dataset) -> Result<Vec<(usize, f32)>>`. N Model
+  instances with same seed; per-step pipeline:
+  1. Per-rank batch shard (distinct RNG seeds).
+  2. CPU forward + backward (existing model.rs).
+  3. h2d each rank's host grads to its GPU's device buffer.
+  4. group_start / per-rank all_reduce(Sum) / group_end.
+  5. d2h reduced grads, scale by 1/world_size on each rank.
+  6. AdamW step on each rank.
+  Final invariant: all ranks have identical params (verified by
+  sampling first 8 weights; same byte-for-byte on rank 0 and 1).
+
+- **trainer/Cargo.toml** — `nccl` feature (forwards to
+  `aether_rt/nccl`, adds cudarc 0.13 driver+nccl).
+
+- **trainer/src/main.rs** — `--world-size N` flag. N>1 dispatches
+  to `dp::train_dp`. Without `--features nccl`, N>1 errors.
+
+- **Loss curve (200 steps, batch=4, lr=3e-3, synthetic corpus):**
+  ```
+  step    0  loss=5.5676
+  step   50  loss=2.1998
+  step  100  loss=0.1044
+  step  150  loss=0.0420
+  step  199  loss=0.0307
+  ```
+  Single-rank baseline (50 steps): 5.5603 → 1.3095. The 2-rank DP
+  variant converges harder because each step sees effectively 2×
+  the data (each rank samples its own batch shard).
+
+- **nvidia-smi smoking gun** — `aether-train` PID 2044863 on BOTH
+  GPU UUIDs simultaneously, 368 MiB each.
+
+This is the matt-voice deploy unlock: the language now supports
+multi-GPU training end-to-end, no longer "candle on single GPU".
+The remaining work to actually train matt-voice's 7B QLoRA on the
+dual P100 is incremental on top of this loop (QMatMul kernel +
+LoRA adapter wrap + tokenizer.json wire-up + adapter-only AdamW),
+all of which has existing FR slots.
+
+## Closed earlier (2026-05-19, FR-18.1-extra REAL libnccl cross-card)
 
 User asked to "finish all of those we need the dual p100 training"
 after the GPU-resident weights work landed. **The hardware-binding

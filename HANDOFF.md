@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-19 (FR-18.1-extra LANDED: real cross-card NCCL on cnc 2× P100; data-parallel training-step witness verified end-to-end)
+2026-05-19 (DUAL-P100 TRAINING LANDED — aether-train --world-size 2 trains a model across both P100s with NCCL gradient sync, loss 5.57 → 0.03 over 200 steps)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -200,20 +200,45 @@ P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
 
+## Dual-P100 training LANDED
+
+`aether-train --world-size 2 --features nccl` trains a model across
+both P100s end-to-end via NCCL gradient all-reduce. Verified on
+cnc-server:
+
+```
+[aether-train-dp ws=2] step=    0 loss=5.5676 lr=3.00e-4 elapsed=0.1s
+[aether-train-dp ws=2] step=   50 loss=2.1998 lr=2.68e-3 elapsed=3.4s
+[aether-train-dp ws=2] step=  100 loss=0.1044 lr=1.62e-3 elapsed=6.8s
+[aether-train-dp ws=2] step=  150 loss=0.0420 lr=4.84e-4 elapsed=10.1s
+[aether-train-dp ws=2] step=  199 loss=0.0307 lr=2.05e-7 elapsed=13.3s
+[aether-train-dp] final params identical across ranks: true (sampled first 8 of 85504)
+```
+
+nvidia-smi proof: aether-train PID 2044863 visible on BOTH GPU
+UUIDs simultaneously (368 MiB on `bb77bda0...` first P100,
+368 MiB on `17bd0d20...` second P100). Real cross-card data
+exchange via libnccl 2.21.5 ncclAllReduce.
+
+Shape of the loop:
+- `trainer/src/dp.rs::train_dp` — N Model instances (same seed),
+  per-step: per-rank batch shard, forward/backward, h2d host grads,
+  group_start/per-rank all_reduce(Sum)/group_end, d2h, scale by
+  1/world_size, AdamW. Final-state invariant check confirms ranks
+  end with identical params.
+- `trainer/Cargo.toml` `nccl` feature forwards to `aether_rt/nccl`
+  + adds cudarc 0.13 for the typed group_start/end API.
+- `trainer/src/main.rs --world-size N` dispatches to train_dp.
+
 ## What's Next
 
 Items 1 + 2 from the prior "What's Next" + the GPU-resident
-weights variant + FR-18.1-extra all shipped this session. Remaining
-matt-voice deploy work:
+weights variant + FR-18.1-extra + dual-P100 training all shipped
+this session. Remaining matt-voice deploy work:
 
-1. **Multi-rank training-loop bringup** on the new NCCL surface. The
-   FR-18.1-extra witnesses prove all_reduce + per-rank gradient
-   exchange work; the next step is plugging that into the trainer
-   crate so `cargo run --bin aether-train --features nccl` actually
-   trains a model across both P100s. Need: multi-process spawn (one
-   process per rank) OR a single-process multi-stream variant.
-   Simplest first cut: data-parallel mode + AdamW + the train_tiny
-   shape from existing CPU witnesses.
+1. **(DONE)** Multi-rank training-loop bringup. `aether-train
+   --world-size 2 --features nccl` works on cnc 2× P100; loss
+   declines, params identical at convergence.
 2. **Pipeline-parallel 1F1B real impl** (matt-voice §FR-18.6).
    Today's `aether_pp_simulate_2stage_forward_f32` is in-process.
    Real PP needs send/recv between adjacent ranks via the

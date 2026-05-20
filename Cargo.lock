@@ -76,6 +76,7 @@ name = "trainer"
 version = "0.1.0"
 dependencies = [
  "aether_rt",
+ "cudarc",
 ]
 
 [[package]]
