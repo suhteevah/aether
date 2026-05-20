@@ -1430,6 +1430,33 @@ unsafe fn tcp_streams() -> &'static mut Vec<Option<Box<std::net::TcpStream>>> {
     }
 }
 
+/// FR-18.10 — bind a TCP listener on `<addr>:port`. Caller supplies
+/// the bind address as bytes; pass `"0.0.0.0"` to accept on all
+/// interfaces (for multi-host distributed servers). Pass `port = 0`
+/// for OS-assigned ephemeral. Returns listener handle or -1.
+#[no_mangle] pub unsafe extern "C" fn aether_tcp_listen_addr(
+    addr: i64, addr_len: c_int, port: i64,
+) -> i64 {
+    if addr == 0 || addr_len <= 0 || !(0..=65535).contains(&port) { return -1; }
+    let addr_bytes = std::slice::from_raw_parts(addr as *const u8, addr_len as usize);
+    let Ok(addr_str) = std::str::from_utf8(addr_bytes) else { return -1; };
+    let bind = format!("{}:{}", addr_str, port);
+    match std::net::TcpListener::bind(&bind) {
+        Ok(l) => {
+            let v = tcp_listeners();
+            for (i, slot) in v.iter_mut().enumerate() {
+                if slot.is_none() { *slot = Some(Box::new(l)); return i as i64; }
+            }
+            v.push(Some(Box::new(l)));
+            (v.len() - 1) as i64
+        }
+        Err(e) => {
+            eprintln!("[tcp_listen_addr] bind {} failed: {}", bind, e);
+            -1
+        }
+    }
+}
+
 /// Bound local port for a listener (useful when port=0 was passed). -1 on err.
 #[no_mangle] pub unsafe extern "C" fn aether_tcp_listener_port(handle: i64) -> i64 {
     if handle < 0 { return -1; }

@@ -30,7 +30,7 @@
 use std::os::raw::c_int;
 
 use aether_rt::{
-    aether_tcp_listen, aether_tcp_accept_one,
+    aether_tcp_listen_addr, aether_tcp_accept_one,
     aether_tcp_connect_host,
     aether_tcp_send, aether_tcp_recv,
     aether_tcp_close, aether_tcp_stream_close,
@@ -122,9 +122,14 @@ fn main() {
         match cli.role.as_str() {
             "server" => {
                 assert_eq!(cli.rank, 0, "server is always rank 0");
-                let listener = aether_tcp_listen(cli.port);
+                let bind_addr = "0.0.0.0";
+                let listener = aether_tcp_listen_addr(
+                    bind_addr.as_ptr() as i64,
+                    bind_addr.len() as c_int,
+                    cli.port,
+                );
                 assert!(listener >= 0, "listen failed: {}", listener);
-                eprintln!("[rank 0] listening on port {} for {} peers...",
+                eprintln!("[rank 0] listening on 0.0.0.0:{} for {} peers...",
                     cli.port, cli.world_size - 1);
 
                 // Accept `world_size - 1` peer connections.
