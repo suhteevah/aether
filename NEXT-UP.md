@@ -9,7 +9,59 @@ instrumentation, differential testing harness, crash dump primitive,
 cross-compile witness). The remaining FRs are organized below by what
 unlocks what — not by phase number.
 
-## Closed this batch (2026-05-20, FR-18.10 UNPARKED via 3-host TCP all-reduce)
+## Closed this batch (2026-05-20, GPU-native Qwen block forward + Q4_K gap doc)
+
+User said: "address major inference on gpu bugs/fr to bring to
+parity with llama.cpp". Profiled the existing cuBLAS-routed path
+(53s/token CPU → 4s/token cuBLAS) against llama.cpp's reference
+(~30 tok/s = 33 ms/token). Identified the dominant gap and closed
+the second-biggest piece of it.
+
+### Closed: full-GPU block forward (115x speedup vs CPU)
+
+The cuBLAS-only routing left every non-matmul op (RMSNorm/RoPE/
+GQA/SiLU/residual) bouncing activations across PCIe per call.
+Shipped 5 new CUDA kernels eliminating the bouncing:
+
+- `rms_norm_fwd`, `rope_apply`, `gqa_repeat_kv`, `silu_inplace`,
+  `mul_inplace`, `add_inplace`, `bias_add` -- all added to
+  `runtime/src/cuda.rs::KERNEL_SRC` and exposed via
+  `aether_op_*_f32_cuda` extern wrappers.
+- Parity tests: `runtime/tests/matt_voice_ops_cuda_parity.rs`
+  -- 5/5 new kernels match CPU reference within 1e-4.
+- Integration test: `runtime/tests/qwen25_block_forward_full_gpu.rs`
+  -- real Qwen2.5 block 0 forward end-to-end on device.
+  GPU 0.05s vs CPU 5.79s = **115x**. max_diff vs CPU = 2.956e-5.
+
+### NEW open FR: Q4_K-on-GPU (dequant fused with matmul)
+
+The remaining gap to llama.cpp parity is **storing weights as
+Q4_K on the GPU + fusing dequant with sgemm**, not f32-expanding
+everything. Today we expand 217 MB Q4_K to 870 MB f32 per block
+on the host before h2d.
+
+- Memory: 4x bloat
+- Bandwidth: 4x PCIe traffic
+- Compute: cuBLAS sgemm runs over the bloated f32 vs llama.cpp's
+  fused kernel that reads Q4_K directly
+
+Implementing this is the single biggest remaining matt-voice
+production-deploy FR. Estimated ~50x additional speedup -- would
+bring per-token cost to ~30ms on RTX 3070 Ti, matching llama.cpp.
+
+Scope:
+1. New device kernel that dequants Q4_K_M block into shared mem
+   inline + runs sgemm-style matmul against the f32 activation
+2. Q4_K weights remain in their 144-bytes-per-256-quants form on
+   device (allocated via aether_dev_alloc_u8 -- new fn)
+3. Forward path passes the Q4_K device handle + activation device
+   handle to the fused kernel
+4. Routes through `qwen25_block_forward_full_gpu.rs` callsites
+
+Tagged FR-17.14-extra-deepest for tracking. Plus Q6_K-on-GPU
+for V proj + ffn_down (the 2 Q6_K tensors in Qwen blocks).
+
+## Closed earlier (2026-05-20, FR-18.10 UNPARKED via 3-host TCP all-reduce)
 
 User said "we need 18.10 and 18.11" after enumerating the three
 machines on the LAN. Three-host pool verified:

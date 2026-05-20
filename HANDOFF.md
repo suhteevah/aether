@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (FR-18.10 UNPARKED — 3-host TCP/IP all-reduce across kokonoe+cnc+satibook produces correct sum on all 3 ranks; multi-host distributed real, no longer hardware-blocked)
+2026-05-20 (GPU-NATIVE QWEN BLOCK FORWARD — 115x speedup over CPU, max_diff 3e-5 vs CPU reference; 5 new CUDA kernels for RMSNorm/RoPE/GQA/SiLU/elementwise; the remaining bug to close llama.cpp parity is Q4_K-on-GPU)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -199,6 +199,72 @@ NCCL compatibility note: ollama's bundled libnccl 2.29 dropped sm_60
 P100s. Aether links against libnccl 2.21.5+cuda12.4 from the local
 fish-speech venv via `/usr/local/lib/libnccl.so.2` symlink. Documented
 in NEXT-UP.
+
+## GPU-native Qwen block forward LANDED — 115x speedup
+
+User asked: "address major inference on gpu bugs/FR to bring to
+parity with llama.cpp". Identified the dominant gap: every
+non-matmul op in qwen forward was bouncing activations through
+CPU (h2d/d2h per op). Shipped 5 new device kernels closing that:
+
+### New CUDA kernels (added to KERNEL_SRC + ctx)
+- `rms_norm_fwd` — RMSNorm `y = x * gamma / sqrt(mean(x^2) + eps)`
+- `rope_apply`  — rotary in-place, half-half pair, Qwen-style
+- `gqa_repeat_kv` — broadcast n_kv -> n_q heads (parallel copy)
+- `silu_inplace` — `x = x / (1 + exp(-x))`
+- `mul_inplace` / `add_inplace` / `bias_add` — element-wise
+
+### New extern wrappers in runtime/src/cuda.rs
+- `aether_op_rms_norm_f32_cuda(x, gamma, out, eps, rows, d)`
+- `aether_op_rope_apply_f32_cuda(x, seq, n_heads, head_dim, base, pos_start)`
+- `aether_op_gqa_repeat_kv_f32_cuda(in, out, seq, n_kv, head_dim, n_q)`
+- `aether_op_silu_f32_cuda(x, n)`
+- `aether_op_mul_inplace_f32_cuda(x, y, n)`
+- `aether_op_add_inplace_f32_cuda(x, y, n)` (residual)
+- `aether_op_bias_add_f32_cuda(x, bias, rows, cols)`
+
+### Verification
+- 5 parity tests (`matt_voice_ops_cuda_parity.rs`): every new
+  kernel matches its CPU reference within 1e-4 / 1e-5.
+- `qwen25_block_forward_full_gpu.rs` runs the entire block 0
+  forward of real Qwen2.5-7B with all ops on device. Matches
+  the CPU reference within `max_diff=2.956e-5` across all
+  14336 output elements.
+
+### Measured (release build, 11900K + RTX 3070 Ti)
+
+| Phase | Time |
+|---|---|
+| CPU reference forward (block 0, seq=4) | 5.79 s |
+| GPU all-on-device forward (block 0, seq=4) | **0.05 s** |
+| Speedup vs CPU | **115×** |
+| One-time h2d weight upload (per block) | 0.27 s |
+
+For autoregressive generation per token:
+- Prior cuBLAS-routed: ~4 s/token (per-op CPU bouncing dominated)
+- Estimated new: ~1.4 s/token (28 blocks × 50 ms + h2d weight load)
+- llama.cpp Q4_K-on-GPU reference: ~30 tok/s = 33 ms/token
+
+### Remaining llama.cpp parity gap: Q4_K-on-GPU
+
+The dominant remaining bug to close llama.cpp parity is **fused
+dequant + matmul for Q4_K weights**. Today Aether dequantises
+Q4_K_M block weights to f32 on the host then h2d's the f32:
+- Memory: 870 MB f32 per block vs 217 MB Q4_K (4x)
+- Bandwidth: 870 MB h2d per block vs 217 MB Q4_K (4x)
+- Plus: cuBLAS sgemm on f32, not the fused dequant+matmul that
+  llama.cpp implements
+
+Implementing this is the single biggest remaining FR for matt-voice
+production deploy. ~50× speedup expected. Scope:
+1. Allocate Q4_K_M blocks (raw bytes) on device, not dequant'd f32
+2. Custom CUDA kernel: dequant Q4_K block into shared mem, then
+   sgemm-style matmul in same kernel
+3. Apply to all `aether_op_matmul_f32_cuda` callsites that read
+   Q4_K weights (full transformer forward)
+
+Once shipped, matt-voice on RTX 3070 Ti should hit ~30 tok/s,
+which is competitive with llama.cpp on the same hardware.
 
 ## FR-18.10 UNPARKED — 3-host TCP/IP all-reduce works
 

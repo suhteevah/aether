@@ -52,6 +52,14 @@ struct CudaCtx {
     scale_f32:         CudaFunction,
     gelu_inplace:      CudaFunction,
     add_layer_norm_fwd:CudaFunction,
+    // matt-voice deploy: keep entire Qwen forward on device.
+    rms_norm_fwd:      CudaFunction,
+    rope_apply:        CudaFunction,
+    gqa_repeat_kv:     CudaFunction,
+    silu_inplace:      CudaFunction,
+    mul_inplace:       CudaFunction,
+    add_inplace:       CudaFunction,
+    bias_add:          CudaFunction,
 }
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
@@ -362,6 +370,119 @@ extern "C" __global__ void adamw_step(
     float vh = vi * bc2_inv;
     param[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * param[i]);
 }
+
+// matt-voice / FR-17.5-extra — RMSNorm: y[r,i] = x[r,i] * gamma[i] / sqrt(mean(x[r,:]^2) + eps)
+// One thread per row. d ≤ 4096 fits in a single block's worth of shared work.
+extern "C" __global__ void rms_norm_fwd(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    float*       __restrict__ y,
+    float eps,
+    int rows, int d)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + r * d;
+    float*       yr = y + r * d;
+    float sumsq = 0.0f;
+    for (int i = 0; i < d; i++) sumsq += xr[i] * xr[i];
+    float inv_rms = 1.0f / sqrtf(sumsq / (float)d + eps);
+    for (int i = 0; i < d; i++) yr[i] = xr[i] * inv_rms * gamma[i];
+}
+
+// matt-voice / FR-17.13-extra — RoPE in-place. Llama-style "half-half"
+// pair layout: pair (i, i + head_dim/2). One thread per (t, h, i) tuple
+// where i in [0, head_dim/2). theta = (t + pos_start) * base^(-2i/head_dim).
+extern "C" __global__ void rope_apply(
+    float*       __restrict__ x,
+    int seq, int n_heads, int head_dim,
+    float base, int pos_start)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hd_half = head_dim / 2;
+    int total = seq * n_heads * hd_half;
+    if (idx >= total) return;
+    int t = idx / (n_heads * hd_half);
+    int rem = idx - t * (n_heads * hd_half);
+    int h = rem / hd_half;
+    int i = rem - h * hd_half;
+    int base_off = (t * n_heads + h) * head_dim;
+    float pos = (float)(t + pos_start);
+    float exp = -2.0f * (float)i / (float)head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float x0 = x[i0], x1 = x[i1];
+    x[i0] = x0 * c - x1 * s;
+    x[i1] = x0 * s + x1 * c;
+}
+
+// matt-voice / FR-17.13-extra GQA — broadcast n_kv_heads -> n_q_heads
+// by repeating each KV head g = n_q_heads / n_kv_heads times.
+extern "C" __global__ void gqa_repeat_kv(
+    const float* __restrict__ kv_in,
+    float*       __restrict__ kv_out,
+    int seq, int n_kv_heads, int head_dim, int n_q_heads)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * n_q_heads * head_dim;
+    if (idx >= total) return;
+    int t = idx / (n_q_heads * head_dim);
+    int rem = idx - t * (n_q_heads * head_dim);
+    int qh = rem / head_dim;
+    int d  = rem - qh * head_dim;
+    int g  = n_q_heads / n_kv_heads;
+    int kh = qh / g;
+    int src_off = (t * n_kv_heads + kh) * head_dim + d;
+    kv_out[idx] = kv_in[src_off];
+}
+
+// matt-voice / FR-17.6-extra — SiLU in place: x[i] = x[i] * sigmoid(x[i])
+// = x[i] / (1 + exp(-x[i])).
+extern "C" __global__ void silu_inplace(
+    float* __restrict__ x,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float xi = x[i];
+    x[i] = xi / (1.0f + expf(-xi));
+}
+
+// matt-voice — element-wise multiply in place: x[i] *= y[i]. Used by
+// SwiGLU MLP after SiLU(gate) so we get silu(gate) * up.
+extern "C" __global__ void mul_inplace(
+    float*       __restrict__ x,
+    const float* __restrict__ y,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= y[i];
+}
+
+// matt-voice — residual / in-place add: x[i] += y[i].
+extern "C" __global__ void add_inplace(
+    float*       __restrict__ x,
+    const float* __restrict__ y,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+// matt-voice — broadcast-add a bias vector across rows: x[r, c] += bias[c].
+extern "C" __global__ void bias_add(
+    float*       __restrict__ x,
+    const float* __restrict__ bias,
+    int rows, int cols)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx >= total) return;
+    int c = idx % cols;
+    x[idx] += bias[c];
+}
 "#;
 
 static CTX: OnceLock<CudaCtx> = OnceLock::new();
@@ -399,7 +520,10 @@ fn ctx() -> &'static CudaCtx {
               "add_f32", "gelu_fwd", "gelu_bwd",
               "layer_norm_fwd", "layer_norm_bwd_dx", "layer_norm_bwd_params",
               "softmax_f32", "softmax_bwd", "softmax_bwd_scaled", "scale_f32",
-              "gelu_inplace", "add_layer_norm_fwd"])
+              "gelu_inplace", "add_layer_norm_fwd",
+              // matt-voice deploy kernels
+              "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
+              "silu_inplace", "mul_inplace", "add_inplace", "bias_add"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -416,11 +540,20 @@ fn ctx() -> &'static CudaCtx {
         let scale_f32             = device.get_func("aether_kernels", "scale_f32").unwrap();
         let gelu_inplace          = device.get_func("aether_kernels", "gelu_inplace").unwrap();
         let add_layer_norm_fwd    = device.get_func("aether_kernels", "add_layer_norm_fwd").unwrap();
+        let rms_norm_fwd          = device.get_func("aether_kernels", "rms_norm_fwd").unwrap();
+        let rope_apply            = device.get_func("aether_kernels", "rope_apply").unwrap();
+        let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
+        let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
+        let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
+        let add_inplace           = device.get_func("aether_kernels", "add_inplace").unwrap();
+        let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
                   softmax_f32, softmax_bwd, softmax_bwd_scaled, scale_f32, gelu_inplace,
-                  add_layer_norm_fwd }
+                  add_layer_norm_fwd,
+                  rms_norm_fwd, rope_apply, gqa_repeat_kv,
+                  silu_inplace, mul_inplace, add_inplace, bias_add }
     })
 }
 
@@ -1143,6 +1276,141 @@ fn libm_powf(base: f32, n: f32) -> f32 {
 /// timing measurements that span GPU kernel launches.
 #[no_mangle] pub extern "C" fn aether_dev_sync() -> c_int {
     let _ = ctx().device.synchronize();
+    0
+}
+
+// =====================================================================
+// matt-voice deploy — Qwen forward kernels on device. The non-matmul
+// ops (RMSNorm / RoPE / GQA / SiLU / element-wise mul + add / bias_add)
+// run entirely on the GPU, so the per-block forward only crosses PCIe
+// at block boundaries (or never, with a full GPU-resident weight cache).
+// =====================================================================
+
+/// FR-17.5-extra — RMSNorm forward on device.
+/// y[r, i] = x[r, i] * gamma[i] / sqrt(mean(x[r, :]^2) + eps)
+#[no_mangle] pub extern "C" fn aether_op_rms_norm_f32_cuda(
+    x: i64, gamma: i64, out: i64, eps: f32, rows: c_int, d: c_int,
+) -> c_int {
+    let (Some(ix), Some(ig), Some(io)) = (handle_to_idx(x), handle_to_idx(gamma), handle_to_idx(out))
+        else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let g_p = bs[ig].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[io].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(rows as u32);
+    unsafe {
+        let xv = &*x_p; let gv = &*g_p; let ov = &mut *o_p;
+        ctx().rms_norm_fwd.clone()
+            .launch(cfg, (xv, gv, ov, eps, rows, d))
+            .expect("launch rms_norm_fwd");
+    }
+    0
+}
+
+/// FR-17.13-extra — RoPE applied in place to `[seq, n_heads, head_dim]`.
+/// Llama-style half-half pair layout. `base` is the rotary base (Qwen2.5: 1e6).
+/// `pos_start` is the absolute position of the first row.
+#[no_mangle] pub extern "C" fn aether_op_rope_apply_f32_cuda(
+    x: i64, seq: c_int, n_heads: c_int, head_dim: c_int,
+    base: f32, pos_start: c_int,
+) -> c_int {
+    let Some(ix) = handle_to_idx(x) else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (seq * n_heads * (head_dim / 2)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let xv = &mut *x_p;
+        ctx().rope_apply.clone()
+            .launch(cfg, (xv, seq, n_heads, head_dim, base, pos_start))
+            .expect("launch rope_apply");
+    }
+    0
+}
+
+/// FR-17.13-extra (GQA) — broadcast K/V from `n_kv_heads` to `n_q_heads`.
+#[no_mangle] pub extern "C" fn aether_op_gqa_repeat_kv_f32_cuda(
+    kv_in: i64, kv_out: i64,
+    seq: c_int, n_kv_heads: c_int, head_dim: c_int, n_q_heads: c_int,
+) -> c_int {
+    let (Some(ii), Some(io)) = (handle_to_idx(kv_in), handle_to_idx(kv_out))
+        else { return -1; };
+    if (n_q_heads % n_kv_heads) != 0 { return 1; }
+    let bs = unsafe { bufs() };
+    let i_p = bs[ii].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[io].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (seq * n_q_heads * head_dim) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let iv = &*i_p; let ov = &mut *o_p;
+        ctx().gqa_repeat_kv.clone()
+            .launch(cfg, (iv, ov, seq, n_kv_heads, head_dim, n_q_heads))
+            .expect("launch gqa_repeat_kv");
+    }
+    0
+}
+
+/// matt-voice — SiLU forward in place: x[i] = x[i] / (1 + exp(-x[i])).
+#[no_mangle] pub extern "C" fn aether_op_silu_f32_cuda(x: i64, n: c_int) -> c_int {
+    let Some(ix) = handle_to_idx(x) else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        let xv = &mut *x_p;
+        ctx().silu_inplace.clone().launch(cfg, (xv, n)).expect("launch silu_inplace");
+    }
+    0
+}
+
+/// matt-voice — element-wise multiply in place: x[i] *= y[i]. Used for
+/// SwiGLU's `silu(gate) * up` step.
+#[no_mangle] pub extern "C" fn aether_op_mul_inplace_f32_cuda(
+    x: i64, y: i64, n: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let y_p = bs[iy].as_ref().unwrap() as *const CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        let xv = &mut *x_p; let yv = &*y_p;
+        ctx().mul_inplace.clone().launch(cfg, (xv, yv, n)).expect("launch mul_inplace");
+    }
+    0
+}
+
+/// matt-voice — residual in place: x[i] += y[i].
+#[no_mangle] pub extern "C" fn aether_op_add_inplace_f32_cuda(
+    x: i64, y: i64, n: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let y_p = bs[iy].as_ref().unwrap() as *const CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        let xv = &mut *x_p; let yv = &*y_p;
+        ctx().add_inplace.clone().launch(cfg, (xv, yv, n)).expect("launch add_inplace");
+    }
+    0
+}
+
+/// matt-voice — broadcast-add a bias vector along the last dim:
+/// x[r, c] += bias[c].
+#[no_mangle] pub extern "C" fn aether_op_bias_add_f32_cuda(
+    x: i64, bias: i64, rows: c_int, cols: c_int,
+) -> c_int {
+    let (Some(ix), Some(ib)) = (handle_to_idx(x), handle_to_idx(bias)) else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let b_p = bs[ib].as_ref().unwrap() as *const CudaSlice<f32>;
+    let total = (rows * cols) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let xv = &mut *x_p; let bv = &*b_p;
+        ctx().bias_add.clone().launch(cfg, (xv, bv, rows, cols)).expect("launch bias_add");
+    }
     0
 }
 
