@@ -6059,23 +6059,14 @@ unsafe fn cuda_matmul_through(
     let mut mean_buf = vec![0.0f32; s];
     let mut inv_std_buf = vec![0.0f32; s];
 
-    // Pick the matmul backend: cuBLAS through host pointers (cuda feature)
-    // or the CPU ops::matmul_f32. The closure is a `fn`-style indirection
-    // so the dispatch happens at build time, not per-call.
-    #[cfg(feature = "cuda")]
-    let matmul = |a: *const f32, b: *const f32, o: *mut f32, m: usize, k: usize, n: usize| {
-        unsafe { cuda_matmul_through(a, b, o, m, k, n); }
-    };
-    #[cfg(not(feature = "cuda"))]
+    // CPU-only baseline. Routing through cuBLAS lives in the explicit
+    // sibling `aether_llm_inference_bench_tps_cuda` (per-call wrapper)
+    // and `_cuda_resident` (GPU-resident weights). Keeping this fn
+    // CPU-only ensures the FR-19.16 ≥100 tok/s gate is independent of
+    // build feature flags + GPU contention.
     let matmul = |a: *const f32, b: *const f32, o: *mut f32, m: usize, k: usize, n: usize| {
         unsafe { ops::matmul_f32(a, b, o, m, k, n); }
     };
-    #[cfg(feature = "cuda")]
-    {
-        // Warm the cuda context out of the timed region so the first
-        // matmul doesn't pay JIT / cublas-handle init.
-        crate::cuda::aether_dev_init();
-    }
 
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
@@ -6116,6 +6107,105 @@ unsafe fn cuda_matmul_through(
     if elapsed <= 0.0 { return 0.0; }
     ((iters as f64) / elapsed) as f32
 }
+
+// =====================================================================
+// FR-19.16-extra (cuda routing) — Same Llama-architecture shape as
+// `aether_llm_inference_bench_tps` (above) but every matmul goes
+// through cuBLAS via the per-call `cuda_matmul_through` wrapper.
+// Weights are re-uploaded on every matmul -- the deeper variant
+// `_cuda_resident` (below) keeps weights device-resident.
+//
+// Returns -1.0 when the cuda feature isn't built (so witnesses can
+// detect the stub via aether_f32_close_exit).
+#[cfg(feature = "cuda")]
+#[no_mangle] pub unsafe extern "C" fn aether_llm_inference_bench_tps_cuda(
+    n_iters: c_int, d_model: c_int, n_layers: c_int, ff: c_int, seq_len: c_int,
+) -> f32 {
+    if n_iters <= 0 || d_model <= 0 || n_layers <= 0 || ff <= 0 || seq_len <= 0 {
+        return 0.0;
+    }
+    let d = d_model as usize;
+    let n = n_layers as usize;
+    let f = ff as usize;
+    let s = seq_len as usize;
+    let iters = n_iters as usize;
+
+    let mut rng_state: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    let mut rand_f32 = || -> f32 {
+        rng_state = rng_state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        ((z & 0xFFFF) as f32 / 65536.0 - 0.5) * 0.02
+    };
+
+    struct Layer {
+        ln1_g: Vec<f32>, ln1_b: Vec<f32>,
+        wq: Vec<f32>, wk: Vec<f32>, wv: Vec<f32>, wo: Vec<f32>,
+        ln2_g: Vec<f32>, ln2_b: Vec<f32>,
+        w_up: Vec<f32>, w_down: Vec<f32>,
+    }
+    let layers: Vec<Layer> = (0..n).map(|_| Layer {
+        ln1_g: (0..d).map(|_| 1.0_f32).collect(),
+        ln1_b: (0..d).map(|_| 0.0_f32).collect(),
+        wq: (0..d*d).map(|_| rand_f32()).collect(),
+        wk: (0..d*d).map(|_| rand_f32()).collect(),
+        wv: (0..d*d).map(|_| rand_f32()).collect(),
+        wo: (0..d*d).map(|_| rand_f32()).collect(),
+        ln2_g: (0..d).map(|_| 1.0_f32).collect(),
+        ln2_b: (0..d).map(|_| 0.0_f32).collect(),
+        w_up: (0..d*f).map(|_| rand_f32()).collect(),
+        w_down: (0..f*d).map(|_| rand_f32()).collect(),
+    }).collect();
+
+    let mut x: Vec<f32> = (0..s*d).map(|_| rand_f32()).collect();
+    let mut ln_out = vec![0.0f32; s * d];
+    let mut q = vec![0.0f32; s * d];
+    let mut k = vec![0.0f32; s * d];
+    let mut v = vec![0.0f32; s * d];
+    let mut attn_out = vec![0.0f32; s * d];
+    let mut attn_scratch = vec![0.0f32; s * s];
+    let mut proj = vec![0.0f32; s * d];
+    let mut up = vec![0.0f32; s * f];
+    let mut down = vec![0.0f32; s * d];
+    let mut mean_buf = vec![0.0f32; s];
+    let mut inv_std_buf = vec![0.0f32; s];
+
+    crate::cuda::aether_dev_init();
+    let matmul = |a: *const f32, b: *const f32, o: *mut f32, m: usize, k: usize, n: usize| {
+        unsafe { cuda_matmul_through(a, b, o, m, k, n); }
+    };
+
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        for layer in &layers {
+            ops::layer_norm_f32(x.as_ptr(), layer.ln1_g.as_ptr(), layer.ln1_b.as_ptr(), 1e-5,
+                ln_out.as_mut_ptr(), mean_buf.as_mut_ptr(), inv_std_buf.as_mut_ptr(), s, d);
+            matmul(ln_out.as_ptr(), layer.wq.as_ptr(), q.as_mut_ptr(), s, d, d);
+            matmul(ln_out.as_ptr(), layer.wk.as_ptr(), k.as_mut_ptr(), s, d, d);
+            matmul(ln_out.as_ptr(), layer.wv.as_ptr(), v.as_mut_ptr(), s, d, d);
+            ops::sdpa_causal_f32(q.as_ptr(), k.as_ptr(), v.as_ptr(),
+                attn_out.as_mut_ptr(), attn_scratch.as_mut_ptr(), 1, s, d);
+            matmul(attn_out.as_ptr(), layer.wo.as_ptr(), proj.as_mut_ptr(), s, d, d);
+            for i in 0..s*d { x[i] += proj[i]; }
+            ops::layer_norm_f32(x.as_ptr(), layer.ln2_g.as_ptr(), layer.ln2_b.as_ptr(), 1e-5,
+                ln_out.as_mut_ptr(), mean_buf.as_mut_ptr(), inv_std_buf.as_mut_ptr(), s, d);
+            matmul(ln_out.as_ptr(), layer.w_up.as_ptr(), up.as_mut_ptr(), s, d, f);
+            ops::silu_f32(up.as_mut_ptr(), s * f);
+            matmul(up.as_ptr(), layer.w_down.as_ptr(), down.as_mut_ptr(), s, f, d);
+            for i in 0..s*d { x[i] += down[i]; }
+        }
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    if elapsed <= 0.0 { return 0.0; }
+    ((iters as f64) / elapsed) as f32
+}
+
+#[cfg(not(feature = "cuda"))]
+#[no_mangle] pub unsafe extern "C" fn aether_llm_inference_bench_tps_cuda(
+    _n_iters: c_int, _d_model: c_int, _n_layers: c_int, _ff: c_int, _seq_len: c_int,
+) -> f32 { -1.0 }
 
 // =====================================================================
 // FR-19.16-extra-deeper — Llama-architecture inference bench with

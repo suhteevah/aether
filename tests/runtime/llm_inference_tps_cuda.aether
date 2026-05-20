@@ -27,20 +27,23 @@
 //     test as the CPU bench, just routed through cuBLAS.
 use runtime;
 
-extern fn aether_llm_inference_bench_tps(
+extern fn aether_llm_inference_bench_tps_cuda(
     n_iters: i32, d_model: i32, n_layers: i32, ff: i32, seq_len: i32,
 ) -> f32;
 extern fn aether_f32_in_band_exit(v: f32, lo: f32, hi: f32) -> i32;
+extern fn aether_f32_close_exit(a: f32, b: f32) -> i32;
 
 fn main() -> i32 {
     // Smaller n_iters (50) because each matmul pays an h2d/d2h round
     // trip under the per-call cuBLAS wrapper. We just need a finite
     // measured tok/s, not >=100 tok/s.
-    let tps: f32 = aether_llm_inference_bench_tps(50, 64, 2, 256, 8);
+    let tps: f32 = aether_llm_inference_bench_tps_cuda(50, 64, 2, 256, 8);
     aether_print_kv_f32("llama_shaped_tps_cuda", tps);
 
-    // Gate: finite, in (0.001, 1e6) tok/s. The wide upper bound just
-    // catches "infinite tok/s" pathologies (e.g. elapsed-time = 0).
+    // Reject the -1.0 "cuda not built" sentinel from the stub variant.
+    let is_sentinel: i32 = aether_f32_close_exit(tps, -1.0);
+    if is_sentinel == 42 { return 2; }
+    // Gate: finite, in (0.001, 1e6) tok/s.
     let gate: i32 = aether_f32_in_band_exit(tps, 0.001, 1000000.0);
     if gate != 42 { return 1; }
     42
