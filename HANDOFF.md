@@ -1,7 +1,7 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-20 (**37.22 tok/s warm** = 124% of llama.cpp on RTX 3070 Ti / Qwen2.5-7B. CUDA graph capture is the standing win. Attempted further kernel-level optimization (smallN 32-thread CTAs for K/V proj; interleaved gate+up FMA in FFN) — both were faster in isolation, both regressed end-to-end via shared nvrtc unit pressure. Reverted; the unused kernel definitions were dragging the FFN by 7%. KERNEL_SRC is load-bearing; treat additions to it the way you'd treat additions to a tight loop.)
+2026-05-21 (**37.22 tok/s warm** = 124% of llama.cpp on RTX 3070 Ti / Qwen2.5-7B. Standing wins this session: per-block Q4_K/Q6_K dtype dispatch (NaN fix), fused FFN kernel (gate+up+silu+mul in 1 launch), CUDA graph capture for autoregressive decode (+37% throughput). Investigated speculative decoding (theoretical 1.6-2.6x but needs ~7-8 days of seq>1 kernel work; deferred). Path E step 11 attempt (self-host compiler if/else) blocked on Aether-compiler 8-arg fn bug — documented in docs/PATH_E_STATUS.md.)
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
@@ -32,22 +32,120 @@ Honesty scan: 0 todo / 0 unimplemented / 4 known-OK stubs (unchanged).
 
 ## What Was Done This Session
 
-Nine commits, pushed to `origin/main`:
+Twelve commits, pushed to `origin/main`. The arc is matt-voice perf
+optimization from the broken NaN starting state to 124% of llama.cpp
+on Qwen2.5-7B, plus two investigations (speculative decoding,
+self-host step 11) that didn't ship code but produced actionable
+plans + memory.
 
 ```
-32784f7 Path A FR-15.1: SSA-driven opt pipeline rewrites AST at --O1
-ffb2336 Path A FR-15.2: regalloc plan drives r12..r15 promotion
-8cae67c Path A FR-15.3: AVX2 emit via aether_asm + dot builtin
-e5fa443 Path C FR-17.3: conv2d CPU direct-loop reference
-976dbce Phase 17 closeout: Q4_0 + FA2 + layer modules f32 + Llama partial
-a8214f6 Phase 18 closeout: NCCL + PP + TP + FSDP + ZeRO + overlap + grad_compress
-499c49e Phase 19 kickoff: FR-19.9 byte-level BPE tokenizer
-ace5367 Phase 19 advance: FR-19.10 Jinja-lite chat template
-a1ddb5f Phase 19 closeout: 13 items (PKV/CB/specdec/MM/tool/rate/obs/vision/speech/ChaCha20/HTTP/OpenAI/WS)
-217934d Phase 19 100%: FR-19.16 partial tok/s bench (177 tok/s, ≥100 ✓)
-3283015 matt-voice deploy pack: 5 FR-x-extras (cuda + SafeTensors + Q4_K + tokenizer.json + chat_template.jinja)
-172f423 FR-17.14-extra-deeper: real GGUF reader walks Qwen2.5-7B
+399718e fix(matt-voice): per-block Q4_K/Q6_K dtype dispatch
+9b5a21e perf(matt-voice): fused FFN kernel (gate+up+silu+mul in 1 launch)
+859745d perf(matt-voice): byte-once Q4_K matmul v3 (kept alt, NOT on hot path)
+1682bfe docs: HANDOFF + NEXT-UP + BENCH_LEDGER for 27.22 tok/s baseline
+7e1804f perf(matt-voice): CUDA graph capture for autoregressive decode -> 37.35 tok/s
+5aaf3a4 docs: HANDOFF + NEXT-UP + BENCH_LEDGER for 37.35 tok/s graph baseline
+f40d259 perf(matt-voice): small-N matmul kernel explored, not promoted
+add5216 perf(matt-voice): revert smallN matmul kernels (regress FFN via nvrtc unit pressure)
+a3aa6ef docs: kernel-asm exploration learnings + 37.22 tok/s warm baseline
+ef94fa3 docs: speculative decoding investigation -- analysis, not implementation
+b23d661 NEXT-UP: speculative decoding investigated, deferred per user direction
+62e18aa docs: Path E (self-host) status -- step 11 blocked on 8-arg fn bug
 ```
+
+### The big win: CUDA graphs (commit 7e1804f)
+After the prior session shipped fused matmul kernels and on-device
+KV cache + attention to reach 25 tok/s, this session pushed end-to-end
+through:
+1. **NaN bisect (399718e)**: per-block Q4_K/Q6_K dtype dispatch.
+   Qwen2.5-7B Q4_K_M is mixed-precision; V proj and ffn_down switch
+   between Q4_K (144 B blocks) and Q6_K (210 B blocks) per layer.
+   Hardcoding from block 0's dtype made block 3's V proj read garbage.
+   Fix: store dt_v + dt_down per BlockGpu, dispatch matmul kernel by
+   stored dtype. Generated IDs `[358, 2776, 264, 220, 17]` match
+   cuBLAS reference exactly. **25.5 tok/s.**
+
+2. **Fused FFN kernel (9b5a21e)**: replaces 4 kernel launches per
+   layer (gate matmul + up matmul + silu + mul_inplace) with 1.
+   Gate and up share x_norm; one kernel computes both, applies
+   silu(gate)*up, writes one output. Parity bit-identical
+   (`max_diff = 0`). **+7% throughput: 25.5 -> 27.2 tok/s warm mean.**
+
+3. **CUDA graph capture (7e1804f)**: per-token forward gets recorded
+   into one CUDA graph at first decode step; subsequent steps replay
+   the graph with just a 4-int step_args h2d update. Compresses
+   ~370 kernel launches per token into one `cuGraphLaunch`. Three
+   pieces:
+   - **Device-arg kernel variants** of rope_apply, append_kv,
+     attention_seq1 that read pos/cur_seq from device memory
+   - **Raw cudarc::driver::sys** bindings to cuStreamBeginCapture_v2,
+     cuStreamEndCapture, cuGraphInstantiateWithFlags, cuGraphLaunch
+   - **CudaDevice::new_with_stream()** instead of new() — the legacy
+     default stream cannot be captured (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED)
+   **+37% throughput: 27.2 -> 37.35 tok/s = 124% of llama.cpp's ~30.**
+
+### Kernel-asm exploration (a3aa6ef arc)
+User asked to push further on the "assembly aspect" for more tok/s.
+Per-shape matmul bench (matmul_per_shape_bench.rs) found:
+- K/V proj at 512-out shape runs at 4.3% of peak BW (worst offender)
+- FFN at 18944-out runs at 39% (dominant cost, ~9 ms/token)
+- Q/O at 21%, down at 29%, lm_head at 38-46%
+
+Tried 3 kernel-level wins:
+1. **smallN matmul** (32-thread CTAs for K/V): 1.32x in isolation,
+   end-to-end REGRESSION (~5%). SM scheduling fragments when mixing
+   CTA sizes. Reverted.
+2. **Interleaved FFN gate+up FMA**: 1.02x in isolation, end-to-end
+   noise/regression. Reverted.
+3. **Byte-once v3 matmul** (deeper from prior session): also slower
+   end-to-end. Kept as alternate, not on hot path.
+
+The unifying lesson: adding `__global__` kernels to KERNEL_SRC
+regresses the existing actively-used ones by 5-7% via nvrtc unit
+pressure (shared register allocation analysis). Removing the smallN
+kernels restored the 37.35 baseline. **Treat KERNEL_SRC as load-
+bearing — additions are not free.**
+
+Plus discovered GPU boost-clock cold-start phantom: first run after
+idle is ~5% slow while clocks ramp 210 -> 1950 MHz. Don't include
+the cold run in N-run means.
+
+### Speculative decoding investigation (ef94fa3, b23d661)
+User: "Investigate speculative decoding". Empirical bench
+(spec_dec_naive_verify_bench.rs) proved: naive verify by re-launching
+the seq=1 graph N times scales **linearly** in N (4.00x at N=4).
+**Break-even acceptance rate for N=4 is 99.96% — mathematically
+impossible.** Speculative decoding requires real seq>1 kernels.
+
+Full architecture analysis in docs/SPECULATIVE_DECODING_INVESTIGATION.md:
+6 kernels need seq>1 variants + draft model integration + verification
+orchestration. ~7-8 days for production quality. Expected speedup
+1.6-2.6x (55-90 tok/s).
+
+User decision: defer. The 37.22 tok/s baseline is already strong;
+ship the matt-voice critical path instead.
+
+### Path E step 11 attempt (62e18aa)
+User: "go on 5" => Path E self-host compiler. Bootstrap step 10 (a
+baby aetherc in Aether-source that emits real x86-64 .s files) is
+shipped; step 11 was meant to add `if/else` + comparison operators.
+
+Blocked on a real **Aether asm-backend bug**: 8-arg recursive fn
+signatures access-violate at `popq %rbp; ret` epilogue, even on
+step-10's working input the moment any fn gets an 8th arg. Bisection
+ruled out the new code; the bug is purely about 8-arg signatures and
+outgoing-arg space interfering with caller-frame locals.
+
+Investigation captured in docs/PATH_E_STATUS.md with three concrete
+next-step options. Memory updated at memory/asm_backend_known_gaps.md.
+
+### New memories captured
+- `qwen25_q4km_mixed_precision_per_block_dtype.md` — V/ffn_down dtype varies per layer
+- `cuda_graphs_pattern.md` — non-default stream + devarg kernels + raw cudarc sys
+- `nvrtc_kernel_unit_pressure.md` — KERNEL_SRC is load-bearing; unused kernels hurt active ones
+- `gpu_boost_clock_warmup.md` — 5% cold-start phantom; discard run 1 from N-run means
+
+### Stale-but-still-relevant prior session details
 
 ### Path A complete (FR-15.{1,2,3}) — earlier in session
 - SSA-driven opt pipeline rewrites AST at --O1
@@ -123,23 +221,29 @@ verified, zero false** across 9 commits.
 
 ## Current State
 
-**Working:**
+**Working (matt-voice perf — the headline):**
+- **37.22 tok/s warm mean on Qwen2.5-7B Q4_K_M / RTX 3070 Ti = 124% of llama.cpp**
+- Generated IDs bit-identical to cuBLAS reference: `[358, 2776, 264, 220, 17]`
+- Full forward pass via on-device fused matmul + on-device KV cache
+  + GPU attention kernel, all wrapped in one CUDA graph that replays
+  per decode step
+- `runtime/tests/qwen25_graph_decode.rs` is the standing benchmark
+- Per-shape diagnostic: `runtime/tests/matmul_per_shape_bench.rs`
+
+**Working (broader project, unchanged from prior session):**
 - 169/196 audit-tagged witnesses pass.
 - 10 phases at 100% (6-14 + 17 + 19).
-- `cargo build -p aether_rt --features cuda` succeeds; cuBLAS path
-  live for any `// requires: cuda` witness.
-- Real Qwen2.5-7B Q4_K_M GGUF readable via `aether_gguf_*` extern
-  surface.
+- `cargo build -p aether_rt --features cuda` succeeds; cuBLAS path live.
+- Real Qwen2.5-7B Q4_K_M GGUF readable via `aether_gguf_*` extern surface.
 - matt-voice's serving-deploy critical path's LANGUAGE work:
   - ✅ BPE algorithm + chat template engine
   - ✅ tokenizer.json + chat_template.jinja file loaders
-  - ✅ Q4_K_M dequant + GGUF reader
+  - ✅ Q4_K_M dequant + GGUF reader (and now mixed-precision-aware)
   - ✅ SafeTensors multi-tensor parser
-  - ✅ cuda runtime path live (cuBLAS sgemm + nvrtc kernels)
-  - ⏳ Full forward pass through real Qwen2.5 weights at scale
+  - ✅ cuda runtime path live (cuBLAS sgemm + nvrtc kernels + CUDA graphs)
+  - ✅ **Full forward pass through real Qwen2.5 weights at scale (this session)**
   - ⏳ FR-19.1-extra full TLS 1.3 handshake (XL)
-  - ⏳ FR-18.1-extra real libnccl link (hardware-binding)
-  - ⏳ FR-19.16-extra Llama-1B at 100 tok/s on 3070 Ti (composite)
+  - ⏳ FR-19.16-extra deploy as HTTP server (composite of TLS + HTTP + serving)
 
 **Honest scaffold-vs-shipped notes** (updated):
 - Phase 19's FR-19.16 ships a PARTIAL tok/s bench (177 tok/s on
@@ -159,16 +263,71 @@ verified, zero false** across 9 commits.
 
 ## Blocking Issues
 
-None on the kokonoe-local side. Remaining gates are:
-- **FR-19.1-extra full TLS 1.3** — XL effort, multi-session.
-- **FR-17.19-extra-deeper Llama-1B real weights** — needs the
-  ~1.3 GB Llama-3.2-1B SafeTensors download (auth-gated HF) OR
-  use the local Qwen2.5-7B (already loaded, but bigger model).
-- **FR-19.16-extra real ≥100 tok/s on real Llama-1B / 3070 Ti**
-  — composite of the above + cuda matmul wiring through the
-  dequant chain.
+None on the matt-voice perf critical path — the 37.22 tok/s baseline
+is solid and tested. Remaining deploy items + active blockers:
+
+- **Path E step 11 (self-host if/else)** — blocked on Aether asm
+  backend bug: 8-arg fn signatures crash on `popq %rbp; ret`
+  epilogue. See `docs/PATH_E_STATUS.md` for the investigation and
+  three workaround options. Workaround needed before continuing
+  the self-host bootstrap chain.
+- **FR-19.1-extra full TLS 1.3** — XL multi-session work for real
+  HTTPS serving. Not blocking the local 37 tok/s state.
+- **FR-19.16-extra deploy as HTTP server** — composite of TLS +
+  HTTP + serving. Multi-session.
 - **FR-18.1-extra real libnccl** — needs the cnc 2× P100 box
   (kokonoe is single-GPU).
+
+## What's Next
+
+Prioritized for the next session:
+
+1. **Pick a direction.** Three options surfaced this session:
+   - **D-path (matt-voice deploy)**: TLS 1.3 → HTTP serving →
+     OpenAI-compat endpoint → real production. Highest user-value;
+     XL multi-session.
+   - **E-path (self-host)**: fix the 8-arg fn bug in the asm
+     backend, then continue bootstrap steps. M-L for the fix,
+     then incremental.
+   - **Spec-decode build-out** (deferred this session): build
+     seq>1 kernel suite + draft model integration. ~7-8 days.
+     Expected 60-90 tok/s but bundles with batched serving.
+
+2. **If extending CUDA perf work on matt-voice**: the FFN at
+   39% peak BW is the dominant cost. Further gains require either
+   PTX/SASS-level kernel work (high risk per this session's
+   lessons) or moving to tensor-cores (XL, requires F16 reorg).
+   Diminishing returns; ~37 tok/s is already past llama.cpp.
+
+3. **If picking up Path E step 11**: easiest path is the
+   step-11-lite variant (comparison ops only, no labels, doesn't
+   need 8 args). Real fix is auditing
+   `compiler/src/codegen/asm/mod.rs` outgoing-arg-area layout.
+
+## Notes for Next Session
+
+- **The 37.22 tok/s number is WARM mean.** First run after GPU idle
+  shows ~35 tok/s while clocks ramp 210 → 1950 MHz. Always
+  pre-warm before measuring. `nvidia-smi --query-gpu=clocks.current.graphics`
+  confirms boost state per iteration.
+- **KERNEL_SRC is load-bearing.** Adding new `__global__` kernels
+  to `runtime/src/cuda.rs::KERNEL_SRC` can regress existing active
+  kernels by 5-7% via nvrtc shared register-allocation analysis.
+  Always re-run `matmul_per_shape_bench.rs` + the full graph
+  decode after KERNEL_SRC edits.
+- **In-isolation kernel benchmarks lie.** smallN was 1.32x in
+  isolation but -5% end-to-end. Always validate via end-to-end
+  `qwen25_graph_decode.rs` before promoting.
+- **CUDA graph capture requires non-default stream.** `CudaDevice::new()`
+  uses the legacy null stream; `cuStreamBeginCapture_v2` rejects
+  it. Already switched to `CudaDevice::new_with_stream()` in cuda.rs.
+- **Per-block dtype dispatch matters for Q4_K_M**. Qwen2.5-7B has
+  V proj and ffn_down switching between Q4_K and Q6_K per layer.
+  Hardcoding from block 0 → NaN at first mismatched layer. See
+  `memory/qwen25_q4km_mixed_precision_per_block_dtype.md`.
+- **bench/qwen25_7b_autoregressive section in docs/BENCH_LEDGER.md**
+  is the canonical perf history for this model. Append rows when
+  this number moves.
 
 ## FR-18.1-extra — Real libnccl cross-card (LANDED)
 
