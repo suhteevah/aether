@@ -1,8 +1,85 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 evening (**SharedKvPool multi-tenancy LANDED — true vLLM-shape
-foundation.** `runtime/src/serving.rs::SharedKvPool` owns per-layer
+2026-05-24 night (**Batched-forward stage 1 LANDED + bigger-models scope
+captured.**
+
+**Stage 1 — batched paged attention kernel.**
+`runtime/src/cuda.rs::batched_paged_attention_seqB_devarg` fans across
+`(blockIdx.x = head, blockIdx.y = request_idx)` so one launch processes B
+concurrent requests against the shared K/V pool, with each request
+indexing its own row of `page_table_batch` (row stride = a runtime arg).
+All B requests share `cur_seq` (synchronous batched step).
+
+`runtime/tests/cuda_batched_paged_attention_parity.rs` verifies bit-
+identical output to running `paged_attention_seq1_devarg` B times
+sequentially: **`max_abs_diff = 0.000e0`** for both requests with
+DIFFERENT page tables (request A maps to physical blocks [0, 1],
+request B maps to [3, 5] within the same shared pool).  Passes on RTX
+3070 Ti.
+
+**What remains for the full BatchedQwenSession.**  The attention kernel
+is the most-complex piece and is now done; the other batched kernels
+needed are:
+
+| Op | Status | Notes |
+|---|---|---|
+| `paged_attention_seqB` | ✅ shipped this commit | B queries, B page tables, 1 launch |
+| `rms_norm_fwd` | ⏳ | already takes `rows`; just FFI plumbing for `rows=B` |
+| `rope_apply_devarg` | ⏳ | already takes `seq`; FFI plumbing for `seq=B` |
+| `paged_append_kv_seqB` | ⏳ | similar shape — B (k_new, v_new) pairs against B page tables |
+| `bias_add_f32`, `add_inplace_f32` | ⏳ | already row-loop-friendly |
+| `fused_q4k_matmul_seqB_v2` | ⏳ **biggest piece** | needs the fused dequant-+-matmul kernel re-derived for B rows; dequant becomes amortized across batch |
+| `fused_q6k_matmul_seqB_v2` | ⏳ | mirrors Q4_K path |
+| `fused_q4k_ffn_gate_up_silu_mul_seqB` | ⏳ | gate+up+SiLU+mul fused, batch dim |
+| LM head `fused_q4k|q6k_matmul` | ⏳ | shared shape with the Q/K/V projections |
+
+The matmul batching is the hard part — the existing seq=1 fused kernels
+are dense.  Estimated work: 1-2 weeks for a clean BatchedQwenSession that
+runs Qwen2.5-7B B-batched with the same correctness/perf as the seq=1
+contiguous path.  The architectural design + the attention kernel + the
+shared-pool foundation are now all in place; the remaining lift is
+mostly kernel-by-kernel.
+
+**Bigger models — refactor scope captured.**
+Per the OPENCLAW_FR.md operator-side audit (consumer-side concerns
+section, dated 2026-05-23), the next deployment shapes are:
+
+- **Qwen2.5-14B**: 48 decoder blocks (vs 28 for 7B); other shape dims
+  potentially different.  Blocks on FR-17-extra-14b-e2e.  Per-block
+  Q4_K/Q6_K dtype dispatch may need re-enumeration; the 7B path
+  encountered a NaN-at-block-3 regression that was root-caused to
+  exactly this mixed-precision pattern (per
+  `memory/qwen25_q4km_mixed_precision_per_block_dtype.md`) — 14B will
+  have its own per-block dtype pattern that needs verification.
+- **Qwen2.5-32B-Q3_K_M**: even larger; will likely need
+  tensor-parallel inference (FR-18-extra-tp-infer-bench) since 32B Q3_K_M
+  weights exceed a single 3070 Ti's 8 GB by ~2-3x.
+- **bge-large (embeddings)**: BERT-style encoder, not decoder; requires
+  FR-17-extra-bert-fwd (different forward shape — no autoregressive
+  KV cache, single-pass over full sequence).  Plus
+  FR-19-extra-embed-endpoint for the `/v1/embeddings` OpenAI route.
+
+The common pre-requisite for all three is **generalizing QwenSession's
+hardcoded constants** (`N_LAYERS=28`, `D_MODEL=3584`, `N_Q_HEADS=28`,
+`N_KV_HEADS=4`, `HEAD_DIM=128`, `D_FF=18944`, `VOCAB=152064`) into
+runtime parameters read from the GGUF metadata.  Today these are `const`
+in `serving.rs:57-67`; making them runtime values is a moderate refactor
+that touches every kernel-launch site.  Subsequently, per-arch dispatch
+(Qwen2.5 vs Llama vs BERT) requires either a per-arch session type or
+a config-driven forward pass.
+
+Filing these as future-session FRs.  The deployment surface as it
+stands today serves Qwen2.5-7B; bigger and other-shape models are
+multi-session work.
+
+**aether-serve from this commit onward** exposes the batched attention
+kernel via its FFI but does NOT yet route through it (BatchedQwenSession
+is the missing layer).  Single-tenant single-request decode unchanged
+at 30-34 tok/s on RTX 3070 Ti.
+
+### 2026-05-24 evening (SharedKvPool multi-tenancy)
+**SharedKvPool multi-tenancy LANDED — true vLLM-shape foundation.** `runtime/src/serving.rs::SharedKvPool` owns per-layer
 (`N_LAYERS × 2 = 56`) GPU buffers + a free-block bitmap.
 `Arc<SharedKvPool>` shared across multiple `QwenSession`s on the same
 model; each session binds via `QwenSession::new_paged_with_pool(path, pool)`,
