@@ -1,16 +1,24 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-21 (**37.22 tok/s warm** = 124% of llama.cpp on RTX 3070 Ti / Qwen2.5-7B. Standing wins this session: per-block Q4_K/Q6_K dtype dispatch (NaN fix), fused FFN kernel (gate+up+silu+mul in 1 launch), CUDA graph capture for autoregressive decode (+37% throughput). Investigated speculative decoding (theoretical 1.6-2.6x but needs ~7-8 days of seq>1 kernel work; deferred). Path E step 11 attempt (self-host compiler if/else) blocked on Aether-compiler 8-arg fn bug — documented in docs/PATH_E_STATUS.md.)
+2026-05-22 evening (**TLS 1.3 server-side handshake state machine SHIPPED — FR-19.1-extra**. `runtime/src/tls13.rs` implements RFC 8446 server end-to-end on top of Aether's from-scratch crypto: TLSPlaintext/TLSCiphertext record layer with per-record nonce derivation (IV XOR seq big-endian) + AAD construction, key schedule (Early/Handshake/Master + 4 traffic secrets per §7.1), handshake message codecs (parse ClientHello, encode ServerHello/EncryptedExtensions/Certificate/CertificateVerify/Finished, parse client Finished), minimal X.509 self-signed Ed25519 cert generator (OID 1.3.101.112, full DER tree), and a `TlsServerSession` state-machine driver. Profile: TLS_CHACHA20_POLY1305_SHA256 + X25519 + Ed25519 only; no PSK / 0-RTT / resumption / ALPN. Witness: `runtime/tests/tls13_loopback.rs` (in-process server + matching client; full handshake + 2 app-data records round-trip; tamper test rejects flipped server flight). `.aether` audit witness: `tests/runtime/tls13_handshake.aether` exits 42 via `aether_tls13_self_loopback_smoke`. FFI surface: `aether_tls13_server_new/feed/take_outbound/send/is_done/free`. Audit clean.
+
+### 2026-05-22 morning (prior in same day)
+**aether-serve generates real Qwen text via HTTP**. End-to-end Qwen2.5-7B hosting on localhost: `aether-serve --gguf <path> --warmup 6` → curl POST `/v1/chat/completions` returns OpenAI-shaped JSON with real generated text at 24 tok/s warm (capped by GPU power state on bursty single-request workloads; same kernels reach 37 tok/s warm in the sustained `qwen25_graph_decode` bench). SSE streaming (`"stream":true`) emits per-token delta chunks. Plus FR-19.1-extra crypto primitives (SHA-256/512, HMAC, HKDF, X25519, Ed25519) — the foundation underneath the TLS 1.3 handshake shipped this evening.
+
+### 2026-05-21 (prior session)
+**37.22 tok/s warm** = 124% of llama.cpp on RTX 3070 Ti / Qwen2.5-7B. Standing wins from that session: per-block Q4_K/Q6_K dtype dispatch (NaN fix), fused FFN kernel (gate+up+silu+mul in 1 launch), CUDA graph capture for autoregressive decode (+37% throughput). Investigated speculative decoding (theoretical 1.6-2.6x but needs ~7-8 days of seq>1 kernel work; deferred). Path E step 11 attempt (self-host compiler if/else) blocked on Aether-compiler 8-arg fn bug — documented in docs/PATH_E_STATUS.md.
 
 ## Project Status
 🟢 **Audit: 169/196 (86%) — 10 of 19 phases at 100%**. matt-voice's
 serving-deploy critical path within Aether's language + runtime is
 materially complete: GGUF reader + Q4_K_M dequant + cuda routing
 live, tokenizer.json + chat_template loaders, SafeTensors multi-
-tensor parser. Remaining gates are multi-session work (full TLS
-1.3, real forward pass through real weights at scale) or hardware-
-binding (libnccl cross-card on cnc 2× P100).
+tensor parser, **TLS 1.3 server-side handshake state machine LANDED
+this evening (FR-19.1-extra, on top of the crypto primitives from
+this morning's session)**. Remaining gates: HTTP/2 + HPACK, real-
+world TLS interop (vs curl/openssl), real RNG, cert-chain verifier
+(for client-side), and hardware-binding NCCL on cnc 2× P100.
 
 ```
 Phase 6-14: 78/78 witnessed (100%) — unchanged
@@ -27,10 +35,212 @@ Phase 24:    7/10 witnessed (70%)  — unchanged
 TOTAL:    169/196 (86%)
 ```
 
-Workspace tests: 134+ unit tests pass.
+Workspace tests: **61 lib tests pass** (up from 59 — +2 crypto: ed25519_rfc8032_test_1, sha512_known_vectors), 134+ workspace integration tests still pass.
 Honesty scan: 0 todo / 0 unimplemented / 4 known-OK stubs (unchanged).
 
-## What Was Done This Session
+## What Was Done This Session (2026-05-22 evening, TLS 1.3 handshake)
+
+User direction: "go on 1" — Path D, full TLS 1.3 handshake state machine
+on top of the prior session's RFC-verified crypto primitives.
+
+### `runtime/src/tls13.rs` — full TLS 1.3 server, no external deps
+
+Single-file module (~1100 LOC) implementing RFC 8446 server profile:
+
+| Layer | What it does |
+|---|---|
+| `record::*` | TLSPlaintext / TLSCiphertext codec; `build_nonce(iv, seq)` = IV XOR right-aligned seq big-endian; `build_aad` = type(0x17) ‖ 0x0303 ‖ u16 len; `seal_record` / `open_record` thin wrappers over `aead_chacha20_poly1305_{seal,open}` (newly exposed Rust API in lib.rs); `parse_plaintext` for cleartext records (ClientHello, ServerHello). |
+| `key_schedule::Schedule` | Early Secret = HKDF-Extract(0, 0); Handshake Secret = HKDF-Extract(Derive-Secret(es, "derived", ""), DHE); Master Secret = HKDF-Extract(Derive-Secret(hs, "derived", ""), 0). `derive_secret(secret, label, transcript)` = HKDF-Expand-Label(secret, label, SHA-256(transcript), 32). Per-direction handshake + app traffic secrets all derived per §7.1. `traffic_keys(secret)` = HKDF-Expand-Label(., "key", 32) + (., "iv", 12). `finished_mac(base_key, transcript)` = HMAC-SHA256(HKDF-Expand-Label(base_key, "finished", 32), SHA-256(transcript)). |
+| `handshake::*` | `wrap(msg_type, body)` adds the 4-byte (type ‖ u24 len) header. `parse_client_hello` walks `legacy_version=0x0303 ‖ random[32] ‖ sid<u8> ‖ cipher_suites<u16> ‖ comp<u8> ‖ extensions<u16>`; extracts supported_versions (0x002b), supported_groups (0x000a), signature_algorithms (0x000d), key_share (0x0033 — X25519 entry). `encode_server_hello` emits the same with supported_versions(=tls 1.3) + key_share(x25519, server_pub). `encode_encrypted_extensions` = `[0, 0]` (empty list). `encode_certificate` = `u8(0) ‖ u24(list_len) ‖ u24(cert_len) ‖ cert_der ‖ u16(0)`. `encode_certificate_verify` = `u16(sig_alg) ‖ u16(64) ‖ ed25519_sig`. `encode_finished(verify_data)` = the 32-byte VD. `server_cert_verify_signed_content(transcript)` = `0x20*64 ‖ "TLS 1.3, server CertificateVerify" ‖ 0x00 ‖ SHA-256(transcript)` per §4.4.3. Internal `Reader` for zero-copy parsing. |
+| `x509::self_sign_ed25519(seed, cn, serial) -> (cert_der, pub_key)` | Builds TBSCertificate as SEQUENCE { version=v3, serial INTEGER, sigAlg, issuer (Name with CN), validity (UTCTime 240101000000Z..490101000000Z), subject (Name with CN), SPKI (Ed25519 OID 1.3.101.112 ‖ BIT STRING(0x00 ‖ pub_key)) } then signs TBS via `aether_ed25519_sign`, wraps Certificate = SEQUENCE { tbs, sigAlg, signature BIT STRING }. Returns DER bytes + the 32-byte pub key for the matching session. |
+| `TlsServerSession` | State machine: `ExpectClientHello -> SentServerFlight -> Connected -> Closed`. `feed(input)` parses incoming records by current state; on CH it emits ServerHello (TLSPlaintext) + one encrypted record containing {EE, Cert, CV, Finished}; on encrypted Finished it verifies the MAC, transitions to Connected. `send_app_data(plaintext)` seals into a TLSCiphertext app-data record and appends to outbound. `take_outbound()` drains the response queue. CCS records tolerated and skipped (RFC 8446 §5). |
+| `client_for_test::TestClient` | Matching client harness in the same file (used by tests, kept compiled because it's small and gated only by being inside `pub mod`). `build_client_hello_record` crafts a wire-correct ClientHello with our cipher suite/group/sig-alg/key_share. `process_server_flight_and_build_client_finished` parses ServerHello, derives DHE shared, decrypts the encrypted flight, extracts the Ed25519 SPKI from the Certificate, verifies the CertificateVerify signature against the transcript, recomputes server Finished MAC, and constructs the client's own Finished record. |
+| FFI surface | `aether_tls13_server_new`, `_feed`, `_take_outbound`, `_send`, `_is_done`, `_free`, and `_self_loopback_smoke` (one-shot in-process loopback returning 42 on success). All `#[no_mangle] extern "C"`, callable from `.aether`. |
+
+### Witnesses
+
+`runtime/tests/tls13_loopback.rs` — two integration tests:
+- `tls13_full_loopback` — CH (149 B) → server flight (503 B) → client Finished (58 B) → server `Connected` → 1 server→client + 1 client→server app-data record (37 B plaintext, 59 B on-the-wire each direction). All bytes verified.
+- `tls13_tampered_server_flight_rejected` — bit-flip one byte inside the encrypted second record; client must reject (CV signature fail or MAC mismatch).
+
+`tests/runtime/tls13_handshake.aether` — `// roadmap: P19.1`, calls `aether_tls13_self_loopback_smoke()` and forwards its exit code. Exits 42.
+
+Audit: still 169/196 (FR-19.1-extra reuses the parent tag per the
+`fr_x_extra_tag_convention.md` convention — depth-over-breadth).
+
+### lib.rs surgery
+
+- Made `chacha20_xor`, `poly1305_mac`, `poly1305_key_gen` `pub(crate)`.
+- Added `aead_chacha20_poly1305_seal` and `aead_chacha20_poly1305_open` Rust
+  helpers (mirror of the FFI functions but with Vec / Option return).
+- Added `pub mod tls13;`.
+
+### Architectural choices worth remembering
+
+- **One encrypted record for the whole server flight**. EE‖Cert‖CV‖Finished
+  concatenated as the inner plaintext of a single TLSCiphertext. RFC permits
+  fragmentation; we don't, because everything fits within the 16 KB record limit.
+- **No ChangeCipherSpec emit**. We tolerate-and-skip incoming CCS (some
+  clients send one for middlebox compat) but don't emit one ourselves. RFC
+  §5: "MAY send", we choose MAY-NOT.
+- **No HelloRetryRequest**. ClientHello MUST come with an X25519 key_share in
+  the first message. Real clients all do this for X25519 because the group
+  is universally supported.
+- **No padding** in TLSCiphertext.  RFC §5.4 makes padding optional.
+- **DER builder is direct write** — no full ASN.1 lib. ~100 LOC.
+
+### What's still missing on the D-path
+
+In dependency order from "first to tackle next session":
+1. **HTTP/2 framing + HPACK** (M-L). Independent of TLS. SETTINGS / HEADERS / DATA / WINDOW_UPDATE / PING + static HPACK table. h2c over plaintext TCP works as a first slice; h2-over-TLS slots on top of `TlsServerSession`.
+2. **Real-world interop** (M). Drive a TLS connection from `curl --tlsv1.3` against `aether-serve` — currently the test loopback proves the bytes are correct against our own client implementation. A round-trip against curl/openssl/rustls would catch any wire-format drift.
+3. **Wire `TlsServerSession` into `aether-serve`** (M). Today the binary uses plain HTTP/1.1. The clean integration: per-accept-on-listener spawn → wrap socket → drive TLS handshake → on Connected, plumb decrypted bytes into the existing HTTP/1.1 parser. Pure additive.
+4. **TlsClientSession** (M). The client half (which we have inline in `client_for_test`) deserves a clean public API for outbound calls.
+5. **Real RNG** (S). Today `server_random` / `x25519_priv` come from the caller; production needs `getrandom`-equivalent. Single-platform Win32 `BCryptGenRandom` works.
+6. **Cert chain / root store** (L). Today: self-signed only. Real internet needs a trusted-root verifier (or a CA-signed leaf, with a manual root pre-loaded).
+7. **Resumption / 0-RTT / PSK** (XL). Not blocking the D-path proof; multi-session.
+
+The 1100 LOC of `tls13.rs` is the load-bearing core. Items 1-5 are each
+similar weight or smaller. Path D is roughly half-done by code volume.
+
+---
+
+## What Was Done Prior in 2026-05-22 (morning — real-LLM hosting)
+
+User direction: "lets try to closeout the rest of the hosting for real llama in aether"
++ "models downloaded now for smoke testing" + "in theory llama.cpp and aether are a switch flip away"
++ explicit scope: "Full Path D (TLS 1.3 + HTTP/2)".
+
+### aether-serve now generates real Qwen2.5-7B text via OpenAI-compat HTTP
+
+`trainer/src/bin/serve.rs` was previously a STUB that returned
+`[aether-serve stub: integrate qwen25_autoregressive_cuda forward here]`.
+This session wired the real forward chain + tokenizer + JSON + SSE
+streaming. End state:
+
+```
+target/release/aether-serve.exe \
+  --port 8181 \
+  --model qwen2.5-7b-instruct \
+  --gguf "C:\Users\Matt\.ollama\models\blobs\sha256-2bada8a7..." \
+  --warmup 6
+
+# In another shell:
+curl -X POST http://localhost:8181/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt_ids":[9707,11,1879,0],"max_tokens":32}'
+
+→ {"id":"chatcmpl-aether-serve-1","object":"chat.completion",
+   "model":"qwen2.5-7b-instruct",
+   "choices":[{"index":0,"message":{"role":"assistant",
+     "content":" I'm a 25-year-old software developer from the UK,
+                and I'm currently working on a project that involves
+                creating a web application"},
+     "finish_reason":"stop"}],
+   "usage":{"prompt_tokens":4,"completion_tokens":28}}
+```
+
+Generated IDs `[358, 2776, 264, 220, 17, ...]` are BIT-IDENTICAL to
+the prior session's reference `qwen25_graph_decode.rs` test.
+
+Pieces shipped:
+1. **`runtime/src/serving.rs`** — `QwenSession` struct factored from
+   the reference impl. Owns 28 BlockGpu + KvCache + activation
+   buffers + step_args + a captured CUDA graph + the loaded BPE
+   tokenizer (vocab 152064, merges 151387) + EOS token id. Methods:
+   `new(gguf_path)`, `prefill(&[ids])`, `decode_step(last_id)`,
+   `generate(&prompt, n, stop)`, `decode_ids(&ids) → String`,
+   `warmup(N)`. Drop frees all GPU handles.
+2. **`runtime/src/serving.rs` decode_ids** — uses GPT-2 byte fixup
+   (RFC convention `Ġ` ↔ 0x20 etc.) so generated bytes round-trip
+   to readable text. Returns "" if tokenizer absent.
+3. **`trainer/src/bin/serve.rs`** — JSON body parser (`prompt_ids`,
+   `max_tokens`, `stream`), endpoint dispatch (`GET /health`,
+   `GET /v1/models`, `POST /v1/chat/completions`,
+   `POST /v1/completions`), JSON-escape for content, EOS auto-stop,
+   `--warmup N` flag.
+4. **SSE streaming** — when `stream:true`, response uses
+   `Content-Type: text/event-stream` + chunked transfer encoding,
+   emits one `data: {choices:[{delta:{content:"..."}}]}\n\n` per
+   generated token, terminates with `data: [DONE]\n\n`. Verified
+   via `curl -N`.
+5. **`trainer` cuda feature** — new `cuda = ["aether_rt/cuda"]`
+   passthrough; `cargo build --release -p trainer --features cuda`
+   produces a release binary with cuBLAS + nvrtc routing.
+
+### Performance reality check
+
+The 37.22 tok/s figure from prior session was a SUSTAINED bench
+that holds the GPU at P2/1950MHz across N decode steps. The serve
+binary's bursty workload pattern (request → idle → request) lets
+the GPU drop into P5/P8 power states between requests (210 MHz)
+and the FIRST request after idle takes ~200 ms per token while
+the GPU climbs back to P2.
+
+Mitigation: `--warmup N` runs N synthetic decode steps on startup
+to drive the GPU into P2 and pre-capture the graph. Subsequent
+requests within a few seconds of the warmup (or each other) sustain
+24-37 tok/s. Long-idle gaps still trigger the cold-clock penalty.
+
+The right production fix is `nvidia-smi -pm 1` (persistence mode)
++ `nvidia-smi -ac <mem>,<gfx>` (lock clocks) — admin commands
+outside Aether's scope. Documented but not enforced.
+
+### FR-19.1-extra: TLS 1.3 crypto primitives (foundation)
+
+Path D requires a full TLS 1.3 handshake stack from scratch
+(per Aether's no-external-deps rule). This session shipped the
+crypto foundation, all RFC-verified against test vectors:
+
+| Primitive | Source | Test vector |
+|---|---|---|
+| SHA-256 | FIPS 180-4 | `abc`, `""`, 56-byte boundary |
+| SHA-512 | FIPS 180-4 | `abc`, `""` |
+| HMAC-SHA256 | RFC 2104 | RFC 4231 §4.2 test case 1 |
+| HKDF-Extract | RFC 5869 | RFC 5869 §A.1 test case 1 |
+| HKDF-Expand | RFC 5869 | RFC 5869 §A.1 test case 1 |
+| HKDF-Expand-Label | RFC 8446 §7.1 | Shape + determinism smoke |
+| X25519 (scalar_mult / derive_public / shared_secret) | RFC 7748 | §5.2 first vector + DH roundtrip |
+| Ed25519 (derive_public / sign / verify) | RFC 8032 | §7.1 TEST 1 |
+
+ABI surface (all `#[no_mangle] extern "C"`):
+- `aether_sha256`, `aether_sha512`
+- `aether_hmac_sha256`
+- `aether_hkdf_extract`, `aether_hkdf_expand`, `aether_tls13_hkdf_expand_label`
+- `aether_x25519_derive_public`, `aether_x25519_shared_secret`
+- `aether_ed25519_derive_public`, `aether_ed25519_sign`, `aether_ed25519_verify`
+
+Internal implementations: radix-2^51 field arithmetic over GF(2^255-19),
+twisted-Edwards point ops (X, Y, Z, T extended coords),
+double-and-add scalar mult (non-constant-time; FR-x-extra for ct),
+sc_reduce via long-division (verify-only path; Barrett-form
+constant-time is FR-x-extra). Curve constants (d, sqrt(-1), base
+point) computed/derived at runtime from byte forms or self-checked
+against `x^2 == -1`.
+
+### Bugs caught in-flight
+
+1. **X25519 fe_from_bytes over-masked limb 4 to 50 bits** — total
+   read was 254 bits (off by 1 from input bit 254). Fix: read full
+   51 bits for all 5 limbs (255 total; input bit 255 ignored implicitly).
+2. **fe_pow_p_plus_3_over_8 final mul was by z instead of z^2** —
+   gave z^(2^252 - 3) instead of z^(2^252 - 2). Fix: multiply by z2.
+3. **Initial "compute sqrt(-1) via fe_pow_p_plus_3_over_8(-1)" returns 1**
+   (since `(-1)^(even exponent) == 1`). Fix: use `2^((p-1)/4)` with
+   a hardcoded constant + self-check at first access.
+4. **Ed25519 verify subtracted k*A instead of adding** — sign was
+   inverted in the negation logic. Fix: drop the negate step, just
+   compute `R + k*A` directly.
+
+### Decode-side text round-trip caveat
+
+`aether_bpe_encode` (text → ids) is byte-level and DOES NOT match
+HF's GPT-2 unicode-char-level BPE for Qwen. Decode round-trips
+fine (proven). For now, clients must send `prompt_ids` (token ids);
+the `messages[].content` text path returns 501 with a clear error.
+Encode parity is FR-19.9-extra-deeper (multi-session).
+
+## What Was Done Prior Session (2026-05-21)
 
 Twelve commits, pushed to `origin/main`. The arc is matt-voice perf
 optimization from the broken NaN starting state to 124% of llama.cpp
@@ -221,7 +431,16 @@ verified, zero false** across 9 commits.
 
 ## Current State
 
-**Working (matt-voice perf — the headline):**
+**Working (deploy — the new headline):**
+- **`aether-serve` produces real Qwen2.5-7B text via OpenAI HTTP**
+  - `POST /v1/chat/completions` (single-shot JSON OR `stream:true` SSE)
+  - `GET /v1/models`, `GET /health`
+  - JSON-escape, EOS auto-stop, warmup on startup
+  - 24-37 tok/s warm (dependent on GPU power state — see HANDOFF
+    "Performance reality check" subsection)
+- Generated IDs bit-identical to `qwen25_graph_decode.rs` reference
+
+**Working (matt-voice perf — prior session headline):**
 - **37.22 tok/s warm mean on Qwen2.5-7B Q4_K_M / RTX 3070 Ti = 124% of llama.cpp**
 - Generated IDs bit-identical to cuBLAS reference: `[358, 2776, 264, 220, 17]`
 - Full forward pass via on-device fused matmul + on-device KV cache
@@ -230,8 +449,20 @@ verified, zero false** across 9 commits.
 - `runtime/tests/qwen25_graph_decode.rs` is the standing benchmark
 - Per-shape diagnostic: `runtime/tests/matmul_per_shape_bench.rs`
 
+**Working (TLS 1.3 crypto foundation — this session):**
+- 7 RFC-verified primitives: SHA-256, SHA-512, HMAC-SHA256, HKDF
+  (Extract+Expand+Expand-Label), X25519 (derive+shared), Ed25519
+  (derive+sign+verify), ChaCha20-Poly1305 (prior).
+- ABI: `aether_sha256/512`, `aether_hmac_sha256`, `aether_hkdf_*`,
+  `aether_tls13_hkdf_expand_label`, `aether_x25519_*`, `aether_ed25519_*`
+- Full TLS 1.3 cipher suite TLS_CHACHA20_POLY1305_SHA256 is now
+  buildable from these primitives. Remaining: handshake state
+  machine, record layer, X.509 cert handling.
+
 **Working (broader project, unchanged from prior session):**
-- 169/196 audit-tagged witnesses pass.
+- 169/196 audit-tagged witnesses pass (no change — crypto adds are
+  library funcs not roadmap line items).
+- 61 lib tests pass (+2 from prior session: ed25519, sha512).
 - 10 phases at 100% (6-14 + 17 + 19).
 - `cargo build -p aether_rt --features cuda` succeeds; cuBLAS path live.
 - Real Qwen2.5-7B Q4_K_M GGUF readable via `aether_gguf_*` extern surface.
@@ -241,9 +472,14 @@ verified, zero false** across 9 commits.
   - ✅ Q4_K_M dequant + GGUF reader (and now mixed-precision-aware)
   - ✅ SafeTensors multi-tensor parser
   - ✅ cuda runtime path live (cuBLAS sgemm + nvrtc kernels + CUDA graphs)
-  - ✅ **Full forward pass through real Qwen2.5 weights at scale (this session)**
-  - ⏳ FR-19.1-extra full TLS 1.3 handshake (XL)
-  - ⏳ FR-19.16-extra deploy as HTTP server (composite of TLS + HTTP + serving)
+  - ✅ Full forward pass through real Qwen2.5 weights at scale
+  - ✅ **OpenAI-compat HTTP server returns real text (this session)**
+  - ✅ **TLS 1.3 crypto primitives RFC-verified (this session)**
+  - ⏳ FR-19.1-extra TLS 1.3 handshake state machine (XL, partial — primitives done)
+  - ⏳ FR-19.2-extra HTTP/2 framing + HPACK
+  - ⏳ FR-19.9-extra-deeper text→ids encode with GPT-2 unicode BPE
+  - ⏳ FR-19.4-extra real paged KV cache (block allocator)
+  - ⏳ FR-19.5-extra continuous batching scheduler
 
 **Honest scaffold-vs-shipped notes** (updated):
 - Phase 19's FR-19.16 ships a PARTIAL tok/s bench (177 tok/s on
@@ -280,18 +516,55 @@ is solid and tested. Remaining deploy items + active blockers:
 
 ## What's Next
 
-Prioritized for the next session:
+For "switch flip from llama.cpp": the **basic** hosting path is now
+done (single-shot + SSE). The remaining Path D pieces, in dependency
+order:
 
-1. **Pick a direction.** Three options surfaced this session:
-   - **D-path (matt-voice deploy)**: TLS 1.3 → HTTP serving →
-     OpenAI-compat endpoint → real production. Highest user-value;
-     XL multi-session.
-   - **E-path (self-host)**: fix the 8-arg fn bug in the asm
-     backend, then continue bootstrap steps. M-L for the fix,
-     then incremental.
-   - **Spec-decode build-out** (deferred this session): build
-     seq>1 kernel suite + draft model integration. ~7-8 days.
-     Expected 60-90 tok/s but bundles with batched serving.
+1. **TLS 1.3 handshake state machine** (XL, ~1-2 sessions). With the
+   crypto primitives in place, this is mostly:
+   - Record layer (TLSPlaintext + TLSCiphertext wrappers — ChaCha20-
+     Poly1305 already encrypts the records)
+   - Handshake messages: ClientHello, ServerHello, EncryptedExtensions,
+     Certificate, CertificateVerify, Finished
+   - Key schedule: early_secret, handshake_secret, master_secret +
+     derive_secret + 8 per-direction traffic keys (HKDF-Expand-Label
+     already shipped — just call it 8 times with the right labels)
+   - Self-signed cert generation (Ed25519 keypair + minimal X.509 DER)
+   - State machine driver: drive a TLS connection from accept to
+     handshake_finished
+2. **HTTP/2 framing + HPACK** (M-L). Independent of TLS — h2c
+   over plain TCP is fine for the in-flight increment. HEADERS /
+   DATA / SETTINGS / WINDOW_UPDATE / PING + static HPACK table.
+3. **Real paged KV cache** (M) — block allocator over a fixed GPU
+   pool, virtual-page mapping per request. Replaces today's
+   single-resident KV per QwenSession. Unlocks multi-request
+   serving without growing per-request VRAM.
+4. **Continuous batching scheduler** (M) — decode N requests per
+   step rather than one. Sits on top of paged KV cache.
+
+Three alternative directions (orthogonal to D-path):
+
+1. **D-path** (TLS / HTTP/2 / batching) — see above.
+2. **E-path (self-host)**: fix the 8-arg fn bug in the asm backend,
+   then continue bootstrap steps. M-L for the fix, then incremental.
+3. **Spec-decode build-out** (deferred prior session): seq>1 kernel
+   suite + draft model. ~7-8 days. 60-90 tok/s upside.
+
+### Operational note for next-session smoke testing
+
+When measuring `aether-serve` perf or running benches:
+- Run `nvidia-smi -pm 1` and `nvidia-smi --query-gpu=pstate` to
+  verify GPU is in persistence mode at P0/P2 before measuring.
+- Use `--warmup 6` (or higher) on `aether-serve` to drive GPU
+  into P2 before serving real requests.
+- Discard the FIRST run after spawn from any N-run mean
+  (cold-clock penalty per `memory/gpu_boost_clock_warmup.md`).
+- Reference standing bench is `cargo test --release --features cuda
+  -p aether_rt --test qwen25_graph_decode -- --ignored --nocapture`
+  — this should report 27-37 tok/s on a hot GPU. If it reports
+  <10 tok/s, the GPU is in P5/P8 and serve will be slow too.
+
+(Continuing from prior session's option list — unchanged.)
 
 2. **If extending CUDA perf work on matt-voice**: the FFN at
    39% peak BW is the dominant cost. Further gains require either

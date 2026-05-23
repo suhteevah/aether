@@ -14,8 +14,13 @@ pub mod ops;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "cuda")]
+pub mod serving;
+
 #[cfg(feature = "nccl")]
 pub mod nccl_real;
+
+pub mod tls13;
 
 // Single-threaded tape for the bootstrap runtime. Originally `thread_local!`
 // — the TLS init hook for that drags Rust's `std::thread` machinery into the
@@ -5703,7 +5708,7 @@ fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     }
     out
 }
-fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
+pub(crate) fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8]) {
     let mut blk = counter;
     let mut i = 0;
     while i < data.len() {
@@ -5714,7 +5719,7 @@ fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &mut [u8])
         blk = blk.wrapping_add(1);
     }
 }
-fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+pub(crate) fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
     // r = key[0..16] with clamp, s = key[16..32]
     let mut r = [0u8; 16]; r.copy_from_slice(&key[..16]);
     r[3] &= 15; r[7] &= 15; r[11] &= 15; r[15] &= 15;
@@ -5796,9 +5801,55 @@ fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
     tag[12..16].copy_from_slice(&(h3_full as u32).to_le_bytes());
     tag
 }
-fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
+pub(crate) fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
     let block0 = chacha20_block(key, 0, nonce);
     let mut k = [0u8; 32]; k.copy_from_slice(&block0[..32]); k
+}
+
+/// AEAD ChaCha20-Poly1305 seal — Rust API.  Returns ciphertext || 16-byte tag.
+pub(crate) fn aead_chacha20_poly1305_seal(
+    key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8],
+) -> Vec<u8> {
+    let poly_key = poly1305_key_gen(key, nonce);
+    let mut out = Vec::with_capacity(plaintext.len() + 16);
+    out.extend_from_slice(plaintext);
+    chacha20_xor(key, 1, nonce, &mut out[..plaintext.len()]);
+    let mut mac_buf: Vec<u8> = Vec::new();
+    mac_buf.extend_from_slice(aad);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(&out[..plaintext.len()]);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_buf.extend_from_slice(&(plaintext.len() as u64).to_le_bytes());
+    let tag = poly1305_mac(&poly_key, &mac_buf);
+    out.extend_from_slice(&tag);
+    out
+}
+
+/// AEAD ChaCha20-Poly1305 open — Rust API.  `ct_and_tag` is ciphertext || tag.
+/// Returns plaintext on success; None on tag mismatch or malformed input.
+pub(crate) fn aead_chacha20_poly1305_open(
+    key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ct_and_tag: &[u8],
+) -> Option<Vec<u8>> {
+    if ct_and_tag.len() < 16 { return None; }
+    let ct_len = ct_and_tag.len() - 16;
+    let ct = &ct_and_tag[..ct_len];
+    let recv_tag = &ct_and_tag[ct_len..];
+    let poly_key = poly1305_key_gen(key, nonce);
+    let mut mac_buf: Vec<u8> = Vec::new();
+    mac_buf.extend_from_slice(aad);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(ct);
+    while mac_buf.len() % 16 != 0 { mac_buf.push(0); }
+    mac_buf.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_buf.extend_from_slice(&(ct.len() as u64).to_le_bytes());
+    let computed = poly1305_mac(&poly_key, &mac_buf);
+    let mut diff = 0u8;
+    for i in 0..16 { diff |= computed[i] ^ recv_tag[i]; }
+    if diff != 0 { return None; }
+    let mut out = ct.to_vec();
+    chacha20_xor(key, 1, nonce, &mut out);
+    Some(out)
 }
 /// AEAD encrypt: (key32, nonce12, aad?, plaintext) → (ciphertext || 16-byte tag).
 /// `n_plain` plaintext bytes; output is `n_plain + 16` bytes. Returns
@@ -5871,6 +5922,1069 @@ fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
     let out_slice = std::slice::from_raw_parts_mut(out as *mut u8, ct.len());
     out_slice.copy_from_slice(&pt);
     ct.len() as c_int
+}
+
+// =====================================================================
+// FR-19.1-extra (a) — SHA-256 (FIPS 180-4).
+//
+// One-shot + incremental API. The TLS 1.3 key schedule (HKDF-Extract/
+// Expand + HMAC) is built on top of this. Verified against the standard
+// "abc" / "" / FIPS Appendix B test vectors in the unit tests below.
+// =====================================================================
+
+const SHA256_K: [u32; 64] = [
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+];
+
+const SHA256_IV: [u32; 8] = [
+    0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+    0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
+];
+
+fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[i*4], block[i*4+1], block[i*4+2], block[i*4+3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+        let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+    }
+    let mut a = state[0]; let mut b = state[1]; let mut c = state[2]; let mut d = state[3];
+    let mut e = state[4]; let mut f = state[5]; let mut g = state[6]; let mut h = state[7];
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA256_K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let mj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(mj);
+        h = g; g = f; f = e; e = d.wrapping_add(t1);
+        d = c; c = b; b = a; a = t1.wrapping_add(t2);
+    }
+    state[0] = state[0].wrapping_add(a); state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c); state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e); state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g); state[7] = state[7].wrapping_add(h);
+}
+
+pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
+    let mut state = SHA256_IV;
+    let mut len = 0u64;
+    let mut buf = [0u8; 64];
+    let mut buf_len = 0usize;
+    let mut data = msg;
+    while !data.is_empty() {
+        let take = (64 - buf_len).min(data.len());
+        buf[buf_len..buf_len+take].copy_from_slice(&data[..take]);
+        buf_len += take;
+        data = &data[take..];
+        len += take as u64 * 8;
+        if buf_len == 64 {
+            sha256_compress(&mut state, &buf);
+            buf_len = 0;
+        }
+    }
+    // Pad: 0x80, zeros, length-be64.
+    buf[buf_len] = 0x80;
+    buf_len += 1;
+    if buf_len > 56 {
+        for i in buf_len..64 { buf[i] = 0; }
+        sha256_compress(&mut state, &buf);
+        buf_len = 0;
+        buf = [0u8; 64];
+    }
+    for i in buf_len..56 { buf[i] = 0; }
+    buf[56..64].copy_from_slice(&len.to_be_bytes());
+    sha256_compress(&mut state, &buf);
+    let mut out = [0u8; 32];
+    for i in 0..8 { out[i*4..i*4+4].copy_from_slice(&state[i].to_be_bytes()); }
+    out
+}
+
+/// One-shot SHA-256. Writes 32 bytes to `out`. Returns 32 or -1.
+#[no_mangle] pub unsafe extern "C" fn aether_sha256(
+    msg: *const c_void, n_msg: c_int,
+    out: *mut c_void,
+) -> c_int {
+    if msg.is_null() || out.is_null() || n_msg < 0 { return -1; }
+    let slice = std::slice::from_raw_parts(msg as *const u8, n_msg as usize);
+    let digest = sha256(slice);
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, 32);
+    o.copy_from_slice(&digest);
+    32
+}
+
+// =====================================================================
+// FR-19.1-extra (b) — HMAC-SHA256 (RFC 2104).
+// =====================================================================
+pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k0 = [0u8; 64];
+    if key.len() > 64 {
+        let h = sha256(key);
+        k0[..32].copy_from_slice(&h);
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64]; let mut opad = [0x5cu8; 64];
+    for i in 0..64 { ipad[i] ^= k0[i]; opad[i] ^= k0[i]; }
+    let mut inner = Vec::with_capacity(64 + msg.len());
+    inner.extend_from_slice(&ipad); inner.extend_from_slice(msg);
+    let h_in = sha256(&inner);
+    let mut outer = Vec::with_capacity(64 + 32);
+    outer.extend_from_slice(&opad); outer.extend_from_slice(&h_in);
+    sha256(&outer)
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hmac_sha256(
+    key: *const c_void, n_key: c_int,
+    msg: *const c_void, n_msg: c_int,
+    out: *mut c_void,
+) -> c_int {
+    if key.is_null() || msg.is_null() || out.is_null() || n_key < 0 || n_msg < 0 { return -1; }
+    let k = std::slice::from_raw_parts(key as *const u8, n_key as usize);
+    let m = std::slice::from_raw_parts(msg as *const u8, n_msg as usize);
+    let tag = hmac_sha256(k, m);
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, 32);
+    o.copy_from_slice(&tag);
+    32
+}
+
+// =====================================================================
+// FR-19.1-extra (c) — HKDF (RFC 5869).
+//
+// HKDF-Extract(salt, ikm) -> PRK         (32 bytes for SHA-256)
+// HKDF-Expand(prk, info, L) -> OKM       (L bytes, L ≤ 255*32)
+//
+// TLS 1.3 also adds HKDF-Expand-Label per RFC 8446 §7.1.
+// =====================================================================
+pub(crate) fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
+    let s = if salt.is_empty() { &[0u8; 32][..] } else { salt };
+    hmac_sha256(s, ikm)
+}
+
+pub(crate) fn hkdf_expand(prk: &[u8; 32], info: &[u8], len: usize) -> Vec<u8> {
+    assert!(len <= 255 * 32, "HKDF-Expand: L too large");
+    let n = (len + 31) / 32;
+    let mut t_prev: Vec<u8> = Vec::new();
+    let mut okm = Vec::with_capacity(n * 32);
+    for i in 1..=n {
+        let mut input = Vec::with_capacity(t_prev.len() + info.len() + 1);
+        input.extend_from_slice(&t_prev);
+        input.extend_from_slice(info);
+        input.push(i as u8);
+        t_prev = hmac_sha256(prk, &input).to_vec();
+        okm.extend_from_slice(&t_prev);
+    }
+    okm.truncate(len);
+    okm
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hkdf_extract(
+    salt: *const c_void, n_salt: c_int,
+    ikm: *const c_void, n_ikm: c_int,
+    out: *mut c_void,
+) -> c_int {
+    if ikm.is_null() || out.is_null() || n_salt < 0 || n_ikm < 0 { return -1; }
+    let s = if salt.is_null() { &[][..] }
+            else { std::slice::from_raw_parts(salt as *const u8, n_salt as usize) };
+    let k = std::slice::from_raw_parts(ikm as *const u8, n_ikm as usize);
+    let prk = hkdf_extract(s, k);
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, 32);
+    o.copy_from_slice(&prk);
+    32
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_hkdf_expand(
+    prk: *const c_void, n_prk: c_int,
+    info: *const c_void, n_info: c_int,
+    out: *mut c_void, n_out: c_int,
+) -> c_int {
+    if prk.is_null() || out.is_null() || n_prk != 32 || n_info < 0 || n_out <= 0 { return -1; }
+    if n_out as usize > 255 * 32 { return -1; }
+    let mut p = [0u8; 32];
+    p.copy_from_slice(std::slice::from_raw_parts(prk as *const u8, 32));
+    let i = if info.is_null() || n_info == 0 { &[][..] }
+            else { std::slice::from_raw_parts(info as *const u8, n_info as usize) };
+    let okm = hkdf_expand(&p, i, n_out as usize);
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, n_out as usize);
+    o.copy_from_slice(&okm);
+    n_out
+}
+
+/// HKDF-Expand-Label per RFC 8446 §7.1.
+///   HkdfLabel = struct { uint16 length; opaque label<7..255>;
+///                        opaque context<0..255>; }
+///   label = "tls13 " ++ user_label
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_hkdf_expand_label(
+    secret: *const c_void, n_secret: c_int,
+    label: *const c_void, n_label: c_int,
+    context: *const c_void, n_context: c_int,
+    out: *mut c_void, n_out: c_int,
+) -> c_int {
+    if secret.is_null() || label.is_null() || out.is_null() { return -1; }
+    if n_secret != 32 || n_label <= 0 || n_label > 255 || n_context < 0 || n_context > 255 { return -1; }
+    if n_out <= 0 || n_out > 0xffff { return -1; }
+    let lbl = std::slice::from_raw_parts(label as *const u8, n_label as usize);
+    let ctx = if context.is_null() || n_context == 0 { &[][..] }
+              else { std::slice::from_raw_parts(context as *const u8, n_context as usize) };
+    let full_label = {
+        let mut v = Vec::with_capacity(6 + lbl.len());
+        v.extend_from_slice(b"tls13 ");
+        v.extend_from_slice(lbl);
+        v
+    };
+    if full_label.len() > 255 { return -1; }
+    let mut info = Vec::with_capacity(2 + 1 + full_label.len() + 1 + ctx.len());
+    info.extend_from_slice(&(n_out as u16).to_be_bytes());
+    info.push(full_label.len() as u8);
+    info.extend_from_slice(&full_label);
+    info.push(ctx.len() as u8);
+    info.extend_from_slice(ctx);
+
+    let mut p = [0u8; 32];
+    p.copy_from_slice(std::slice::from_raw_parts(secret as *const u8, 32));
+    let okm = hkdf_expand(&p, &info, n_out as usize);
+    let o = std::slice::from_raw_parts_mut(out as *mut u8, n_out as usize);
+    o.copy_from_slice(&okm);
+    n_out
+}
+
+// =====================================================================
+// FR-19.1-extra (d) — X25519 (RFC 7748).
+//
+// Curve25519 scalar multiplication. The TLS 1.3 key_share group used
+// for ECDHE on basically every modern handshake. 32-byte private
+// scalar in, 32-byte public point out. Verified against RFC 7748
+// §5.2 test vector in the unit tests.
+// =====================================================================
+fn x25519_fe_add(out: &mut [u64; 5], a: &[u64; 5], b: &[u64; 5]) {
+    for i in 0..5 { out[i] = a[i] + b[i]; }
+}
+fn x25519_fe_sub(out: &mut [u64; 5], a: &[u64; 5], b: &[u64; 5]) {
+    // c = a + (2*p - b); 2*p = 2^256 - 38 → done via per-limb add+borrow trick.
+    let two_p_0: u64 = 0xfffffffffffda;
+    let two_p_other: u64 = 0xffffffffffffe;
+    out[0] = a[0] + two_p_0 - b[0];
+    out[1] = a[1] + two_p_other - b[1];
+    out[2] = a[2] + two_p_other - b[2];
+    out[3] = a[3] + two_p_other - b[3];
+    out[4] = a[4] + two_p_other - b[4];
+}
+fn x25519_fe_mul(out: &mut [u64; 5], a: &[u64; 5], b: &[u64; 5]) {
+    // Schoolbook on radix-2^51 limbs. Reduce mod 2^255 - 19.
+    let m = |x: u128| (x as u64) & ((1u64 << 51) - 1);
+    let a0 = a[0] as u128; let a1 = a[1] as u128; let a2 = a[2] as u128;
+    let a3 = a[3] as u128; let a4 = a[4] as u128;
+    let b0 = b[0] as u128; let b1 = b[1] as u128; let b2 = b[2] as u128;
+    let b3 = b[3] as u128; let b4 = b[4] as u128;
+    let b1_19 = 19 * b1; let b2_19 = 19 * b2; let b3_19 = 19 * b3; let b4_19 = 19 * b4;
+
+    let d0 = a0*b0 + a1*b4_19 + a2*b3_19 + a3*b2_19 + a4*b1_19;
+    let d1 = a0*b1 + a1*b0    + a2*b4_19 + a3*b3_19 + a4*b2_19;
+    let d2 = a0*b2 + a1*b1    + a2*b0    + a3*b4_19 + a4*b3_19;
+    let d3 = a0*b3 + a1*b2    + a2*b1    + a3*b0    + a4*b4_19;
+    let d4 = a0*b4 + a1*b3    + a2*b2    + a3*b1    + a4*b0;
+
+    let c = (d0 >> 51) as u64; let r0 = m(d0);
+    let d1 = d1 + c as u128; let c = (d1 >> 51) as u64; let r1 = m(d1);
+    let d2 = d2 + c as u128; let c = (d2 >> 51) as u64; let r2 = m(d2);
+    let d3 = d3 + c as u128; let c = (d3 >> 51) as u64; let r3 = m(d3);
+    let d4 = d4 + c as u128; let c = (d4 >> 51) as u64; let r4 = m(d4);
+    // Carry from limb 4 wraps into limb 0 with factor 19.
+    let r0 = r0 + 19 * c;
+    let c2 = r0 >> 51; let r0 = r0 & ((1u64 << 51) - 1);
+    out[0] = r0; out[1] = r1 + c2; out[2] = r2; out[3] = r3; out[4] = r4;
+}
+fn x25519_fe_sq(out: &mut [u64; 5], a: &[u64; 5]) {
+    let mut tmp = [0u64; 5];
+    x25519_fe_mul(&mut tmp, a, a);
+    *out = tmp;
+}
+fn x25519_fe_mul_121665(out: &mut [u64; 5], a: &[u64; 5]) {
+    let m = |x: u128| (x as u64) & ((1u64 << 51) - 1);
+    let c0 = a[0] as u128 * 121665;
+    let c1 = a[1] as u128 * 121665;
+    let c2 = a[2] as u128 * 121665;
+    let c3 = a[3] as u128 * 121665;
+    let c4 = a[4] as u128 * 121665;
+    let c = (c0 >> 51) as u64; let r0 = m(c0);
+    let c1 = c1 + c as u128; let c = (c1 >> 51) as u64; let r1 = m(c1);
+    let c2 = c2 + c as u128; let c = (c2 >> 51) as u64; let r2 = m(c2);
+    let c3 = c3 + c as u128; let c = (c3 >> 51) as u64; let r3 = m(c3);
+    let c4 = c4 + c as u128; let c = (c4 >> 51) as u64; let r4 = m(c4);
+    let r0 = r0 + 19 * c;
+    let c2 = r0 >> 51; let r0 = r0 & ((1u64 << 51) - 1);
+    out[0] = r0; out[1] = r1 + c2; out[2] = r2; out[3] = r3; out[4] = r4;
+}
+fn x25519_fe_invert(out: &mut [u64; 5], z: &[u64; 5]) {
+    // Compute z^(2^255 - 21) = z^(-1) mod 2^255 - 19, via 2^255 - 21 chain.
+    let sq_into = |dst: &mut [u64;5], src: &[u64;5]| x25519_fe_sq(dst, src);
+    let sq_inplace = |x: &mut [u64;5]| { let tmp = *x; x25519_fe_sq(x, &tmp); };
+    let mul_inplace = |x: &mut [u64;5], y: &[u64;5]| { let tmp = *x; x25519_fe_mul(x, &tmp, y); };
+
+    let mut z2 = [0u64; 5]; sq_into(&mut z2, z);
+    let mut z9 = [0u64; 5]; sq_into(&mut z9, &z2); sq_inplace(&mut z9); mul_inplace(&mut z9, z);
+    let mut z11 = [0u64; 5]; x25519_fe_mul(&mut z11, &z9, &z2);
+    let mut z2_5_0 = [0u64; 5]; sq_into(&mut z2_5_0, &z11); mul_inplace(&mut z2_5_0, &z9);
+    let mut z2_10_0 = [0u64; 5]; sq_into(&mut z2_10_0, &z2_5_0);
+    for _ in 0..4 { sq_inplace(&mut z2_10_0); }
+    mul_inplace(&mut z2_10_0, &z2_5_0);
+    let mut z2_20_0 = [0u64; 5]; sq_into(&mut z2_20_0, &z2_10_0);
+    for _ in 0..9 { sq_inplace(&mut z2_20_0); }
+    mul_inplace(&mut z2_20_0, &z2_10_0);
+    let mut z2_40_0 = [0u64; 5]; sq_into(&mut z2_40_0, &z2_20_0);
+    for _ in 0..19 { sq_inplace(&mut z2_40_0); }
+    mul_inplace(&mut z2_40_0, &z2_20_0);
+    let mut z2_50_0 = [0u64; 5]; sq_into(&mut z2_50_0, &z2_40_0);
+    for _ in 0..9 { sq_inplace(&mut z2_50_0); }
+    mul_inplace(&mut z2_50_0, &z2_10_0);
+    let mut z2_100_0 = [0u64; 5]; sq_into(&mut z2_100_0, &z2_50_0);
+    for _ in 0..49 { sq_inplace(&mut z2_100_0); }
+    mul_inplace(&mut z2_100_0, &z2_50_0);
+    let mut z2_200_0 = [0u64; 5]; sq_into(&mut z2_200_0, &z2_100_0);
+    for _ in 0..99 { sq_inplace(&mut z2_200_0); }
+    mul_inplace(&mut z2_200_0, &z2_100_0);
+    let mut z2_250_0 = [0u64; 5]; sq_into(&mut z2_250_0, &z2_200_0);
+    for _ in 0..49 { sq_inplace(&mut z2_250_0); }
+    mul_inplace(&mut z2_250_0, &z2_50_0);
+    let mut z2_255_5 = [0u64; 5]; sq_into(&mut z2_255_5, &z2_250_0);
+    for _ in 0..4 { sq_inplace(&mut z2_255_5); }
+    x25519_fe_mul(out, &z2_255_5, &z11);
+}
+fn x25519_fe_to_bytes(out: &mut [u8; 32], h: &[u64; 5]) {
+    let mask = (1u64 << 51) - 1;
+    let mut h = *h;
+    // Reduce: carry propagate twice.
+    for _ in 0..2 {
+        let c = h[0] >> 51; h[0] &= mask; h[1] += c;
+        let c = h[1] >> 51; h[1] &= mask; h[2] += c;
+        let c = h[2] >> 51; h[2] &= mask; h[3] += c;
+        let c = h[3] >> 51; h[3] &= mask; h[4] += c;
+        let c = h[4] >> 51; h[4] &= mask; h[0] += 19 * c;
+    }
+    // Conditional subtract p if h >= p.
+    let q = (h[0] + 19) >> 51;
+    let q = (h[1] + q) >> 51;
+    let q = (h[2] + q) >> 51;
+    let q = (h[3] + q) >> 51;
+    let q = (h[4] + q) >> 51;
+    h[0] += 19 * q;
+    let c = h[0] >> 51; h[0] &= mask; h[1] += c;
+    let c = h[1] >> 51; h[1] &= mask; h[2] += c;
+    let c = h[2] >> 51; h[2] &= mask; h[3] += c;
+    let c = h[3] >> 51; h[3] &= mask; h[4] += c;
+    h[4] &= mask;
+    // Pack to little-endian bytes byte-by-byte (each limb is 51 bits;
+    // shifting 102 bits in a single u64 would overflow).
+    for i in 0..32 { out[i] = 0; }
+    // Pack 5 51-bit limbs into 32 bytes (256 bits) LE.
+    let bits = [h[0], h[1], h[2], h[3], h[4]];
+    let mut bitpos = 0usize;
+    for limb in &bits {
+        let mut v = *limb;
+        let mut bits_in_limb = 51;
+        while bits_in_limb > 0 {
+            let byte_idx = bitpos / 8;
+            let bit_off  = bitpos % 8;
+            let space = 8 - bit_off;
+            let take = bits_in_limb.min(space);
+            let mask_take = ((1u64 << take) - 1) as u8;
+            out[byte_idx] |= ((v as u8) & mask_take) << bit_off;
+            v >>= take;
+            bitpos += take;
+            bits_in_limb -= take;
+        }
+    }
+}
+fn x25519_fe_from_bytes(out: &mut [u64; 5], bytes: &[u8; 32]) {
+    // Five 51-bit limbs cover bits 0..254 of the input (255 data bits).
+    // RFC 7748 says the top bit of byte 31 (input bit 255) must be
+    // masked off; since we never read it, the mask is implicit.
+    let mask = (1u64 << 51) - 1;
+    let mut limbs = [0u64; 5];
+    let mut bitpos = 0usize;
+    for limb_i in 0..5 {
+        let mut bits_in_limb = 51;
+        let mut v = 0u64;
+        let mut have = 0;
+        while bits_in_limb > 0 {
+            let byte_idx = bitpos / 8;
+            let bit_off  = bitpos % 8;
+            let avail = 8 - bit_off;
+            let take = bits_in_limb.min(avail);
+            let mask_take = ((1u64 << take) - 1) as u64;
+            let chunk = ((bytes[byte_idx] as u64) >> bit_off) & mask_take;
+            v |= chunk << have;
+            have += take;
+            bitpos += take;
+            bits_in_limb -= take;
+        }
+        limbs[limb_i] = v & mask;
+    }
+    *out = limbs;
+}
+fn x25519_cswap(swap: u64, a: &mut [u64; 5], b: &mut [u64; 5]) {
+    let mask = swap.wrapping_neg();
+    for i in 0..5 {
+        let d = (a[i] ^ b[i]) & mask;
+        a[i] ^= d; b[i] ^= d;
+    }
+}
+
+/// Compute u-coordinate scalar multiplication: out = scalar * u.
+/// RFC 7748 X25519 — Montgomery ladder over Curve25519.
+pub(crate) fn x25519_scalar_mult(scalar: &[u8; 32], u_in: &[u8; 32]) -> [u8; 32] {
+    // Clamp scalar per RFC 7748.
+    let mut k = *scalar;
+    k[0] &= 248; k[31] &= 127; k[31] |= 64;
+    let mut x1 = [0u64; 5]; x25519_fe_from_bytes(&mut x1, u_in);
+    let mut x2 = [0u64; 5]; x2[0] = 1;
+    let mut z2 = [0u64; 5];
+    let mut x3 = x1; let mut z3 = [0u64; 5]; z3[0] = 1;
+    let mut swap: u64 = 0;
+    for t in (0..=254).rev() {
+        let k_t = ((k[t/8] >> (t%8)) & 1) as u64;
+        swap ^= k_t;
+        x25519_cswap(swap, &mut x2, &mut x3);
+        x25519_cswap(swap, &mut z2, &mut z3);
+        swap = k_t;
+        let mut a = [0u64;5]; x25519_fe_add(&mut a, &x2, &z2);
+        let mut aa = [0u64;5]; x25519_fe_sq(&mut aa, &a);
+        let mut b = [0u64;5]; x25519_fe_sub(&mut b, &x2, &z2);
+        let mut bb = [0u64;5]; x25519_fe_sq(&mut bb, &b);
+        let mut e = [0u64;5]; x25519_fe_sub(&mut e, &aa, &bb);
+        let mut c = [0u64;5]; x25519_fe_add(&mut c, &x3, &z3);
+        let mut d = [0u64;5]; x25519_fe_sub(&mut d, &x3, &z3);
+        let mut da = [0u64;5]; x25519_fe_mul(&mut da, &d, &a);
+        let mut cb = [0u64;5]; x25519_fe_mul(&mut cb, &c, &b);
+        let mut sum = [0u64;5]; x25519_fe_add(&mut sum, &da, &cb);
+        let mut x3n = [0u64;5]; x25519_fe_sq(&mut x3n, &sum);
+        let mut dif = [0u64;5]; x25519_fe_sub(&mut dif, &da, &cb);
+        let mut difsq = [0u64;5]; x25519_fe_sq(&mut difsq, &dif);
+        let mut z3n = [0u64;5]; x25519_fe_mul(&mut z3n, &difsq, &x1);
+        let mut x2n = [0u64;5]; x25519_fe_mul(&mut x2n, &aa, &bb);
+        let mut e121665 = [0u64;5]; x25519_fe_mul_121665(&mut e121665, &e);
+        let mut tmp = [0u64;5]; x25519_fe_add(&mut tmp, &aa, &e121665);
+        let mut z2n = [0u64;5]; x25519_fe_mul(&mut z2n, &e, &tmp);
+        x2 = x2n; z2 = z2n; x3 = x3n; z3 = z3n;
+    }
+    x25519_cswap(swap, &mut x2, &mut x3);
+    x25519_cswap(swap, &mut z2, &mut z3);
+    let mut z2_inv = [0u64; 5]; x25519_fe_invert(&mut z2_inv, &z2);
+    let mut out_fe = [0u64; 5]; x25519_fe_mul(&mut out_fe, &x2, &z2_inv);
+    let mut out = [0u8; 32]; x25519_fe_to_bytes(&mut out, &out_fe);
+    out
+}
+
+/// X25519 public key derivation: pub = scalar * basepoint(9).
+#[no_mangle] pub unsafe extern "C" fn aether_x25519_derive_public(
+    scalar: *const c_void, out: *mut c_void,
+) -> c_int {
+    if scalar.is_null() || out.is_null() { return -1; }
+    let mut s = [0u8; 32]; s.copy_from_slice(std::slice::from_raw_parts(scalar as *const u8, 32));
+    let mut bp = [0u8; 32]; bp[0] = 9;
+    let pubk = x25519_scalar_mult(&s, &bp);
+    std::slice::from_raw_parts_mut(out as *mut u8, 32).copy_from_slice(&pubk);
+    32
+}
+
+/// X25519 shared-secret computation: shared = scalar * peer_pub.
+#[no_mangle] pub unsafe extern "C" fn aether_x25519_shared_secret(
+    scalar: *const c_void, peer_pub: *const c_void, out: *mut c_void,
+) -> c_int {
+    if scalar.is_null() || peer_pub.is_null() || out.is_null() { return -1; }
+    let mut s = [0u8; 32]; s.copy_from_slice(std::slice::from_raw_parts(scalar as *const u8, 32));
+    let mut p = [0u8; 32]; p.copy_from_slice(std::slice::from_raw_parts(peer_pub as *const u8, 32));
+    let shared = x25519_scalar_mult(&s, &p);
+    std::slice::from_raw_parts_mut(out as *mut u8, 32).copy_from_slice(&shared);
+    32
+}
+
+// =====================================================================
+// FR-19.1-extra (e) — SHA-512 (FIPS 180-4).
+//
+// 64-bit cousin of SHA-256. Needed internally by Ed25519. Same
+// structure (8-word state + 80-round compression + length-padded
+// blocks) but 1024-bit blocks and different IV/K constants.
+// Verified against the standard "abc" + "" vectors.
+// =====================================================================
+const SHA512_IV: [u64; 8] = [
+    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+];
+const SHA512_K: [u64; 80] = [
+    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+];
+
+fn sha512_compress(state: &mut [u64; 8], block: &[u8; 128]) {
+    let mut w = [0u64; 80];
+    for i in 0..16 {
+        w[i] = u64::from_be_bytes([
+            block[i*8], block[i*8+1], block[i*8+2], block[i*8+3],
+            block[i*8+4], block[i*8+5], block[i*8+6], block[i*8+7],
+        ]);
+    }
+    for i in 16..80 {
+        let s0 = w[i-15].rotate_right(1) ^ w[i-15].rotate_right(8) ^ (w[i-15] >> 7);
+        let s1 = w[i-2].rotate_right(19) ^ w[i-2].rotate_right(61) ^ (w[i-2] >> 6);
+        w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+    }
+    let mut a = state[0]; let mut b = state[1]; let mut c = state[2]; let mut d = state[3];
+    let mut e = state[4]; let mut f = state[5]; let mut g = state[6]; let mut h = state[7];
+    for i in 0..80 {
+        let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA512_K[i]).wrapping_add(w[i]);
+        let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+        let mj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(mj);
+        h = g; g = f; f = e; e = d.wrapping_add(t1);
+        d = c; c = b; b = a; a = t1.wrapping_add(t2);
+    }
+    state[0] = state[0].wrapping_add(a); state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c); state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e); state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g); state[7] = state[7].wrapping_add(h);
+}
+
+pub(crate) fn sha512(msg: &[u8]) -> [u8; 64] {
+    let mut state = SHA512_IV;
+    let mut buf = [0u8; 128];
+    let mut buf_len = 0usize;
+    let mut total_bits: u128 = 0;
+    let mut data = msg;
+    while !data.is_empty() {
+        let take = (128 - buf_len).min(data.len());
+        buf[buf_len..buf_len+take].copy_from_slice(&data[..take]);
+        buf_len += take;
+        total_bits += (take as u128) * 8;
+        data = &data[take..];
+        if buf_len == 128 {
+            sha512_compress(&mut state, &buf);
+            buf_len = 0;
+        }
+    }
+    buf[buf_len] = 0x80;
+    buf_len += 1;
+    if buf_len > 112 {
+        for i in buf_len..128 { buf[i] = 0; }
+        sha512_compress(&mut state, &buf);
+        buf_len = 0;
+        buf = [0u8; 128];
+    }
+    for i in buf_len..112 { buf[i] = 0; }
+    buf[112..128].copy_from_slice(&total_bits.to_be_bytes());
+    sha512_compress(&mut state, &buf);
+    let mut out = [0u8; 64];
+    for i in 0..8 { out[i*8..i*8+8].copy_from_slice(&state[i].to_be_bytes()); }
+    out
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_sha512(
+    msg: *const c_void, n_msg: c_int,
+    out: *mut c_void,
+) -> c_int {
+    if msg.is_null() || out.is_null() || n_msg < 0 { return -1; }
+    let slice = std::slice::from_raw_parts(msg as *const u8, n_msg as usize);
+    let digest = sha512(slice);
+    std::slice::from_raw_parts_mut(out as *mut u8, 64).copy_from_slice(&digest);
+    64
+}
+
+// =====================================================================
+// FR-19.1-extra (f) — Ed25519 (RFC 8032).
+//
+// EdDSA over edwards25519 with SHA-512. Provides aether_ed25519_sign
+// and aether_ed25519_verify against RFC 8032 §7.1 test vectors.
+//
+// Implementation notes:
+//   - Scalars (32B) are little-endian; signatures are 64B (R || S).
+//   - Curve point representation: extended Edwards (X, Y, Z, T).
+//   - Field element representation: 5×51-bit limbs over GF(2^255-19),
+//     reusing the X25519 fe ops above.
+//   - Scalar reduction mod ell uses a simple 6-limb 51-bit accumulator
+//     with Barrett-style reduction.
+//
+// Reference: ref10 from libsodium / supercop; cleaned up & translated
+// to Rust. Verified against RFC 8032 §7.1 vectors below.
+// =====================================================================
+
+// edwards25519 group order ell = 2^252 + 27742317777372353535851937790883648493.
+const ELL: [u8; 32] = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+];
+// d = -121665/121666 (mod p), the edwards25519 curve constant.
+// Computed at runtime from the field-element ops to avoid hand-typed limb
+// errors. Cached in an OnceLock.
+fn ed25519_d_fe() -> [u64; 5] {
+    use std::sync::OnceLock;
+    static D: OnceLock<[u8; 40]> = OnceLock::new();
+    let bytes = D.get_or_init(|| {
+        let mut a = ed25519_zero_fe(); a[0] = 121665;
+        let mut neg_a = [0u64; 5]; x25519_fe_sub(&mut neg_a, &ed25519_zero_fe(), &a);
+        let mut b = ed25519_zero_fe(); b[0] = 121666;
+        let mut b_inv = [0u64; 5]; x25519_fe_invert(&mut b_inv, &b);
+        let mut d = [0u64; 5]; x25519_fe_mul(&mut d, &neg_a, &b_inv);
+        let mut out = [0u8; 40];
+        for i in 0..5 { out[i*8..i*8+8].copy_from_slice(&d[i].to_le_bytes()); }
+        out
+    });
+    let mut d = [0u64; 5];
+    for i in 0..5 {
+        d[i] = u64::from_le_bytes(bytes[i*8..i*8+8].try_into().unwrap());
+    }
+    d
+}
+fn ed25519_one_fe() -> [u64; 5] { [1, 0, 0, 0, 0] }
+fn ed25519_zero_fe() -> [u64; 5] { [0, 0, 0, 0, 0] }
+
+#[derive(Clone, Copy)]
+struct EdPoint { x: [u64;5], y: [u64;5], z: [u64;5], t: [u64;5] }
+
+fn ed_identity() -> EdPoint {
+    EdPoint { x: ed25519_zero_fe(), y: ed25519_one_fe(), z: ed25519_one_fe(), t: ed25519_zero_fe() }
+}
+
+// Base point B in extended Edwards form. Decoded from its standard
+// 32-byte compressed encoding (RFC 8032 §6) to dodge hand-typed limb
+// errors. Caches the decoded point at first access.
+fn ed_base() -> EdPoint {
+    use std::sync::OnceLock;
+    static BASE: OnceLock<[u8; 200]> = OnceLock::new();  // 5 limbs × 8 bytes × 4 fields = 160; +pad
+    let bytes = BASE.get_or_init(|| {
+        // Standard By encoding (LE): byte 0 = 0x58, bytes 1..31 = 0x66, x_sign = 0.
+        let mut by = [0x66u8; 32];
+        by[0] = 0x58;
+        let p = ed_decode(&by).expect("base point decode");
+        let mut out = [0u8; 200];
+        let mut push = |off: usize, fe: &[u64; 5]| {
+            for i in 0..5 {
+                out[off + i*8..off + i*8 + 8].copy_from_slice(&fe[i].to_le_bytes());
+            }
+        };
+        push(0,  &p.x);
+        push(40, &p.y);
+        push(80, &p.z);
+        push(120, &p.t);
+        out
+    });
+    let read = |off: usize| -> [u64; 5] {
+        let mut fe = [0u64; 5];
+        for i in 0..5 {
+            fe[i] = u64::from_le_bytes(bytes[off + i*8 .. off + i*8 + 8].try_into().unwrap());
+        }
+        fe
+    };
+    EdPoint { x: read(0), y: read(40), z: read(80), t: read(120) }
+}
+
+fn ed_add(p1: &EdPoint, p2: &EdPoint) -> EdPoint {
+    let mut a = [0u64;5]; let mut tmp = [0u64;5];
+    x25519_fe_sub(&mut tmp, &p1.y, &p1.x);
+    let mut b = [0u64;5];
+    x25519_fe_sub(&mut b, &p2.y, &p2.x);
+    x25519_fe_mul(&mut a, &tmp, &b);
+    let mut c = [0u64;5]; let mut tmp2 = [0u64;5];
+    x25519_fe_add(&mut tmp, &p1.y, &p1.x);
+    x25519_fe_add(&mut tmp2, &p2.y, &p2.x);
+    x25519_fe_mul(&mut c, &tmp, &tmp2);
+    let d_const = ed25519_d_fe();
+    let mut two_d = [0u64;5]; x25519_fe_add(&mut two_d, &d_const, &d_const);
+    let mut d_val = [0u64;5];
+    x25519_fe_mul(&mut d_val, &p1.t, &p2.t);
+    let mut tmp3 = d_val;
+    x25519_fe_mul(&mut d_val, &tmp3, &two_d);
+    let mut z_val = [0u64;5];
+    x25519_fe_mul(&mut z_val, &p1.z, &p2.z);
+    let mut z2 = [0u64;5]; x25519_fe_add(&mut z2, &z_val, &z_val);
+    let mut e = [0u64;5]; x25519_fe_sub(&mut e, &c, &a);
+    let mut f = [0u64;5]; x25519_fe_sub(&mut f, &z2, &d_val);
+    let mut g = [0u64;5]; x25519_fe_add(&mut g, &z2, &d_val);
+    let mut h = [0u64;5]; x25519_fe_add(&mut h, &c, &a);
+    let mut x_out = [0u64;5]; x25519_fe_mul(&mut x_out, &e, &f);
+    let mut y_out = [0u64;5]; x25519_fe_mul(&mut y_out, &g, &h);
+    let mut t_out = [0u64;5]; x25519_fe_mul(&mut t_out, &e, &h);
+    let mut z_out = [0u64;5]; x25519_fe_mul(&mut z_out, &f, &g);
+    let _ = tmp3;
+    EdPoint { x: x_out, y: y_out, z: z_out, t: t_out }
+}
+
+fn ed_double(p: &EdPoint) -> EdPoint { ed_add(p, p) }
+
+fn ed_scalar_mult(scalar: &[u8; 32], p: &EdPoint) -> EdPoint {
+    let mut result = ed_identity();
+    // Standard double-and-add, MSB first. Not constant-time — fine for
+    // verify but signing should use a constant-time impl. FR-x-extra.
+    for byte_idx in (0..32).rev() {
+        for bit in (0..8).rev() {
+            result = ed_double(&result);
+            if (scalar[byte_idx] >> bit) & 1 == 1 {
+                result = ed_add(&result, p);
+            }
+        }
+    }
+    result
+}
+
+fn ed_to_affine_y(p: &EdPoint) -> ([u8; 32], bool) {
+    let mut z_inv = [0u64; 5]; x25519_fe_invert(&mut z_inv, &p.z);
+    let mut x = [0u64; 5]; x25519_fe_mul(&mut x, &p.x, &z_inv);
+    let mut y = [0u64; 5]; x25519_fe_mul(&mut y, &p.y, &z_inv);
+    let mut x_bytes = [0u8; 32]; x25519_fe_to_bytes(&mut x_bytes, &x);
+    let mut y_bytes = [0u8; 32]; x25519_fe_to_bytes(&mut y_bytes, &y);
+    let x_sign = (x_bytes[0] & 1) == 1;
+    y_bytes[31] |= (x_sign as u8) << 7;
+    (y_bytes, x_sign)
+}
+
+/// Decode a 32-byte little-endian compressed Edwards point: y || x_sign.
+fn ed_decode(bytes: &[u8; 32]) -> Option<EdPoint> {
+    let mut y_bytes = *bytes;
+    let x_sign = (y_bytes[31] >> 7) & 1;
+    y_bytes[31] &= 0x7f;
+    let mut y = [0u64; 5]; x25519_fe_from_bytes(&mut y, &y_bytes);
+
+    // x^2 = (y^2 - 1) / (d*y^2 + 1)
+    let mut y2 = [0u64; 5]; x25519_fe_sq(&mut y2, &y);
+    let one = ed25519_one_fe();
+    let mut num = [0u64; 5]; x25519_fe_sub(&mut num, &y2, &one);
+    let d_const = ed25519_d_fe();
+    let mut dy2 = [0u64; 5]; x25519_fe_mul(&mut dy2, &d_const, &y2);
+    let mut den = [0u64; 5]; x25519_fe_add(&mut den, &dy2, &one);
+    let mut den_inv = [0u64; 5]; x25519_fe_invert(&mut den_inv, &den);
+    let mut x2 = [0u64; 5]; x25519_fe_mul(&mut x2, &num, &den_inv);
+
+    // x = x2 ^ ((p+3)/8) — square root via the Tonelli shortcut.
+    let mut x = fe_pow_p_plus_3_over_8(&x2);
+    let mut x_sq = [0u64; 5]; x25519_fe_sq(&mut x_sq, &x);
+    // Check x_sq == x2; if x_sq == -x2 then multiply x by sqrt(-1).
+    let mut neg_x2 = [0u64; 5]; x25519_fe_sub(&mut neg_x2, &ed25519_zero_fe(), &x2);
+    let mut diff = [0u64; 5]; x25519_fe_sub(&mut diff, &x_sq, &x2);
+    let mut diff_b = [0u8; 32]; x25519_fe_to_bytes(&mut diff_b, &diff);
+    let is_eq = diff_b.iter().all(|&b| b == 0);
+    if !is_eq {
+        // x_sq should equal -x2; multiply x by sqrt(-1).
+        let mut neg_diff = [0u64; 5]; x25519_fe_sub(&mut neg_diff, &x_sq, &neg_x2);
+        let mut nd_b = [0u8; 32]; x25519_fe_to_bytes(&mut nd_b, &neg_diff);
+        if !nd_b.iter().all(|&b| b == 0) {
+            return None;
+        }
+        let sqrt_m1 = sqrt_neg1_fe();
+        let mut new_x = [0u64; 5];
+        x25519_fe_mul(&mut new_x, &x, &sqrt_m1);
+        x = new_x;
+    }
+
+    let mut x_bytes = [0u8; 32]; x25519_fe_to_bytes(&mut x_bytes, &x);
+    if (x_bytes[0] & 1) != x_sign {
+        let mut neg = [0u64; 5]; x25519_fe_sub(&mut neg, &ed25519_zero_fe(), &x);
+        x = neg;
+    }
+
+    let mut t = [0u64; 5]; x25519_fe_mul(&mut t, &x, &y);
+    Some(EdPoint { x, y, z: ed25519_one_fe(), t })
+}
+
+fn sqrt_neg1_fe() -> [u64; 5] {
+    // sqrt(-1) mod p = 2 ^ ((p-1)/4) since p ≡ 5 (mod 8) and 2 is a
+    // non-residue. (p-1)/4 = 2^253 - 5. Cached after first compute.
+    use std::sync::OnceLock;
+    static S: OnceLock<[u8; 40]> = OnceLock::new();
+    let bytes = S.get_or_init(|| {
+        // Standard hex (LE bytes): from libsodium ed25519_ref10.
+        const S_BYTES: [u8; 32] = [
+            0xb0, 0xa0, 0x0e, 0x4a, 0x27, 0x1b, 0xee, 0xc4,
+            0x78, 0xe4, 0x2f, 0xad, 0x06, 0x18, 0x43, 0x2f,
+            0xa7, 0xd7, 0xfb, 0x3d, 0x99, 0x00, 0x4d, 0x2b,
+            0x0b, 0xdf, 0xc1, 0x4f, 0x80, 0x24, 0x83, 0x2b,
+        ];
+        let mut s_fe = [0u64; 5]; x25519_fe_from_bytes(&mut s_fe, &S_BYTES);
+        // Self-check: s_fe^2 == -1 mod p.
+        let mut sq = [0u64; 5]; x25519_fe_sq(&mut sq, &s_fe);
+        let mut neg_one = [0u64; 5]; x25519_fe_sub(&mut neg_one, &ed25519_zero_fe(), &ed25519_one_fe());
+        let mut diff = [0u64; 5]; x25519_fe_sub(&mut diff, &sq, &neg_one);
+        let mut diff_b = [0u8; 32]; x25519_fe_to_bytes(&mut diff_b, &diff);
+        assert!(diff_b.iter().all(|&b| b == 0), "sqrt_neg1 self-check failed");
+        let mut out = [0u8; 40];
+        for i in 0..5 { out[i*8..i*8+8].copy_from_slice(&s_fe[i].to_le_bytes()); }
+        out
+    });
+    let mut s = [0u64; 5];
+    for i in 0..5 {
+        s[i] = u64::from_le_bytes(bytes[i*8..i*8+8].try_into().unwrap());
+    }
+    s
+}
+
+fn fe_pow_p_plus_3_over_8(z: &[u64; 5]) -> [u64; 5] {
+    // (p + 3) / 8 = 2^252 - 2. Standard chain:
+    let sq_into = |dst: &mut [u64;5], src: &[u64;5]| x25519_fe_sq(dst, src);
+    let sq_inplace = |x: &mut [u64;5]| { let tmp = *x; x25519_fe_sq(x, &tmp); };
+    let mul_inplace = |x: &mut [u64;5], y: &[u64;5]| { let tmp = *x; x25519_fe_mul(x, &tmp, y); };
+
+    let mut z2 = [0u64; 5]; sq_into(&mut z2, z);
+    let mut z9 = [0u64; 5]; sq_into(&mut z9, &z2); sq_inplace(&mut z9); mul_inplace(&mut z9, z);
+    let mut z11 = [0u64; 5]; x25519_fe_mul(&mut z11, &z9, &z2);
+    let mut z2_5_0 = [0u64; 5]; sq_into(&mut z2_5_0, &z11); mul_inplace(&mut z2_5_0, &z9);
+    let mut z2_10_0 = [0u64; 5]; sq_into(&mut z2_10_0, &z2_5_0);
+    for _ in 0..4 { sq_inplace(&mut z2_10_0); }
+    mul_inplace(&mut z2_10_0, &z2_5_0);
+    let mut z2_20_0 = [0u64; 5]; sq_into(&mut z2_20_0, &z2_10_0);
+    for _ in 0..9 { sq_inplace(&mut z2_20_0); }
+    mul_inplace(&mut z2_20_0, &z2_10_0);
+    let mut z2_40_0 = [0u64; 5]; sq_into(&mut z2_40_0, &z2_20_0);
+    for _ in 0..19 { sq_inplace(&mut z2_40_0); }
+    mul_inplace(&mut z2_40_0, &z2_20_0);
+    let mut z2_50_0 = [0u64; 5]; sq_into(&mut z2_50_0, &z2_40_0);
+    for _ in 0..9 { sq_inplace(&mut z2_50_0); }
+    mul_inplace(&mut z2_50_0, &z2_10_0);
+    let mut z2_100_0 = [0u64; 5]; sq_into(&mut z2_100_0, &z2_50_0);
+    for _ in 0..49 { sq_inplace(&mut z2_100_0); }
+    mul_inplace(&mut z2_100_0, &z2_50_0);
+    let mut z2_200_0 = [0u64; 5]; sq_into(&mut z2_200_0, &z2_100_0);
+    for _ in 0..99 { sq_inplace(&mut z2_200_0); }
+    mul_inplace(&mut z2_200_0, &z2_100_0);
+    let mut z2_250_0 = [0u64; 5]; sq_into(&mut z2_250_0, &z2_200_0);
+    for _ in 0..49 { sq_inplace(&mut z2_250_0); }
+    mul_inplace(&mut z2_250_0, &z2_50_0);
+    // (p+3)/8 = 2^252 - 2 = (2^250 - 1) * 4 + 2.
+    // z^(2^252 - 2) = (z^(2^250-1))^4 * z^2.
+    let mut out = [0u64; 5];
+    let mut z2_252_2 = z2_250_0; sq_inplace(&mut z2_252_2); sq_inplace(&mut z2_252_2);
+    x25519_fe_mul(&mut out, &z2_252_2, &z2);
+    out
+}
+
+/// Reduce a 64-byte little-endian scalar mod ell into a 32-byte
+/// little-endian result.
+fn sc_reduce(input: &[u8; 64]) -> [u8; 32] {
+    // Compute s = input mod ell via long division on big-integer
+    // limbs. Slow but simple; this is verify-only path so timing is
+    // not critical. FR-x-extra: constant-time Barrett.
+    use std::cmp::Ordering;
+    let mut a = [0u32; 17]; // 64 bytes = 16 u32 + 1 spare
+    for i in 0..16 {
+        a[i] = u32::from_le_bytes([input[i*4], input[i*4+1], input[i*4+2], input[i*4+3]]);
+    }
+    let ell32: [u32; 8] = [
+        0x5cf5d3ed, 0x5812631a, 0xa2f79cd6, 0x14def9de,
+        0x00000000, 0x00000000, 0x00000000, 0x10000000,
+    ];
+    // Repeated subtraction approach: bring `a` down by subtracting
+    // ell × 2^k. Walk from MSB.
+    let cmp_ge = |x: &[u32; 17], y: &[u32; 17]| -> Ordering {
+        for i in (0..17).rev() {
+            if x[i] != y[i] { return x[i].cmp(&y[i]); }
+        }
+        Ordering::Equal
+    };
+    let sub_inplace = |dst: &mut [u32; 17], src: &[u32; 17]| {
+        let mut borrow: i64 = 0;
+        for i in 0..17 {
+            let v = dst[i] as i64 - src[i] as i64 - borrow;
+            if v < 0 {
+                dst[i] = (v + (1i64 << 32)) as u32;
+                borrow = 1;
+            } else {
+                dst[i] = v as u32;
+                borrow = 0;
+            }
+        }
+    };
+    for shift_words in (0..9).rev() {
+        for shift_bits in (0..32).rev() {
+            let mut shifted = [0u32; 17];
+            let mut carry = 0u64;
+            for i in 0..8 {
+                let v = (ell32[i] as u64) << shift_bits | carry;
+                shifted[i + shift_words] = (v & 0xffffffff) as u32;
+                carry = v >> 32;
+            }
+            if 8 + shift_words < 17 {
+                shifted[8 + shift_words] = (carry & 0xffffffff) as u32;
+            } else if carry != 0 {
+                continue;  // shifted > 2^(17*32); skip
+            }
+            if cmp_ge(&a, &shifted) != Ordering::Less {
+                sub_inplace(&mut a, &shifted);
+            }
+        }
+    }
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i*4..i*4+4].copy_from_slice(&a[i].to_le_bytes());
+    }
+    out
+}
+
+/// Ed25519 keypair derivation: 32-byte seed → (32-byte pubkey).
+/// Per RFC 8032 §5.1.5: SHA-512(seed) → h (64 bytes), clamp h[..32],
+/// scalar mult by base, encode.
+#[no_mangle] pub unsafe extern "C" fn aether_ed25519_derive_public(
+    seed: *const c_void, out_pub: *mut c_void,
+) -> c_int {
+    if seed.is_null() || out_pub.is_null() { return -1; }
+    let s = std::slice::from_raw_parts(seed as *const u8, 32);
+    let mut h = sha512(s);
+    h[0] &= 248; h[31] &= 127; h[31] |= 64;
+    let mut scalar = [0u8; 32]; scalar.copy_from_slice(&h[..32]);
+    let p = ed_scalar_mult(&scalar, &ed_base());
+    let (encoded, _) = ed_to_affine_y(&p);
+    std::slice::from_raw_parts_mut(out_pub as *mut u8, 32).copy_from_slice(&encoded);
+    32
+}
+
+/// Ed25519 sign: (seed, pubkey, message) → 64-byte signature.
+#[no_mangle] pub unsafe extern "C" fn aether_ed25519_sign(
+    seed: *const c_void, pubkey: *const c_void,
+    msg: *const c_void, n_msg: c_int,
+    out_sig: *mut c_void,
+) -> c_int {
+    if seed.is_null() || pubkey.is_null() || msg.is_null() || out_sig.is_null() { return -1; }
+    if n_msg < 0 { return -1; }
+    let s = std::slice::from_raw_parts(seed as *const u8, 32);
+    let pk = std::slice::from_raw_parts(pubkey as *const u8, 32);
+    let m  = std::slice::from_raw_parts(msg as *const u8, n_msg as usize);
+
+    let h = sha512(s);
+    let mut a_clamped = [0u8; 32]; a_clamped.copy_from_slice(&h[..32]);
+    a_clamped[0] &= 248; a_clamped[31] &= 127; a_clamped[31] |= 64;
+    let prefix = &h[32..];
+
+    // r = SHA-512(prefix || msg) mod ell
+    let mut buf = Vec::with_capacity(32 + m.len()); buf.extend_from_slice(prefix); buf.extend_from_slice(m);
+    let r_hash = sha512(&buf);
+    let mut r_hash64 = [0u8; 64]; r_hash64.copy_from_slice(&r_hash);
+    let r = sc_reduce(&r_hash64);
+
+    // R = r * B
+    let r_point = ed_scalar_mult(&r, &ed_base());
+    let (r_encoded, _) = ed_to_affine_y(&r_point);
+
+    // k = SHA-512(R || A || M) mod ell
+    let mut k_input = Vec::with_capacity(32 + 32 + m.len());
+    k_input.extend_from_slice(&r_encoded);
+    k_input.extend_from_slice(pk);
+    k_input.extend_from_slice(m);
+    let k_hash = sha512(&k_input);
+    let mut k_hash64 = [0u8; 64]; k_hash64.copy_from_slice(&k_hash);
+    let k = sc_reduce(&k_hash64);
+
+    // S = (r + k * a) mod ell
+    let s_scalar = sc_muladd(&k, &a_clamped, &r);
+
+    let out = std::slice::from_raw_parts_mut(out_sig as *mut u8, 64);
+    out[..32].copy_from_slice(&r_encoded);
+    out[32..].copy_from_slice(&s_scalar);
+    64
+}
+
+fn sc_muladd(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
+    // Compute (a*b + c) mod ell via 64-byte intermediate.
+    let to_u64 = |x: &[u8; 32], i: usize| u32::from_le_bytes([x[i*4],x[i*4+1],x[i*4+2],x[i*4+3]]) as u64;
+    let mut prod = [0u64; 17];
+    for i in 0..8 {
+        let ai = to_u64(a, i);
+        let mut carry = 0u64;
+        for j in 0..8 {
+            let bj = to_u64(b, j);
+            let cur = prod[i+j] + ai * bj + carry;
+            prod[i+j] = cur & 0xffffffff;
+            carry = cur >> 32;
+        }
+        prod[i+8] = carry;
+    }
+    // Add c.
+    let mut carry = 0u64;
+    for i in 0..8 {
+        let v = prod[i] + to_u64(c, i) + carry;
+        prod[i] = v & 0xffffffff;
+        carry = v >> 32;
+    }
+    for i in 8..17 {
+        if carry == 0 { break; }
+        let v = prod[i] + carry;
+        prod[i] = v & 0xffffffff;
+        carry = v >> 32;
+    }
+    let mut bytes = [0u8; 64];
+    for i in 0..16 {
+        bytes[i*4..i*4+4].copy_from_slice(&(prod[i] as u32).to_le_bytes());
+    }
+    sc_reduce(&bytes)
+}
+
+/// Ed25519 verify: (pubkey, message, signature) → 0 on valid, -1 invalid.
+#[no_mangle] pub unsafe extern "C" fn aether_ed25519_verify(
+    pubkey: *const c_void,
+    msg: *const c_void, n_msg: c_int,
+    sig: *const c_void,
+) -> c_int {
+    if pubkey.is_null() || msg.is_null() || sig.is_null() || n_msg < 0 { return -1; }
+    let pk_bytes = std::slice::from_raw_parts(pubkey as *const u8, 32);
+    let mut pk_arr = [0u8; 32]; pk_arr.copy_from_slice(pk_bytes);
+    let m  = std::slice::from_raw_parts(msg as *const u8, n_msg as usize);
+    let sg = std::slice::from_raw_parts(sig as *const u8, 64);
+    let mut r_enc = [0u8; 32]; r_enc.copy_from_slice(&sg[..32]);
+    let mut s_arr = [0u8; 32]; s_arr.copy_from_slice(&sg[32..]);
+
+    // S must be < ell.
+    for i in (0..32).rev() {
+        if s_arr[i] < ELL[i] { break; }
+        if s_arr[i] > ELL[i] { return -1; }
+        if i == 0 { return -1; } // S == ell
+    }
+
+    let Some(a_point) = ed_decode(&pk_arr) else { return -1; };
+    let Some(r_point) = ed_decode(&r_enc) else { return -1; };
+
+    let mut k_input = Vec::with_capacity(64 + m.len());
+    k_input.extend_from_slice(&r_enc);
+    k_input.extend_from_slice(pk_bytes);
+    k_input.extend_from_slice(m);
+    let k_hash = sha512(&k_input);
+    let mut k_hash64 = [0u8; 64]; k_hash64.copy_from_slice(&k_hash);
+    let k = sc_reduce(&k_hash64);
+
+    // Check: S*B == R + k*A.
+    let sb = ed_scalar_mult(&s_arr, &ed_base());
+    let ka = ed_scalar_mult(&k, &a_point);
+    let rhs = ed_add(&r_point, &ka);
+    // Compare sb and rhs via affine y + x_sign.
+    let (sb_b, _) = ed_to_affine_y(&sb);
+    let (rhs_b, _) = ed_to_affine_y(&rhs);
+    if sb_b == rhs_b { 0 } else { -1 }
 }
 
 // =====================================================================
@@ -8545,5 +9659,180 @@ mod conv2d_tests {
             assert_eq!(rc, 0);
         }
         assert_eq!(output, vec![27.0; 4]);
+    }
+
+    // ================= FR-19.1-extra crypto primitives =================
+
+    fn hex(s: &str) -> Vec<u8> {
+        s.as_bytes().chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn sha256_known_vectors() {
+        // FIPS 180-4 + RFC vectors.
+        let h = super::sha256(b"abc");
+        assert_eq!(hex_encode(&h), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let h = super::sha256(b"");
+        assert_eq!(hex_encode(&h), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        // 56-byte boundary case ("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq").
+        let h = super::sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+        assert_eq!(hex_encode(&h), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231_vector1() {
+        // RFC 4231 §4.2: Key = 20*0x0b, Data = "Hi There".
+        let key = vec![0x0bu8; 20];
+        let tag = super::hmac_sha256(&key, b"Hi There");
+        assert_eq!(hex_encode(&tag),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    }
+
+    #[test]
+    fn hkdf_rfc5869_test_case_1() {
+        let ikm  = hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b");
+        let salt = hex("000102030405060708090a0b0c");
+        let info = hex("f0f1f2f3f4f5f6f7f8f9");
+        let prk = super::hkdf_extract(&salt, &ikm);
+        assert_eq!(hex_encode(&prk),
+            "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+        let okm = super::hkdf_expand(&prk, &info, 42);
+        assert_eq!(hex_encode(&okm),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+    }
+
+    #[test]
+    fn x25519_rfc7748_test_vector() {
+        // RFC 7748 §5.2 first vector.
+        let scalar = hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+        let mut sc = [0u8; 32]; sc.copy_from_slice(&scalar);
+        let u_in = hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+        let mut u = [0u8; 32]; u.copy_from_slice(&u_in);
+        let out = super::x25519_scalar_mult(&sc, &u);
+        assert_eq!(hex_encode(&out),
+            "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+    }
+
+    #[test]
+    fn x25519_dh_roundtrip() {
+        // Alice and Bob each derive a public key, then a shared secret.
+        // Both arrive at the same shared secret.
+        let alice_priv = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let bob_priv   = hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        let mut a = [0u8; 32]; a.copy_from_slice(&alice_priv);
+        let mut b = [0u8; 32]; b.copy_from_slice(&bob_priv);
+        let mut bp = [0u8; 32]; bp[0] = 9;
+        let alice_pub = super::x25519_scalar_mult(&a, &bp);
+        let bob_pub   = super::x25519_scalar_mult(&b, &bp);
+        let s_alice = super::x25519_scalar_mult(&a, &bob_pub);
+        let s_bob   = super::x25519_scalar_mult(&b, &alice_pub);
+        assert_eq!(s_alice, s_bob, "DH shared secrets must match");
+        // RFC 7748 §6.1 expected secret.
+        assert_eq!(hex_encode(&s_alice),
+            "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+    }
+
+    #[test]
+    fn tls13_hkdf_expand_label_shape() {
+        // The wire-shape of HkdfLabel: length(2) + label_len(1) + "tls13 " + user_label + ctx_len(1) + ctx.
+        // Use HKDF-Expand under the hood with this info string. Smoke-check
+        // that the expand returns the requested length and is deterministic.
+        let secret = [0x42u8; 32];
+        let label = b"derived";
+        let ctx = &super::sha256(b"")[..];
+        let mut out = [0u8; 32];
+        unsafe {
+            let n = aether_tls13_hkdf_expand_label(
+                secret.as_ptr() as *const _, 32,
+                label.as_ptr() as *const _, label.len() as i32,
+                ctx.as_ptr() as *const _, ctx.len() as i32,
+                out.as_mut_ptr() as *mut _, 32,
+            );
+            assert_eq!(n, 32);
+        }
+        // Second invocation: must match (deterministic).
+        let mut out2 = [0u8; 32];
+        unsafe {
+            aether_tls13_hkdf_expand_label(
+                secret.as_ptr() as *const _, 32,
+                label.as_ptr() as *const _, label.len() as i32,
+                ctx.as_ptr() as *const _, ctx.len() as i32,
+                out2.as_mut_ptr() as *mut _, 32,
+            );
+        }
+        assert_eq!(out, out2);
+    }
+
+    #[test]
+    fn sha512_known_vectors() {
+        let h = super::sha512(b"abc");
+        assert_eq!(hex_encode(&h),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+        let h = super::sha512(b"");
+        assert_eq!(hex_encode(&h),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e");
+    }
+
+    #[test]
+    fn ed25519_rfc8032_test_1() {
+        // RFC 8032 §7.1 TEST 1
+        let seed = hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let pub_expected = hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        let mut seed_arr = [0u8; 32]; seed_arr.copy_from_slice(&seed);
+        let mut pub_out = [0u8; 32];
+        unsafe {
+            let n = aether_ed25519_derive_public(seed_arr.as_ptr() as *const _, pub_out.as_mut_ptr() as *mut _);
+            assert_eq!(n, 32);
+        }
+        assert_eq!(&pub_out[..], &pub_expected[..]);
+
+        let msg: Vec<u8> = vec![];
+        let sig_expected = hex(
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        );
+        let mut sig_out = [0u8; 64];
+        unsafe {
+            let n = aether_ed25519_sign(
+                seed_arr.as_ptr() as *const _, pub_out.as_ptr() as *const _,
+                msg.as_ptr() as *const _, msg.len() as i32,
+                sig_out.as_mut_ptr() as *mut _,
+            );
+            assert_eq!(n, 64);
+        }
+        assert_eq!(&sig_out[..], &sig_expected[..]);
+
+        // Verify the signature.
+        unsafe {
+            let v = aether_ed25519_verify(
+                pub_out.as_ptr() as *const _,
+                msg.as_ptr() as *const _, msg.len() as i32,
+                sig_out.as_ptr() as *const _,
+            );
+            assert_eq!(v, 0, "verify should succeed");
+
+            // Flip a sig byte → must reject.
+            let mut bad_sig = sig_out;
+            bad_sig[0] ^= 1;
+            let v = aether_ed25519_verify(
+                pub_out.as_ptr() as *const _,
+                msg.as_ptr() as *const _, msg.len() as i32,
+                bad_sig.as_ptr() as *const _,
+            );
+            assert_eq!(v, -1, "tampered sig should reject");
+        }
+    }
+
+    fn hex_encode(b: &[u8]) -> String {
+        const H: &[u8] = b"0123456789abcdef";
+        let mut s = Vec::with_capacity(b.len() * 2);
+        for byte in b {
+            s.push(H[(byte >> 4) as usize]);
+            s.push(H[(byte & 0xf) as usize]);
+        }
+        String::from_utf8(s).unwrap()
     }
 }

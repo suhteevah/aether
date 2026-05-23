@@ -26,6 +26,11 @@ path = "src/bin/allreduce.rs"
 
 [features]
 default = []
+# `cuda`: enable cuBLAS/cuDNN routing in aether_rt + unlock the
+# `aether-serve` real-forward path (QwenSession). Without this feature
+# `aether-serve` returns a stub response (no GGUF load, no real GPU
+# forward — used for HTTP/JSON plumbing tests only).
+cuda = ["aether_rt/cuda"]
 # `nccl`: enable the data-parallel training loop in `dp.rs`. Forwards
 # the same-named feature to aether_rt so libnccl is linked. Without
 # this feature the trainer is single-rank CPU only.
