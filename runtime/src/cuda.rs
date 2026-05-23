@@ -73,11 +73,36 @@ struct CudaCtx {
     attention_seq1_devarg: CudaFunction,
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
-    // Paged KV variants (FR-19.4-extra). Compiled as a separate nvrtc unit
-    // so they don't apply register-allocator pressure on the main kernels
-    // (see memory: nvrtc_kernel_unit_pressure.md).
+}
+
+/// FR-19.4-extra paged-KV kernels — held in a separate `OnceCell` so the
+/// PTX/load only happens when paged kernels are first invoked.  This keeps
+/// the contiguous-decode hot path untouched: the qwen25_graph_decode bench
+/// regressed from 37 → 31 tok/s when paged compilation ran inside the main
+/// `ctx()` init, even though the paged kernels were never called by that
+/// bench (cross-module device-side pressure per memory:
+/// nvrtc_kernel_unit_pressure.md).  Lazy-init restores baseline.
+struct PagedCtx {
     paged_append_kv_devarg: CudaFunction,
     paged_attention_seq1_devarg: CudaFunction,
+}
+
+static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
+
+fn paged_ctx() -> &'static PagedCtx {
+    PAGED_CTX.get_or_init(|| {
+        let device = &ctx().device;
+        let paged_ptx = compile_ptx(PAGED_KERNEL_SRC).expect("compile_ptx paged");
+        device.load_ptx(paged_ptx, "aether_paged_kernels",
+            &["paged_append_kv_devarg", "paged_attention_seq1_devarg"])
+            .expect("load_ptx paged");
+        PagedCtx {
+            paged_append_kv_devarg:
+                device.get_func("aether_paged_kernels", "paged_append_kv_devarg").unwrap(),
+            paged_attention_seq1_devarg:
+                device.get_func("aether_paged_kernels", "paged_attention_seq1_devarg").unwrap(),
+        }
+    })
 }
 
 /// FR-19.4-extra paged-KV kernels.  Separate nvrtc unit so its register
@@ -1688,16 +1713,6 @@ fn ctx() -> &'static CudaCtx {
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
 
-        // Paged-KV kernels — separate nvrtc compilation unit.
-        let paged_ptx = compile_ptx(PAGED_KERNEL_SRC).expect("compile_ptx paged");
-        device.load_ptx(paged_ptx, "aether_paged_kernels",
-            &["paged_append_kv_devarg", "paged_attention_seq1_devarg"])
-            .expect("load_ptx paged");
-        let paged_append_kv_devarg =
-            device.get_func("aether_paged_kernels", "paged_append_kv_devarg").unwrap();
-        let paged_attention_seq1_devarg =
-            device.get_func("aether_paged_kernels", "paged_attention_seq1_devarg").unwrap();
-
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
@@ -1710,8 +1725,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
-                  append_kv, attention_seq1,
-                  paged_append_kv_devarg, paged_attention_seq1_devarg }
+                  append_kv, attention_seq1 }
     })
 }
 
@@ -2754,7 +2768,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         let knr = &*kn; let vnr = &*vn;
         let kpm = &mut *kp; let vpm = &mut *vp;
         let ptv = &*pt; let sv = &*sp;
-        ctx().paged_append_kv_devarg.clone()
+        paged_ctx().paged_append_kv_devarg.clone()
             .launch(cfg, (knr, vnr, kpm, vpm, ptv, d_kv, block_size, sv))
             .expect("launch paged_append_kv_devarg");
     }
@@ -2795,7 +2809,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     unsafe {
         let qv = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
         let ov = &mut *o_p; let sv = &*sp;
-        ctx().paged_attention_seq1_devarg.clone()
+        paged_ctx().paged_attention_seq1_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, sv))
             .expect("launch paged_attention_seq1_devarg");
     }
