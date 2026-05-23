@@ -147,6 +147,149 @@ fn tls13_client_session_loopback() {
     assert_eq!(got, c2s);
 }
 
+/// ALPN negotiation loopback: client offers ["h2","http/1.1"], server supports
+/// ["http/1.1","h2"], result = "http/1.1" (server preference).
+#[test]
+fn tls13_alpn_negotiation() {
+    use aether_rt::tls13::TlsServerSession;
+    let server_seed = [0xb1u8; 32];
+    let server_random = [0xb2u8; 32];
+    let server_x25519_priv = [0xb3u8; 32];
+    let client_x25519_priv = [0xb4u8; 32];
+    let client_random = [0xb5u8; 32];
+
+    let server_alpn = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+    let client_alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let mut server = TlsServerSession::new_with_alpn(
+        &server_seed, &server_random, &server_x25519_priv,
+        "aether-alpn-test", b"\x05",
+        server_alpn,
+    );
+    let mut client = TlsClientSession::new_with_alpn(
+        client_x25519_priv, client_random, (0..16u8).collect(),
+        client_alpn,
+    );
+
+    // Drive handshake.
+    let to_server = client.take_outbound();
+    server.feed(&to_server).unwrap();
+    let to_client = server.take_outbound();
+    client.feed(&to_client).unwrap();
+    assert!(client.is_handshake_done());
+    let fin = client.take_outbound();
+    server.feed(&fin).unwrap();
+    assert_eq!(server.state(), State::Connected);
+
+    // Both sides see the same negotiated protocol — server's first preference
+    // that also appears in client's list = "http/1.1".
+    assert_eq!(server.negotiated_alpn(), Some(b"http/1.1".as_slice()),
+        "server picked: {:?}", server.negotiated_alpn());
+    assert_eq!(client.negotiated_alpn(), Some(b"http/1.1".as_slice()),
+        "client saw: {:?}", client.negotiated_alpn());
+}
+
+/// ALPN where client offers "h2" only and server supports "h2" too -> h2 wins.
+#[test]
+fn tls13_alpn_h2_only() {
+    use aether_rt::tls13::TlsServerSession;
+    let mut server = TlsServerSession::new_with_alpn(
+        &[0xc1u8; 32], &[0xc2u8; 32], &[0xc3u8; 32],
+        "aether-alpn-h2", b"\x06",
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    );
+    let mut client = TlsClientSession::new_with_alpn(
+        [0xc4u8; 32], [0xc5u8; 32], (0..8u8).collect(),
+        vec![b"h2".to_vec()],
+    );
+    server.feed(&client.take_outbound()).unwrap();
+    client.feed(&server.take_outbound()).unwrap();
+    server.feed(&client.take_outbound()).unwrap();
+    assert_eq!(server.negotiated_alpn(), Some(b"h2".as_slice()));
+    assert_eq!(client.negotiated_alpn(), Some(b"h2".as_slice()));
+}
+
+/// Cert chain / trust-anchor verifier: client configured with the server's
+/// SPKI pubkey as a trusted anchor; handshake completes and self-sig is
+/// verified.  Then run with a WRONG anchor and verify it's rejected.
+#[test]
+fn tls13_trust_anchor_positive() {
+    use aether_rt::tls13::TlsServerSession;
+    use aether_rt::tls13::client_for_test::verify_self_signed_ed25519_cert;
+
+    // Build server.  Compute the SPKI pubkey it will use (Ed25519 derive from seed).
+    let seed = [0xe1u8; 32];
+    let mut server_pub = [0u8; 32];
+    unsafe {
+        aether_rt::aether_ed25519_derive_public(
+            seed.as_ptr() as *const std::ffi::c_void,
+            server_pub.as_mut_ptr() as *mut std::ffi::c_void,
+        );
+    }
+    let mut server = TlsServerSession::new(
+        &seed, &[0xe2u8; 32], &[0xe3u8; 32], "aether-trust-test", b"\x08",
+    );
+
+    // Build client with that pubkey as the lone trust anchor.
+    let mut client = TlsClientSession::new_full(
+        [0xe4u8; 32], [0xe5u8; 32], (0..8u8).collect(),
+        Vec::new(),                     // no ALPN
+        vec![server_pub],               // trust anchor
+    );
+
+    server.feed(&client.take_outbound()).unwrap();
+    let to_client = server.take_outbound();
+    // First, sanity-check our self-sig verifier on the server's own cert.
+    // We extract the cert DER directly from x509::self_sign_ed25519.
+    let (cert_der, _) = aether_rt::tls13::x509::self_sign_ed25519(&seed, "aether-trust-test", b"\x08");
+    assert!(verify_self_signed_ed25519_cert(&cert_der),
+        "the cert builder must emit verifiable self-signatures");
+
+    client.feed(&to_client).expect("client must accept server with valid trust anchor");
+    server.feed(&client.take_outbound()).unwrap();
+    assert!(client.is_handshake_done());
+}
+
+#[test]
+fn tls13_trust_anchor_negative() {
+    use aether_rt::tls13::TlsServerSession;
+    let mut server = TlsServerSession::new(
+        &[0xf1u8; 32], &[0xf2u8; 32], &[0xf3u8; 32], "aether-bad-trust", b"\x09",
+    );
+    // Client configured with a completely different anchor.
+    let mut client = TlsClientSession::new_full(
+        [0xf4u8; 32], [0xf5u8; 32], (0..8u8).collect(),
+        Vec::new(),
+        vec![[0xdeu8; 32]],  // bogus trust anchor
+    );
+    server.feed(&client.take_outbound()).unwrap();
+    let to_client = server.take_outbound();
+    let result = client.feed(&to_client);
+    assert!(result.is_err(),
+        "client must reject server when SPKI doesn't match any trust anchor; got {:?}", result);
+}
+
+/// ALPN where there's no overlap -> server emits no ALPN extension, both sides
+/// negotiated_alpn() = None.
+#[test]
+fn tls13_alpn_no_overlap() {
+    use aether_rt::tls13::TlsServerSession;
+    let mut server = TlsServerSession::new_with_alpn(
+        &[0xd1u8; 32], &[0xd2u8; 32], &[0xd3u8; 32],
+        "aether-alpn-none", b"\x07",
+        vec![b"h2".to_vec()],
+    );
+    let mut client = TlsClientSession::new_with_alpn(
+        [0xd4u8; 32], [0xd5u8; 32], (0..8u8).collect(),
+        vec![b"smtp".to_vec()],
+    );
+    server.feed(&client.take_outbound()).unwrap();
+    client.feed(&server.take_outbound()).unwrap();
+    server.feed(&client.take_outbound()).unwrap();
+    assert_eq!(server.negotiated_alpn(), None);
+    assert_eq!(client.negotiated_alpn(), None);
+}
+
 /// Negative test: a tampered server flight (single byte flipped) must fail the
 /// client's CV signature or MAC checks.
 #[test]

@@ -121,18 +121,28 @@ impl TlsStream {
     /// Build a TLS session bound to the given socket fd.  Generates fresh
     /// Ed25519 + X25519 keys + server_random + serial.  Does NOT run the
     /// handshake — call `handshake()` next.
+    ///
+    /// ALPN support: advertises ["h2", "http/1.1"] so HTTP/2 over TLS works
+    /// with clients that need ALPN to commit to h2 (RFC 7540 §3.4).  Post-
+    /// handshake routing still uses the peek-preface auto-detect, so even
+    /// non-ALPN clients work over TLS.
     unsafe fn accept(fd: i64, cn: &str) -> Self {
         let ed_seed = rand32();
         let server_random = rand32();
         let x25519_priv = rand32();
         let mut serial = [0u8; 16];
         let _ = aether_random_bytes(serial.as_mut_ptr() as *mut c_void, 16);
-        // Clear top bit so DER INTEGER stays positive without an extra leading 0x00.
         serial[0] &= 0x7f;
         if serial[0] == 0 { serial[0] = 1; }
-        let sess = TlsServerSession::new(&ed_seed, &server_random, &x25519_priv, cn, &serial);
+        let sess = TlsServerSession::new_with_alpn(
+            &ed_seed, &server_random, &x25519_priv, cn, &serial,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        );
         Self { fd, sess, app_buf: Vec::new(), eof: false }
     }
+
+    /// What protocol was negotiated via ALPN (or None if no overlap).
+    fn negotiated_alpn(&self) -> Option<&[u8]> { self.sess.negotiated_alpn() }
 
     /// Drive the TLS handshake by ping-ponging recv/send until session is Connected.
     unsafe fn handshake(&mut self) -> Result<(), &'static str> {

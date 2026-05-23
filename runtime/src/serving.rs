@@ -46,6 +46,8 @@ use crate::cuda::{
     aether_op_rope_apply_devarg_f32_cuda,
     aether_op_append_kv_devarg_f32_cuda,
     aether_op_attention_seq1_devarg_f32_cuda,
+    aether_op_paged_append_kv_devarg_f32_cuda,
+    aether_op_paged_attention_seq1_devarg_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
@@ -137,8 +139,13 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     }
 }
 
+/// Forward one block.  `paged_cfg = Some((page_table_dev, block_size))` routes
+/// append_kv + attention_seq1 through the paged variants; None uses the
+/// contiguous kernels.  With an identity-mapping page table both modes are
+/// bit-identical (witnessed in `runtime/tests/cuda_paged_kv_parity.rs`).
 unsafe fn block_forward_devarg(
     bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, step_args: i64,
+    paged_cfg: Option<(i64, i32)>,
 ) {
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_q, act.q,
@@ -159,13 +166,23 @@ unsafe fn block_forward_devarg(
         1, N_Q_HEADS as c_int, HEAD_DIM as c_int, ROPE_BASE, step_args);
     aether_op_rope_apply_devarg_f32_cuda(act.k_step,
         1, N_KV_HEADS as c_int, HEAD_DIM as c_int, ROPE_BASE, step_args);
-    aether_op_append_kv_devarg_f32_cuda(act.k_step, act.v_step, kv.k_cache, kv.v_cache,
-        D_KV as c_int, step_args);
     let scale: f32 = 1.0 / (HEAD_DIM as f32).sqrt();
-    aether_op_attention_seq1_devarg_f32_cuda(
-        act.q, kv.k_cache, kv.v_cache, act.attn_out,
-        N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int, scale,
-        MAX_SEQ as c_int, step_args);
+    if let Some((page_table_dev, block_size)) = paged_cfg {
+        aether_op_paged_append_kv_devarg_f32_cuda(
+            act.k_step, act.v_step, kv.k_cache, kv.v_cache, page_table_dev,
+            D_KV as c_int, block_size, step_args);
+        aether_op_paged_attention_seq1_devarg_f32_cuda(
+            act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+            N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int,
+            block_size, scale, MAX_SEQ as c_int, step_args);
+    } else {
+        aether_op_append_kv_devarg_f32_cuda(act.k_step, act.v_step, kv.k_cache, kv.v_cache,
+            D_KV as c_int, step_args);
+        aether_op_attention_seq1_devarg_f32_cuda(
+            act.q, kv.k_cache, kv.v_cache, act.attn_out,
+            N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int, scale,
+            MAX_SEQ as c_int, step_args);
+    }
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.attn_out, bw.w_o, act.proj,
         D_MODEL as c_int, (bw.nb_qo / D_MODEL) as c_int);
     aether_op_add_inplace_f32_cuda(act.x, act.proj, D_MODEL as c_int);
@@ -220,12 +237,32 @@ pub struct QwenSession {
     /// auto-stop in `generate()` when caller doesn't pass an explicit
     /// stop_token. -1 if metadata absent.
     pub eos_token: i32,
+    /// FR-19.4-extra paged-KV mode.  When Some, kvs[i].k_cache / v_cache point
+    /// at the per-layer KV POOL (size pool_blocks * block_size * d_kv f32);
+    /// `page_table_dev` holds an identity mapping [0,1,..,pool_blocks-1] used
+    /// by the paged kernels.  Bit-identical to contiguous mode at identity
+    /// mapping (proven in cuda_paged_kv_parity.rs).
+    paged_cfg: Option<PagedCfg>,
+}
+
+struct PagedCfg {
+    page_table_dev: i64,
+    block_size: i32,
 }
 
 impl QwenSession {
-    /// Open a GGUF + upload all weights to GPU. Returns Err on missing
-    /// file or shape mismatch with Qwen2.5-7B (28 layers, d=3584).
+    /// Open a GGUF + upload all weights to GPU.  Default: contiguous KV.
     pub fn new(gguf_path: &str) -> Result<Self, String> {
+        Self::new_with_mode(gguf_path, false)
+    }
+    /// Construct with explicit KV-cache mode.  `paged = true` routes K/V
+    /// reads/writes through `paged_append_kv_devarg` + `paged_attention_seq1_devarg`
+    /// against an identity page table.  Bit-identical to contiguous mode but
+    /// exercises the FR-19.4-extra paged path end-to-end in the real decoder.
+    pub fn new_paged(gguf_path: &str) -> Result<Self, String> {
+        Self::new_with_mode(gguf_path, true)
+    }
+    fn new_with_mode(gguf_path: &str, paged: bool) -> Result<Self, String> {
         if !std::path::Path::new(gguf_path).exists() {
             return Err(format!("GGUF not found: {}", gguf_path));
         }
@@ -258,6 +295,21 @@ impl QwenSession {
             }).collect();
             let step_args = aether_dev_alloc_i32(4);  // [pos, cur_seq, 0, 0]
 
+            // Paged-KV: identity mapping of block_size=4 logical blocks to
+            // physical blocks [0, 1, ..., MAX_SEQ/block_size - 1].  Same
+            // memory layout as contiguous; the kernel walks the page_table
+            // for every K/V access.
+            let paged_cfg = if paged {
+                const BLOCK_SIZE: i32 = 4;
+                let n_blocks = (MAX_SEQ as i32) / BLOCK_SIZE;
+                let pt_dev = aether_dev_alloc_i32(n_blocks);
+                let pt_host: Vec<i32> = (0..n_blocks).collect();
+                aether_dev_h2d_i32(pt_host.as_ptr() as i64, pt_dev, n_blocks);
+                Some(PagedCfg { page_table_dev: pt_dev, block_size: BLOCK_SIZE })
+            } else {
+                None
+            };
+
             let (bpe_handle, eos_token) = load_tokenizer_from_gguf(h);
             let gpt2_u2b = build_gpt2_unicode_to_byte();
             Ok(QwenSession {
@@ -267,8 +319,13 @@ impl QwenSession {
                 next_pos: 0,
                 graph_captured: false,
                 bpe_handle, gpt2_u2b, eos_token,
+                paged_cfg,
             })
         }
+    }
+
+    fn paged_arg(&self) -> Option<(i64, i32)> {
+        self.paged_cfg.as_ref().map(|p| (p.page_table_dev, p.block_size))
     }
 
     /// Reset the KV cache + position for a new request. Cheap (no GPU
@@ -322,7 +379,7 @@ impl QwenSession {
                 let step_host = [pos, cur_seq, 0i32, 0i32];
                 aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
                 for b in 0..N_LAYERS {
-                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args);
+                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg());
                 }
             }
             aether_dev_sync();
@@ -344,7 +401,7 @@ impl QwenSession {
         let rc = aether_dev_graph_begin();
         assert_eq!(rc, 0, "aether_dev_graph_begin failed: {}", rc);
         for b in 0..N_LAYERS {
-            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args);
+            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg());
         }
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
@@ -481,6 +538,9 @@ impl Drop for QwenSession {
                 let _ = aether_dev_free_f32(kv.v_cache);
             }
             let _ = aether_dev_free_i32(self.step_args);
+            if let Some(p) = self.paged_cfg.take() {
+                let _ = aether_dev_free_i32(p.page_table_dev);
+            }
             if self.bpe_handle >= 0 {
                 let _ = aether_bpe_tokenizer_free(self.bpe_handle);
             }

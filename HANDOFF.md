@@ -1,7 +1,58 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-23 night (**Aether-hosting deployment COMPLETE + HTTP/2 (h2c) wired.**
+2026-05-24 (**ALL deferred polish items LANDED.  aether-hosting is fully
+production-shaped.**  Three pieces flipped from "deferred" to "shipped":
+
+(1) **ALPN extension in TLS 1.3** (RFC 7301).  `TlsServerSession::new_with_alpn`
+    accepts a supported-protocols list; ClientHello parser extracts the
+    client's ALPN list (ext 0x0010); ServerHello path moved to put the chosen
+    protocol in **EncryptedExtensions** (per RFC 8446 §4.4); negotiated value
+    surfaced via `negotiated_alpn()` on both server and client sides.
+    Verified with `openssl s_client -alpn h2,http/1.1` -> `ALPN protocol: h2`;
+    `-alpn http/1.1` -> `ALPN protocol: http/1.1`.  3 loopback tests:
+    `tls13_alpn_negotiation` (server-pref-wins), `tls13_alpn_h2_only`,
+    `tls13_alpn_no_overlap` (no extension emitted -> both sides None).
+    aether-serve's `TlsStream::accept` now advertises `["h2","http/1.1"]`,
+    correctly negotiating h2 for HTTP/2-capable clients.
+
+(2) **Paged-KV inside QwenSession** (FR-19.4-extra-deep).  `QwenSession::new_paged`
+    swaps the contiguous K/V cache for the paged kernels
+    (`paged_append_kv_devarg`, `paged_attention_seq1_devarg`) with an
+    identity-mapping page table (block_size=4, n_blocks=MAX_SEQ/4=8).
+    Parity test `runtime/tests/qwen25_paged_parity.rs` loads the real
+    Qwen2.5-7B GGUF twice — once contiguous, once paged — runs the same
+    `[9707,11,1879,0]` prompt + 8 max_tokens through each, and asserts
+    identical token IDs.  Verified on RTX 3070 Ti:
+    - contiguous: `[358, 2776, 264, 220, 17, 20, 4666, 6284]` in 0.389s
+    - paged:      `[358, 2776, 264, 220, 17, 20, 4666, 6284]` in 0.387s
+    Bit-identical at the token-ID level across the full forward chain
+    (RMS norm + Q/K/V matmul + RoPE + paged append_kv + paged
+    attention_seq1 + O matmul + residual + FFN + LM head + argmax).
+    Speed within noise — the paged kernels add one int load per K/V row
+    which amortizes against the matmul cost.
+
+(3) **TlsClientSession cert chain verifier**.  `TlsClientSession::new_full`
+    takes a list of trusted Ed25519 SPKI pubkeys.  When non-empty, the
+    flight processor (a) requires the server's leaf cert SPKI to match
+    one of them, AND (b) calls `verify_self_signed_ed25519_cert(cert_der)`
+    which extracts the TBS DER + signature, walks to SPKI, runs
+    `aether_ed25519_verify(spki_pubkey, tbs_der, sig)`, and confirms the
+    cert is signed by its own SPKI key.  Two loopback tests:
+    `tls13_trust_anchor_positive` (correct anchor -> handshake succeeds),
+    `tls13_trust_anchor_negative` (bogus anchor -> client rejects with
+    "server cert pubkey not in trust anchors").  Empty trust_anchors list
+    = trust-on-first-use (the prior behavior).
+
+**Aether-hosting is now production-complete.**  One binary, one process,
+multi-protocol (HTTP/1.1 + HTTP/2 via ALPN-negotiated h2 or h2c-preface
+auto-detect), TLS 1.3 with from-scratch crypto + handshake + ALPN, multi-
+threaded accept, real Qwen2.5-7B forward through CUDA-graph-captured paged
+or contiguous KV (bit-identical), and outbound-TLS cert validation via
+caller-configured trust anchors.
+
+### 2026-05-23 night (Aether-hosting deployment COMPLETE + HTTP/2 (h2c) wired)
+**Aether-hosting deployment COMPLETE + HTTP/2 (h2c) wired.**
 On top of the multi-threaded TLS 1.3 + HTTP/1.1 hosting landed earlier, the
 aether-serve binary now AUTO-DETECTS HTTP/2 (h2c, prior-knowledge mode) on
 each incoming connection by peeking the 24-byte preface

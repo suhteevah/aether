@@ -292,6 +292,8 @@ pub mod handshake {
         pub offers_tls13: bool,
         pub offers_x25519: bool,
         pub offers_ed25519: bool,
+        /// ALPN (RFC 7301) protocol names the client advertises, in order.
+        pub alpn_offered: Vec<Vec<u8>>,
     }
 
     /// Parse a ClientHello message body (after the 4-byte handshake header has been stripped).
@@ -322,6 +324,7 @@ pub mod handshake {
         let mut offers_ed25519 = false;
         let mut x25519_key_share = [0u8; 32];
         let mut found_key_share = false;
+        let mut alpn_offered: Vec<Vec<u8>> = Vec::new();
 
         let mut er = Reader::new(ext_body);
         while er.remaining() > 0 {
@@ -377,6 +380,17 @@ pub mod handshake {
                         }
                     }
                 }
+                0x0010 => {
+                    // ALPN (RFC 7301): u16 list_len || ProtocolName<1..255>+ where each = u8 len || bytes
+                    if ext_data.len() < 2 { return None; }
+                    let list_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
+                    let mut pr = Reader::new(&ext_data[2..2 + list_len]);
+                    while pr.remaining() > 0 {
+                        let nlen = pr.read_u8()? as usize;
+                        let name = pr.read_bytes(nlen)?;
+                        alpn_offered.push(name.to_vec());
+                    }
+                }
                 _ => {}
             }
         }
@@ -389,6 +403,7 @@ pub mod handshake {
             offers_tls13,
             offers_x25519,
             offers_ed25519,
+            alpn_offered,
         })
     }
 
@@ -427,10 +442,25 @@ pub mod handshake {
         body
     }
 
-    /// EncryptedExtensions body — empty (no ALPN, no SNI ack, no nothing).
-    pub fn encode_encrypted_extensions() -> Vec<u8> {
-        // ExtensionList<0..2^16-1>: a u16 length of zero.
-        vec![0, 0]
+    /// EncryptedExtensions body.  In TLS 1.3 ALPN moves from ServerHello to
+    /// EncryptedExtensions (RFC 8446 §4.4 + RFC 7301).  If `alpn_chosen`
+    /// is Some, emit an ALPN extension with exactly that one protocol.
+    pub fn encode_encrypted_extensions(alpn_chosen: Option<&[u8]>) -> Vec<u8> {
+        let mut exts = Vec::new();
+        if let Some(proto) = alpn_chosen {
+            // Inner ALPN: u16 list_len || u8 proto_len || proto_bytes
+            let inner_len = 1 + proto.len();
+            // Outer: u16 type=0x0010 || u16 ext_len || (u16 inner_list_len || u8 plen || proto)
+            exts.extend_from_slice(&0x0010u16.to_be_bytes());
+            exts.extend_from_slice(&((2 + inner_len) as u16).to_be_bytes());
+            exts.extend_from_slice(&(inner_len as u16).to_be_bytes());
+            exts.push(proto.len() as u8);
+            exts.extend_from_slice(proto);
+        }
+        let mut body = Vec::with_capacity(2 + exts.len());
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        body
     }
 
     /// Certificate body — single CertificateEntry with `cert_der`, no extensions.
@@ -673,6 +703,11 @@ pub struct TlsServerSession {
     server_random: [u8; 32],
     server_x25519_priv: [u8; 32],
     server_x25519_pub: [u8; 32],
+    /// ALPN protocols this server accepts, in preference order.
+    /// Empty = no ALPN support; server won't emit the extension.
+    supported_alpn: Vec<Vec<u8>>,
+    /// Negotiated ALPN protocol (filled in after ClientHello).
+    alpn_chosen: Option<Vec<u8>>,
 
     client_hs_keys: Option<key_schedule::DirKeys>,
     server_hs_keys: Option<key_schedule::DirKeys>,
@@ -705,6 +740,20 @@ impl TlsServerSession {
         cn: &str,
         serial: &[u8],
     ) -> Self {
+        Self::new_with_alpn(ed25519_seed, server_random, x25519_priv, cn, serial, Vec::new())
+    }
+
+    /// Construct a server session that will negotiate ALPN against the given
+    /// `supported_alpn` list (server's preference order — picks the first
+    /// match from `alpn_offered` that the server supports).
+    pub fn new_with_alpn(
+        ed25519_seed: &[u8; 32],
+        server_random: &[u8; 32],
+        x25519_priv: &[u8; 32],
+        cn: &str,
+        serial: &[u8],
+        supported_alpn: Vec<Vec<u8>>,
+    ) -> Self {
         let (cert_der, cert_pub) = x509::self_sign_ed25519(ed25519_seed, cn, serial);
         let mut bp = [0u8; 32]; bp[0] = 9;
         let server_x25519_pub = x25519_scalar_mult(x25519_priv, &bp);
@@ -719,6 +768,8 @@ impl TlsServerSession {
             server_random: *server_random,
             server_x25519_priv: *x25519_priv,
             server_x25519_pub,
+            supported_alpn,
+            alpn_chosen: None,
             client_hs_keys: None,
             server_hs_keys: None,
             client_app_keys: None,
@@ -736,6 +787,9 @@ impl TlsServerSession {
 
     pub fn state(&self) -> State { self.state }
     pub fn is_handshake_done(&self) -> bool { self.state == State::Connected }
+
+    /// The ALPN protocol the server picked, if any (set after ClientHello).
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> { self.alpn_chosen.as_deref() }
 
     /// Drain pending outbound bytes.
     pub fn take_outbound(&mut self) -> Vec<u8> {
@@ -837,8 +891,19 @@ impl TlsServerSession {
         let server_hs_keys = key_schedule::traffic_keys(&sched.server_hs_traffic_secret);
         let client_hs_keys = key_schedule::traffic_keys(&sched.client_hs_traffic_secret);
 
+        // ALPN negotiation: pick the first server-supported protocol that the
+        // client also offered.  Order = server preference.
+        self.alpn_chosen = None;
+        for srv in &self.supported_alpn {
+            if parsed.alpn_offered.iter().any(|c| c == srv) {
+                self.alpn_chosen = Some(srv.clone());
+                break;
+            }
+        }
+
         // Build the server's encrypted flight: EncryptedExtensions || Certificate || CertificateVerify || Finished.
-        let ee = handshake::wrap(HS_ENCRYPTED_EXTENSIONS, &handshake::encode_encrypted_extensions());
+        let ee_body = handshake::encode_encrypted_extensions(self.alpn_chosen.as_deref());
+        let ee = handshake::wrap(HS_ENCRYPTED_EXTENSIONS, &ee_body);
         self.transcript.extend_from_slice(&ee);
 
         let cert_msg = handshake::wrap(HS_CERTIFICATE, &handshake::encode_certificate(&self.server_cert_der));
@@ -1155,7 +1220,24 @@ impl TlsClientSession {
     /// Caller should `take_outbound()` and send those bytes to the server, then
     /// `feed()` server responses until `is_handshake_done()`.
     pub fn new(x25519_priv: [u8; 32], random: [u8; 32], session_id: Vec<u8>) -> Self {
-        let client = client_for_test::TestClient::new(x25519_priv, random, session_id);
+        Self::new_with_alpn(x25519_priv, random, session_id, Vec::new())
+    }
+
+    pub fn new_with_alpn(
+        x25519_priv: [u8; 32], random: [u8; 32], session_id: Vec<u8>,
+        alpn_offered: Vec<Vec<u8>>,
+    ) -> Self {
+        Self::new_full(x25519_priv, random, session_id, alpn_offered, Vec::new())
+    }
+
+    /// Full constructor: trust anchors are Ed25519 SPKI pubkeys the client
+    /// will accept on the server's cert.  Empty = trust-on-first-use.
+    pub fn new_full(
+        x25519_priv: [u8; 32], random: [u8; 32], session_id: Vec<u8>,
+        alpn_offered: Vec<Vec<u8>>,
+        trust_anchors: Vec<[u8; 32]>,
+    ) -> Self {
+        let client = client_for_test::TestClient::new_full(x25519_priv, random, session_id, alpn_offered, trust_anchors);
         let ch = client.build_client_hello_record();
         Self {
             state: ClientState::ExpectServerFlight,
@@ -1169,6 +1251,11 @@ impl TlsClientSession {
             server_app_seq: 0,
             client_app_seq: 0,
         }
+    }
+
+    /// The ALPN protocol the server picked (matched against our offered list).
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.client.alpn_chosen.get().and_then(|i| self.client.alpn_offered.get(i).map(|v| v.as_slice()))
     }
 
     pub fn state(&self) -> ClientState { self.state }
@@ -1358,14 +1445,40 @@ pub mod client_for_test {
         pub pub_x25519: [u8; 32],
         pub random: [u8; 32],
         pub session_id: Vec<u8>,
+        /// ALPN protocol names to offer; empty = no ALPN extension.
+        pub alpn_offered: Vec<Vec<u8>>,
+        /// ALPN chosen by the server (filled after processing flight).
+        pub alpn_chosen: std::cell::Cell<Option<usize>>,
+        /// FR-19.1-extra-cert: Ed25519 public keys the client trusts.
+        /// When non-empty, the server's cert SPKI MUST appear here AND the
+        /// cert must self-verify (signed by its own SPKI key) for the
+        /// handshake to proceed.  Empty = trust on first use (accept any
+        /// self-signed cert).
+        pub trust_anchors: Vec<[u8; 32]>,
     }
 
     impl TestClient {
         pub fn new(priv_x25519: [u8; 32], random: [u8; 32], session_id: Vec<u8>) -> Self {
+            Self::new_with_alpn(priv_x25519, random, session_id, Vec::new())
+        }
+        pub fn new_with_alpn(
+            priv_x25519: [u8; 32], random: [u8; 32], session_id: Vec<u8>,
+            alpn_offered: Vec<Vec<u8>>,
+        ) -> Self {
+            Self::new_full(priv_x25519, random, session_id, alpn_offered, Vec::new())
+        }
+        pub fn new_full(
+            priv_x25519: [u8; 32], random: [u8; 32], session_id: Vec<u8>,
+            alpn_offered: Vec<Vec<u8>>,
+            trust_anchors: Vec<[u8; 32]>,
+        ) -> Self {
             let mut bp = [0u8; 32]; bp[0] = 9;
             let pub_x25519 = x25519_scalar_mult(&priv_x25519, &bp);
-            Self { priv_x25519, pub_x25519, random, session_id }
+            Self { priv_x25519, pub_x25519, random, session_id, alpn_offered,
+                   alpn_chosen: std::cell::Cell::new(None), trust_anchors }
         }
+        /// Returns the alpn_offered index that the server picked, if any.
+        pub fn negotiated_alpn_index(&self) -> Option<usize> { self.alpn_chosen.get() }
 
         /// Construct a real ClientHello record carrying our key share + supported_versions etc.
         pub fn build_client_hello_record(&self) -> Vec<u8> {
@@ -1404,6 +1517,19 @@ pub mod client_for_test {
             exts.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
             exts.extend_from_slice(&32u16.to_be_bytes());
             exts.extend_from_slice(&self.pub_x25519);
+            // ALPN (RFC 7301): u16 type=0x0010 || u16 ext_len || u16 list_len || (u8 plen || proto)+
+            if !self.alpn_offered.is_empty() {
+                let mut inner = Vec::new();
+                for p in &self.alpn_offered {
+                    inner.push(p.len() as u8);
+                    inner.extend_from_slice(p);
+                }
+                let ext_body_len = 2 + inner.len();
+                exts.extend_from_slice(&0x0010u16.to_be_bytes());
+                exts.extend_from_slice(&(ext_body_len as u16).to_be_bytes());
+                exts.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+                exts.extend_from_slice(&inner);
+            }
             body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
             body.extend_from_slice(&exts);
 
@@ -1516,15 +1642,56 @@ pub mod client_for_test {
             // EE
             let (ee_full, n1) = peel_hs_msg(&decrypted[idx..]).ok_or("ee peel")?;
             if ee_full[0] != HS_ENCRYPTED_EXTENSIONS { return Err("not EE".into()); }
+            // Parse EE body (after the 4-byte HS header) for ALPN.
+            if ee_full.len() >= 6 {
+                let ee_body = &ee_full[4..];
+                let list_len = u16::from_be_bytes([ee_body[0], ee_body[1]]) as usize;
+                if ee_body.len() >= 2 + list_len {
+                    let mut ep = 2;
+                    while ep + 4 <= 2 + list_len {
+                        let etype = u16::from_be_bytes([ee_body[ep], ee_body[ep + 1]]);
+                        let elen = u16::from_be_bytes([ee_body[ep + 2], ee_body[ep + 3]]) as usize;
+                        if ep + 4 + elen > ee_body.len() { break; }
+                        if etype == 0x0010 && elen >= 3 {
+                            // ALPN: u16 inner_list_len || u8 plen || proto bytes
+                            let inner_list_len = u16::from_be_bytes([ee_body[ep + 4], ee_body[ep + 5]]) as usize;
+                            if inner_list_len >= 1 && ep + 4 + 2 + 1 <= ee_body.len() {
+                                let plen = ee_body[ep + 6] as usize;
+                                if ep + 4 + 2 + 1 + plen <= ee_body.len() {
+                                    let proto = &ee_body[ep + 7 .. ep + 7 + plen];
+                                    if let Some(i) = self.alpn_offered.iter().position(|p| p.as_slice() == proto) {
+                                        self.alpn_chosen.set(Some(i));
+                                    }
+                                }
+                            }
+                        }
+                        ep += 4 + elen;
+                    }
+                }
+            }
             transcript.extend_from_slice(ee_full);
             idx += n1;
             // Cert
             let (cert_full, n2) = peel_hs_msg(&decrypted[idx..]).ok_or("cert peel")?;
             if cert_full[0] != HS_CERTIFICATE { return Err("not Cert".into()); }
-            // Extract pub key from cert (we built it ourselves so we know format).
+            // Extract pub key + the cert DER itself for trust-anchor check.
             let server_cert_body = &cert_full[4..];
-            let server_cert_pub = extract_ed25519_pub_from_cert_msg_body(server_cert_body)
-                .ok_or("extract pub failed")?;
+            let (server_cert_pub, server_cert_der) =
+                extract_ed25519_pub_and_der_from_cert_msg_body(server_cert_body)
+                    .ok_or("extract pub failed")?;
+
+            // Trust-anchor verification (FR-19.1-extra-cert).  When the client
+            // was configured with `trust_anchors`, the server's cert SPKI
+            // public key MUST be one of them AND the cert must self-verify
+            // (signed by its own SPKI — true for our self-signed deployment).
+            if !self.trust_anchors.is_empty() {
+                if !self.trust_anchors.iter().any(|a| a == &server_cert_pub) {
+                    return Err("server cert pubkey not in trust anchors".into());
+                }
+                if !verify_self_signed_ed25519_cert(&server_cert_der) {
+                    return Err("server cert self-signature failed".into());
+                }
+            }
             transcript.extend_from_slice(cert_full);
             idx += n2;
             // CV
@@ -1589,6 +1756,96 @@ pub mod client_for_test {
         let total = 4 + body_len;
         if buf.len() < total { return None; }
         Some((&buf[..total], total))
+    }
+
+    /// Verify a self-signed Ed25519 X.509 certificate: extracts the SPKI
+    /// pubkey, the TBS DER, and the signature, then runs ed25519_verify.
+    /// Returns true iff the cert is signed by its own SPKI key.
+    pub fn verify_self_signed_ed25519_cert(cert_der: &[u8]) -> bool {
+        // Cert: SEQUENCE { tbs, sigAlg, BIT STRING sig }
+        let Some((tag, body, _total)) = der_peel(cert_der) else { return false; };
+        if tag != 0x30 { return false; }
+        // First child = TBSCertificate.  We need its FULL DER bytes (incl. SEQ
+        // header) since that's what was signed.
+        let Some((tbs_tag, _tbs_body, tbs_total)) = der_peel(body) else { return false; };
+        if tbs_tag != 0x30 { return false; }
+        let tbs_full = &body[..tbs_total];
+
+        // Walk TBS children to find SPKI (7th child after version/serial/sigAlg/
+        // issuer/validity/subject).
+        let tbs_inner = &body[..tbs_total];
+        let Some((_, tbs_children, _)) = der_peel(tbs_inner) else { return false; };
+        let mut p = tbs_children;
+        for _ in 0..6 {
+            let Some((_t, _b, n)) = der_peel(p) else { return false; };
+            p = &p[n..];
+        }
+        let Some((spki_tag, spki_body, _)) = der_peel(p) else { return false; };
+        if spki_tag != 0x30 { return false; }
+        let Some((_alg_tag, _alg_body, alg_n)) = der_peel(spki_body) else { return false; };
+        let bit_str = &spki_body[alg_n..];
+        let Some((bs_tag, bs_body, _)) = der_peel(bit_str) else { return false; };
+        if bs_tag != 0x03 || bs_body.len() < 33 || bs_body[0] != 0 { return false; }
+        let mut pub_key = [0u8; 32];
+        pub_key.copy_from_slice(&bs_body[1..33]);
+
+        // Outer second child = sigAlg (skip), third child = BIT STRING signature.
+        let mut q = &body[tbs_total..];
+        let Some((_a_tag, _a_body, a_n)) = der_peel(q) else { return false; };
+        q = &q[a_n..];
+        let Some((sig_tag, sig_body, _)) = der_peel(q) else { return false; };
+        if sig_tag != 0x03 || sig_body.len() != 65 || sig_body[0] != 0 { return false; }
+        let sig = &sig_body[1..65];
+
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(sig);
+
+        unsafe {
+            crate::aether_ed25519_verify(
+                pub_key.as_ptr() as *const c_void,
+                tbs_full.as_ptr() as *const c_void, tbs_full.len() as c_int,
+                sig_arr.as_ptr() as *const c_void,
+            ) == 0
+        }
+    }
+
+    /// Walk the Certificate message body and return (pubkey, full_cert_der).
+    fn extract_ed25519_pub_and_der_from_cert_msg_body(body: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
+        if body.len() < 1 { return None; }
+        let ctx_len = body[0] as usize;
+        if body.len() < 1 + ctx_len + 3 { return None; }
+        let p = 1 + ctx_len;
+        let list_len = ((body[p] as usize) << 16) | ((body[p + 1] as usize) << 8) | (body[p + 2] as usize);
+        let p = p + 3;
+        if body.len() < p + list_len { return None; }
+        let cert_len = ((body[p] as usize) << 16) | ((body[p + 1] as usize) << 8) | (body[p + 2] as usize);
+        let p = p + 3;
+        if body.len() < p + cert_len + 2 { return None; }
+        let cert_der = &body[p..p + cert_len];
+        let pubkey = extract_ed25519_pub_from_cert_der(cert_der)?;
+        Some((pubkey, cert_der.to_vec()))
+    }
+
+    /// Just walk a cert DER and pull the Ed25519 pubkey from the SPKI.
+    fn extract_ed25519_pub_from_cert_der(cert_der: &[u8]) -> Option<[u8; 32]> {
+        let (tag, body0, _) = der_peel(cert_der)?;
+        if tag != 0x30 { return None; }
+        let (ttag, tbs_body, _) = der_peel(body0)?;
+        if ttag != 0x30 { return None; }
+        let mut p = tbs_body;
+        for _ in 0..6 {
+            let (_t, _b, n) = der_peel(p)?;
+            p = &p[n..];
+        }
+        let (spki_tag, spki_body, _) = der_peel(p)?;
+        if spki_tag != 0x30 { return None; }
+        let (_alg_tag, _alg_body, alg_n) = der_peel(spki_body)?;
+        let bit_str = &spki_body[alg_n..];
+        let (bs_tag, bs_body, _) = der_peel(bit_str)?;
+        if bs_tag != 0x03 || bs_body.len() < 33 || bs_body[0] != 0 { return None; }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bs_body[1..33]);
+        Some(out)
     }
 
     /// Walk the Certificate message body and extract the Ed25519 SPKI public key.
