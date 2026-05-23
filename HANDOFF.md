@@ -1,8 +1,65 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 night (**Batched-forward stage 1 LANDED + bigger-models scope
-captured.**
+2026-05-25 (**Bigger-models foundation LANDED: runtime ModelConfig from
+GGUF metadata + multi-arch probe.**  Every hardcoded Qwen2.5-7B
+dimension in `runtime/src/serving.rs` is now a runtime parameter read
+from the GGUF metadata at session construction.
+
+**New: `ModelConfig::from_gguf(handle)`** parses `general.architecture`
++ the `<arch>.embedding_length`, `<arch>.block_count`,
+`<arch>.attention.head_count`, `<arch>.attention.head_count_kv`,
+`<arch>.feed_forward_length`, `<arch>.rope.freq_base`,
+`<arch>.attention.layer_norm_rms_epsilon` keys.  Falls back to 7B
+defaults for any missing key.
+
+**Refactor surface:**
+- `block_forward_devarg` now takes `cfg: &ModelConfig, max_seq: usize`
+  and threads every kernel-launch dim through it.
+- `SharedKvPool::new_for_shape(n_blocks, block_size, n_layers, d_kv)`
+  sizes per-layer pools from runtime shape; legacy `new(...)` shortcut
+  preserved for Qwen2.5-7B callers.
+- Every `aether_dev_alloc_f32(D_MODEL)` / `(D_KV)` / `(D_FF)` /
+  `(VOCAB)` etc. inside `new_with_mode` swapped to `cfg.*`.
+- `dequant_embd_row`, `decode_step`, `prefill`, `capture_graph_now` all
+  now use `self.cfg.*`.
+
+**Kernel constraints enforced at load time** (rejects with a clear error
+instead of producing NaN):
+- `head_dim` must be multiple of 32 and ≤ 256 (attention_seq1's
+  `per_lane = head_dim >> 5` layout caps out at 8 slots × 32 lanes).
+- `n_q_heads` must be divisible by `n_kv_heads` (GQA invariant).
+- `d_model` and `d_kv` must be multiples of 256 (Q4_K super-block).
+
+**Regression check:** Qwen2.5-7B bit-identical to pre-refactor —
+`qwen25_paged_parity` + `qwen25_multitenant_pool` tests both green.
+
+**`aether-serve --probe --gguf <path>`** opens any GGUF, prints the
+detected ModelConfig + shape-constraint + arch-compat status, exits.
+Used to enumerate locally-available models:
+
+| Model | Arch | Layers | d_model | KV | head_dim | Status |
+|---|---|---|---|---|---|---|
+| Qwen2.5-7B | `qwen2` | 28 | 3584 | 4 | 128 | ✅ ready |
+| Qwen2.5-14B (not local) | `qwen2` | 48 | 5120 | 8 | 128 | ✅ would load with same kernels |
+| Qwen3-8B | `qwen3` | 36 | 4096 | 8 | 128 | ⚠ Q/K RMS norm tensors not yet loaded |
+| Qwen3-VL | `qwen3vl` | 36 | 4096 | 8 | 128 | ⚠ qwen3 changes + vision tower |
+| Qwen3-Coder 30B | `qwen3moe` | 48 | 2048 | 4 | 64 | ⚠ MoE FFN — needs router + per-expert dispatch |
+| DeepSeek-Coder-V2 16B | `deepseek2` | 27 | 2048 | 16 | 128 | ⚠ MLA attention + MoE FFN |
+| Gemma3 27B | `gemma3` | 62 | 5376 | 16 | 168 | ❌ head_dim=168 fails constraint; needs kernel re-derive |
+
+**Bottom line:** the runtime-shape refactor unblocks any **Qwen2.5
+variant** (14B, 32B) — same kernels, different dims.  Per-arch work
+needed for everything else:
+- `qwen3*` → load + plumb the per-head Q/K RMS norm tensors
+- `*moe` → MoE FFN kernel (gate_exps/up_exps/down_exps + token routing)
+- `deepseek2` → MLA attention kernel (latent KV projection)
+- `gemma3` → relax head_dim constraint or add per-arch kernel variants
+
+Filing each as separate FRs.
+
+### 2026-05-24 night (Batched-forward stage 1)
+**Batched-forward stage 1 LANDED + bigger-models scope captured.**
 
 **Stage 1 — batched paged attention kernel.**
 `runtime/src/cuda.rs::batched_paged_attention_seqB_devarg` fans across

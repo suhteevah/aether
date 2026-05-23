@@ -56,6 +56,10 @@ use crate::cuda::{
     aether_dev_graph_launch, aether_dev_graph_destroy,
 };
 
+// Historical Qwen2.5-7B-specific constants — kept ONLY for tests/witnesses
+// that need to reference the 7B shape explicitly.  Production paths use the
+// runtime-loaded `ModelConfig` populated from GGUF metadata at session
+// construction so 14B / 32B / other-arch models pick up their correct shapes.
 pub const D_MODEL: usize = 3584;
 pub const N_LAYERS: usize = 28;
 pub const N_Q_HEADS: usize = 28;
@@ -67,6 +71,96 @@ pub const VOCAB: usize = 152064;
 pub const ROPE_BASE: f32 = 1_000_000.0;
 pub const NORM_EPS: f32 = 1e-6;
 pub const MAX_SEQ: usize = 32;  // FIXME: bump after profiling per-MAX_SEQ cost
+
+/// FR-17-extra-runtime-shape — Runtime model configuration read from GGUF
+/// metadata.  Replaces the historical `const`s for everything that's
+/// actually shape-dependent.  Populated by `ModelConfig::from_gguf` at
+/// session construction.
+#[derive(Debug, Clone)]
+pub struct ModelConfig {
+    pub d_model: usize,
+    pub n_layers: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub d_kv: usize,
+    pub d_ff: usize,
+    pub vocab: usize,
+    pub rope_base: f32,
+    pub norm_eps: f32,
+    pub arch: String, // "qwen2", "llama", etc.  Used for metadata-key namespacing.
+}
+
+impl ModelConfig {
+    /// Hardcoded Qwen2.5-7B shape — fallback when GGUF metadata is missing or
+    /// for tests.  Kept consistent with the const block above.
+    pub fn qwen2_5_7b() -> Self {
+        Self {
+            d_model: D_MODEL, n_layers: N_LAYERS, n_q_heads: N_Q_HEADS,
+            n_kv_heads: N_KV_HEADS, head_dim: HEAD_DIM, d_kv: D_KV,
+            d_ff: D_FF, vocab: VOCAB,
+            rope_base: ROPE_BASE, norm_eps: NORM_EPS,
+            arch: "qwen2".to_string(),
+        }
+    }
+
+    /// Read shape parameters from a GGUF metadata block.  Falls back to
+    /// 7B defaults for any key that's missing or malformed.
+    pub unsafe fn from_gguf(gguf_handle: i64) -> Self {
+        let arch = read_meta_string(gguf_handle, "general.architecture")
+            .unwrap_or_else(|| "qwen2".to_string());
+        let prefix = arch.clone();
+
+        let d_model = read_meta_u32(gguf_handle, &format!("{}.embedding_length", prefix))
+            .map(|v| v as usize).unwrap_or(D_MODEL);
+        let n_layers = read_meta_u32(gguf_handle, &format!("{}.block_count", prefix))
+            .map(|v| v as usize).unwrap_or(N_LAYERS);
+        let n_q_heads = read_meta_u32(gguf_handle, &format!("{}.attention.head_count", prefix))
+            .map(|v| v as usize).unwrap_or(N_Q_HEADS);
+        let n_kv_heads = read_meta_u32(gguf_handle, &format!("{}.attention.head_count_kv", prefix))
+            .map(|v| v as usize).unwrap_or(N_KV_HEADS);
+        let head_dim = if n_q_heads > 0 { d_model / n_q_heads } else { HEAD_DIM };
+        let d_kv = n_kv_heads * head_dim;
+        let d_ff = read_meta_u32(gguf_handle, &format!("{}.feed_forward_length", prefix))
+            .map(|v| v as usize).unwrap_or(D_FF);
+        // VOCAB usually comes from tokenizer.ggml.tokens length, not from a
+        // model-shape key.  Use the tokenizer-array count when present.
+        let vocab = {
+            let key = b"tokenizer.ggml.tokens";
+            let n = crate::aether_gguf_get_metadata_array_string_n(
+                gguf_handle, key.as_ptr() as i64, key.len() as c_int);
+            if n > 0 { n as usize } else { VOCAB }
+        };
+        let rope_base = read_meta_f32(gguf_handle, &format!("{}.rope.freq_base", prefix))
+            .unwrap_or(ROPE_BASE);
+        let norm_eps = read_meta_f32(gguf_handle,
+            &format!("{}.attention.layer_norm_rms_epsilon", prefix))
+            .unwrap_or(NORM_EPS);
+        Self {
+            d_model, n_layers, n_q_heads, n_kv_heads, head_dim, d_kv,
+            d_ff, vocab, rope_base, norm_eps, arch,
+        }
+    }
+}
+
+unsafe fn read_meta_u32(h: i64, key: &str) -> Option<u32> {
+    let v = crate::aether_gguf_get_metadata_u32(
+        h, key.as_ptr() as i64, key.len() as c_int);
+    if v < 0 { None } else { Some(v as u32) }
+}
+unsafe fn read_meta_f32(h: i64, key: &str) -> Option<f32> {
+    let v = crate::aether_gguf_get_metadata_f32(
+        h, key.as_ptr() as i64, key.len() as c_int);
+    if v.is_nan() { None } else { Some(v as f32) }
+}
+unsafe fn read_meta_string(h: i64, key: &str) -> Option<String> {
+    let mut buf = vec![0u8; 256];
+    let n = crate::aether_gguf_get_metadata_string(
+        h, key.as_ptr() as i64, key.len() as c_int,
+        buf.as_mut_ptr() as i64, buf.len() as c_int);
+    if n <= 0 { return None; }
+    String::from_utf8(buf[..n as usize].to_vec()).ok()
+}
 
 struct BlockGpu {
     attn_norm_g: i64, ffn_norm_g: i64,
@@ -103,30 +197,40 @@ struct KvCacheGpu { k_cache: i64, v_cache: i64 }
 pub struct SharedKvPool {
     pub n_blocks: i32,
     pub block_size: i32,
-    pool_k: Vec<i64>,   // per-layer device pointer (f32, size = n_blocks*block_size*D_KV)
+    pub n_layers: usize,
+    pub d_kv: usize,
+    pool_k: Vec<i64>,   // per-layer device pointer (f32, size = n_blocks*block_size*d_kv)
     pool_v: Vec<i64>,
     free: std::sync::Mutex<Vec<bool>>,  // free[b] = block b is free
 }
 
 impl SharedKvPool {
-    /// Allocate `n_blocks` blocks of `block_size` tokens each.  Each block
-    /// holds block_size × D_KV f32 K and V values.  Pre-touches every
-    /// per-layer GPU buffer so the captured graph sees stable pointers.
-    pub fn new(n_blocks: i32, block_size: i32) -> std::sync::Arc<Self> {
+    /// Allocate `n_blocks` blocks of `block_size` tokens each, sized for a
+    /// model with `n_layers` × `d_kv` K/V dimensions.  Each block holds
+    /// block_size × d_kv f32 K and V values per layer.
+    pub fn new_for_shape(
+        n_blocks: i32, block_size: i32, n_layers: usize, d_kv: usize,
+    ) -> std::sync::Arc<Self> {
         unsafe { crate::cuda::aether_dev_init(); }
-        let n_per_pool = (n_blocks * block_size) as usize * D_KV;
-        let mut pool_k = Vec::with_capacity(N_LAYERS);
-        let mut pool_v = Vec::with_capacity(N_LAYERS);
-        for _ in 0..N_LAYERS {
+        let n_per_pool = (n_blocks * block_size) as usize * d_kv;
+        let mut pool_k = Vec::with_capacity(n_layers);
+        let mut pool_v = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
             unsafe {
                 pool_k.push(aether_dev_alloc_f32(n_per_pool as c_int));
                 pool_v.push(aether_dev_alloc_f32(n_per_pool as c_int));
             }
         }
         std::sync::Arc::new(Self {
-            n_blocks, block_size, pool_k, pool_v,
+            n_blocks, block_size, n_layers, d_kv, pool_k, pool_v,
             free: std::sync::Mutex::new(vec![true; n_blocks as usize]),
         })
+    }
+
+    /// Backwards-compatible shortcut for the Qwen2.5-7B shape.  Use
+    /// `new_for_shape` for any other architecture.
+    pub fn new(n_blocks: i32, block_size: i32) -> std::sync::Arc<Self> {
+        Self::new_for_shape(n_blocks, block_size, N_LAYERS, D_KV)
     }
 
     /// Per-layer K pool device pointer.  Stable for the lifetime of the pool.
@@ -215,65 +319,80 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     }
 }
 
-/// Forward one block.  `paged_cfg = Some((page_table_dev, block_size))` routes
-/// append_kv + attention_seq1 through the paged variants; None uses the
-/// contiguous kernels.  With an identity-mapping page table both modes are
+/// Forward one block.  Takes a `cfg: &ModelConfig` so the runtime dims
+/// flow into every kernel launch.  Hardcoded Qwen2.5-7B shape removed
+/// — same kernel code path works for any model whose ops are
+/// shape-compatible (Qwen2.5-14B, 32B, future Qwen variants).
+///
+/// `paged_cfg = Some((page_table_dev, block_size))` routes append_kv +
+/// attention_seq1 through the paged variants; None uses the contiguous
+/// kernels.  With an identity-mapping page table both modes are
 /// bit-identical (witnessed in `runtime/tests/cuda_paged_kv_parity.rs`).
 unsafe fn block_forward_devarg(
     bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, step_args: i64,
     paged_cfg: Option<(i64, i32)>,
+    cfg: &ModelConfig,
+    max_seq: usize,
 ) {
-    aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
+    let d_model = cfg.d_model as c_int;
+    let d_kv = cfg.d_kv as c_int;
+    let d_ff = cfg.d_ff as c_int;
+    let n_q_heads = cfg.n_q_heads as c_int;
+    let n_kv_heads = cfg.n_kv_heads as c_int;
+    let head_dim = cfg.head_dim as c_int;
+    let rope_base = cfg.rope_base;
+    let norm_eps = cfg.norm_eps;
+    aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_q, act.q,
-        D_MODEL as c_int, (bw.nb_qo / D_MODEL) as c_int);
-    aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, D_MODEL as c_int);
+        d_model, (bw.nb_qo / cfg.d_model) as c_int);
+    aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, d_model);
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_k, act.k_step,
-        D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
-    aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, D_KV as c_int);
+        d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
+    aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv);
     if bw.dt_v == 14 {
         aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
-            D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
+            d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
     } else {
         aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
-            D_KV as c_int, (bw.nb_kv / D_KV) as c_int);
+            d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
     }
-    aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, D_KV as c_int);
+    aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
     aether_op_rope_apply_devarg_f32_cuda(act.q,
-        1, N_Q_HEADS as c_int, HEAD_DIM as c_int, ROPE_BASE, step_args);
+        1, n_q_heads, head_dim, rope_base, step_args);
     aether_op_rope_apply_devarg_f32_cuda(act.k_step,
-        1, N_KV_HEADS as c_int, HEAD_DIM as c_int, ROPE_BASE, step_args);
-    let scale: f32 = 1.0 / (HEAD_DIM as f32).sqrt();
+        1, n_kv_heads, head_dim, rope_base, step_args);
+    let scale: f32 = 1.0 / (cfg.head_dim as f32).sqrt();
     if let Some((page_table_dev, block_size)) = paged_cfg {
         aether_op_paged_append_kv_devarg_f32_cuda(
             act.k_step, act.v_step, kv.k_cache, kv.v_cache, page_table_dev,
-            D_KV as c_int, block_size, step_args);
+            d_kv, block_size, step_args);
         aether_op_paged_attention_seq1_devarg_f32_cuda(
             act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
-            N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int,
-            block_size, scale, MAX_SEQ as c_int, step_args);
+            n_q_heads, n_kv_heads, head_dim,
+            block_size, scale, max_seq as c_int, step_args);
     } else {
         aether_op_append_kv_devarg_f32_cuda(act.k_step, act.v_step, kv.k_cache, kv.v_cache,
-            D_KV as c_int, step_args);
+            d_kv, step_args);
         aether_op_attention_seq1_devarg_f32_cuda(
             act.q, kv.k_cache, kv.v_cache, act.attn_out,
-            N_Q_HEADS as c_int, N_KV_HEADS as c_int, HEAD_DIM as c_int, scale,
-            MAX_SEQ as c_int, step_args);
+            n_q_heads, n_kv_heads, head_dim, scale,
+            max_seq as c_int, step_args);
     }
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.attn_out, bw.w_o, act.proj,
-        D_MODEL as c_int, (bw.nb_qo / D_MODEL) as c_int);
-    aether_op_add_inplace_f32_cuda(act.x, act.proj, D_MODEL as c_int);
-    aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, NORM_EPS, 1, D_MODEL as c_int);
+        d_model, (bw.nb_qo / cfg.d_model) as c_int);
+    aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
+    aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
         act.x_norm, bw.w_gate, bw.w_up, act.gate,
-        D_FF as c_int, (bw.nb_gate_up / D_FF) as c_int);
+        d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
     if bw.dt_down == 14 {
         aether_op_fused_q6k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
-            D_MODEL as c_int, (bw.nb_down / D_MODEL) as c_int);
+            d_model, (bw.nb_down / cfg.d_model) as c_int);
     } else {
         aether_op_fused_q4k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
-            D_MODEL as c_int, (bw.nb_down / D_MODEL) as c_int);
+            d_model, (bw.nb_down / cfg.d_model) as c_int);
     }
-    aether_op_add_inplace_f32_cuda(act.x, act.down, D_MODEL as c_int);
+    aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
 }
 
 /// Owns the entire decode-ready GPU state for one Qwen2.5-7B model.
@@ -325,6 +444,9 @@ pub struct QwenSession {
     pool: Option<std::sync::Arc<SharedKvPool>>,
     owned_blocks: Vec<i32>,
     page_table_host: Vec<i32>,
+    /// FR-17-extra-runtime-shape — runtime shape from GGUF metadata.
+    /// Falls back to Qwen2.5-7B if metadata absent.
+    pub cfg: ModelConfig,
 }
 
 struct PagedCfg {
@@ -374,25 +496,59 @@ impl QwenSession {
                 return Err(format!("aether_gguf_open failed: {}", h));
             }
 
-            let blocks: Vec<BlockGpu> = (0..N_LAYERS).map(|b| load_block(h, b)).collect();
+            // FR-17-extra-runtime-shape: read shape from GGUF metadata.
+            // Qwen2.5-7B reads back to the 7B defaults; Qwen2.5-14B picks up
+            // 48 blocks / d=5120 / 40 heads / 8 KV heads / D_FF=13824.
+            let cfg = ModelConfig::from_gguf(h);
+            eprintln!("[QwenSession] arch={} layers={} d_model={} heads_q={} heads_kv={} head_dim={} d_ff={} vocab={} rope={} eps={:.2e}",
+                cfg.arch, cfg.n_layers, cfg.d_model, cfg.n_q_heads, cfg.n_kv_heads,
+                cfg.head_dim, cfg.d_ff, cfg.vocab, cfg.rope_base, cfg.norm_eps);
+            // Kernel constraints (FR-17-extra-runtime-shape).  The fused
+            // kernels work for any Qwen-style shape that satisfies these
+            // bounds.  Everything else (n_layers, d_model, d_ff, vocab)
+            // flows through as a runtime dim into the launch args.
+            //   - head_dim must be a multiple of 32 and <= 256
+            //     (attention_seq1 lays out per_lane = head_dim >> 5 with
+            //      8 slots per lane).
+            //   - n_q_heads must be divisible by n_kv_heads (GQA invariant).
+            //   - d_model must be a multiple of 256 (Q4_K super-block size).
+            //   - d_kv must be a multiple of 256.
+            if cfg.head_dim == 0 || cfg.head_dim % 32 != 0 || cfg.head_dim > 256 {
+                return Err(format!(
+                    "FR-17-extra-runtime-shape: unsupported head_dim={}.  \
+                     Kernel supports head_dim ∈ {{32, 64, 96, 128, 160, 192, 224, 256}}.",
+                    cfg.head_dim));
+            }
+            if cfg.n_kv_heads == 0 || cfg.n_q_heads % cfg.n_kv_heads != 0 {
+                return Err(format!(
+                    "FR-17-extra-runtime-shape: n_q_heads({}) must be a multiple of n_kv_heads({}).",
+                    cfg.n_q_heads, cfg.n_kv_heads));
+            }
+            if cfg.d_model == 0 || cfg.d_model % 256 != 0 || cfg.d_kv == 0 || cfg.d_kv % 256 != 0 {
+                return Err(format!(
+                    "FR-17-extra-runtime-shape: d_model({}) and d_kv({}) must both be multiples of 256 (Q4_K super-block).",
+                    cfg.d_model, cfg.d_kv));
+            }
+
+            let blocks: Vec<BlockGpu> = (0..cfg.n_layers).map(|b| load_block(h, b)).collect();
             let final_norm_g = upload_f32_tensor(h, "output_norm.weight");
             let (lm_head, lm_n_blocks, lm_dt) = upload_tensor_u8(h, "output.weight");
 
             let act = ActivationGpu {
-                x: aether_dev_alloc_f32(D_MODEL as c_int),
-                x_norm: aether_dev_alloc_f32(D_MODEL as c_int),
-                q: aether_dev_alloc_f32(D_MODEL as c_int),
-                k_step: aether_dev_alloc_f32(D_KV as c_int),
-                v_step: aether_dev_alloc_f32(D_KV as c_int),
-                attn_out: aether_dev_alloc_f32(D_MODEL as c_int),
-                proj: aether_dev_alloc_f32(D_MODEL as c_int),
-                gate: aether_dev_alloc_f32(D_FF as c_int),
-                down: aether_dev_alloc_f32(D_MODEL as c_int),
-                logits: aether_dev_alloc_f32(VOCAB as c_int),
+                x: aether_dev_alloc_f32(cfg.d_model as c_int),
+                x_norm: aether_dev_alloc_f32(cfg.d_model as c_int),
+                q: aether_dev_alloc_f32(cfg.d_model as c_int),
+                k_step: aether_dev_alloc_f32(cfg.d_kv as c_int),
+                v_step: aether_dev_alloc_f32(cfg.d_kv as c_int),
+                attn_out: aether_dev_alloc_f32(cfg.d_model as c_int),
+                proj: aether_dev_alloc_f32(cfg.d_model as c_int),
+                gate: aether_dev_alloc_f32(cfg.d_ff as c_int),
+                down: aether_dev_alloc_f32(cfg.d_model as c_int),
+                logits: aether_dev_alloc_f32(cfg.vocab as c_int),
             };
-            let kvs: Vec<KvCacheGpu> = (0..N_LAYERS).map(|_| KvCacheGpu {
-                k_cache: aether_dev_alloc_f32((MAX_SEQ * D_KV) as c_int),
-                v_cache: aether_dev_alloc_f32((MAX_SEQ * D_KV) as c_int),
+            let kvs: Vec<KvCacheGpu> = (0..cfg.n_layers).map(|_| KvCacheGpu {
+                k_cache: aether_dev_alloc_f32((MAX_SEQ * cfg.d_kv) as c_int),
+                v_cache: aether_dev_alloc_f32((MAX_SEQ * cfg.d_kv) as c_int),
             }).collect();
             let step_args = aether_dev_alloc_i32(4);  // [pos, cur_seq, 0, 0]
 
@@ -424,6 +580,7 @@ impl QwenSession {
                 pool: None,
                 owned_blocks: Vec::new(),
                 page_table_host: Vec::new(),
+                cfg,
             })
         }
     }
@@ -511,14 +668,14 @@ impl QwenSession {
             self.gguf_handle, needle.as_ptr() as i64, needle.len() as c_int);
         assert!(idx >= 0);
         let n_elems = aether_gguf_get_tensor_n_elems(self.gguf_handle, idx) as usize;
-        let total_rows = n_elems / D_MODEL;
+        let total_rows = n_elems / self.cfg.d_model;
         let dptr = aether_gguf_get_tensor_data_ptr(self.gguf_handle, idx) as *const u8;
-        let blocks_per_row = D_MODEL / 256;
+        let blocks_per_row = self.cfg.d_model / 256;
         let bytes_per_row = blocks_per_row * 144;
         assert!(token_id < total_rows, "token_id {} out of vocab {}", token_id, total_rows);
         let row_bytes = std::slice::from_raw_parts(
             dptr.add(token_id * bytes_per_row), bytes_per_row);
-        let mut row_f32 = vec![0.0f32; D_MODEL];
+        let mut row_f32 = vec![0.0f32; self.cfg.d_model];
         aether_dequant_q4_k_m(
             row_bytes.as_ptr() as *const c_void,
             row_f32.as_mut_ptr() as *mut c_void,
@@ -546,12 +703,12 @@ impl QwenSession {
                     panic!("[QwenSession.prefill] pool allocation failed at pos {}: {}", pos, e);
                 }
                 let emb = self.dequant_embd_row(t_id);
-                aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, D_MODEL as c_int);
+                aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, self.cfg.d_model as c_int);
                 let cur_seq = pos + 1;
                 let step_host = [pos, cur_seq, 0i32, 0i32];
                 aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
-                for b in 0..N_LAYERS {
-                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg());
+                for b in 0..self.cfg.n_layers {
+                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
                 }
             }
             aether_dev_sync();
@@ -572,20 +729,20 @@ impl QwenSession {
     unsafe fn capture_graph_now(&mut self) {
         let rc = aether_dev_graph_begin();
         assert_eq!(rc, 0, "aether_dev_graph_begin failed: {}", rc);
-        for b in 0..N_LAYERS {
-            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg());
+        for b in 0..self.cfg.n_layers {
+            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
         }
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
-            NORM_EPS, 1, D_MODEL as c_int);
+            self.cfg.norm_eps, 1, self.cfg.d_model as c_int);
         if self.lm_dt == 14 {
             aether_op_fused_q6k_matmul_seq1_v2_cuda(
                 self.act.x_norm, self.lm_head, self.act.logits,
-                VOCAB as c_int, (self.lm_n_blocks / VOCAB) as c_int);
+                self.cfg.vocab as c_int, (self.lm_n_blocks / self.cfg.vocab) as c_int);
         } else {
             aether_op_fused_q4k_matmul_seq1_v2_cuda(
                 self.act.x_norm, self.lm_head, self.act.logits,
-                VOCAB as c_int, (self.lm_n_blocks / VOCAB) as c_int);
+                self.cfg.vocab as c_int, (self.lm_n_blocks / self.cfg.vocab) as c_int);
         }
         let rc = aether_dev_graph_end();
         assert_eq!(rc, 0, "aether_dev_graph_end failed: {}", rc);
@@ -611,7 +768,7 @@ impl QwenSession {
             }
             // Feed input embedding + step args.
             let emb = self.dequant_embd_row(last_id);
-            aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, D_MODEL as c_int);
+            aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, self.cfg.d_model as c_int);
             let cur_seq = pos + 1;
             let step_host = [pos, cur_seq, 0i32, 0i32];
             aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
@@ -625,8 +782,8 @@ impl QwenSession {
             assert_eq!(rc, 0, "aether_dev_graph_launch failed: {}", rc);
             aether_dev_sync();
 
-            let mut logits = vec![0.0f32; VOCAB];
-            aether_dev_d2h_f32(self.act.logits, logits.as_mut_ptr() as i64, VOCAB as c_int);
+            let mut logits = vec![0.0f32; self.cfg.vocab];
+            aether_dev_d2h_f32(self.act.logits, logits.as_mut_ptr() as i64, self.cfg.vocab as c_int);
             self.next_pos += 1;
             argmax(&logits)
         }

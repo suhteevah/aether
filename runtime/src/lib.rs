@@ -8053,6 +8053,10 @@ struct GgufTensorInfo {
 /// scalar metadata entries).
 enum GgufMeta {
     U32(u32),
+    /// Wider model-dim values (context_length in some GGUFs is u64).
+    U64(u64),
+    /// Float scalar metadata — rope.freq_base, layer_norm_rms_epsilon, etc.
+    F32(f32),
     String(String),
     /// Array of strings — used for `tokenizer.ggml.tokens` (152064
     /// entries on Qwen2.5) and `_merges`.
@@ -8122,6 +8126,16 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
         4 => {  // u32 -- captured
             let v = gguf_read_u32(b, off)?;
             Some(Some(GgufMeta::U32(v)))
+        }
+        6 => {  // f32 -- captured
+            if *off + 4 > b.len() { return None; }
+            let v = f32::from_le_bytes(b[*off..*off + 4].try_into().ok()?);
+            *off += 4;
+            Some(Some(GgufMeta::F32(v)))
+        }
+        10 => {  // u64 -- captured
+            let v = gguf_read_u64(b, off)?;
+            Some(Some(GgufMeta::U64(v)))
         }
         8 => {  // string -- captured
             let s = gguf_read_string(b, off)?;
@@ -8374,7 +8388,28 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
     let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
     match g.metadata.get(key_str) {
         Some(GgufMeta::U32(v)) => *v as i64,
+        Some(GgufMeta::U64(v)) => *v as i64,
         _ => -1,
+    }
+}
+
+/// Read an f32 metadata value.  Returns the value cast to f64 (because i64
+/// is the existing return type and we want lossless round-trip for the
+/// typical small values: rope.freq_base ~= 1e6, norm_eps ~= 1e-6) — caller
+/// downcasts to f32.  Returns NaN on missing key / wrong type.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_f32(
+    handle: i64, key: i64, key_len: c_int,
+) -> f64 {
+    if handle < 0 || key == 0 || key_len <= 0 { return f64::NAN; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return f64::NAN; }
+    let Some(g) = tbl[h].as_ref() else { return f64::NAN; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return f64::NAN; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::F32(v)) => *v as f64,
+        _ => f64::NAN,
     }
 }
 

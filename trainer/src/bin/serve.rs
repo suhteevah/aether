@@ -61,6 +61,11 @@ struct Cli {
     /// pool on Drop, so the pool effectively caps concurrent KV memory
     /// rather than letting per-request KV grow unbounded.
     pool_blocks: i32,
+    /// FR-17-extra-runtime-shape: probe mode — open the GGUF, print the
+    /// detected ModelConfig (architecture + shape + rope/eps), exit.  No
+    /// weight upload, no listener.  Useful for confirming the runtime-shape
+    /// detector picks up a new model correctly before trying to serve it.
+    probe: bool,
 }
 
 fn parse_cli() -> Cli {
@@ -75,6 +80,7 @@ fn parse_cli() -> Cli {
         tls_cn: "aether-serve.local".into(),
         paged: false,
         pool_blocks: 0,
+        probe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -97,6 +103,7 @@ fn parse_cli() -> Cli {
                 cli.pool_blocks = it.next().expect("--pool-blocks N").parse().expect("pool-blocks int");
                 cli.paged = true;
             }
+            "--probe" => cli.probe = true,
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -991,8 +998,113 @@ fn http_status_text(code: i32) -> &'static str {
     }
 }
 
+/// FR-17-extra-runtime-shape probe.  Open the GGUF, run `ModelConfig::from_gguf`,
+/// print the detected shape, exit.  No weight upload.  Lets the operator
+/// confirm a new model is detected correctly before attempting to serve it.
+#[cfg(feature = "cuda")]
+unsafe fn run_probe(path: &str) {
+    use aether_rt::{aether_gguf_open, aether_gguf_close};
+    use aether_rt::serving::ModelConfig;
+    use std::os::raw::c_int;
+    eprintln!("[probe] opening {}", path);
+    let h = aether_gguf_open(path.as_ptr() as i64, path.len() as c_int);
+    if h < 0 { eprintln!("[probe] gguf open failed: {}", h); std::process::exit(1); }
+    let cfg = ModelConfig::from_gguf(h);
+    println!("Detected model shape:");
+    println!("  architecture : {}", cfg.arch);
+    println!("  n_layers     : {}", cfg.n_layers);
+    println!("  d_model      : {}", cfg.d_model);
+    println!("  n_q_heads    : {}", cfg.n_q_heads);
+    println!("  n_kv_heads   : {}", cfg.n_kv_heads);
+    println!("  head_dim     : {}", cfg.head_dim);
+    println!("  d_kv         : {}", cfg.d_kv);
+    println!("  d_ff         : {}", cfg.d_ff);
+    println!("  vocab        : {}", cfg.vocab);
+    println!("  rope_base    : {}", cfg.rope_base);
+    println!("  norm_eps     : {:.2e}", cfg.norm_eps);
+    println!();
+    // Kernel-constraint check (mirrors new_with_mode's checks).
+    let mut violations = Vec::<String>::new();
+    if cfg.head_dim == 0 || cfg.head_dim % 32 != 0 || cfg.head_dim > 256 {
+        violations.push(format!("head_dim={} not supported (need multiple of 32, ≤ 256)", cfg.head_dim));
+    }
+    if cfg.n_kv_heads == 0 || cfg.n_q_heads % cfg.n_kv_heads != 0 {
+        violations.push(format!("n_q_heads({}) % n_kv_heads({}) != 0", cfg.n_q_heads, cfg.n_kv_heads));
+    }
+    if cfg.d_model == 0 || cfg.d_model % 256 != 0 || cfg.d_kv == 0 || cfg.d_kv % 256 != 0 {
+        violations.push(format!("d_model({}) / d_kv({}) must be multiples of 256 (Q4_K super-block)", cfg.d_model, cfg.d_kv));
+    }
+    if violations.is_empty() {
+        println!("All shape constraints satisfied.");
+    } else {
+        println!("Shape constraint violations:");
+        for v in &violations { println!("  - {}", v); }
+    }
+    // Architecture compatibility — the kernels today implement Qwen2.5-style
+    // dense attention + dense FFN with GQA.  Other arches need additional
+    // per-arch work even if the shape passes the SHAPE constraints above.
+    println!();
+    println!("Architecture compatibility:");
+    let (loadable, notes): (bool, &[&str]) = match cfg.arch.as_str() {
+        "qwen2" => (true, &[
+            "  ✅ Qwen2.5 dense attention + GQA + dense FFN.",
+            "     Today's kernel surface implements this arch directly.",
+            "     Loadable for any Qwen2.5 variant (7B verified; 14B/32B should work — needs GGUF).",
+        ]),
+        "qwen3" => (false, &[
+            "  ⚠ Qwen3 adds per-head Q/K RMS norm (attn_q_norm / attn_k_norm tensors).",
+            "     `load_block` currently doesn't read these.  FR: load + plumb in",
+            "     forward pass before attn_q/k projection.",
+        ]),
+        "qwen3vl" => (false, &[
+            "  ⚠ Qwen3-VL adds vision encoder + Q/K norm (qwen3 changes).",
+            "     Same FR as qwen3 plus a vision-tower path we don't have.",
+        ]),
+        "qwen3moe" => (false, &[
+            "  ⚠ Qwen3-Coder uses Mixture-of-Experts FFN (multiple gate_exps/up_exps/down_exps",
+            "     + a router).  Our fused_q4k_ffn_gate_up_silu_mul kernel is dense-only.",
+            "     FR: MoE FFN kernel (token routing + per-expert dispatch).",
+        ]),
+        "deepseek2" => (false, &[
+            "  ⚠ DeepSeek-V2/Coder uses Multi-head Latent Attention (MLA) — KV is",
+            "     projected into a small latent dim, not split into per-head K/V.",
+            "     Plus MoE FFN.  Major per-arch kernel work.",
+        ]),
+        "gemma3" => (false, &[
+            "  ⚠ Gemma3 uses head_dim=168 (off the supported set) + has its own",
+            "     pre/post-attention normalization layout + sliding-window attention.",
+        ]),
+        "llama" => (false, &[
+            "  ⚠ Llama is close to Qwen2.5 (no attention biases, no Q/K norm).  Should be",
+            "     a small variant of the existing kernels — drop the `bias_add` calls for",
+            "     attn_q/k/v after the matmul.  FR-17-extra-llama-fwd.",
+        ]),
+        _ => (false, &[
+            "  ❓ Unknown architecture — requires per-arch implementation work.",
+        ]),
+    };
+    for line in notes { println!("{}", line); }
+    if !loadable && violations.is_empty() {
+        println!();
+        println!("→ shape OK, but arch-specific kernel work needed before this model loads.");
+    } else if loadable && violations.is_empty() {
+        println!();
+        println!("→ READY: model would load with `aether-serve --gguf <this>`.");
+    }
+    aether_gguf_close(h);
+}
+
 fn main() {
     let cli = parse_cli();
+    #[cfg(feature = "cuda")]
+    if cli.probe {
+        let path = cli.gguf.as_ref().unwrap_or_else(|| {
+            eprintln!("[aether-serve] --probe requires --gguf <path>");
+            std::process::exit(2);
+        });
+        unsafe { run_probe(path); }
+        std::process::exit(0);
+    }
     let tls_on = cli.tls;
     let tls_cn = cli.tls_cn.clone();
     let state = match ServerState::new(cli) {
