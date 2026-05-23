@@ -1,7 +1,32 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-23 (**Path D landing — full TLS 1.3 + HTTP/2 + aether-serve HTTPS interop.**
+2026-05-23 evening (**Real paged KV cache landing — FR-19.4-extra.** Built on top of
+the existing CPU-side block allocator (`aether_pkv_*` from FR-19.4): added per-request
+**virtual page table** primitive (`aether_pkv_pagetable_*`) plus two new **GPU
+kernels** (`paged_append_kv_devarg`, `paged_attention_seq1_devarg`) that walk the
+page table on every K/V read and write.  Kernels compiled in a SEPARATE nvrtc
+unit (`aether_paged_kernels`) so they don't apply register-allocator pressure
+on the main `KERNEL_SRC` kernels (per the `nvrtc_kernel_unit_pressure.md`
+memory).  Parity test (`runtime/tests/cuda_paged_kv_parity.rs`) runs on the
+RTX 3070 Ti and proves:
+1. With **identity page-table mapping** the paged kernels produce
+   bit-identical output (`max_abs_diff < 1e-5`) to the contiguous
+   `append_kv_devarg` + `attention_seq1_devarg` reference, across the full
+   Qwen2.5 shape (n_q_heads=28, n_kv_heads=4, head_dim=128, cur_seq=7).
+2. With a **permuted page table** (`logical [0,1] → physical [2,0]`) the
+   attention output is unchanged — proving the kernel correctly walks the
+   indirection rather than reading the raw pool layout.
+`.aether` audit witness `tests/runtime/paged_kv_pagetable.aether` exercises
+the page-table FFI surface (new/set/get/len/destroy + i64-returning get to
+sidestep the asm-backend i32-sign-extend gap per
+`asm_backend_known_gaps.md`).  Audit clean.  Integration into `QwenSession`
+deferred — single-request serving doesn't benefit from page tables, the
+payoff is when paged KV combines with the continuous-batching scheduler
+(real implementation is FR-19.5-extra).
+
+### 2026-05-23 morning (Path D landing — TLS 1.3 + HTTP/2 + aether-serve HTTPS)
+**Path D landing — full TLS 1.3 + HTTP/2 + aether-serve HTTPS interop.**
 Pickup from "go on 1" → completed every tractable Path D item.  Highlights:
 (1) **aether-serve has a working `--tls` mode**: generates fresh Ed25519 + X25519
 on startup via `aether_random_bytes` (BCryptGenRandom on Windows), self-signs

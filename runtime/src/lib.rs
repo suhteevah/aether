@@ -5259,6 +5259,102 @@ unsafe fn pkv_table() -> &'static mut Vec<Option<Box<PagedKVCache>>> {
 }
 
 // =====================================================================
+// FR-19.4-extra — Paged KV cache: real per-request virtual page table.
+//
+// Each request owns a `PageTable` mapping its logical block index (i.e.
+// floor(token_pos / block_size)) to a physical block id from the shared
+// pool.  The pool itself is the existing PagedKVCache; the page-table
+// layer here adds the per-request indirection that vLLM uses to keep
+// memory shared without fragmentation.
+// =====================================================================
+struct PageTable {
+    /// logical_block_idx -> physical_block_id (-1 if unmapped).
+    blocks: Vec<i32>,
+}
+struct PtCell(UnsafeCell<Vec<Option<Box<PageTable>>>>);
+unsafe impl Sync for PtCell {}
+static PT_TABLE: PtCell = PtCell(UnsafeCell::new(Vec::new()));
+unsafe fn pt_table() -> &'static mut Vec<Option<Box<PageTable>>> { &mut *PT_TABLE.0.get() }
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_pagetable_new(initial_capacity: c_int) -> i64 {
+    if initial_capacity < 0 { return -1; }
+    let pt = PageTable { blocks: vec![-1; initial_capacity as usize] };
+    let tbl = pt_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(pt)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(pt)));
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_pagetable_set(
+    h: i64, logical_idx: c_int, physical_block: c_int,
+) -> c_int {
+    if h < 0 || logical_idx < 0 { return -1; }
+    let tbl = pt_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(pt) = tbl[hu].as_mut() else { return -1; };
+    let li = logical_idx as usize;
+    if li >= pt.blocks.len() { pt.blocks.resize(li + 1, -1); }
+    pt.blocks[li] = physical_block;
+    0
+}
+
+/// Returns the physical block id mapped to `logical_idx` (i64 — i32-sign-extend
+/// gap in the asm backend means returning c_int=-1 gets zero-extended in the
+/// caller's i64 slot; i64 return avoids that).  Returns -1 for unmapped /
+/// out-of-bounds.
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_pagetable_get(h: i64, logical_idx: c_int) -> i64 {
+    if h < 0 || logical_idx < 0 { return -1; }
+    let tbl = pt_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(pt) = tbl[hu].as_ref() else { return -1; };
+    let li = logical_idx as usize;
+    if li >= pt.blocks.len() { return -1; }
+    pt.blocks[li] as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_pagetable_len(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = pt_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(pt) = tbl[hu].as_ref() else { return -1; };
+    pt.blocks.len() as c_int
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_pagetable_destroy(h: i64) -> c_int {
+    if h < 0 { return -1; }
+    let tbl = pt_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    tbl[hu] = None;
+    0
+}
+
+/// Translate a logical token position to (physical_block, in_block_offset).
+/// Returns -1 in the high-bits-as-error or packs result as i64:
+///   bits 0..31 = physical_block, bits 32..63 = in_block_offset.
+/// Caller decodes both halves.  Returns -1 on bad inputs / unmapped.
+#[no_mangle] pub unsafe extern "C" fn aether_pkv_pagetable_translate(
+    h: i64, token_pos: c_int, block_size: c_int,
+) -> i64 {
+    if h < 0 || token_pos < 0 || block_size <= 0 { return -1; }
+    let tbl = pt_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(pt) = tbl[hu].as_ref() else { return -1; };
+    let logical = token_pos as usize / block_size as usize;
+    let in_block = token_pos as usize % block_size as usize;
+    if logical >= pt.blocks.len() { return -1; }
+    let phys = pt.blocks[logical];
+    if phys < 0 { return -1; }
+    ((phys as i64) & 0xffffffff) | ((in_block as i64) << 32)
+}
+
+// =====================================================================
 // FR-19.5 — Continuous batching scheduler (simulation).
 //
 // vLLM-class scheduler: new requests enter mid-decode (no padding

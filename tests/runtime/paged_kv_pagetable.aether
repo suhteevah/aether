@@ -1,0 +1,37 @@
+// roadmap: P19.4
+// expect: exit=42
+//
+// FR-19.4-extra — Paged KV page-table primitive (per-request virtual
+// page table on top of the existing block allocator).
+//
+// Real GPU-backed paged KV kernels (paged_append_kv_devarg +
+// paged_attention_seq1_devarg) live in `runtime/src/cuda.rs` and are
+// witnessed in `runtime/tests/cuda_paged_kv_parity.rs` — that test
+// runs on real GPU and proves the kernels produce bit-identical
+// output to the contiguous reference when the page table is identity,
+// and that a permuted page table still yields the same logical
+// attention output (kernel correctly walks the indirection).
+use runtime;
+
+extern fn aether_pkv_pagetable_new(initial_capacity: i32) -> i64;
+extern fn aether_pkv_pagetable_set(h: i64, logical_idx: i32, physical_block: i32) -> i32;
+extern fn aether_pkv_pagetable_get(h: i64, logical_idx: i32) -> i64;
+extern fn aether_pkv_pagetable_len(h: i64) -> i32;
+extern fn aether_pkv_pagetable_destroy(h: i64) -> i32;
+
+fn main() -> i32 {
+    let h: i64 = aether_pkv_pagetable_new(4);
+    if h < 0 { return 1; }
+
+    if aether_pkv_pagetable_set(h, 0, 7) != 0 { return 2; }
+    if aether_pkv_pagetable_set(h, 3, 2) != 0 { return 3; }
+
+    if aether_pkv_pagetable_get(h, 0) != 7 { return 4; }
+    if aether_pkv_pagetable_get(h, 3) != 2 { return 5; }
+    if aether_pkv_pagetable_get(h, 1) != -1 { return 6; }   // unmapped, -1 sentinel (i64 return)
+
+    if aether_pkv_pagetable_len(h) != 4 { return 7; }
+
+    aether_pkv_pagetable_destroy(h);
+    42
+}

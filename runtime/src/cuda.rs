@@ -73,7 +73,144 @@ struct CudaCtx {
     attention_seq1_devarg: CudaFunction,
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
+    // Paged KV variants (FR-19.4-extra). Compiled as a separate nvrtc unit
+    // so they don't apply register-allocator pressure on the main kernels
+    // (see memory: nvrtc_kernel_unit_pressure.md).
+    paged_append_kv_devarg: CudaFunction,
+    paged_attention_seq1_devarg: CudaFunction,
 }
+
+/// FR-19.4-extra paged-KV kernels.  Separate nvrtc unit so its register
+/// allocation doesn't perturb the main KERNEL_SRC kernels.
+///
+/// Pool memory layout (per layer × {K, V}): contiguous f32 of size
+/// `pool_n_blocks * block_size * d_kv`.  Block id `b` lives at offset
+/// `b * block_size * d_kv`.  Within a block, position `p` of `d_kv`
+/// elements lives at `b * block_size * d_kv + p * d_kv`.
+///
+/// Per-request page_table: `int[]` where `page_table[L]` = physical block
+/// id holding logical block `L` of the request.  Token at request-relative
+/// position `pos` ↔ physical row `page_table[pos / block_size] * block_size
+/// + (pos % block_size)`.
+const PAGED_KERNEL_SRC: &str = r#"
+extern "C" __global__ void paged_append_kv_devarg(
+    const float* __restrict__ k_new,
+    const float* __restrict__ v_new,
+    float*       __restrict__ k_pool,
+    float*       __restrict__ v_pool,
+    const int*   __restrict__ page_table,
+    int          d_kv,
+    int          block_size,
+    const int*   __restrict__ step_args)
+{
+    int pos = step_args[0];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= d_kv) return;
+    int logical_blk = pos / block_size;
+    int in_blk_pos  = pos - logical_blk * block_size;
+    int phys_blk    = page_table[logical_blk];
+    size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+    k_pool[row * d_kv + tid] = k_new[tid];
+    v_pool[row * d_kv + tid] = v_new[tid];
+}
+
+extern "C" __global__ void paged_attention_seq1_devarg(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int*   __restrict__ page_table,
+    float*       __restrict__ attn_out,
+    int n_q_heads, int n_kv_heads, int head_dim, int block_size,
+    float scale, const int* __restrict__ step_args)
+{
+    int cur_seq = step_args[1];
+    extern __shared__ float scores[];
+
+    int head    = blockIdx.x;
+    int lane    = threadIdx.x;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head = head / kv_per_q;
+    int d_kv    = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;
+
+    const float* q_ptr = q + head * head_dim;
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane * per_lane + i];
+    }
+
+    // Pass 1: scores[t] = Q · K[t, kv_head] * scale, with K from paged pool
+    for (int t = 0; t < cur_seq; t++) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        const float* k_ptr = k_pool + row * d_kv + kv_head * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane * per_lane + i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncwarp();
+
+    // Pass 2: softmax (max, exp+sum, normalize)
+    float local_max = __int_as_float(0xFF800000u);
+    for (int t = lane; t < cur_seq; t += 32) {
+        float s = scores[t];
+        if (s > local_max) local_max = s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    float max_val = __shfl_sync(0xFFFFFFFFu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int t = lane; t < cur_seq; t += 32) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, off);
+    }
+    float sum_val = __shfl_sync(0xFFFFFFFFu, local_sum, 0);
+    float inv_sum = 1.0f / sum_val;
+    for (int t = lane; t < cur_seq; t += 32) {
+        scores[t] *= inv_sum;
+    }
+    __syncwarp();
+
+    // Pass 3: aggregate V by softmax weights, V from paged pool
+    float out_local[8] = {0.0f};
+    for (int t = 0; t < cur_seq; t++) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        float w = scores[t];
+        const float* v_ptr = v_pool + row * d_kv + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) out_local[i] += w * v_ptr[lane * per_lane + i];
+        }
+    }
+    float* out_ptr = attn_out + head * head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) out_ptr[lane * per_lane + i] = out_local[i];
+    }
+}
+"#;
 
 /// Embedded CUDA C source for the small custom kernels cuBLAS doesn't
 /// cover. JIT-compiled to PTX once at first `aether_dev_init` and loaded
@@ -1550,6 +1687,17 @@ fn ctx() -> &'static CudaCtx {
         let attention_seq1_devarg = device.get_func("aether_kernels", "attention_seq1_devarg").unwrap();
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
+
+        // Paged-KV kernels — separate nvrtc compilation unit.
+        let paged_ptx = compile_ptx(PAGED_KERNEL_SRC).expect("compile_ptx paged");
+        device.load_ptx(paged_ptx, "aether_paged_kernels",
+            &["paged_append_kv_devarg", "paged_attention_seq1_devarg"])
+            .expect("load_ptx paged");
+        let paged_append_kv_devarg =
+            device.get_func("aether_paged_kernels", "paged_append_kv_devarg").unwrap();
+        let paged_attention_seq1_devarg =
+            device.get_func("aether_paged_kernels", "paged_attention_seq1_devarg").unwrap();
+
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
@@ -1562,7 +1710,8 @@ fn ctx() -> &'static CudaCtx {
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
-                  append_kv, attention_seq1 }
+                  append_kv, attention_seq1,
+                  paged_append_kv_devarg, paged_attention_seq1_devarg }
     })
 }
 
@@ -2573,6 +2722,82 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().attention_seq1_devarg.clone()
             .launch(cfg, (qv, kcv, vcv, ov, n_q_heads, n_kv_heads, head_dim, scale, sv))
             .expect("launch attention_seq1_devarg");
+    }
+    0
+}
+
+/// FR-19.4-extra — paged append_kv. Writes K/V at the physical row located via
+/// `page_table[pos / block_size] * block_size + (pos % block_size)`.
+#[no_mangle] pub extern "C" fn aether_op_paged_append_kv_devarg_f32_cuda(
+    k_new_dev: i64, v_new_dev: i64,
+    k_pool_dev: i64, v_pool_dev: i64,
+    page_table_dev: i64,
+    d_kv: c_int, block_size: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_kn) = handle_to_idx(k_new_dev) else { return -1; };
+    let Some(i_vn) = handle_to_idx(v_new_dev) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool_dev) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool_dev) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_dev) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if d_kv <= 0 || block_size <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let kn = bs[i_kn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vn = bs[i_vn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp = bs[i_kp].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let vp = bs[i_vp].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let pt = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let sp = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let cfg = LaunchConfig::for_num_elems(d_kv as u32);
+    unsafe {
+        let knr = &*kn; let vnr = &*vn;
+        let kpm = &mut *kp; let vpm = &mut *vp;
+        let ptv = &*pt; let sv = &*sp;
+        ctx().paged_append_kv_devarg.clone()
+            .launch(cfg, (knr, vnr, kpm, vpm, ptv, d_kv, block_size, sv))
+            .expect("launch paged_append_kv_devarg");
+    }
+    0
+}
+
+/// FR-19.4-extra — paged attention_seq1. Reads K[t], V[t] from
+/// `pool + (page_table[t / block_size] * block_size + (t % block_size)) * d_kv`.
+#[no_mangle] pub extern "C" fn aether_op_paged_attention_seq1_devarg_f32_cuda(
+    q_dev: i64, k_pool: i64, v_pool: i64,
+    page_table_dev: i64,
+    attn_out: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int, block_size: c_int,
+    scale: f32, max_seq: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_dev) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0 || block_size <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp_p = bs[i_kp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vp_p = bs[i_vp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pt_p = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp  = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let shmem = (max_seq as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
+        let ov = &mut *o_p; let sv = &*sp;
+        ctx().paged_attention_seq1_devarg.clone()
+            .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, sv))
+            .expect("launch paged_attention_seq1_devarg");
     }
     0
 }
