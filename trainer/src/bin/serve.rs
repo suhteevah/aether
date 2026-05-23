@@ -51,6 +51,11 @@ struct Cli {
     warmup: usize,
     tls: bool,
     tls_cn: String,
+    /// FR-19.4-extra: route K/V through the paged kernels with an identity
+    /// page table (block_size=4).  Bit-identical token output to the
+    /// contiguous path (witnessed in qwen25_paged_parity.rs); the deployment
+    /// payoff is multi-tenant pool sharing (future work).
+    paged: bool,
 }
 
 fn parse_cli() -> Cli {
@@ -63,6 +68,7 @@ fn parse_cli() -> Cli {
         warmup: 4,
         tls: false,
         tls_cn: "aether-serve.local".into(),
+        paged: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -80,8 +86,9 @@ fn parse_cli() -> Cli {
             "--warmup" => cli.warmup = it.next().expect("--warmup N").parse().expect("warmup int"),
             "--tls" => { cli.tls = true; if cli.port == 8080 { cli.port = 8443; } }
             "--tls-cn" => cli.tls_cn = it.next().expect("--tls-cn NAME"),
+            "--paged" => cli.paged = true,
             "-h" | "--help" => {
-                eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME]");
+                eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
                 eprintln!("  Listens on 0.0.0.0:port for OpenAI-compat /v1/chat/completions.");
                 eprintln!("  --gguf points at any Qwen2.5-7B-Instruct Q4_K_M model file.");
@@ -89,6 +96,9 @@ fn parse_cli() -> Cli {
                 eprintln!("    the GPU into P0/P2 power state and pre-capture the graph.");
                 eprintln!("  --tls enables TLS 1.3 (self-signed Ed25519 cert generated on startup");
                 eprintln!("        with --tls-cn as the cert CN; default port becomes 8443).");
+                eprintln!("  --paged routes K/V through paged_append_kv_devarg +");
+                eprintln!("        paged_attention_seq1_devarg (FR-19.4-extra) — identity");
+                eprintln!("        page table, bit-identical token output to contiguous mode.");
                 eprintln!("  Without --gguf, returns a stub response (HTTP/JSON plumbing only).");
                 std::process::exit(0);
             }
@@ -360,9 +370,14 @@ impl ServerState {
         {
             let session = match &cli.gguf {
                 Some(path) => {
-                    eprintln!("[aether-serve] loading GGUF: {}", path);
+                    eprintln!("[aether-serve] loading GGUF: {}{}", path,
+                        if cli.paged { " (paged KV mode)" } else { "" });
                     let t = std::time::Instant::now();
-                    let mut s = QwenSession::new(path)?;
+                    let mut s = if cli.paged {
+                        QwenSession::new_paged(path)?
+                    } else {
+                        QwenSession::new(path)?
+                    };
                     eprintln!("[aether-serve] model loaded in {:.2}s", t.elapsed().as_secs_f32());
                     if cli.warmup > 0 {
                         eprintln!("[aether-serve] warming GPU + capturing graph ({} steps)...", cli.warmup);
