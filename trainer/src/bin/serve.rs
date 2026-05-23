@@ -1022,6 +1022,22 @@ unsafe fn run_probe(path: &str) {
     println!("  vocab        : {}", cfg.vocab);
     println!("  rope_base    : {}", cfg.rope_base);
     println!("  norm_eps     : {:.2e}", cfg.norm_eps);
+    if cfg.kv_lora_rank > 0 {
+        println!();
+        println!("MLA (Multi-head Latent Attention) detected:");
+        println!("  kv_lora_rank      : {}", cfg.kv_lora_rank);
+        println!("  q_lora_rank       : {} {}",
+            cfg.q_lora_rank,
+            if cfg.q_lora_rank == 0 { "(direct Q, no LoRA)" } else { "" });
+        println!("  qk_head_dim       : {}  (qk_nope+qk_rope)", cfg.qk_head_dim);
+        println!("  qk_rope_head_dim  : {}", cfg.qk_rope_head_dim);
+        println!("  v_head_dim        : {}", cfg.v_head_dim);
+        println!("  leading_dense_blks: {}", cfg.leading_dense_blocks);
+        println!("  n_shared_experts  : {}", cfg.n_shared_experts);
+    }
+    if cfg.sliding_window > 0 {
+        println!("  sliding_window: {}", cfg.sliding_window);
+    }
     println!();
     // Kernel-constraint check (mirrors new_with_mode's checks).
     let mut violations = Vec::<String>::new();
@@ -1072,11 +1088,24 @@ unsafe fn run_probe(path: &str) {
             "     Verification needs more GPU memory than this 8 GB card (30B is ~17 GB Q4_K_M).",
         ]),
         "deepseek2" => (false, &[
-            "  ⚠ DeepSeek-V2/Coder MoE FFN is shipped via FR-17-extra-moe-fwd above.",
-            "     REMAINING: Multi-head Latent Attention (MLA) — KV is projected into a",
-            "     low-dim latent space, then decompressed for attention.  Different tensor",
-            "     layout (attn_kv_a + attn_kv_b instead of attn_k + attn_v).  Needs a new",
-            "     attention kernel.  FR-17-extra-mla-fwd (multi-session).",
+            "  🟡 DeepSeek-V2 MLA kernels SHIPPED (FR-17-extra-mla-fwd, partial):",
+            "      - paged_attention_mla_devarg — split per-head dims for Q/K (192) vs V",
+            "        (128), CPU↔GPU bit-witnessed in cuda_attention_mla_parity.rs.",
+            "      - paged_append_kv_mla_devarg — independent K/V row strides, also",
+            "        witnessed.",
+            "      - ModelConfig reads kv_lora_rank / q_lora_rank / qk_head_dim /",
+            "        qk_rope_head_dim / v_head_dim / leading_dense_blocks /",
+            "        n_shared_experts from GGUF metadata.",
+            "      - load_block reads attn_kv_a_mqa / attn_kv_a_norm / attn_kv_b and the",
+            "        optional attn_q_a / attn_q_a_norm / attn_q_b LoRA tensors.",
+            "     REMAINING for end-to-end: (a) c_kv projection + per-head decompression",
+            "     glue kernels, (b) partial-dim RoPE on Q_rope (per-head, qk_rope_head_dim)",
+            "     and K_rope_shared (single broadcast vec).  block_forward_devarg detects",
+            "     MLA layout today and panics with a clear pointer rather than producing",
+            "     garbage activations.  MoE FFN is shipped via FR-17-extra-moe-fwd (above).",
+            "     End-to-end is also blocked on (c) Q4_0 dispatch — DeepSeek-V2-Lite",
+            "     ships in Q4_0 not Q4_K — and (d) YaRN RoPE scaling (V2 uses",
+            "     rope.scaling.type=yarn, factor=40).",
         ]),
         "gemma3" => (true, &[
             "  ✅ Gemma3 dispatch shipped (FR-17-extra-gemma-fwd):",

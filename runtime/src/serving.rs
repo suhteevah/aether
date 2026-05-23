@@ -129,6 +129,36 @@ pub struct ModelConfig {
     /// Gemma3 specifically alternates sliding/full per layer (per-layer
     /// alternation is a future refinement; today this is a uniform setting).
     pub sliding_window: i32,
+    /// FR-17-extra-mla-fwd — DeepSeek-V2 Multi-head Latent Attention.
+    /// 0 = standard attention (default).  >0 = use MLA with this latent KV
+    /// rank.  When > 0 the per-block tensor layout switches to (attn_kv_a_mqa,
+    /// attn_kv_a_norm, attn_kv_b, attn_q [+optional q_a/q_b]) and the per-
+    /// head K/V dims become (qk_head_dim, v_head_dim) rather than head_dim
+    /// for both.
+    pub kv_lora_rank: i32,
+    /// MLA: low-rank Q projection rank.  0 = direct attn_q (no Q LoRA, used
+    /// by DeepSeek-V2-Lite).  >0 = attn_q_a + attn_q_a_norm + attn_q_b path.
+    pub q_lora_rank: i32,
+    /// MLA: per-head Q/K dim = qk_nope_head_dim + qk_rope_head_dim
+    /// (e.g. 128 + 64 = 192 for V2-Lite).  0 = N/A.
+    pub qk_head_dim: i32,
+    /// MLA: subset of qk_head_dim that gets rotary applied.  K_rope is
+    /// SHARED across heads in MLA (a single qk_rope_head_dim vector per
+    /// token), while Q_rope is per-head.  0 = N/A.
+    pub qk_rope_head_dim: i32,
+    /// MLA: per-head V dim (e.g. 128 for V2-Lite).  Different from qk_head_dim.
+    /// 0 = N/A.
+    pub v_head_dim: i32,
+    /// MLA: number of leading blocks that use the DENSE FFN (instead of
+    /// MoE).  DeepSeek-V2-Lite has 1 leading dense block (layer 0).
+    /// Layers in [0, leading_dense_blocks) are dense; layers in
+    /// [leading_dense_blocks, n_layers) are MoE.  0 = all blocks MoE
+    /// (when n_experts > 0).  Unused when n_experts == 0.
+    pub leading_dense_blocks: i32,
+    /// MLA: number of always-on shared experts (in addition to top-k routed
+    /// experts).  DeepSeek-V2-Lite uses 2 shared experts.  0 = no shared
+    /// experts (Qwen3-MoE).  Unused when n_experts == 0.
+    pub n_shared_experts: i32,
 }
 
 impl ModelConfig {
@@ -143,6 +173,9 @@ impl ModelConfig {
             arch: "qwen2".to_string(),
             n_experts: 0, n_experts_used: 0,
             sliding_window: 0,
+            kv_lora_rank: 0, q_lora_rank: 0,
+            qk_head_dim: 0, qk_rope_head_dim: 0, v_head_dim: 0,
+            leading_dense_blocks: 0, n_shared_experts: 0,
         }
     }
 
@@ -187,11 +220,43 @@ impl ModelConfig {
         let sliding_window = read_meta_u32(gguf_handle,
             &format!("{}.attention.sliding_window", prefix))
             .map(|v| v as i32).unwrap_or(0);
+        // FR-17-extra-mla-fwd — DeepSeek-V2 MLA keys.
+        //   deepseek2.attention.kv_lora_rank      (e.g. 512)
+        //   deepseek2.attention.q_lora_rank       (optional; absent for V2-Lite)
+        //   deepseek2.attention.key_length        (qk_nope + qk_rope, e.g. 192)
+        //   deepseek2.attention.value_length      (v_head_dim, e.g. 128)
+        //   deepseek2.rope.dimension_count        (qk_rope_head_dim, e.g. 64)
+        //   deepseek2.leading_dense_block_count   (e.g. 1)
+        //   deepseek2.expert_shared_count         (e.g. 2)
+        let kv_lora_rank = read_meta_u32(gguf_handle,
+            &format!("{}.attention.kv_lora_rank", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let q_lora_rank = read_meta_u32(gguf_handle,
+            &format!("{}.attention.q_lora_rank", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let qk_head_dim = read_meta_u32(gguf_handle,
+            &format!("{}.attention.key_length", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let v_head_dim = read_meta_u32(gguf_handle,
+            &format!("{}.attention.value_length", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let qk_rope_head_dim = read_meta_u32(gguf_handle,
+            &format!("{}.rope.dimension_count", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let leading_dense_blocks = read_meta_u32(gguf_handle,
+            &format!("{}.leading_dense_block_count", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let n_shared_experts = read_meta_u32(gguf_handle,
+            &format!("{}.expert_shared_count", prefix))
+            .map(|v| v as i32).unwrap_or(0);
         Self {
             d_model, n_layers, n_q_heads, n_kv_heads, head_dim, d_kv,
             d_ff, vocab, rope_base, norm_eps, arch,
             n_experts, n_experts_used,
             sliding_window,
+            kv_lora_rank, q_lora_rank,
+            qk_head_dim, qk_rope_head_dim, v_head_dim,
+            leading_dense_blocks, n_shared_experts,
         }
     }
 }
@@ -245,6 +310,24 @@ struct BlockGpu {
     w_router: i64,
     w_gate_exps: i64, w_up_exps: i64, w_down_exps: i64,
     dt_gate_exps: i32, dt_up_exps: i32, dt_down_exps: i32,
+    /// FR-17-extra-mla-fwd — DeepSeek-V2 MLA per-block tensors.
+    /// All 0 when the arch isn't MLA.
+    ///   w_kv_a_mqa: [d_model x (kv_lora_rank + qk_rope_head_dim)] (Q4_K)
+    ///   attn_kv_a_norm_g: [kv_lora_rank] (F32) — RMS norm gain on c_kv latent
+    ///   w_kv_b: [kv_lora_rank x (n_heads * (qk_nope_head_dim + v_head_dim))] (Q4_K)
+    ///   w_q_a / attn_q_a_norm_g / w_q_b: present iff q_lora_rank > 0.
+    ///     w_q_a:   [d_model x q_lora_rank]
+    ///     attn_q_a_norm_g: [q_lora_rank]
+    ///     w_q_b:   [q_lora_rank x (n_heads * qk_head_dim)]
+    ///   When q_lora_rank == 0 the existing `w_q` field holds the direct
+    ///   [d_model x (n_heads * qk_head_dim)] projection.
+    w_kv_a_mqa: i64,
+    attn_kv_a_norm_g: i64,
+    w_kv_b: i64,
+    w_q_a: i64,
+    attn_q_a_norm_g: i64,
+    w_q_b: i64,
+    dt_kv_a_mqa: i32, dt_kv_b: i32, dt_q_a: i32, dt_q_b: i32,
 }
 
 struct ActivationGpu {
@@ -414,9 +497,35 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
 
 unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     let p = format!("blk.{}.", b);
+    // FR-17-extra-mla-fwd — DeepSeek-V2 MLA blocks use a different K/V
+    // layout: attn_kv_a_mqa + attn_kv_a_norm + attn_kv_b instead of
+    // attn_k + attn_v.  Detected by the presence of attn_kv_a_mqa.weight.
+    // Q can be either direct attn_q (q_lora_rank == 0, V2-Lite) or
+    // attn_q_a + attn_q_a_norm + attn_q_b (q_lora_rank > 0, larger V2 vars).
+    let (w_kv_a_mqa, _, dt_kv_a_mqa) =
+        upload_tensor_u8_opt(h, &format!("{}attn_kv_a_mqa.weight", p));
+    let is_mla = w_kv_a_mqa != 0;
+    let (w_kv_b, _, dt_kv_b) = if is_mla {
+        upload_tensor_u8_opt(h, &format!("{}attn_kv_b.weight", p))
+    } else { (0, 0, 0) };
+    let (w_q_a, _, dt_q_a) = if is_mla {
+        upload_tensor_u8_opt(h, &format!("{}attn_q_a.weight", p))
+    } else { (0, 0, 0) };
+    let (w_q_b, _, dt_q_b) = if is_mla {
+        upload_tensor_u8_opt(h, &format!("{}attn_q_b.weight", p))
+    } else { (0, 0, 0) };
+    // For MLA blocks attn_k/attn_v don't exist; for non-MLA blocks they do.
     let (w_q, nb_qo, dt_q)         = upload_tensor_u8(h, &format!("{}attn_q.weight", p));
-    let (w_k, nb_kv, dt_k)         = upload_tensor_u8(h, &format!("{}attn_k.weight", p));
-    let (w_v, _, dt_v)             = upload_tensor_u8(h, &format!("{}attn_v.weight", p));
+    let (w_k, nb_kv, dt_k)         = if is_mla {
+        (0, 0, 0)
+    } else {
+        upload_tensor_u8(h, &format!("{}attn_k.weight", p))
+    };
+    let (w_v, _, dt_v)             = if is_mla {
+        (0, 0, 0)
+    } else {
+        upload_tensor_u8(h, &format!("{}attn_v.weight", p))
+    };
     let (w_o, _, dt_o)             = upload_tensor_u8(h, &format!("{}attn_output.weight", p));
     // For DENSE FFN the three tensors live under ffn_gate/up/down.  For MoE
     // they live under ffn_gate_exps/up_exps/down_exps and there's a router
@@ -449,6 +558,13 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         nb_qo, nb_kv, nb_gate_up, nb_down,
         w_router, w_gate_exps, w_up_exps, w_down_exps,
         dt_gate_exps, dt_up_exps, dt_down_exps,
+        w_kv_a_mqa,
+        attn_kv_a_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_kv_a_norm.weight", p)),
+        w_kv_b,
+        w_q_a,
+        attn_q_a_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_q_a_norm.weight", p)),
+        w_q_b,
+        dt_kv_a_mqa, dt_kv_b, dt_q_a, dt_q_b,
     }
 }
 
@@ -476,6 +592,23 @@ unsafe fn block_forward_devarg(
     let rope_base = cfg.rope_base;
     let norm_eps = cfg.norm_eps;
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
+    // FR-17-extra-mla-fwd — DeepSeek-V2 MLA branch.  The MLA attention kernel
+    // + paged append kernel are landed and CPU↔GPU bit-witnessed in
+    // runtime/tests/cuda_attention_mla_parity.rs.  The pre-attention plumbing
+    // (compressed-KV projection + per-head decompression + RoPE on partial
+    // dims + Q/K composition) needs a few small fan-out kernels that aren't
+    // wired into this forward path yet.  Detect the MLA layout and stop with
+    // a clear error message so a user loading DeepSeek-V2 doesn't get
+    // silently-wrong activations.
+    if bw.w_kv_a_mqa != 0 || cfg.kv_lora_rank > 0 {
+        panic!("FR-17-extra-mla-fwd: MLA attention kernel + paged-append \
+            kernel are landed (paged_attention_mla_devarg / \
+            paged_append_kv_mla_devarg), but the full forward integration \
+            (c_kv projection + decompression + per-head RoPE composition) \
+            is not yet wired into block_forward_devarg.  Detected MLA at \
+            cfg.kv_lora_rank={}, w_kv_a_mqa={}.",
+            cfg.kv_lora_rank, bw.w_kv_a_mqa);
+    }
     dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, d_model, d_model);
     if bw.b_q != 0 {
         // Qwen2 has Q bias; Qwen3 doesn't (BlockGpu.b_q == 0 for qwen3).
