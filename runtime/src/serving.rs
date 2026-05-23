@@ -167,7 +167,12 @@ struct BlockGpu {
     w_q: i64, w_k: i64, w_o: i64, w_gate: i64, w_up: i64,
     w_v: i64, dt_v: i32,
     w_down: i64, dt_down: i32,
+    /// Q/K/V biases — present in Qwen2.5 (qwen2 arch).  Qwen3 dropped these.
+    /// 0 indicates "absent".
     b_q: i64, b_k: i64, b_v: i64,
+    /// FR-17-extra-qwen3-fwd — per-head Q/K RMS norm (Qwen3-style).
+    /// 0 indicates "absent" (qwen2 / older archs).
+    attn_q_norm_g: i64, attn_k_norm_g: i64,
     nb_qo: usize, nb_kv: usize, nb_gate_up: usize, nb_down: usize,
 }
 
@@ -298,6 +303,20 @@ unsafe fn upload_f32_tensor(h: i64, name: &str) -> i64 {
     d
 }
 
+/// Non-panicking variant for tensors that exist on some archs but not others.
+/// Returns 0 (treated as "absent" by callers) if the tensor isn't in the GGUF.
+unsafe fn upload_f32_tensor_opt(h: i64, name: &str) -> i64 {
+    let needle = name.as_bytes();
+    let idx = aether_gguf_find_tensor_by_name(h, needle.as_ptr() as i64, needle.len() as c_int);
+    if idx < 0 { return 0; }
+    let n_elems = aether_gguf_get_tensor_n_elems(h, idx) as usize;
+    let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
+    let host: Vec<f32> = std::slice::from_raw_parts(dptr as *const f32, n_elems).to_vec();
+    let d = aether_dev_alloc_f32(n_elems as c_int);
+    aether_dev_h2d_f32(host.as_ptr() as i64, d, n_elems as c_int);
+    d
+}
+
 unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     let p = format!("blk.{}.", b);
     let (w_q, nb_qo, _)            = upload_tensor_u8(h, &format!("{}attn_q.weight", p));
@@ -312,9 +331,13 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         ffn_norm_g:  upload_f32_tensor(h, &format!("{}ffn_norm.weight", p)),
         w_q, w_k, w_o, w_gate, w_up,
         w_v, dt_v, w_down, dt_down,
-        b_q: upload_f32_tensor(h, &format!("{}attn_q.bias", p)),
-        b_k: upload_f32_tensor(h, &format!("{}attn_k.bias", p)),
-        b_v: upload_f32_tensor(h, &format!("{}attn_v.bias", p)),
+        // Qwen2 has biases on Q/K/V; Qwen3 doesn't.  Load as optional.
+        b_q: upload_f32_tensor_opt(h, &format!("{}attn_q.bias", p)),
+        b_k: upload_f32_tensor_opt(h, &format!("{}attn_k.bias", p)),
+        b_v: upload_f32_tensor_opt(h, &format!("{}attn_v.bias", p)),
+        // Qwen3 has per-head Q/K RMS norm; Qwen2 doesn't.  Load as optional.
+        attn_q_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_q_norm.weight", p)),
+        attn_k_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_k_norm.weight", p)),
         nb_qo, nb_kv, nb_gate_up, nb_down,
     }
 }
@@ -345,10 +368,15 @@ unsafe fn block_forward_devarg(
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_q, act.q,
         d_model, (bw.nb_qo / cfg.d_model) as c_int);
-    aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, d_model);
+    if bw.b_q != 0 {
+        // Qwen2 has Q bias; Qwen3 doesn't (BlockGpu.b_q == 0 for qwen3).
+        aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, d_model);
+    }
     aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_k, act.k_step,
         d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
-    aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv);
+    if bw.b_k != 0 {
+        aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv);
+    }
     if bw.dt_v == 14 {
         aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
             d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
@@ -356,7 +384,22 @@ unsafe fn block_forward_devarg(
         aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
             d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
     }
-    aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
+    if bw.b_v != 0 {
+        aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
+    }
+    // FR-17-extra-qwen3-fwd — per-head Q/K RMS norm (Qwen3-style).
+    // gamma shape [head_dim] is broadcast across heads; applied to each head's
+    // head_dim-sized slice via rms_norm with rows=n_q_heads, d=head_dim.
+    if bw.attn_q_norm_g != 0 {
+        aether_op_rms_norm_f32_cuda(
+            act.q, bw.attn_q_norm_g, act.q,
+            norm_eps, n_q_heads, head_dim);
+    }
+    if bw.attn_k_norm_g != 0 {
+        aether_op_rms_norm_f32_cuda(
+            act.k_step, bw.attn_k_norm_g, act.k_step,
+            norm_eps, n_kv_heads, head_dim);
+    }
     aether_op_rope_apply_devarg_f32_cuda(act.q,
         1, n_q_heads, head_dim, rope_base, step_args);
     aether_op_rope_apply_devarg_f32_cuda(act.k_step,
@@ -851,9 +894,12 @@ impl Drop for QwenSession {
                 let _ = aether_dev_free_u8(b.w_gate);
                 let _ = aether_dev_free_u8(b.w_up);
                 let _ = aether_dev_free_u8(b.w_down);
-                let _ = aether_dev_free_f32(b.b_q);
-                let _ = aether_dev_free_f32(b.b_k);
-                let _ = aether_dev_free_f32(b.b_v);
+                // Optional tensors — only free if present.
+                if b.b_q != 0 { let _ = aether_dev_free_f32(b.b_q); }
+                if b.b_k != 0 { let _ = aether_dev_free_f32(b.b_k); }
+                if b.b_v != 0 { let _ = aether_dev_free_f32(b.b_v); }
+                if b.attn_q_norm_g != 0 { let _ = aether_dev_free_f32(b.attn_q_norm_g); }
+                if b.attn_k_norm_g != 0 { let _ = aether_dev_free_f32(b.attn_k_norm_g); }
             }
             let _ = aether_dev_free_f32(self.final_norm_g);
             let _ = aether_dev_free_u8(self.lm_head);
