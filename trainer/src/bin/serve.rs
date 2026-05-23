@@ -35,6 +35,7 @@ use aether_rt::{
     aether_openai_render_completion,
     aether_random_bytes,
     tls13::TlsServerSession,
+    http2,
 };
 
 #[cfg(feature = "cuda")]
@@ -411,11 +412,15 @@ impl Transport for TlsStream {
 
 /// Read bytes until we have full HTTP/1.1 headers + the declared Content-Length
 /// body, returning the assembled buffer (headers + body) or an error.
-unsafe fn read_full_http_request(t: &mut dyn Transport, max: usize) -> Result<Vec<u8>, &'static str> {
+/// `prefix` is bytes already peeked off the wire — prepended into the buffer
+/// so the parser sees them.
+unsafe fn read_full_http_request_with_prefix(
+    t: &mut dyn Transport, max: usize, prefix: &[u8],
+) -> Result<Vec<u8>, &'static str> {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    buf.extend_from_slice(prefix);
     let mut tmp = vec![0u8; 8192];
-    // Phase 1: read until CRLF CRLF.
-    let mut header_end: Option<usize> = None;
+    let mut header_end = find_crlf_crlf(&buf).map(|p| p + 4);
     while header_end.is_none() {
         if buf.len() >= max { return Err("request too large"); }
         let n = t.read(&mut tmp)?;
@@ -424,7 +429,6 @@ unsafe fn read_full_http_request(t: &mut dyn Transport, max: usize) -> Result<Ve
         if let Some(p) = find_crlf_crlf(&buf) { header_end = Some(p + 4); }
     }
     let body_start = header_end.unwrap();
-    // Parse Content-Length out of headers.
     let head = &buf[..body_start];
     let content_length = parse_content_length(head).unwrap_or(0);
     let need = body_start + content_length;
@@ -437,6 +441,231 @@ unsafe fn read_full_http_request(t: &mut dyn Transport, max: usize) -> Result<Ve
     buf.truncate(need);
     Ok(buf)
 }
+
+/// HTTP/2 (h2c, prior-knowledge mode) server.  Caller has already consumed
+/// the 24-byte client preface from the transport.  We send our SETTINGS frame
+/// + ACK the client's SETTINGS, then loop: read HEADERS frame, optionally
+/// DATA frames, dispatch through the existing JSON parser, and emit
+/// HEADERS+DATA response frames.  Single concurrent stream per connection
+/// supported; multi-stream HEADERS-interleave handled.
+unsafe fn handle_request_h2(state: &ServerState, t: &mut dyn Transport) {
+    // 1) Send our SETTINGS frame.
+    let mut out = Vec::new();
+    http2::build_settings(&mut out, &[
+        (http2::SETTINGS_HEADER_TABLE_SIZE, 0), // we don't index dynamically
+        (http2::SETTINGS_MAX_CONCURRENT_STREAMS, 16),
+        (http2::SETTINGS_INITIAL_WINDOW_SIZE, 65535),
+        (http2::SETTINGS_MAX_FRAME_SIZE, 16384),
+    ]);
+    if t.write(&out).is_err() { return; }
+
+    // 2) Frame loop.
+    let mut in_buf: Vec<u8> = Vec::with_capacity(16384);
+    let mut tmp = vec![0u8; 16384];
+    // Per-stream state: hpack-decoded headers + accumulated DATA body.
+    use std::collections::HashMap;
+    struct StreamState {
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        body: Vec<u8>,
+        end_stream: bool,
+        end_headers: bool,
+    }
+    let mut streams: HashMap<u32, StreamState> = HashMap::new();
+
+    loop {
+        // Try to parse a complete frame from in_buf.
+        while let Some((frame, consumed)) = http2::Frame::parse(&in_buf) {
+            in_buf.drain(..consumed);
+            let ft = frame.frame_type;
+            if ft == http2::FRAME_SETTINGS {
+                if (frame.flags & http2::FLAG_ACK) == 0 {
+                    let mut ack = Vec::new();
+                    http2::build_settings_ack(&mut ack);
+                    let _ = t.write(&ack);
+                }
+            } else if ft == http2::FRAME_PING {
+                if (frame.flags & http2::FLAG_ACK) == 0 && frame.payload.len() == 8 {
+                    let mut ping = Vec::new();
+                    let mut payload = [0u8; 8];
+                    payload.copy_from_slice(&frame.payload);
+                    http2::build_ping_ack(&mut ping, &payload);
+                    let _ = t.write(&ping);
+                }
+            } else if ft == http2::FRAME_WINDOW_UPDATE || ft == http2::FRAME_PRIORITY {
+                // Accept and ignore.
+            } else if ft == http2::FRAME_HEADERS {
+                let sid = frame.stream_id;
+                let end_stream = (frame.flags & http2::FLAG_END_STREAM) != 0;
+                let end_headers = (frame.flags & http2::FLAG_END_HEADERS) != 0;
+                let mut hpack_payload = frame.payload.clone();
+                if (frame.flags & http2::FLAG_PRIORITY) != 0 {
+                    if hpack_payload.len() < 5 { send_goaway(t, sid, 1); return; }
+                    hpack_payload.drain(..5);
+                }
+                if (frame.flags & http2::FLAG_PADDED) != 0 {
+                    if hpack_payload.is_empty() { send_goaway(t, sid, 1); return; }
+                    let pad_len = hpack_payload[0] as usize;
+                    hpack_payload.drain(..1);
+                    if pad_len > hpack_payload.len() { send_goaway(t, sid, 1); return; }
+                    hpack_payload.truncate(hpack_payload.len() - pad_len);
+                }
+                let headers = match http2::hpack_decode_headers(&hpack_payload) {
+                    Some(h) => h,
+                    None => { send_goaway(t, sid, 9); return; }
+                };
+                let entry = streams.entry(sid).or_insert(StreamState {
+                    headers: Vec::new(), body: Vec::new(),
+                    end_stream: false, end_headers: false,
+                });
+                entry.headers = headers;
+                entry.end_stream = end_stream;
+                entry.end_headers = end_headers;
+                if end_headers && end_stream {
+                    if let Some(s) = streams.remove(&sid) {
+                        dispatch_h2_stream(state, t, sid, s.headers, s.body);
+                    }
+                }
+            } else if ft == http2::FRAME_DATA {
+                let sid = frame.stream_id;
+                let mut payload = frame.payload.clone();
+                if (frame.flags & http2::FLAG_PADDED) != 0 {
+                    if payload.is_empty() { send_goaway(t, sid, 1); return; }
+                    let pad_len = payload[0] as usize;
+                    payload.drain(..1);
+                    if pad_len > payload.len() { send_goaway(t, sid, 1); return; }
+                    payload.truncate(payload.len() - pad_len);
+                }
+                if let Some(entry) = streams.get_mut(&sid) {
+                    entry.body.extend_from_slice(&payload);
+                    if (frame.flags & http2::FLAG_END_STREAM) != 0 {
+                        entry.end_stream = true;
+                        if entry.end_headers {
+                            let s = streams.remove(&sid).unwrap();
+                            dispatch_h2_stream(state, t, sid, s.headers, s.body);
+                        }
+                    }
+                }
+            } else if ft == http2::FRAME_RST_STREAM {
+                streams.remove(&frame.stream_id);
+            } else if ft == http2::FRAME_GOAWAY {
+                return;
+            }
+            // Unknown frame types: ignored per RFC.
+        }
+        // Need more bytes.
+        let n = match t.read(&mut tmp) {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n == 0 { return; }
+        in_buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+unsafe fn send_goaway(t: &mut dyn Transport, last_stream_id: u32, error_code: u32) {
+    let mut buf = Vec::new();
+    http2::build_goaway(&mut buf, last_stream_id, error_code);
+    let _ = t.write(&buf);
+}
+
+/// Dispatch one h2 stream — headers + body are owned (moved out of the
+/// per-stream state in handle_request_h2).
+unsafe fn dispatch_h2_stream(
+    state: &ServerState, t: &mut dyn Transport,
+    stream_id: u32,
+    headers: Vec<(Vec<u8>, Vec<u8>)>,
+    body: Vec<u8>,
+) {
+    let req = http2::build_h2_request(stream_id, headers);
+    eprintln!("[serve] h2 {} {} body_len={}",
+        std::str::from_utf8(&req.method).unwrap_or("?"),
+        std::str::from_utf8(&req.path).unwrap_or("?"),
+        body.len());
+    let path_str = std::str::from_utf8(&req.path).unwrap_or("").to_string();
+    let method_str = std::str::from_utf8(&req.method).unwrap_or("").to_string();
+    match (method_str.as_str(), path_str.as_str()) {
+        ("GET", "/health") => write_h2_text(t, stream_id, 200, b"ok"),
+        ("GET", "/v1/models") => {
+            let body = format!(
+                "{{\"object\":\"list\",\"data\":[{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"aether\"}}]}}",
+                state.cli.model);
+            write_h2_json(t, stream_id, 200, body.as_bytes());
+        }
+        ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
+            let resp = match parse_body(&body, state.cli.max_tokens_default) {
+                Ok(req) => render_completion_json(state, &req),
+                Err(e) => format!("{{\"error\":\"{}\"}}", e),
+            };
+            write_h2_json(t, stream_id, 200, resp.as_bytes());
+        }
+        _ => write_h2_text(t, stream_id, 404, b"not found"),
+    }
+}
+
+unsafe fn write_h2_text(t: &mut dyn Transport, stream_id: u32, code: u16, msg: &[u8]) {
+    let resp = http2::H2Response {
+        status: code, body: msg.to_vec(),
+        content_type: b"text/plain".to_vec(),
+    };
+    let mut out = Vec::new();
+    http2::write_h2_response(&mut out, stream_id, &resp);
+    let _ = t.write(&out);
+}
+unsafe fn write_h2_json(t: &mut dyn Transport, stream_id: u32, code: u16, body: &[u8]) {
+    let resp = http2::H2Response {
+        status: code, body: body.to_vec(),
+        content_type: b"application/json".to_vec(),
+    };
+    let mut out = Vec::new();
+    http2::write_h2_response(&mut out, stream_id, &resp);
+    let _ = t.write(&out);
+}
+
+/// Render the OpenAI completion JSON for an H2 request (shares the cuda /
+/// stub branching with the HTTP/1.1 path).
+unsafe fn render_completion_json(state: &ServerState, req: &JsonBody) -> String {
+    let generated_text: String;
+    let prompt_tokens = req.prompt_ids.len() as c_int;
+    let completion_tokens: c_int;
+    #[cfg(feature = "cuda")]
+    {
+        match &state.session {
+            Some(sess_mu) => {
+                let mut sess = sess_mu.lock().unwrap();
+                let stop = state.cli.stop_token.or_else(|| {
+                    if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
+                });
+                let ids = sess.generate(&req.prompt_ids, req.max_tokens, stop);
+                completion_tokens = ids.len() as c_int;
+                let text = sess.decode_ids(&ids);
+                generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
+            }
+            None => {
+                generated_text = "[aether-serve stub: --gguf not supplied]".into();
+                completion_tokens = 0;
+            }
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        generated_text = "[aether-serve stub: built without --features cuda]".into();
+        completion_tokens = 0;
+        let _ = state;
+    }
+    let resp_id = b"chatcmpl-aether-serve-1";
+    let escaped = json_escape(&generated_text);
+    let mut json_buf = vec![0u8; 65536];
+    let n = aether_openai_render_completion(
+        resp_id.as_ptr() as *const c_void, resp_id.len() as c_int,
+        state.cli.model.as_ptr() as *const c_void, state.cli.model.len() as c_int,
+        escaped.as_ptr() as *const c_void, escaped.len() as c_int,
+        prompt_tokens, completion_tokens,
+        json_buf.as_mut_ptr() as *mut c_void, json_buf.len() as c_int,
+    );
+    if n <= 0 { return "{}".into(); }
+    String::from_utf8_lossy(&json_buf[..n as usize]).into_owned()
+}
+
 
 fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
@@ -454,8 +683,30 @@ fn parse_content_length(head: &[u8]) -> Option<usize> {
     None
 }
 
+/// Auto-detect HTTP/2 (prior-knowledge h2c) vs HTTP/1.1 by peeking at the
+/// first 24 bytes of the inbound stream.  HTTP/2 connections begin with the
+/// 24-byte preface "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (RFC 7540 §3.5).
 unsafe fn handle_request(state: &ServerState, t: &mut dyn Transport) {
-    let req_bytes = match read_full_http_request(t, 1 << 20) {
+    let mut peek = vec![0u8; 24];
+    let mut got = 0;
+    while got < 24 {
+        let n = match t.read(&mut peek[got..]) {
+            Ok(n) => n,
+            Err(e) => { eprintln!("[serve] preface read: {}", e); return; }
+        };
+        if n == 0 { break; }
+        got += n;
+    }
+    if got >= http2::CONNECTION_PREFACE.len() &&
+       &peek[..http2::CONNECTION_PREFACE.len()] == http2::CONNECTION_PREFACE
+    {
+        eprintln!("[serve] h2c connection accepted");
+        handle_request_h2(state, t);
+        return;
+    }
+    // Otherwise treat as HTTP/1.1 — prepend the peeked bytes back into the
+    // request buffer.
+    let req_bytes = match read_full_http_request_with_prefix(t, 1 << 20, &peek[..got]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[serve] {}", e);
