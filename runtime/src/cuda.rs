@@ -75,6 +75,8 @@ struct CudaCtx {
     attention_seq1: CudaFunction,
     fused_f16_matmul_seq1: CudaFunction,
     fused_q4k_expert_matmul_seq1: CudaFunction,
+    bert_self_attention_fwd: CudaFunction,
+    bert_embed_sum: CudaFunction,
 }
 
 /// FR-19.4-extra paged-KV kernels — held in a separate `OnceCell` so the
@@ -2141,6 +2143,140 @@ extern "C" __global__ void dequant_q6_k(
     }
     out[idx] = d * (float)sc[sc_idx] * (float)q;
 }
+
+// FR-17-extra-bert-fwd — BERT bidirectional (full) self-attention.
+//
+// Encoder-only models like BGE compute attention over the WHOLE sequence in
+// one pass — every query position attends to every key position with no
+// causal mask.  Grid is (n_heads, seq) so each block computes one
+// (head, q_pos) row of the [seq, n_heads, head_dim] output tensor.
+//
+// Q / K / V layout: [seq, n_heads, head_dim] (token-major; same as the
+// activations the caller passes through the Q/K/V matmuls).  head_dim must
+// be a multiple of 32 and ≤ 256 (same limits as the decode kernels — per
+// _lane[8] × per_lane=8 caps out at 256).
+//
+// Shared mem: scores[max_seq] f32, sized by the launch.  BERT-base uses
+// seq=512 → 2 KiB.  BERT-large + bge-large stay well under 4 KiB at
+// max_seq=512.
+extern "C" __global__ void bert_self_attention_fwd(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float*       __restrict__ attn_out,
+    int seq, int n_heads, int head_dim,
+    float scale)
+{
+    extern __shared__ float scores[];
+    int head  = blockIdx.x;
+    int q_pos = blockIdx.y;
+    int lane  = threadIdx.x;
+    int per_lane = head_dim >> 5;          // ≤ 8
+
+    const float* q_ptr = q + (q_pos * n_heads + head) * head_dim;
+
+    // Load Q[q_pos, head] into thread-local lanes.
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int col = lane * per_lane + i;
+        q_local[i] = (i < per_lane && col < head_dim) ? q_ptr[col] : 0.0f;
+    }
+
+    // Pass 1: scores[t] = Q[q_pos] · K[t] * scale  for t in [0, seq).
+    for (int t = 0; t < seq; t++) {
+        const float* k_ptr = k + (t * n_heads + head) * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int col = lane * per_lane + i;
+            if (i < per_lane && col < head_dim) acc += q_local[i] * k_ptr[col];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncwarp();
+
+    // Pass 2: softmax over [0, seq).  Bidirectional => no mask.
+    float local_max = __int_as_float(0xFF800000u);
+    for (int t = lane; t < seq; t += 32) {
+        float s = scores[t];
+        if (s > local_max) local_max = s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    float max_val = __shfl_sync(0xFFFFFFFFu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int t = lane; t < seq; t += 32) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, off);
+    }
+    float sum_val = __shfl_sync(0xFFFFFFFFu, local_sum, 0);
+    float inv_sum = 1.0f / sum_val;
+    for (int t = lane; t < seq; t += 32) {
+        scores[t] *= inv_sum;
+    }
+    __syncwarp();
+
+    // Pass 3: out[q_pos, head] = sum_t scores[t] * V[t, head].
+    float out_local[8] = {0.0f};
+    for (int t = 0; t < seq; t++) {
+        const float* v_ptr = v + (t * n_heads + head) * head_dim;
+        float w = scores[t];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int col = lane * per_lane + i;
+            if (i < per_lane && col < head_dim) out_local[i] += w * v_ptr[col];
+        }
+    }
+    float* out_ptr = attn_out + (q_pos * n_heads + head) * head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int col = lane * per_lane + i;
+        if (i < per_lane && col < head_dim) out_ptr[col] = out_local[i];
+    }
+}
+
+// FR-17-extra-bert-fwd — BERT embedding sum.
+//
+// BERT inputs are constructed by summing three learned tables:
+//   x[i] = word_embd[input_ids[i]]
+//        + pos_embd[i]                       (position 0..seq)
+//        + type_embd[token_type_ids[i]]      (segment id 0 or 1)
+// Followed by LayerNorm-with-bias (which we already have).
+//
+// Grid spans seq tokens; each thread copies one element of d_model.
+extern "C" __global__ void bert_embed_sum(
+    const int*   __restrict__ input_ids,
+    const int*   __restrict__ token_type_ids,
+    const float* __restrict__ word_embd,        // [vocab x d_model]
+    const float* __restrict__ pos_embd,         // [max_pos x d_model]
+    const float* __restrict__ type_embd,        // [n_types x d_model]
+    float*       __restrict__ out,              // [seq x d_model]
+    int seq, int d_model)
+{
+    int t   = blockIdx.x;
+    int tid = blockIdx.y * blockDim.x + threadIdx.x;
+    if (t >= seq || tid >= d_model) return;
+    int word = input_ids[t];
+    int typ  = token_type_ids[t];
+    float w = word_embd[word * d_model + tid];
+    float p = pos_embd[t * d_model + tid];
+    float s = type_embd[typ * d_model + tid];
+    out[t * d_model + tid] = w + p + s;
+}
 "#;
 
 static CTX: OnceLock<CudaCtx> = OnceLock::new();
@@ -2202,7 +2338,9 @@ fn ctx() -> &'static CudaCtx {
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
               "fused_f16_matmul_seq1",
-              "fused_q4k_expert_matmul_seq1"])
+              "fused_q4k_expert_matmul_seq1",
+              "bert_self_attention_fwd",
+              "bert_embed_sum"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -2241,6 +2379,8 @@ fn ctx() -> &'static CudaCtx {
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         let fused_f16_matmul_seq1 = device.get_func("aether_kernels", "fused_f16_matmul_seq1").unwrap();
         let fused_q4k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_expert_matmul_seq1").unwrap();
+        let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
+        let bert_embed_sum = device.get_func("aether_kernels", "bert_embed_sum").unwrap();
 
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
@@ -2255,7 +2395,8 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1, fused_f16_matmul_seq1,
-                  fused_q4k_expert_matmul_seq1 }
+                  fused_q4k_expert_matmul_seq1,
+                  bert_self_attention_fwd, bert_embed_sum }
     })
 }
 
@@ -3584,6 +3725,87 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
             .launch(cfg, (knv, vnv, kpv, vpv, ptv,
                           d_k_row, d_v_row, block_size, sv))
             .expect("launch paged_append_kv_mla_devarg");
+    }
+    0
+}
+
+/// FR-17-extra-bert-fwd — full bidirectional self-attention.  Encoder-only
+/// models (BERT, BGE, etc.) process the entire sequence in one pass, every
+/// query attending to every key with no causal mask.
+///
+/// Q / K / V are token-major: [seq, n_heads, head_dim].  Output has the same
+/// shape.  `head_dim` must be a multiple of 32 and ≤ 256.  Shared mem sized
+/// to `seq * 4` bytes (BERT-base seq=512 → 2 KiB, well within the per-block
+/// 48 KiB limit on every supported GPU).
+#[no_mangle] pub extern "C" fn aether_op_bert_self_attention_fwd_f32_cuda(
+    q_dev: i64, k_dev: i64, v_dev: i64, attn_out: i64,
+    seq: c_int, n_heads: c_int, head_dim: c_int, scale: f32,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_k) = handle_to_idx(k_dev) else { return -1; };
+    let Some(i_v) = handle_to_idx(v_dev) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    if seq <= 0 || n_heads <= 0 || head_dim <= 0 { return -1; }
+    if (head_dim & 31) != 0 || head_dim > 256 { return -2; }
+    let bs = unsafe { bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let k_p = bs[i_k].as_ref().unwrap() as *const CudaSlice<f32>;
+    let v_p = bs[i_v].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let shmem = (seq as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_heads as u32, seq as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kv = &*k_p; let vv = &*v_p;
+        let ov = &mut *o_p;
+        ctx().bert_self_attention_fwd.clone()
+            .launch(cfg, (qv, kv, vv, ov, seq, n_heads, head_dim, scale))
+            .expect("launch bert_self_attention_fwd");
+    }
+    0
+}
+
+/// FR-17-extra-bert-fwd — sum word + position + token-type embeddings into
+/// the input activation.  All three embedding tables are F32; output is
+/// [seq, d_model].  Apply BERT's LayerNorm-with-bias afterward (use the
+/// existing `aether_op_layer_norm_fwd_f32_cuda`).
+#[no_mangle] pub extern "C" fn aether_op_bert_embed_sum_f32_cuda(
+    input_ids_dev: i64, token_type_ids_dev: i64,
+    word_embd: i64, pos_embd: i64, type_embd: i64,
+    out: i64,
+    seq: c_int, d_model: c_int,
+) -> c_int {
+    let Some(i_ii) = handle_to_i32_idx(input_ids_dev) else { return -1; };
+    let Some(i_ti) = handle_to_i32_idx(token_type_ids_dev) else { return -1; };
+    let Some(i_we) = handle_to_idx(word_embd) else { return -1; };
+    let Some(i_pe) = handle_to_idx(pos_embd) else { return -1; };
+    let Some(i_te) = handle_to_idx(type_embd) else { return -1; };
+    let Some(i_o) = handle_to_idx(out) else { return -1; };
+    if seq <= 0 || d_model <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let ii_p = ibs[i_ii].as_ref().unwrap() as *const CudaSlice<i32>;
+    let ti_p = ibs[i_ti].as_ref().unwrap() as *const CudaSlice<i32>;
+    let we_p = bs[i_we].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pe_p = bs[i_pe].as_ref().unwrap() as *const CudaSlice<f32>;
+    let te_p = bs[i_te].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let block = 128u32;
+    let cfg = LaunchConfig {
+        grid_dim:  (seq as u32, ((d_model as u32) + block - 1) / block, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let iiv = &*ii_p; let tiv = &*ti_p;
+        let wev = &*we_p; let pev = &*pe_p; let tev = &*te_p;
+        let ov = &mut *o_p;
+        ctx().bert_embed_sum.clone()
+            .launch(cfg, (iiv, tiv, wev, pev, tev, ov, seq, d_model))
+            .expect("launch bert_embed_sum");
     }
     0
 }
