@@ -48,6 +48,7 @@ use crate::cuda::{
     aether_op_attention_seq1_devarg_f32_cuda,
     aether_op_paged_append_kv_devarg_f32_cuda,
     aether_op_paged_attention_seq1_devarg_f32_cuda,
+    aether_op_paged_attention_flex_devarg_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
     aether_op_mul_inplace_f32_cuda, aether_op_silu_f32_cuda,
     aether_op_scale_f32_cuda,
@@ -123,6 +124,11 @@ pub struct ModelConfig {
     pub n_experts: usize,
     /// MoE top-k: number of experts routed per token.  Unused when n_experts=0.
     pub n_experts_used: usize,
+    /// FR-17-extra-gemma-fwd: sliding-window attention scope.  0 = full
+    /// attention (default).  > 0 = restrict attention to last N positions.
+    /// Gemma3 specifically alternates sliding/full per layer (per-layer
+    /// alternation is a future refinement; today this is a uniform setting).
+    pub sliding_window: i32,
 }
 
 impl ModelConfig {
@@ -136,6 +142,7 @@ impl ModelConfig {
             rope_base: ROPE_BASE, norm_eps: NORM_EPS,
             arch: "qwen2".to_string(),
             n_experts: 0, n_experts_used: 0,
+            sliding_window: 0,
         }
     }
 
@@ -177,10 +184,14 @@ impl ModelConfig {
             .map(|v| v as usize).unwrap_or(0);
         let n_experts_used = read_meta_u32(gguf_handle, &format!("{}.expert_used_count", prefix))
             .map(|v| v as usize).unwrap_or(0);
+        let sliding_window = read_meta_u32(gguf_handle,
+            &format!("{}.attention.sliding_window", prefix))
+            .map(|v| v as i32).unwrap_or(0);
         Self {
             d_model, n_layers, n_q_heads, n_kv_heads, head_dim, d_kv,
             d_ff, vocab, rope_base, norm_eps, arch,
             n_experts, n_experts_used,
+            sliding_window,
         }
     }
 }
@@ -219,6 +230,11 @@ struct BlockGpu {
     /// FR-17-extra-qwen3-fwd — per-head Q/K RMS norm (Qwen3-style).
     /// 0 indicates "absent" (qwen2 / older archs).
     attn_q_norm_g: i64, attn_k_norm_g: i64,
+    /// FR-17-extra-gemma-fwd — post-attention + post-FFN RMSNorm.
+    /// Gemma3 places extra RMS norms AFTER the attention output projection
+    /// and AFTER the FFN down projection, BEFORE the residual add.  Qwen
+    /// archs don't have these.  0 = absent.
+    post_attn_norm_g: i64, post_ffn_norm_g: i64,
     /// `nb_*` semantics: for Q4_K/Q6_K, # of 256-elem super-blocks;
     /// for F16, # of elements.  See `upload_tensor_u8` for the contract.
     nb_qo: usize, nb_kv: usize, nb_gate_up: usize, nb_down: usize,
@@ -426,6 +442,10 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         b_v: upload_f32_tensor_opt(h, &format!("{}attn_v.bias", p)),
         attn_q_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_q_norm.weight", p)),
         attn_k_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_k_norm.weight", p)),
+        // Gemma3 names these post_attention_norm.weight + post_ffw_norm.weight.
+        // We accept either spelling for forward compatibility.
+        post_attn_norm_g: upload_f32_tensor_opt(h, &format!("{}post_attention_norm.weight", p)),
+        post_ffn_norm_g:  upload_f32_tensor_opt(h, &format!("{}post_ffw_norm.weight", p)),
         nb_qo, nb_kv, nb_gate_up, nb_down,
         w_router, w_gate_exps, w_up_exps, w_down_exps,
         dt_gate_exps, dt_up_exps, dt_down_exps,
@@ -487,15 +507,31 @@ unsafe fn block_forward_devarg(
     aether_op_rope_apply_devarg_f32_cuda(act.k_step,
         1, n_kv_heads, head_dim, rope_base, step_args);
     let scale: f32 = 1.0 / (cfg.head_dim as f32).sqrt();
+    // FR-17-extra-gemma-fwd: route via the flex attention kernel when the
+    // arch requires features the seq1 kernels don't support: head_dim
+    // that isn't a multiple of 32, or sliding-window scope.
+    let needs_flex = (cfg.head_dim % 32) != 0 || cfg.sliding_window > 0;
     if let Some((page_table_dev, block_size)) = paged_cfg {
         aether_op_paged_append_kv_devarg_f32_cuda(
             act.k_step, act.v_step, kv.k_cache, kv.v_cache, page_table_dev,
             d_kv, block_size, step_args);
-        aether_op_paged_attention_seq1_devarg_f32_cuda(
-            act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
-            n_q_heads, n_kv_heads, head_dim,
-            block_size, scale, max_seq as c_int, step_args);
+        if needs_flex {
+            aether_op_paged_attention_flex_devarg_f32_cuda(
+                act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+                n_q_heads, n_kv_heads, head_dim,
+                block_size, cfg.sliding_window, scale, max_seq as c_int, step_args);
+        } else {
+            aether_op_paged_attention_seq1_devarg_f32_cuda(
+                act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+                n_q_heads, n_kv_heads, head_dim,
+                block_size, scale, max_seq as c_int, step_args);
+        }
     } else {
+        if needs_flex {
+            panic!("FR-17-extra-gemma-fwd: arches needing flex attention \
+                (head_dim%32 != 0 or sliding_window>0) require --paged mode \
+                today.  Contiguous-KV flex kernel is a follow-on.");
+        }
         aether_op_append_kv_devarg_f32_cuda(act.k_step, act.v_step, kv.k_cache, kv.v_cache,
             d_kv, step_args);
         aether_op_attention_seq1_devarg_f32_cuda(
@@ -504,6 +540,13 @@ unsafe fn block_forward_devarg(
             max_seq as c_int, step_args);
     }
     dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, d_model);
+    // FR-17-extra-gemma-fwd: Gemma3 applies a POST-attention RMS norm to
+    // the output projection BEFORE adding to the residual.  Qwen archs
+    // skip this (post_attn_norm_g == 0).
+    if bw.post_attn_norm_g != 0 {
+        aether_op_rms_norm_f32_cuda(act.proj, bw.post_attn_norm_g, act.proj,
+            norm_eps, 1, d_model);
+    }
     aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
 
@@ -522,6 +565,12 @@ unsafe fn block_forward_devarg(
                 bw.dt_gate, bw.dt_up);
         }
         dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
+        // FR-17-extra-gemma-fwd: Gemma3 applies a POST-FFN RMS norm to
+        // the down output BEFORE the residual add.  Qwen archs skip.
+        if bw.post_ffn_norm_g != 0 {
+            aether_op_rms_norm_f32_cuda(act.down, bw.post_ffn_norm_g, act.down,
+                norm_eps, 1, d_model);
+        }
         aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
     }
 }
@@ -741,10 +790,13 @@ impl QwenSession {
             //   - n_q_heads must be divisible by n_kv_heads (GQA invariant).
             //   - d_model must be a multiple of 256 (Q4_K super-block size).
             //   - d_kv must be a multiple of 256.
-            if cfg.head_dim == 0 || cfg.head_dim % 32 != 0 || cfg.head_dim > 256 {
+            // The flex attention kernel handles any head_dim in [1, 256]
+            // (FR-17-extra-gemma-fwd).  Non-multiples-of-32 trigger the
+            // flex path in block_forward_devarg.
+            if cfg.head_dim == 0 || cfg.head_dim > 256 {
                 return Err(format!(
-                    "FR-17-extra-runtime-shape: unsupported head_dim={}.  \
-                     Kernel supports head_dim ∈ {{32, 64, 96, 128, 160, 192, 224, 256}}.",
+                    "FR-17-extra-runtime-shape: head_dim={} out of range [1, 256] \
+                     (attention kernel q_local[8] × per_lane=8 maxes out).",
                     cfg.head_dim));
             }
             if cfg.n_kv_heads == 0 || cfg.n_q_heads % cfg.n_kv_heads != 0 {
@@ -1108,6 +1160,8 @@ impl Drop for QwenSession {
                 if b.b_v != 0 { let _ = aether_dev_free_f32(b.b_v); }
                 if b.attn_q_norm_g != 0 { let _ = aether_dev_free_f32(b.attn_q_norm_g); }
                 if b.attn_k_norm_g != 0 { let _ = aether_dev_free_f32(b.attn_k_norm_g); }
+                if b.post_attn_norm_g != 0 { let _ = aether_dev_free_f32(b.post_attn_norm_g); }
+                if b.post_ffn_norm_g  != 0 { let _ = aether_dev_free_f32(b.post_ffn_norm_g); }
                 // MoE expert weights — only present on qwen3moe/deepseek2.
                 if b.w_router != 0 { let _ = aether_dev_free_f32(b.w_router); }
                 if b.w_gate_exps != 0 { let _ = aether_dev_free_u8(b.w_gate_exps); }

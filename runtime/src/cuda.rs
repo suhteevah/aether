@@ -89,6 +89,7 @@ struct PagedCtx {
     paged_attention_seq1_devarg: CudaFunction,
     batched_paged_attention_seqB_devarg: CudaFunction,
     batched_paged_append_kv_seqB_devarg: CudaFunction,
+    paged_attention_flex_devarg: CudaFunction,
 }
 
 static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
@@ -100,7 +101,8 @@ fn paged_ctx() -> &'static PagedCtx {
         device.load_ptx(paged_ptx, "aether_paged_kernels",
             &["paged_append_kv_devarg", "paged_attention_seq1_devarg",
               "batched_paged_attention_seqB_devarg",
-              "batched_paged_append_kv_seqB_devarg"])
+              "batched_paged_append_kv_seqB_devarg",
+              "paged_attention_flex_devarg"])
             .expect("load_ptx paged");
         PagedCtx {
             paged_append_kv_devarg:
@@ -111,6 +113,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "batched_paged_attention_seqB_devarg").unwrap(),
             batched_paged_append_kv_seqB_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_append_kv_seqB_devarg").unwrap(),
+            paged_attention_flex_devarg:
+                device.get_func("aether_paged_kernels", "paged_attention_flex_devarg").unwrap(),
         }
     })
 }
@@ -150,6 +154,117 @@ extern "C" __global__ void batched_paged_append_kv_seqB_devarg(
     size_t row = (size_t)phys_blk * block_size + in_blk_pos;
     k_pool[row * d_kv + tid] = k_new_batch[req * d_kv + tid];
     v_pool[row * d_kv + tid] = v_new_batch[req * d_kv + tid];
+}
+
+// FR-17-extra-gemma-fwd — flexible attention: handles head_dim that's NOT a
+// multiple of 32 (e.g. Gemma3's head_dim=168) AND optional sliding window
+// scope.  `sliding_window`: when > 0, restrict t to
+// [max(0, cur_seq - sliding_window), cur_seq).  When <= 0, full attention
+// (same as paged_attention_seq1_devarg).
+extern "C" __global__ void paged_attention_flex_devarg(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int*   __restrict__ page_table,
+    float*       __restrict__ attn_out,
+    int n_q_heads, int n_kv_heads, int head_dim, int block_size,
+    int sliding_window,
+    float scale, const int* __restrict__ step_args)
+{
+    int cur_seq = step_args[1];
+    int t_lo = (sliding_window > 0 && cur_seq > sliding_window) ? cur_seq - sliding_window : 0;
+    extern __shared__ float scores[];
+
+    int head    = blockIdx.x;
+    int lane    = threadIdx.x;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head = head / kv_per_q;
+    int d_kv    = n_kv_heads * head_dim;
+    // per_lane = ceil(head_dim / 32) so head_dim NOT a multiple of 32
+    // (e.g. Gemma3 head_dim=168) still works.  Bounds-checked per element.
+    int per_lane = (head_dim + 31) >> 5;
+
+    const float* q_ptr = q + head * head_dim;
+    float q_local[8];   // up to head_dim=256 with per_lane=8
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int col = lane * per_lane + i;
+        q_local[i] = (i < per_lane && col < head_dim) ? q_ptr[col] : 0.0f;
+    }
+
+    // Pass 1: scores[t] = Q · K[t, kv_head] * scale
+    int n_active = cur_seq - t_lo;
+    for (int t = t_lo; t < cur_seq; t++) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        const float* k_ptr = k_pool + row * d_kv + kv_head * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int col = lane * per_lane + i;
+            if (i < per_lane && col < head_dim) acc += q_local[i] * k_ptr[col];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) scores[t - t_lo] = acc * scale;
+    }
+    __syncwarp();
+
+    // Pass 2: softmax over the active window.
+    float local_max = __int_as_float(0xFF800000u);
+    for (int t = lane; t < n_active; t += 32) {
+        float s = scores[t];
+        if (s > local_max) local_max = s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    float max_val = __shfl_sync(0xFFFFFFFFu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int t = lane; t < n_active; t += 32) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, off);
+    }
+    float sum_val = __shfl_sync(0xFFFFFFFFu, local_sum, 0);
+    float inv_sum = 1.0f / sum_val;
+    for (int t = lane; t < n_active; t += 32) {
+        scores[t] *= inv_sum;
+    }
+    __syncwarp();
+
+    // Pass 3: aggregate V over the active window.
+    float out_local[8] = {0.0f};
+    for (int t = t_lo; t < cur_seq; t++) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        float w = scores[t - t_lo];
+        const float* v_ptr = v_pool + row * d_kv + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int col = lane * per_lane + i;
+            if (i < per_lane && col < head_dim) out_local[i] += w * v_ptr[col];
+        }
+    }
+    float* out_ptr = attn_out + head * head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int col = lane * per_lane + i;
+        if (i < per_lane && col < head_dim) out_ptr[col] = out_local[i];
+    }
 }
 
 // FR-19.5-extra-deep — batched paged attention. B queries × B page tables
@@ -3167,6 +3282,53 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
             .launch(cfg, (knr, vnr, kpm, vpm, ptv,
                           d_kv, block_size, page_table_stride, sv))
             .expect("launch batched_paged_append_kv_seqB_devarg");
+    }
+    0
+}
+
+/// FR-17-extra-gemma-fwd — flexible paged attention.  Accepts head_dim
+/// values that aren't multiples of 32 (e.g. Gemma3's head_dim=168) and
+/// optional sliding-window scope (sliding_window > 0 restricts the t-range).
+/// Strictly a superset of paged_attention_seq1_devarg's behavior at the
+/// cost of two extra bounds checks per element in the inner loops.
+#[no_mangle] pub extern "C" fn aether_op_paged_attention_flex_devarg_f32_cuda(
+    q_dev: i64, k_pool: i64, v_pool: i64,
+    page_table_dev: i64, attn_out: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int, block_size: c_int,
+    sliding_window: c_int,
+    scale: f32, max_seq: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_dev) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    let Some(is)  = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0 || block_size <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    if head_dim > 256 { return -3; }  // q_local[8] × per_lane=8 maxes out
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp_p = bs[i_kp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vp_p = bs[i_vp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pt_p = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp  = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let shmem = (max_seq as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
+        let ov = &mut *o_p; let sv = &*sp;
+        paged_ctx().paged_attention_flex_devarg.clone()
+            .launch(cfg, (qv, kpv, vpv, ptv, ov,
+                          n_q_heads, n_kv_heads, head_dim, block_size,
+                          sliding_window, scale, sv))
+            .expect("launch paged_attention_flex_devarg");
     }
     0
 }

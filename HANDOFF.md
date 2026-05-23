@@ -1,8 +1,76 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-25 night (**Per-arch dispatch full sweep: 4-of-4 remaining FRs
-shipped or scoped.**
+2026-05-26 (**Gemma3 dispatch LANDED — 3 of the 4 originally-deferred
+per-arch FRs are now ship-quality code.**
+
+Three pieces shipped this turn for FR-17-extra-gemma-fwd:
+
+(1) **`paged_attention_flex_devarg` CUDA kernel** in
+    `runtime/src/cuda.rs::PAGED_KERNEL_SRC`.  Generalizes the
+    paged attention seq1 kernel:
+    - `per_lane = (head_dim + 31) >> 5` (ceil instead of floor) +
+      per-element bounds check `if (col < head_dim)` so head_dim NOT a
+      multiple of 32 (Gemma3's 168 specifically) works without
+      modification.
+    - `sliding_window` arg: when > 0, restricts `t` in Pass 1 / Pass 3
+      to `[max(0, cur_seq - sliding_window), cur_seq)`.
+    - Strictly a superset of paged_attention_seq1_devarg's behavior.
+
+(2) **FFI wrapper** `aether_op_paged_attention_flex_devarg_f32_cuda` +
+    integration in `block_forward_devarg`.  Auto-routes to flex when
+    `cfg.head_dim % 32 != 0` OR `cfg.sliding_window > 0`.  Contiguous
+    (non-paged) path panics with a clear message — gemma3 requires
+    `--paged` today (contiguous flex variant is a follow-on).
+
+(3) **Gemma3 pre+post-norm dispatch.**  `BlockGpu` gained
+    `post_attn_norm_g` + `post_ffn_norm_g` (Option<i64>, 0 = absent).
+    `load_block` reads `post_attention_norm.weight` +
+    `post_ffw_norm.weight` via `upload_f32_tensor_opt` — qwen archs
+    don't have these; gemma3 does.
+    `block_forward_devarg` applies RMS norm:
+      - AFTER the attention output projection (act.proj) BEFORE
+        residual add
+      - AFTER the FFN down output (act.down) BEFORE residual add
+    Qwen archs skip these (0-check guards).
+
+`ModelConfig` gained `sliding_window: i32` read from
+`<arch>.attention.sliding_window` GGUF metadata.
+
+Verification on RTX 3070 Ti — `runtime/tests/cuda_attention_flex_parity.rs`:
+- **`flex_matches_seq1_on_qwen_shape`**: head_dim=128 + sw=0 →
+  bit-identical (`max_diff = 0.000e0`) to existing seq1 kernel.
+- **`flex_handles_gemma3_head_dim_168`**: head_dim=168 → 5376/5376
+  finite outputs, non-zero — head_dim-flex indexing works.
+- **`flex_sliding_window_restricts_attention_scope`**: sw=3 vs full
+  attention `max_diff = 4.59e-2` — sw param meaningfully restricts.
+
+Qwen2.5-7B regression check (`qwen25_paged_parity`) still PASSES —
+the flex path only fires when arch needs it; Qwen's head_dim=128
++ sw=0 keeps the original seq1 kernel.
+
+Probe constraint relaxed: `head_dim ∈ [1, 256]` now (was
+`{32, 64, ..., 256}`).  d_kv constraint already dropped earlier;
+only `d_model % 256 == 0` and `d_ff % 256 == 0` remain (Q4_K
+super-block input-dim alignment).
+
+**Per-arch state after this commit:**
+
+| Arch | Status |
+|---|---|
+| qwen2 / qwen2.5 | ✅ baseline (verified Qwen2.5-7B) |
+| qwen3 | ✅ verified on Qwen3-8B @ 11 tok/s |
+| qwen3vl | ✅ verified on Qwen3-VL @ 11.6 tok/s |
+| qwen3moe | ✅ code complete (MoE FFN); hw-blocked for verification |
+| llama | ✅ auto-supported (no biases / no norms) |
+| **gemma3** | **✅ code complete (head-dim-flex + sliding-window + post-norms); hw-blocked for verification** |
+| deepseek2 | 🟡 MoE half done; MLA attention is the remaining piece |
+
+ONLY DeepSeek-V2 (MLA attention) is now in the multi-session bucket
+out of the original "future per-arch" backlog.
+
+### 2026-05-25 night (Per-arch dispatch full sweep: qwen3vl + MoE)
+**Per-arch dispatch full sweep: 4-of-4 remaining FRs shipped or scoped.**
 
 | Arch | Pre-this-session | Now |
 |---|---|---|
