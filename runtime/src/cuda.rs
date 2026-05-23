@@ -86,6 +86,7 @@ struct PagedCtx {
     paged_append_kv_devarg: CudaFunction,
     paged_attention_seq1_devarg: CudaFunction,
     batched_paged_attention_seqB_devarg: CudaFunction,
+    batched_paged_append_kv_seqB_devarg: CudaFunction,
 }
 
 static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
@@ -96,7 +97,8 @@ fn paged_ctx() -> &'static PagedCtx {
         let paged_ptx = compile_ptx(PAGED_KERNEL_SRC).expect("compile_ptx paged");
         device.load_ptx(paged_ptx, "aether_paged_kernels",
             &["paged_append_kv_devarg", "paged_attention_seq1_devarg",
-              "batched_paged_attention_seqB_devarg"])
+              "batched_paged_attention_seqB_devarg",
+              "batched_paged_append_kv_seqB_devarg"])
             .expect("load_ptx paged");
         PagedCtx {
             paged_append_kv_devarg:
@@ -105,6 +107,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "paged_attention_seq1_devarg").unwrap(),
             batched_paged_attention_seqB_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_attention_seqB_devarg").unwrap(),
+            batched_paged_append_kv_seqB_devarg:
+                device.get_func("aether_paged_kernels", "batched_paged_append_kv_seqB_devarg").unwrap(),
         }
     })
 }
@@ -122,6 +126,30 @@ fn paged_ctx() -> &'static PagedCtx {
 /// position `pos` ↔ physical row `page_table[pos / block_size] * block_size
 /// + (pos % block_size)`.
 const PAGED_KERNEL_SRC: &str = r#"
+// FR-19.5-extra-deep — batched paged append_kv. B (k_new, v_new) pairs at
+// position step_args[0] of B independent page tables, all writing into the
+// same shared pool.  Grid (d_kv, B).
+extern "C" __global__ void batched_paged_append_kv_seqB_devarg(
+    const float* __restrict__ k_new_batch,    // [B * d_kv]
+    const float* __restrict__ v_new_batch,    // [B * d_kv]
+    float*       __restrict__ k_pool,
+    float*       __restrict__ v_pool,
+    const int*   __restrict__ page_table_batch,
+    int d_kv, int block_size, int page_table_stride,
+    const int* __restrict__ step_args)
+{
+    int pos = step_args[0];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int req = blockIdx.y;
+    if (tid >= d_kv) return;
+    int logical_blk = pos / block_size;
+    int in_blk_pos  = pos - logical_blk * block_size;
+    int phys_blk    = page_table_batch[req * page_table_stride + logical_blk];
+    size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+    k_pool[row * d_kv + tid] = k_new_batch[req * d_kv + tid];
+    v_pool[row * d_kv + tid] = v_new_batch[req * d_kv + tid];
+}
+
 // FR-19.5-extra-deep — batched paged attention. B queries × B page tables
 // in ONE launch.  Grid layout: blockIdx.x = head, blockIdx.y = request_idx.
 // All B requests share k_pool / v_pool but each indexes via its own row
@@ -2924,6 +2952,49 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().paged_attention_seq1_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, sv))
             .expect("launch paged_attention_seq1_devarg");
+    }
+    0
+}
+
+/// FR-19.5-extra-deep — batched paged append_kv: B (k_new, v_new) pairs
+/// written at `step_args[0]` against B page tables in one launch.
+#[no_mangle] pub extern "C" fn aether_op_batched_paged_append_kv_seqB_devarg_f32_cuda(
+    k_new_batch: i64, v_new_batch: i64,
+    k_pool: i64, v_pool: i64,
+    page_table_batch_dev: i64,
+    batch: c_int, d_kv: c_int, block_size: c_int, page_table_stride: c_int,
+    step_args_i32: i64,
+) -> c_int {
+    let Some(i_kn) = handle_to_idx(k_new_batch) else { return -1; };
+    let Some(i_vn) = handle_to_idx(v_new_batch) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_batch_dev) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if batch <= 0 || d_kv <= 0 || block_size <= 0 || page_table_stride <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let kn = bs[i_kn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vn = bs[i_vn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp = bs[i_kp].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let vp = bs[i_vp].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let pt = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let sp = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let threads_per_block: u32 = 256;
+    let blocks_per_req: u32 = ((d_kv as u32) + threads_per_block - 1) / threads_per_block;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_per_req, batch as u32, 1),
+        block_dim: (threads_per_block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let knr = &*kn; let vnr = &*vn;
+        let kpm = &mut *kp; let vpm = &mut *vp;
+        let ptv = &*pt; let sv = &*sp;
+        paged_ctx().batched_paged_append_kv_seqB_devarg.clone()
+            .launch(cfg, (knr, vnr, kpm, vpm, ptv,
+                          d_kv, block_size, page_table_stride, sv))
+            .expect("launch batched_paged_append_kv_seqB_devarg");
     }
     0
 }
