@@ -699,6 +699,7 @@ fn main() {
         Ok(s) => s,
         Err(e) => { eprintln!("[aether-serve] startup error: {}", e); std::process::exit(1); }
     };
+    let state = std::sync::Arc::new(state);
     unsafe {
         let listener = aether_tcp_listen(state.cli.port);
         if listener < 0 {
@@ -707,7 +708,8 @@ fn main() {
         }
         let bound_port = aether_tcp_listener_port(listener);
         let scheme = if tls_on { "https" } else { "http" };
-        eprintln!("[aether-serve] listening on 0.0.0.0:{} ({}, model={})", bound_port, scheme, state.cli.model);
+        eprintln!("[aether-serve] listening on 0.0.0.0:{} ({}, model={}, concurrent=on)",
+            bound_port, scheme, state.cli.model);
         if tls_on {
             eprintln!("[aether-serve] TLS 1.3 enabled; fresh self-signed Ed25519 cert per session (CN={})", tls_cn);
             eprintln!("[aether-serve] try:");
@@ -725,17 +727,27 @@ fn main() {
                 eprintln!("[serve] accept returned {} (continuing)", stream);
                 continue;
             }
-            if tls_on {
-                let mut tls = TlsStream::accept(stream, &tls_cn);
-                match tls.handshake() {
-                    Ok(_) => handle_request(&state, &mut tls),
-                    Err(e) => eprintln!("[serve] tls handshake failed: {}", e),
+            // Spawn a thread per accepted connection.  The QwenSession behind
+            // ServerState is Mutex-wrapped, so threads serialize on actual
+            // forward-pass work (single GPU), but can run HTTP/TLS / decode
+            // concurrently to accept latency.
+            let state_clone = state.clone();
+            let tls_cn_clone = tls_cn.clone();
+            std::thread::spawn(move || {
+                unsafe {
+                    if tls_on {
+                        let mut tls = TlsStream::accept(stream, &tls_cn_clone);
+                        match tls.handshake() {
+                            Ok(_) => handle_request(&state_clone, &mut tls),
+                            Err(e) => eprintln!("[serve] tls handshake failed: {}", e),
+                        }
+                    } else {
+                        let mut plain = PlainTcp { fd: stream };
+                        handle_request(&state_clone, &mut plain);
+                    }
+                    aether_tcp_stream_close(stream);
                 }
-            } else {
-                let mut plain = PlainTcp { fd: stream };
-                handle_request(&state, &mut plain);
-            }
-            aether_tcp_stream_close(stream);
+            });
         }
         #[allow(unreachable_code)]
         { aether_tcp_close(listener); }

@@ -1,7 +1,55 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-23 late evening (**Real continuous-batching scheduler — FR-19.5-extra.**
+2026-05-23 night (**Aether-hosting deployment COMPLETE.** Multi-threaded
+accept in aether-serve: thread per accept, `ServerState` in `Arc`, QwenSession
+mutex serializes the actual GPU decode (one forward pass at a time on the
+single GPU) while TLS handshakes, HTTP parsing, BPE decode, and JSON
+rendering happen concurrently across threads.  Verified end-to-end:
+
+**Single-request real-LLM via TLS:**
+- `target/release/aether-serve.exe --tls --port 18566 --gguf <path> --warmup 4`
+- Real Qwen2.5-7B model loads (3.28s GGUF parse), warmup captures CUDA graph (0.31s)
+- `openssl s_client -tls1_3 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -groups X25519 -sigalgs ed25519`
+  POSTs `/v1/chat/completions` with `prompt_ids=[9707,11,1879,0]`
+- Server decrypts the request through `TlsServerSession.feed`, runs HTTP
+  parser on the cleartext, decodes 28 real tokens through the
+  CUDA-graph-captured Qwen forward at **23.17 tok/s warm**, renders OpenAI
+  JSON, encrypts + sends back via `TlsServerSession.send_app_data`.
+- Client receives: `"content":" I'm a 25-year-old software developer from
+  the UK, and I'm currently working on a project that involves creating a
+  web application"`.
+
+**3 concurrent real-LLM TLS clients (different prompts):**
+- prompt A (`[9707,11,1879,0]`): `"content":" I'm a 25"`
+- prompt B (`[1939,279,16164]`): `"content":" function is not working as expected"`
+- prompt C (`[4340,374,12541]`): `"content":" a sentence?\\n\\n\\\""`
+- First request 10.87 tok/s (cold GPU clock ramp), next two 20.10 / 20.21
+  tok/s as the GPU stayed warm.  All three handshakes + HTTP parsing
+  happened in parallel; the 3 forward passes serialize on the QwenSession
+  mutex.
+
+The complete deployment chain — TCP → TLS 1.3 (Aether's own crypto +
+handshake state machine) → HTTP/1.1 (Aether's own parser) → JSON body
+parse → BPE prompt-id ingestion → CUDA forward (Aether's runtime via
+cudarc → cuBLAS + nvrtc-compiled paged-ready kernels) → BPE detokenize →
+OpenAI-shaped JSON → TLS 1.3 record-layer seal → TCP — runs as ONE binary,
+ONE process, single self-hosted runtime, zero external server libraries.
+
+Items left for future sessions (polish, not blocking):
+- HTTP/2 server-side wire (h2c preface + SETTINGS handshake; the frame codec
+  + HPACK + Huffman decoder already exist in `runtime/src/http2.rs`).
+  Requires ALPN in `tls13` to negotiate h2 over TLS.
+- Wiring the paged-KV kernels into `QwenSession` as a swappable backend.
+  The kernels are parity-verified vs the contiguous reference on RTX 3070 Ti
+  (`cuda_paged_kv_parity.rs`); for single-request serving the contiguous
+  path is faster, the real payoff requires also building a batched-forward
+  kernel that processes N requests per launch.
+- Cert chain / root store for outbound HTTPS (`TlsClientSession` validates
+  self-signed only today).
+
+### 2026-05-23 late evening (Real continuous-batching scheduler — FR-19.5-extra)
+**Real continuous-batching scheduler — FR-19.5-extra.**
 Pool-aware `BatchScheduler` in `runtime/src/lib.rs` that owns per-request page
 tables on top of the FR-19.4-extra paged KV primitives.  FFI:
 `aether_batch_sched_{new, destroy, admit, record_token, finish, reap,
