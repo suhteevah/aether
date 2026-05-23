@@ -87,6 +87,82 @@ struct ActivationGpu {
 
 struct KvCacheGpu { k_cache: i64, v_cache: i64 }
 
+// =====================================================================
+// SharedKvPool — FR-19.4-extra-tenant.
+//
+// One GPU-resident pool per (layer × {K, V}), shared across multiple
+// PagedQwenSessions on the same model.  Blocks within the pool are
+// handed out by a host-side free-list; sessions track their own page
+// tables that map their logical block index -> a physical block id
+// in this pool.
+//
+// Memory footprint: 2 × N_LAYERS × n_blocks × block_size × D_KV × 4 bytes.
+// For Qwen2.5 (28 layers, D_KV=512), 32 blocks × 4 tokens/block = 128
+// token slots ≈ 14.7 MiB total.  Larger pools just grow proportionally.
+// =====================================================================
+pub struct SharedKvPool {
+    pub n_blocks: i32,
+    pub block_size: i32,
+    pool_k: Vec<i64>,   // per-layer device pointer (f32, size = n_blocks*block_size*D_KV)
+    pool_v: Vec<i64>,
+    free: std::sync::Mutex<Vec<bool>>,  // free[b] = block b is free
+}
+
+impl SharedKvPool {
+    /// Allocate `n_blocks` blocks of `block_size` tokens each.  Each block
+    /// holds block_size × D_KV f32 K and V values.  Pre-touches every
+    /// per-layer GPU buffer so the captured graph sees stable pointers.
+    pub fn new(n_blocks: i32, block_size: i32) -> std::sync::Arc<Self> {
+        unsafe { crate::cuda::aether_dev_init(); }
+        let n_per_pool = (n_blocks * block_size) as usize * D_KV;
+        let mut pool_k = Vec::with_capacity(N_LAYERS);
+        let mut pool_v = Vec::with_capacity(N_LAYERS);
+        for _ in 0..N_LAYERS {
+            unsafe {
+                pool_k.push(aether_dev_alloc_f32(n_per_pool as c_int));
+                pool_v.push(aether_dev_alloc_f32(n_per_pool as c_int));
+            }
+        }
+        std::sync::Arc::new(Self {
+            n_blocks, block_size, pool_k, pool_v,
+            free: std::sync::Mutex::new(vec![true; n_blocks as usize]),
+        })
+    }
+
+    /// Per-layer K pool device pointer.  Stable for the lifetime of the pool.
+    pub fn pool_k(&self, layer: usize) -> i64 { self.pool_k[layer] }
+    /// Per-layer V pool device pointer.
+    pub fn pool_v(&self, layer: usize) -> i64 { self.pool_v[layer] }
+
+    /// Allocate a free block; returns block_id or -1 if pool exhausted.
+    pub fn allocate_block(&self) -> i32 {
+        let mut g = self.free.lock().unwrap();
+        for (i, slot) in g.iter_mut().enumerate() {
+            if *slot { *slot = false; return i as i32; }
+        }
+        -1
+    }
+    /// Return a block to the free pool.
+    pub fn free_block(&self, block_id: i32) {
+        if block_id < 0 { return; }
+        let mut g = self.free.lock().unwrap();
+        if (block_id as usize) < g.len() { g[block_id as usize] = true; }
+    }
+    /// Count of currently-allocated blocks.
+    pub fn n_allocated(&self) -> i32 {
+        self.free.lock().unwrap().iter().filter(|&&b| !b).count() as i32
+    }
+}
+
+impl Drop for SharedKvPool {
+    fn drop(&mut self) {
+        unsafe {
+            for &p in &self.pool_k { let _ = aether_dev_free_f32(p); }
+            for &p in &self.pool_v { let _ = aether_dev_free_f32(p); }
+        }
+    }
+}
+
 unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
     let needle = name.as_bytes();
     let idx = aether_gguf_find_tensor_by_name(h, needle.as_ptr() as i64, needle.len() as c_int);
@@ -243,6 +319,12 @@ pub struct QwenSession {
     /// by the paged kernels.  Bit-identical to contiguous mode at identity
     /// mapping (proven in cuda_paged_kv_parity.rs).
     paged_cfg: Option<PagedCfg>,
+    /// FR-19.4-extra-tenant: when Some, this session shares the per-layer
+    /// pools with other sessions; `owned_blocks` tracks the blocks this
+    /// session currently holds (returned to the pool on Drop).
+    pool: Option<std::sync::Arc<SharedKvPool>>,
+    owned_blocks: Vec<i32>,
+    page_table_host: Vec<i32>,
 }
 
 struct PagedCfg {
@@ -262,6 +344,25 @@ impl QwenSession {
     pub fn new_paged(gguf_path: &str) -> Result<Self, String> {
         Self::new_with_mode(gguf_path, true)
     }
+
+    /// Multi-tenant constructor.  Binds this session to a `SharedKvPool`
+    /// (per-layer GPU pools shared across multiple sessions).  Allocates
+    /// blocks from the pool dynamically as the session's position advances
+    /// past block_size boundaries.  Returns the blocks to the pool on Drop.
+    ///
+    /// The kernels use `pool.pool_k(layer)` / `pool.pool_v(layer)` as the
+    /// per-layer K/V base pointers; the per-session page_table_dev maps
+    /// logical block index -> physical block id within the pool.  Multiple
+    /// concurrent sessions running on the same model + the same pool are
+    /// independent because each has its own page_table.
+    pub fn new_paged_with_pool(
+        gguf_path: &str, pool: std::sync::Arc<SharedKvPool>,
+    ) -> Result<Self, String> {
+        let mut s = Self::new_with_mode(gguf_path, true)?;
+        unsafe { s.rebind_to_shared_pool(pool)?; }
+        Ok(s)
+    }
+
     fn new_with_mode(gguf_path: &str, paged: bool) -> Result<Self, String> {
         if !std::path::Path::new(gguf_path).exists() {
             return Err(format!("GGUF not found: {}", gguf_path));
@@ -320,12 +421,77 @@ impl QwenSession {
                 graph_captured: false,
                 bpe_handle, gpt2_u2b, eos_token,
                 paged_cfg,
+                pool: None,
+                owned_blocks: Vec::new(),
+                page_table_host: Vec::new(),
             })
         }
     }
 
     fn paged_arg(&self) -> Option<(i64, i32)> {
         self.paged_cfg.as_ref().map(|p| (p.page_table_dev, p.block_size))
+    }
+
+    /// Switch the session's per-layer KV pointers to a SharedKvPool's pool_k /
+    /// pool_v.  Frees the per-session pool storage allocated by
+    /// `new_with_mode(_, paged=true)` and replaces page_table_dev contents with
+    /// a single initial block allocated from the pool.  The page_table grows
+    /// dynamically in `ensure_block_for_position`.
+    unsafe fn rebind_to_shared_pool(&mut self, pool: std::sync::Arc<SharedKvPool>) -> Result<(), String> {
+        // Free the per-session pool buffers — replace with shared pool pointers.
+        for kv in self.kvs.iter_mut() {
+            let _ = aether_dev_free_f32(kv.k_cache);
+            let _ = aether_dev_free_f32(kv.v_cache);
+        }
+        for (i, kv) in self.kvs.iter_mut().enumerate() {
+            kv.k_cache = pool.pool_k(i);
+            kv.v_cache = pool.pool_v(i);
+        }
+        // Resize page_table_dev — needs MAX_SEQ/block_size logical slots, but
+        // we already allocated that in new_with_mode for the per-session case;
+        // it's fine to reuse the same device alloc.  Init host-side mirror to
+        // "all unmapped" and allocate the first block.
+        let block_size = self.paged_cfg.as_ref().ok_or("paged_cfg required")?.block_size;
+        let n_logical = (MAX_SEQ as i32 + block_size - 1) / block_size;
+        self.page_table_host = vec![-1i32; n_logical as usize];
+        let b0 = pool.allocate_block();
+        if b0 < 0 { return Err("pool exhausted at first allocate".into()); }
+        self.page_table_host[0] = b0;
+        self.owned_blocks.push(b0);
+        if let Some(p) = &self.paged_cfg {
+            aether_dev_h2d_i32(self.page_table_host.as_ptr() as i64, p.page_table_dev, n_logical);
+        }
+        self.pool = Some(pool);
+        Ok(())
+    }
+
+    /// If `pos` falls into a logical block that isn't yet mapped, allocate
+    /// a new physical block from the pool and update page_table_dev.  No-op
+    /// when not in shared-pool mode (the per-session pool is fully identity-
+    /// mapped from new_with_mode).
+    unsafe fn ensure_block_for_position(&mut self, pos: i32) -> Result<(), &'static str> {
+        let Some(p) = &self.paged_cfg else { return Ok(()); };
+        let Some(pool) = self.pool.clone() else { return Ok(()); };
+        let logical = pos / p.block_size;
+        if logical < 0 { return Err("negative position"); }
+        let li = logical as usize;
+        if li < self.page_table_host.len() && self.page_table_host[li] >= 0 {
+            return Ok(()); // already mapped
+        }
+        if li >= self.page_table_host.len() {
+            self.page_table_host.resize(li + 1, -1);
+        }
+        let b = pool.allocate_block();
+        if b < 0 { return Err("pool exhausted"); }
+        self.page_table_host[li] = b;
+        self.owned_blocks.push(b);
+        // H2D the updated page_table.
+        aether_dev_h2d_i32(
+            self.page_table_host.as_ptr() as i64,
+            p.page_table_dev,
+            self.page_table_host.len() as c_int,
+        );
+        Ok(())
     }
 
     /// Reset the KV cache + position for a new request. Cheap (no GPU
@@ -372,9 +538,15 @@ impl QwenSession {
         assert!(!prompt_ids.is_empty(), "prompt cannot be empty");
         unsafe {
             for (i, &t_id) in prompt_ids.iter().enumerate() {
+                let pos = i as i32;
+                // Shared-pool mode: ensure the logical block for this pos is
+                // mapped to a physical block.  No-op for per-session paged or
+                // contiguous modes.
+                if let Err(e) = self.ensure_block_for_position(pos) {
+                    panic!("[QwenSession.prefill] pool allocation failed at pos {}: {}", pos, e);
+                }
                 let emb = self.dequant_embd_row(t_id);
                 aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, D_MODEL as c_int);
-                let pos = i as i32;
                 let cur_seq = pos + 1;
                 let step_host = [pos, cur_seq, 0i32, 0i32];
                 aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
@@ -431,10 +603,15 @@ impl QwenSession {
     /// captured into a CUDA graph for replay on subsequent calls.
     pub fn decode_step(&mut self, last_id: usize) -> usize {
         unsafe {
+            let pos = self.next_pos;
+            // Shared-pool mode may need a fresh block when pos crosses a
+            // block_size boundary; no-op otherwise.
+            if let Err(e) = self.ensure_block_for_position(pos) {
+                panic!("[QwenSession.decode_step] pool allocation failed at pos {}: {}", pos, e);
+            }
             // Feed input embedding + step args.
             let emb = self.dequant_embd_row(last_id);
             aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, D_MODEL as c_int);
-            let pos = self.next_pos;
             let cur_seq = pos + 1;
             let step_host = [pos, cur_seq, 0i32, 0i32];
             aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
@@ -533,9 +710,20 @@ impl Drop for QwenSession {
             let _ = aether_dev_free_f32(self.act.gate);
             let _ = aether_dev_free_f32(self.act.down);
             let _ = aether_dev_free_f32(self.act.logits);
+            let shared = self.pool.is_some();
             for kv in self.kvs.drain(..) {
-                let _ = aether_dev_free_f32(kv.k_cache);
-                let _ = aether_dev_free_f32(kv.v_cache);
+                if !shared {
+                    // Per-session pool buffer — owned by us, must be freed here.
+                    // In shared-pool mode, k_cache/v_cache point at the pool's
+                    // buffers; the SharedKvPool Drop frees them.
+                    let _ = aether_dev_free_f32(kv.k_cache);
+                    let _ = aether_dev_free_f32(kv.v_cache);
+                }
+            }
+            if let Some(pool) = self.pool.take() {
+                for b in self.owned_blocks.drain(..) {
+                    pool.free_block(b);
+                }
             }
             let _ = aether_dev_free_i32(self.step_args);
             if let Some(p) = self.paged_cfg.take() {

@@ -39,7 +39,7 @@ use aether_rt::{
 };
 
 #[cfg(feature = "cuda")]
-use aether_rt::serving::QwenSession;
+use aether_rt::serving::{QwenSession, SharedKvPool};
 
 #[derive(Debug)]
 struct Cli {
@@ -53,9 +53,14 @@ struct Cli {
     tls_cn: String,
     /// FR-19.4-extra: route K/V through the paged kernels with an identity
     /// page table (block_size=4).  Bit-identical token output to the
-    /// contiguous path (witnessed in qwen25_paged_parity.rs); the deployment
-    /// payoff is multi-tenant pool sharing (future work).
+    /// contiguous path (witnessed in qwen25_paged_parity.rs).
     paged: bool,
+    /// FR-19.4-extra-tenant: when >0, allocate a SharedKvPool of this many
+    /// blocks (block_size=4 tokens) and route every aether-serve session
+    /// through it.  Implies --paged.  Sessions return their blocks to the
+    /// pool on Drop, so the pool effectively caps concurrent KV memory
+    /// rather than letting per-request KV grow unbounded.
+    pool_blocks: i32,
 }
 
 fn parse_cli() -> Cli {
@@ -69,6 +74,7 @@ fn parse_cli() -> Cli {
         tls: false,
         tls_cn: "aether-serve.local".into(),
         paged: false,
+        pool_blocks: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -87,6 +93,10 @@ fn parse_cli() -> Cli {
             "--tls" => { cli.tls = true; if cli.port == 8080 { cli.port = 8443; } }
             "--tls-cn" => cli.tls_cn = it.next().expect("--tls-cn NAME"),
             "--paged" => cli.paged = true,
+            "--pool-blocks" => {
+                cli.pool_blocks = it.next().expect("--pool-blocks N").parse().expect("pool-blocks int");
+                cli.paged = true;
+            }
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -362,18 +372,32 @@ struct ServerState {
     cli: Cli,
     #[cfg(feature = "cuda")]
     session: Option<std::sync::Mutex<QwenSession>>,
+    /// FR-19.4-extra-tenant: shared KV pool, kept alive for the lifetime of
+    /// the server when --pool-blocks > 0.  Future-session work routes new
+    /// concurrent requests through additional sessions bound to this pool.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    pool: Option<std::sync::Arc<SharedKvPool>>,
 }
 
 impl ServerState {
     fn new(cli: Cli) -> Result<Self, String> {
         #[cfg(feature = "cuda")]
         {
+            let pool = if cli.pool_blocks > 0 {
+                eprintln!("[aether-serve] allocating SharedKvPool: {} blocks × 4 tokens = {} token capacity",
+                    cli.pool_blocks, cli.pool_blocks * 4);
+                Some(SharedKvPool::new(cli.pool_blocks, 4))
+            } else { None };
+
             let session = match &cli.gguf {
                 Some(path) => {
                     eprintln!("[aether-serve] loading GGUF: {}{}", path,
                         if cli.paged { " (paged KV mode)" } else { "" });
                     let t = std::time::Instant::now();
-                    let mut s = if cli.paged {
+                    let mut s = if let Some(p) = &pool {
+                        QwenSession::new_paged_with_pool(path, p.clone())?
+                    } else if cli.paged {
                         QwenSession::new_paged(path)?
                     } else {
                         QwenSession::new(path)?
@@ -392,7 +416,7 @@ impl ServerState {
                     None
                 }
             };
-            return Ok(ServerState { cli, session });
+            return Ok(ServerState { cli, session, pool });
         }
         #[cfg(not(feature = "cuda"))]
         {

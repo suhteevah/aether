@@ -1,7 +1,43 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 (**ALL deferred polish items LANDED.  aether-hosting is fully
+2026-05-24 evening (**SharedKvPool multi-tenancy LANDED — true vLLM-shape
+foundation.** `runtime/src/serving.rs::SharedKvPool` owns per-layer
+(`N_LAYERS × 2 = 56`) GPU buffers + a free-block bitmap.
+`Arc<SharedKvPool>` shared across multiple `QwenSession`s on the same
+model; each session binds via `QwenSession::new_paged_with_pool(path, pool)`,
+holds its own `page_table_dev` mapping logical block index -> physical
+block id, and grows the page table dynamically on token-boundary
+crossings (`ensure_block_for_position`).  `Drop` returns the session's
+blocks to the pool's free list.
+
+Multi-tenant parity verified on RTX 3070 Ti — `runtime/tests/qwen25_multitenant_pool.rs`
+creates ONE pool (32 blocks × 4 tokens = 128 token capacity), binds TWO
+PagedQwenSessions to it, runs different prompts through each, and
+asserts each session's token IDs match a single-tenant `QwenSession::new`
+reference exactly:
+- session A (`[9707,11,1879,0]`): `[358, 2776, 264, 220, 17, 20]` ✓
+- session B (`[40,1079,264,220,17]`): `[19, 1042, 2310, 8593, 13, 358]` ✓
+Pool tracking: 0 → 2 (init) → 6 (grew during decode) → 0 (reclaimed on Drop).
+
+aether-serve wired with `--pool-blocks N` CLI flag (implies `--paged`).
+End-to-end TLS + h2-ALPN + shared pool + real Qwen verified:
+```
+$ aether-serve --tls --pool-blocks 32 --gguf <Qwen2.5-7B> --warmup 4
+[aether-serve] allocating SharedKvPool: 32 blocks × 4 tokens = 128 token capacity
+[aether-serve] model loaded in 2.17s (paged KV mode)
+...
+POST /v1/chat/completions -> "content":" I'm a 25-year-old"
+```
+
+The remaining "true vLLM-shape" future work — a single batched-forward
+kernel that decodes N concurrent requests in ONE launch (vs the current
+serialize-on-Mutex pattern) — needs a rewrite of every kernel in
+QwenSession to accept a batch dimension.  That's a 1-2 week project; the
+SharedKvPool foundation it builds on top of is now in place.
+
+### 2026-05-24 (ALL deferred polish items LANDED)
+**ALL deferred polish items LANDED.  aether-hosting is fully
 production-shaped.**  Three pieces flipped from "deferred" to "shipped":
 
 (1) **ALPN extension in TLS 1.3** (RFC 7301).  `TlsServerSession::new_with_alpn`
