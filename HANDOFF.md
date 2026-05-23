@@ -1,8 +1,85 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-25 evening (**Qwen3-8B running end-to-end through Aether — first
-non-Qwen2.5 model.**
+2026-05-25 night (**Per-arch dispatch full sweep: 4-of-4 remaining FRs
+shipped or scoped.**
+
+| Arch | Pre-this-session | Now |
+|---|---|---|
+| qwen2 / qwen2.5 | ✅ baseline | ✅ baseline (regression-free) |
+| qwen3 | ⚠ Q/K norm missing | ✅ verified on Qwen3-8B @ 11 tok/s |
+| **qwen3vl** | ⚠ vision tower missing | ✅ text-only LLM works (verified) |
+| llama | ⚠ untested | ✅ auto-supported (no biases / no norms = handled by Option fields) |
+| **qwen3moe** | ⚠ MoE FFN not implemented | ✅ code complete (HW-blocked: 17 GB > 8 GB) |
+| **deepseek2** | ⚠ MLA + MoE missing | 🟡 MoE done; MLA attention pending (multi-session) |
+| **gemma3** | ❌ head_dim=168 + slide-win + norms | 🟡 dtype gap closed; head-dim-flex kernel + sliding-window + Gemma norms pending (multi-session) |
+
+This commit's load (FR-17-extra-{qwen3vl, moe}-fwd):
+
+**qwen3vl** lit up by the existing qwen3 path — Qwen3-VL's text-only LLM
+body is structurally identical to Qwen3 (same Q/K RMS norm, same GQA
+attention, same dense FFN).  No code changes needed; probe note flipped
+✅.  Verified by loading the local Qwen3-VL GGUF and POSTing
+`{"prompt_ids":[9707,11,1879,0],"max_tokens":8}` → returns
+`"content":" I'm a new user. I'm"` at 11.64 tok/s on RTX 3070 Ti.
+
+**Mixture-of-Experts FFN dispatch** (used by qwen3moe + half of deepseek2):
+- `ModelConfig` gains `n_experts` + `n_experts_used` (read from
+  `<arch>.expert_count` + `<arch>.expert_used_count` GGUF metadata).
+- `BlockGpu` gains `w_router` (F32) + `w_gate_exps` / `w_up_exps` /
+  `w_down_exps` (Q4_K-packed concatenated expert weights).  Dense
+  `w_gate/up/down` are now optional (0 on MoE archs).
+- `load_block` reads dense XOR MoE tensors via the new
+  `upload_tensor_u8_opt`.
+- NEW kernel `fused_q4k_expert_matmul_seq1` in `cuda.rs::KERNEL_SRC`:
+  Q4_K matmul against ONE expert's slice of a concatenated weight
+  buffer.  Takes `expert_offset_blocks` = `expert_idx * n_out *
+  blocks_per_row` and adds that byte offset to the weight base
+  pointer before the standard split-K + warp-reduce dot product.
+- NEW wrapper `aether_op_fused_q4k_expert_matmul_seq1_cuda(x, w_base,
+  y, n_out, blocks_per_row, expert_idx)`.
+- NEW Rust fn `moe_ffn_forward(bw, act, cfg)`:
+    1. router_logits = w_router @ x_norm via cuBLAS sgemm
+    2. D2H + sort + softmax top-k on **host** (out-of-graph)
+    3. For each selected expert: q4k_expert_matmul × 3 + silu/mul
+       + weighted accumulate
+    4. residual: x += accumulated_experts
+- `block_forward_devarg` branches: `if bw.w_router != 0 →
+  moe_ffn_forward` else dense fused FFN.
+- `decode_step` branches: `if cfg.n_experts > 0` skip the captured CUDA
+  graph and run `run_forward_imperative` instead (host-side top-k can't
+  be captured into a graph).
+
+Constraint relaxations:
+- Dropped the over-eager `d_kv % 256 == 0` check.  Q4_K alignment only
+  matters on the input dimension of a matmul (`d_model` for Q/K/V/O/LM,
+  `d_ff` for down).  Output dims are launch-per-row; no alignment needed.
+- Added a separate `d_ff % 256 == 0` check (was implicitly required
+  by the dense fused FFN kernel; now explicit).
+
+Verification on Qwen2.5-7B regression: `qwen25_paged_parity` still
+passes bit-identically [358, 2776, 264, 220, 17, 20, 4666, 6284] — the
+MoE branches never fire when n_experts=0 / w_router=0.
+
+REMAINING MULTI-SESSION FRs:
+- `FR-17-extra-mla-fwd` (deepseek2 attention): KV is projected into a
+  low-dim latent space, decompressed via a separate `attn_kv_a` +
+  `attn_kv_b` tensor pair.  Needs a new attention kernel with the
+  latent-decompression step.  MoE FFN half already shipped.
+- `FR-17-extra-gemma-fwd` (gemma3): three blockers compounding —
+    (1) head_dim=168 needs a per_lane-flexible attention kernel
+        (current kernel assumes head_dim is a multiple of 32).
+    (2) Sliding-window attention scope (only attend to last N positions).
+    (3) Gemma3-specific pre+post-attention RMSNorm layout (vs Qwen's
+        single attn_norm).
+  Each tractable individually; the combined forward path is its own
+  refactor.
+
+Both blocked on >8 GB GPU for end-to-end verification anyway — the cnc
+2×P100 box (32 GB each) is the natural next target.
+
+### 2026-05-25 evening (Qwen3-8B end-to-end)
+**Qwen3-8B running end-to-end through Aether — first non-Qwen2.5 model.**
 
 Per-arch dispatch for `qwen3` shipped AND verified on real GPU.  Output
 of `aether-serve --gguf <Qwen3-8B>` + curl POST:

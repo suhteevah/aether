@@ -752,10 +752,20 @@ impl QwenSession {
                     "FR-17-extra-runtime-shape: n_q_heads({}) must be a multiple of n_kv_heads({}).",
                     cfg.n_q_heads, cfg.n_kv_heads));
             }
-            if cfg.d_model == 0 || cfg.d_model % 256 != 0 || cfg.d_kv == 0 || cfg.d_kv % 256 != 0 {
+            // Q4_K kernels iterate over n_in in 256-elem super-blocks; only the
+            // shared (input) dimension needs to be a multiple of 256.  Both
+            // d_model (Q/K/V/O/LM-head n_in) and d_ff (down n_in) feed this.
+            // Output dims (d_kv, vocab) have no such constraint — the kernel
+            // launches one CTA per output row.
+            if cfg.d_model == 0 || cfg.d_model % 256 != 0 {
                 return Err(format!(
-                    "FR-17-extra-runtime-shape: d_model({}) and d_kv({}) must both be multiples of 256 (Q4_K super-block).",
-                    cfg.d_model, cfg.d_kv));
+                    "FR-17-extra-runtime-shape: d_model({}) must be a multiple of 256 (Q4_K super-block).",
+                    cfg.d_model));
+            }
+            if cfg.d_ff == 0 || cfg.d_ff % 256 != 0 {
+                return Err(format!(
+                    "FR-17-extra-runtime-shape: d_ff({}) must be a multiple of 256 (Q4_K super-block).",
+                    cfg.d_ff));
             }
 
             let blocks: Vec<BlockGpu> = (0..cfg.n_layers).map(|b| load_block(h, b)).collect();

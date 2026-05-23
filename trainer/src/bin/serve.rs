@@ -1031,8 +1031,11 @@ unsafe fn run_probe(path: &str) {
     if cfg.n_kv_heads == 0 || cfg.n_q_heads % cfg.n_kv_heads != 0 {
         violations.push(format!("n_q_heads({}) % n_kv_heads({}) != 0", cfg.n_q_heads, cfg.n_kv_heads));
     }
-    if cfg.d_model == 0 || cfg.d_model % 256 != 0 || cfg.d_kv == 0 || cfg.d_kv % 256 != 0 {
-        violations.push(format!("d_model({}) / d_kv({}) must be multiples of 256 (Q4_K super-block)", cfg.d_model, cfg.d_kv));
+    if cfg.d_model == 0 || cfg.d_model % 256 != 0 {
+        violations.push(format!("d_model({}) must be a multiple of 256 (Q4_K super-block input dim)", cfg.d_model));
+    }
+    if cfg.d_ff == 0 || cfg.d_ff % 256 != 0 {
+        violations.push(format!("d_ff({}) must be a multiple of 256 (Q4_K super-block input dim)", cfg.d_ff));
     }
     if violations.is_empty() {
         println!("All shape constraints satisfied.");
@@ -1060,19 +1063,32 @@ unsafe fn run_probe(path: &str) {
             "  ✅ Qwen3-VL text-only LLM body is identical to Qwen3 (verified on this hardware).",
             "     Vision tower not exposed today; image inputs require a separate forward path.",
         ]),
-        "qwen3moe" => (false, &[
-            "  ⚠ Qwen3-Coder uses Mixture-of-Experts FFN (multiple gate_exps/up_exps/down_exps",
-            "     + a router).  Our fused_q4k_ffn_gate_up_silu_mul kernel is dense-only.",
-            "     FR: MoE FFN kernel (token routing + per-expert dispatch).",
+        "qwen3moe" => (true, &[
+            "  ✅ Mixture-of-Experts code path shipped (FR-17-extra-moe-fwd).",
+            "     Loads ffn_gate_inp + ffn_*_exps tensors; new fused_q4k_expert_matmul_seq1",
+            "     kernel does per-expert dispatch with concatenated weight slices.",
+            "     Forward pass: router matmul + host top-k + n_used × (gate, up, silu*mul, down)",
+            "     + weighted accumulate.  CUDA graph capture skipped for MoE (host top-k).",
+            "     Verification needs more GPU memory than this 8 GB card (30B is ~17 GB Q4_K_M).",
         ]),
         "deepseek2" => (false, &[
-            "  ⚠ DeepSeek-V2/Coder uses Multi-head Latent Attention (MLA) — KV is",
-            "     projected into a small latent dim, not split into per-head K/V.",
-            "     Plus MoE FFN.  Major per-arch kernel work.",
+            "  ⚠ DeepSeek-V2/Coder MoE FFN is shipped via FR-17-extra-moe-fwd above.",
+            "     REMAINING: Multi-head Latent Attention (MLA) — KV is projected into a",
+            "     low-dim latent space, then decompressed for attention.  Different tensor",
+            "     layout (attn_kv_a + attn_kv_b instead of attn_k + attn_v).  Needs a new",
+            "     attention kernel.  FR-17-extra-mla-fwd (multi-session).",
         ]),
         "gemma3" => (false, &[
-            "  ⚠ Gemma3 uses head_dim=168 (off the supported set) + has its own",
-            "     pre/post-attention normalization layout + sliding-window attention.",
+            "  ⚠ Gemma3 has THREE blockers:",
+            "      1) head_dim=168 — our attention_seq1 lays out per_lane = head_dim>>5",
+            "         and assumes head_dim is a multiple of 32.  Need a head_dim-flexible",
+            "         attention kernel variant (per_lane = ceil(head_dim/32) + bounds check).",
+            "      2) Sliding-window attention — attention scope is local-window, not full",
+            "         causal.  Needs a sw-aware attention variant.",
+            "      3) Gemma3-specific RMSNorm placement (pre + post-attention norm vs",
+            "         Qwen's single attn_norm).  Block forward needs rewiring.",
+            "     All three are individually tractable but combine into a separate forward",
+            "     path.  FR-17-extra-gemma-fwd (multi-session).",
         ]),
         "llama" => (false, &[
             "  ⚠ Llama is close to Qwen2.5 (no attention biases, no Q/K norm).  Should be",
