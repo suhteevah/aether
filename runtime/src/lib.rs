@@ -5334,6 +5334,244 @@ unsafe fn pt_table() -> &'static mut Vec<Option<Box<PageTable>>> { &mut *PT_TABL
     0
 }
 
+// ============================================================================
+// FR-19.5-extra — Real continuous-batching scheduler.
+//
+// Builds on the paged-KV primitives below.  One scheduler owns:
+//   - a shared block-pool handle (aether_pkv_new),
+//   - a list of active requests, each with its own per-request page table
+//     (aether_pkv_pagetable_new) and a token position.
+//
+// As a request's token position crosses a block_size boundary, the scheduler
+// allocates a fresh physical block from the pool and binds it to the next
+// logical-block slot in that request's page table.  Returning a token
+// (`generated`) advances the position by 1.  When the request is finished
+// (EOS / max_tokens / explicit completion), its blocks are released and
+// the page table is destroyed.
+//
+// The actual per-step forward pass is the caller's responsibility — for
+// the seq=1 autoregressive shape, the caller iterates over `active_request
+// _ids()` and runs a paged_attention_seq1 + paged_append_kv per request,
+// then calls `record_token(req_id, new_tok_id)`.  When a real batched
+// forward kernel lands (FR-19.5-extra-deep) the step will fan out across
+// the active set in one launch.
+// ============================================================================
+
+struct Request {
+    req_id: i32,
+    page_table_h: i64,
+    position: u32,
+    max_tokens: u32,
+    finished: bool,
+    /// Last token emitted (for the next decode step).  Negative = none yet.
+    last_token: i32,
+    /// Number of tokens emitted so far (not counting prompt).
+    tokens_emitted: u32,
+}
+
+struct BatchScheduler {
+    pool_handle: i64,
+    block_size: u32,
+    max_active: u32,
+    requests: Vec<Request>,
+    /// Owned physical blocks per request, indexed parallel to `requests`.
+    owned_blocks: Vec<Vec<i32>>,
+}
+struct SchedCell(UnsafeCell<Vec<Option<Box<BatchScheduler>>>>);
+unsafe impl Sync for SchedCell {}
+static SCHED_TABLE: SchedCell = SchedCell(UnsafeCell::new(Vec::new()));
+unsafe fn sched_table() -> &'static mut Vec<Option<Box<BatchScheduler>>> { &mut *SCHED_TABLE.0.get() }
+
+/// Create a new batch scheduler bound to an existing pool.
+/// `max_active`: capacity of concurrent requests.  Returns scheduler handle.
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_new(
+    pool_h: i64, block_size: c_int, max_active: c_int,
+) -> i64 {
+    if pool_h < 0 || block_size <= 0 || max_active <= 0 { return -1; }
+    let s = BatchScheduler {
+        pool_handle: pool_h,
+        block_size: block_size as u32,
+        max_active: max_active as u32,
+        requests: Vec::new(),
+        owned_blocks: Vec::new(),
+    };
+    let tbl = sched_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(s)); return i as i64; }
+    }
+    tbl.push(Some(Box::new(s)));
+    (tbl.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_destroy(h: i64) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    if let Some(s) = tbl[hu].take() {
+        for r in &s.requests {
+            let _ = aether_pkv_pagetable_destroy(r.page_table_h);
+        }
+        for blocks in &s.owned_blocks {
+            for &b in blocks { let _ = aether_pkv_free_block(s.pool_handle, b); }
+        }
+    }
+    0
+}
+
+/// Admit a new request.  Returns 0 on success, -1 if at capacity,
+/// -2 if pool exhausted.  i64 return to dodge the asm-backend i32-sign-extend
+/// gap (callers comparing `!= -1` from an i32 return get the zero-extended
+/// 0xFFFFFFFF rather than -1).
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_admit(
+    h: i64, req_id: c_int, prompt_len: c_int, max_tokens: c_int,
+) -> i64 {
+    if h < 0 || prompt_len < 0 || max_tokens < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_mut() else { return -1; };
+    if s.requests.len() as u32 >= s.max_active { return -1; }
+
+    // Make a new page table for this request, sized to fit prompt + max_tokens.
+    let total_tokens = prompt_len as u32 + max_tokens as u32;
+    let n_logical_blocks = ((total_tokens + s.block_size - 1) / s.block_size).max(1);
+    let pt_h = aether_pkv_pagetable_new(n_logical_blocks as c_int);
+    if pt_h < 0 { return -2; }
+
+    // Allocate exactly the blocks the prompt needs right now (lazy for the rest).
+    let prompt_blocks = ((prompt_len as u32 + s.block_size - 1) / s.block_size).max(1);
+    let mut owned = Vec::new();
+    for logical in 0..prompt_blocks {
+        let phys = aether_pkv_allocate(s.pool_handle);
+        if phys < 0 {
+            // Roll back.
+            for b in &owned { let _ = aether_pkv_free_block(s.pool_handle, *b); }
+            let _ = aether_pkv_pagetable_destroy(pt_h);
+            return -2;
+        }
+        let _ = aether_pkv_pagetable_set(pt_h, logical as c_int, phys);
+        owned.push(phys);
+    }
+    s.requests.push(Request {
+        req_id, page_table_h: pt_h,
+        position: 0, max_tokens: max_tokens as u32,
+        finished: false, last_token: -1, tokens_emitted: 0,
+    });
+    s.owned_blocks.push(owned);
+    0
+}
+
+/// Advance request `req_id` by emitting `new_token`.  If the token crosses a
+/// block boundary, allocates a fresh physical block.  Returns 0 on success,
+/// -1 if request not found, -2 if pool exhausted.  Marks the request finished
+/// when tokens_emitted reaches max_tokens.
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_record_token(
+    h: i64, req_id: c_int, new_token: c_int,
+) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_mut() else { return -1; };
+    let idx = s.requests.iter().position(|r| r.req_id == req_id);
+    let Some(i) = idx else { return -1; };
+    if s.requests[i].finished { return 0; }
+    s.requests[i].last_token = new_token;
+    s.requests[i].position += 1;
+    s.requests[i].tokens_emitted += 1;
+
+    // If next write position falls in a new logical block, allocate it now.
+    let next_pos = s.requests[i].position;
+    let next_logical = next_pos / s.block_size;
+    let pt_h = s.requests[i].page_table_h;
+    let already = aether_pkv_pagetable_get(pt_h, next_logical as c_int);
+    if already < 0 {
+        // Need a new block.
+        let phys = aether_pkv_allocate(s.pool_handle);
+        if phys < 0 { return -2; }
+        let _ = aether_pkv_pagetable_set(pt_h, next_logical as c_int, phys);
+        s.owned_blocks[i].push(phys);
+    }
+
+    if s.requests[i].tokens_emitted >= s.requests[i].max_tokens {
+        s.requests[i].finished = true;
+    }
+    0
+}
+
+/// Mark a request finished (caller-driven, e.g. for EOS).
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_finish(
+    h: i64, req_id: c_int,
+) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_mut() else { return -1; };
+    let idx = s.requests.iter().position(|r| r.req_id == req_id);
+    let Some(i) = idx else { return -1; };
+    s.requests[i].finished = true;
+    0
+}
+
+/// Reap finished requests, freeing their blocks + page tables.
+/// Returns the number of requests reaped.
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_reap(h: i64) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_mut() else { return -1; };
+    let mut i = 0;
+    let mut reaped = 0;
+    while i < s.requests.len() {
+        if s.requests[i].finished {
+            let req = s.requests.remove(i);
+            let blocks = s.owned_blocks.remove(i);
+            for b in &blocks { let _ = aether_pkv_free_block(s.pool_handle, *b); }
+            let _ = aether_pkv_pagetable_destroy(req.page_table_h);
+            reaped += 1;
+        } else {
+            i += 1;
+        }
+    }
+    reaped
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_n_active(h: i64) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_ref() else { return -1; };
+    s.requests.iter().filter(|r| !r.finished).count() as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_pagetable_for(h: i64, req_id: c_int) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_ref() else { return -1; };
+    for r in &s.requests {
+        if r.req_id == req_id { return r.page_table_h; }
+    }
+    -1
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_batch_sched_position(h: i64, req_id: c_int) -> i64 {
+    if h < 0 { return -1; }
+    let tbl = sched_table();
+    let hu = h as usize;
+    if hu >= tbl.len() { return -1; }
+    let Some(s) = tbl[hu].as_ref() else { return -1; };
+    for r in &s.requests {
+        if r.req_id == req_id { return r.position as i64; }
+    }
+    -1
+}
+
 /// Translate a logical token position to (physical_block, in_block_offset).
 /// Returns -1 in the high-bits-as-error or packs result as i64:
 ///   bits 0..31 = physical_block, bits 32..63 = in_block_offset.

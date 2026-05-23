@@ -1,7 +1,22 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-23 evening (**Real paged KV cache landing — FR-19.4-extra.** Built on top of
+2026-05-23 late evening (**Real continuous-batching scheduler — FR-19.5-extra.**
+Pool-aware `BatchScheduler` in `runtime/src/lib.rs` that owns per-request page
+tables on top of the FR-19.4-extra paged KV primitives.  FFI:
+`aether_batch_sched_{new, destroy, admit, record_token, finish, reap,
+n_active, pagetable_for, position}` — all returning i64 to dodge the
+asm-backend i32 sign-extend gap.  Admit allocates the initial physical
+blocks the prompt needs + a page table; record_token advances the position
+and lazily allocates a new block when the next write crosses a block
+boundary; reap collects finished requests and returns their blocks to the
+pool.  Witness `tests/runtime/batch_scheduler.aether` exits 42 — admits
+2 requests, exhausts capacity (3rd rejected), records 4 tokens through
+req=10, reaps it back to the pool, ends with 1 active and 1 allocated
+block (matching req=11's remaining state).
+
+### 2026-05-23 evening (Real paged KV cache landing — FR-19.4-extra)
+**Real paged KV cache landing — FR-19.4-extra.** Built on top of
 the existing CPU-side block allocator (`aether_pkv_*` from FR-19.4): added per-request
 **virtual page table** primitive (`aether_pkv_pagetable_*`) plus two new **GPU
 kernels** (`paged_append_kv_devarg`, `paged_attention_seq1_devarg`) that walk the

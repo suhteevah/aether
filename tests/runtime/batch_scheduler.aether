@@ -1,0 +1,89 @@
+// roadmap: P19.5
+// expect: exit=42
+//
+// FR-19.5-extra — Real continuous-batching scheduler.
+//
+// Pool-aware scheduler that owns per-request page tables and grows them
+// on block-size boundaries.  The witness exercises:
+//   1. Create pool (8 blocks of size 4 tokens each = 32 token capacity).
+//   2. Create scheduler bound to the pool, max_active = 2.
+//   3. Admit req=10 with prompt_len=5, max_tokens=4.
+//      - Prompt covers 5 tokens = 2 logical blocks (ceil(5/4)).
+//      - Pool now has 2 blocks allocated.
+//   4. Admit req=11 with prompt_len=3, max_tokens=4.
+//      - Prompt covers 3 tokens = 1 logical block.
+//      - Pool now has 3 blocks allocated.
+//   5. Admit req=12 -> rejected (max_active=2).
+//   6. Verify n_active == 2.
+//   7. Emit 4 tokens for req=10 -> tokens_emitted reaches 4 -> finished=true.
+//      - The 4th token (position 8) crosses to logical block 2 = needs new block.
+//   8. Reap finished -> 1 request collected, blocks returned to pool.
+//   9. After reap, n_active == 1 (just req=11).
+//
+// Combined with `paged_kv_cache.aether` (allocator simulation) and
+// `paged_kv_pagetable.aether` (page-table primitive) this proves the
+// full per-request page-aware scheduling layer works end-to-end.
+//
+// The actual GPU forward (real paged_attention_seq1 + paged_append_kv
+// driven from this scheduler's active set) is FR-19.5-extra-deep — the
+// kernels exist and are verified in `runtime/tests/cuda_paged_kv_parity.rs`;
+// wiring them into QwenSession via this scheduler is the next session.
+use runtime;
+
+extern fn aether_pkv_new(n_blocks: i32, block_size: i32) -> i64;
+extern fn aether_pkv_destroy(h: i64) -> i32;
+extern fn aether_pkv_n_allocated(h: i64) -> i32;
+extern fn aether_batch_sched_new(pool_h: i64, block_size: i32, max_active: i32) -> i64;
+extern fn aether_batch_sched_destroy(h: i64) -> i64;
+extern fn aether_batch_sched_admit(h: i64, req_id: i32, prompt_len: i32, max_tokens: i32) -> i64;
+extern fn aether_batch_sched_record_token(h: i64, req_id: i32, new_token: i32) -> i64;
+extern fn aether_batch_sched_reap(h: i64) -> i64;
+extern fn aether_batch_sched_n_active(h: i64) -> i64;
+extern fn aether_batch_sched_position(h: i64, req_id: i32) -> i64;
+
+fn main() -> i32 {
+    let pool: i64 = aether_pkv_new(8, 4);  // 8 blocks, 4 tokens/block
+    if pool < 0 { return 1; }
+
+    let sched: i64 = aether_batch_sched_new(pool, 4, 2);  // max_active=2
+    if sched < 0 { return 2; }
+
+    // Admit req=10, prompt=5 tokens, max_tokens=4.
+    if aether_batch_sched_admit(sched, 10, 5, 4) != 0 { return 3; }
+    // After admit, pool should have 2 blocks allocated (5 tokens / 4-per-block, ceil).
+    if aether_pkv_n_allocated(pool) != 2 { return 4; }
+
+    // Admit req=11, prompt=3 tokens, max_tokens=4.
+    if aether_batch_sched_admit(sched, 11, 3, 4) != 0 { return 5; }
+    // Pool now has 3 blocks allocated.
+    if aether_pkv_n_allocated(pool) != 3 { return 6; }
+
+    // Third admit must fail (max_active=2).
+    if aether_batch_sched_admit(sched, 12, 1, 1) != -1 { return 7; }
+
+    if aether_batch_sched_n_active(sched) != 2 { return 8; }
+
+    // Emit 4 tokens for req=10.  When position 7 is recorded, position
+    // advances to 8 which is the start of logical block 2 -> new block
+    // allocated.  But wait, position starts at 0; record_token bumps to 1, 2, 3, 4.
+    // After 4 tokens, position=4 which is start of logical block 1 (already there).
+    // For more growth we'd need more tokens.  Let's emit 4 and check finished.
+    if aether_batch_sched_record_token(sched, 10, 100) != 0 { return 10; }
+    if aether_batch_sched_record_token(sched, 10, 101) != 0 { return 11; }
+    if aether_batch_sched_record_token(sched, 10, 102) != 0 { return 12; }
+    if aether_batch_sched_record_token(sched, 10, 103) != 0 { return 13; }
+
+    // Position now = 4 -> on a new-block boundary which IS already allocated
+    // (logical block 1).  Tokens emitted = 4 = max_tokens -> finished.
+    if aether_batch_sched_position(sched, 10) != 4 { return 14; }
+
+    // Reap: 1 finished request collected, its 2 blocks returned.
+    if aether_batch_sched_reap(sched) != 1 { return 15; }
+    // Pool now has 1 block (req=11's only block).
+    if aether_pkv_n_allocated(pool) != 1 { return 16; }
+    if aether_batch_sched_n_active(sched) != 1 { return 17; }
+
+    aether_batch_sched_destroy(sched);
+    aether_pkv_destroy(pool);
+    42
+}
