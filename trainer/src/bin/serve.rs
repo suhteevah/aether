@@ -1091,6 +1091,51 @@ unsafe fn run_probe(path: &str) {
         println!();
         println!("→ READY: model would load with `aether-serve --gguf <this>`.");
     }
+
+    // Tensor dtype histogram — quant-aware loaders need to know what's in
+    // the file.  Today's matmul kernels handle dtype 12 (Q4_K) + 14 (Q6_K)
+    // only; F16 / F32 / other Q-types need additional work.
+    let n_tensors = aether_rt::aether_gguf_n_tensors(h);
+    let mut hist = std::collections::BTreeMap::<i32, usize>::new();
+    let mut name_examples = std::collections::BTreeMap::<i32, String>::new();
+    let mut name_buf = [0u8; 256];
+    for i in 0..n_tensors {
+        let dt = aether_rt::aether_gguf_get_tensor_dtype(h, i);
+        *hist.entry(dt).or_default() += 1;
+        name_examples.entry(dt).or_insert_with(|| {
+            let n = aether_rt::aether_gguf_get_tensor_name(h, i, name_buf.as_mut_ptr() as i64, 256);
+            if n > 0 {
+                String::from_utf8_lossy(&name_buf[..n as usize]).to_string()
+            } else { format!("<tensor {}>", i) }
+        });
+    }
+    println!();
+    println!("Tensor dtype histogram ({} tensors total):", n_tensors);
+    let dtype_name = |dt: i32| -> &'static str {
+        match dt {
+            0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1",
+            6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
+            10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
+            14 => "Q6_K", 15 => "Q8_K", 30 => "BF16",
+            _ => "?",
+        }
+    };
+    for (dt, count) in &hist {
+        let supported = matches!(*dt, 0 | 12 | 14);
+        let mark = if supported { "✅" } else { "⚠" };
+        let example = name_examples.get(dt).map(|s| s.as_str()).unwrap_or("");
+        println!("  {} dtype {:3} ({:6}): {:4} tensors  e.g. {}",
+            mark, dt, dtype_name(*dt), count, example);
+    }
+    let unsupported_count: usize = hist.iter()
+        .filter(|(dt, _)| !matches!(**dt, 0 | 12 | 14))
+        .map(|(_, c)| *c).sum();
+    if unsupported_count > 0 {
+        println!();
+        println!("→ {} tensor(s) use dtypes outside the Q4_K + Q6_K + F32 set supported today.",
+            unsupported_count);
+        println!("  FR-17-extra-f16-fwd: add F16 (dtype 1) weight + matmul path.");
+    }
     aether_gguf_close(h);
 }
 

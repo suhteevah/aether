@@ -52,9 +52,34 @@ use crate::cuda::{
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
+    aether_op_fused_f16_matmul_seq1_cuda,
     aether_dev_graph_begin, aether_dev_graph_end,
     aether_dev_graph_launch, aether_dev_graph_destroy,
 };
+
+/// Dispatch matmul kernel based on weight dtype.  Routes F16/Q4_K/Q6_K to
+/// the appropriate fused kernel.  For Q4_K and Q6_K, `nb_units` = number of
+/// 256-elem super-blocks; for F16, `nb_units` = number of elements.
+/// `n_out` = output rows, `n_in` = input cols (= d_model or d_kv etc.).
+unsafe fn dispatch_matmul(
+    x_norm: i64, w: i64, dt: i32, y: i64, n_out: c_int, n_in: c_int,
+) {
+    match dt {
+        12 => {
+            // Q4_K: 256-elem super-blocks; blocks_per_row = n_in / 256.
+            aether_op_fused_q4k_matmul_seq1_v2_cuda(x_norm, w, y, n_out, n_in / 256);
+        }
+        14 => {
+            aether_op_fused_q6k_matmul_seq1_v2_cuda(x_norm, w, y, n_out, n_in / 256);
+        }
+        1 => {
+            // F16 (FR-17-extra-f16-fwd).  Weights stored row-major
+            // [n_out * n_in] as raw F16.
+            aether_op_fused_f16_matmul_seq1_cuda(x_norm, w, y, n_in, n_out);
+        }
+        _ => panic!("dispatch_matmul: unsupported weight dtype {}", dt),
+    }
+}
 
 // Historical Qwen2.5-7B-specific constants — kept ONLY for tests/witnesses
 // that need to reference the 7B shape explicitly.  Production paths use the
@@ -165,14 +190,20 @@ unsafe fn read_meta_string(h: i64, key: &str) -> Option<String> {
 struct BlockGpu {
     attn_norm_g: i64, ffn_norm_g: i64,
     w_q: i64, w_k: i64, w_o: i64, w_gate: i64, w_up: i64,
-    w_v: i64, dt_v: i32,
-    w_down: i64, dt_down: i32,
+    w_v: i64,
+    w_down: i64,
+    /// Per-tensor dtypes (12=Q4_K, 14=Q6_K, 1=F16).  Mixed-quant GGUFs
+    /// (Q4_K_M, Qwen3-Q4_K_M-with-F16-V) need per-tensor dispatch.
+    dt_q: i32, dt_k: i32, dt_v: i32, dt_o: i32,
+    dt_gate: i32, dt_up: i32, dt_down: i32,
     /// Q/K/V biases — present in Qwen2.5 (qwen2 arch).  Qwen3 dropped these.
     /// 0 indicates "absent".
     b_q: i64, b_k: i64, b_v: i64,
     /// FR-17-extra-qwen3-fwd — per-head Q/K RMS norm (Qwen3-style).
     /// 0 indicates "absent" (qwen2 / older archs).
     attn_q_norm_g: i64, attn_k_norm_g: i64,
+    /// `nb_*` semantics: for Q4_K/Q6_K, # of 256-elem super-blocks;
+    /// for F16, # of elements.  See `upload_tensor_u8` for the contract.
     nb_qo: usize, nb_kv: usize, nb_gate_up: usize, nb_down: usize,
 }
 
@@ -278,17 +309,20 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
     assert!(idx >= 0, "{} not found in GGUF", name);
     let dt = aether_gguf_get_tensor_dtype(h, idx);
     let n_elems = aether_gguf_get_tensor_n_elems(h, idx) as usize;
-    let n_blocks = n_elems / 256;
-    let bytes_per_block = match dt {
-        12 => 144,
-        14 => 210,
+    // For block-quantized tensors (Q4_K / Q6_K), "n_blocks" counts 256-elem
+    // super-blocks.  For F16, we return n_elems as the second tuple element
+    // so callers can do `nb / d_model` and get the row count regardless of
+    // the underlying packing.
+    let (n_units, bytes) = match dt {
+        12 => { let nb = n_elems / 256; (nb, nb * 144) }     // Q4_K
+        14 => { let nb = n_elems / 256; (nb, nb * 210) }     // Q6_K
+        1  => { (n_elems, n_elems * 2) }                     // F16 (2 bytes/elem)
         _  => panic!("unsupported dtype {} for tensor {}", dt, name),
     };
-    let n_bytes = n_blocks * bytes_per_block;
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
-    let d_handle = aether_dev_alloc_u8(n_bytes as c_int);
-    aether_dev_h2d_u8(dptr, d_handle, n_bytes as c_int);
-    (d_handle, n_blocks, dt)
+    let d_handle = aether_dev_alloc_u8(bytes as c_int);
+    aether_dev_h2d_u8(dptr, d_handle, bytes as c_int);
+    (d_handle, n_units, dt)
 }
 
 unsafe fn upload_f32_tensor(h: i64, name: &str) -> i64 {
@@ -319,18 +353,19 @@ unsafe fn upload_f32_tensor_opt(h: i64, name: &str) -> i64 {
 
 unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     let p = format!("blk.{}.", b);
-    let (w_q, nb_qo, _)            = upload_tensor_u8(h, &format!("{}attn_q.weight", p));
-    let (w_k, nb_kv, _)            = upload_tensor_u8(h, &format!("{}attn_k.weight", p));
+    let (w_q, nb_qo, dt_q)         = upload_tensor_u8(h, &format!("{}attn_q.weight", p));
+    let (w_k, nb_kv, dt_k)         = upload_tensor_u8(h, &format!("{}attn_k.weight", p));
     let (w_v, _, dt_v)             = upload_tensor_u8(h, &format!("{}attn_v.weight", p));
-    let (w_o, _, _)                = upload_tensor_u8(h, &format!("{}attn_output.weight", p));
-    let (w_gate, nb_gate_up, _)    = upload_tensor_u8(h, &format!("{}ffn_gate.weight", p));
-    let (w_up, _, _)               = upload_tensor_u8(h, &format!("{}ffn_up.weight", p));
+    let (w_o, _, dt_o)             = upload_tensor_u8(h, &format!("{}attn_output.weight", p));
+    let (w_gate, nb_gate_up, dt_gate) = upload_tensor_u8(h, &format!("{}ffn_gate.weight", p));
+    let (w_up, _, dt_up)           = upload_tensor_u8(h, &format!("{}ffn_up.weight", p));
     let (w_down, nb_down, dt_down) = upload_tensor_u8(h, &format!("{}ffn_down.weight", p));
     BlockGpu {
         attn_norm_g: upload_f32_tensor(h, &format!("{}attn_norm.weight", p)),
         ffn_norm_g:  upload_f32_tensor(h, &format!("{}ffn_norm.weight", p)),
         w_q, w_k, w_o, w_gate, w_up,
-        w_v, dt_v, w_down, dt_down,
+        w_v, w_down,
+        dt_q, dt_k, dt_v, dt_o, dt_gate, dt_up, dt_down,
         // Qwen2 has biases on Q/K/V; Qwen3 doesn't.  Load as optional.
         b_q: upload_f32_tensor_opt(h, &format!("{}attn_q.bias", p)),
         b_k: upload_f32_tensor_opt(h, &format!("{}attn_k.bias", p)),
@@ -366,24 +401,16 @@ unsafe fn block_forward_devarg(
     let rope_base = cfg.rope_base;
     let norm_eps = cfg.norm_eps;
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
-    aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_q, act.q,
-        d_model, (bw.nb_qo / cfg.d_model) as c_int);
+    dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, d_model, d_model);
     if bw.b_q != 0 {
         // Qwen2 has Q bias; Qwen3 doesn't (BlockGpu.b_q == 0 for qwen3).
         aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, d_model);
     }
-    aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_k, act.k_step,
-        d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
+    dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
     if bw.b_k != 0 {
         aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv);
     }
-    if bw.dt_v == 14 {
-        aether_op_fused_q6k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
-            d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
-    } else {
-        aether_op_fused_q4k_matmul_seq1_v2_cuda(act.x_norm, bw.w_v, act.v_step,
-            d_kv, (bw.nb_kv / cfg.d_kv) as c_int);
-    }
+    dispatch_matmul(act.x_norm, bw.w_v, bw.dt_v, act.v_step, d_kv, d_model);
     if bw.b_v != 0 {
         aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
     }
@@ -421,20 +448,21 @@ unsafe fn block_forward_devarg(
             n_q_heads, n_kv_heads, head_dim, scale,
             max_seq as c_int, step_args);
     }
-    aether_op_fused_q4k_matmul_seq1_v2_cuda(act.attn_out, bw.w_o, act.proj,
-        d_model, (bw.nb_qo / cfg.d_model) as c_int);
+    dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, d_model);
     aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
-    aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
-        act.x_norm, bw.w_gate, bw.w_up, act.gate,
-        d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
-    if bw.dt_down == 14 {
-        aether_op_fused_q6k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
-            d_model, (bw.nb_down / cfg.d_model) as c_int);
+    // gate+up fused (Q4_K only).  If either is F16/Q6_K we'd need to fall
+    // back to separate matmuls — not exercised on Qwen2.5 / Qwen3 where
+    // gate/up are always Q4_K in the typical Q4_K_M quants.
+    if bw.dt_gate == 12 && bw.dt_up == 12 {
+        aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
+            act.x_norm, bw.w_gate, bw.w_up, act.gate,
+            d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
     } else {
-        aether_op_fused_q4k_matmul_seq1_v2_cuda(act.gate, bw.w_down, act.down,
-            d_model, (bw.nb_down / cfg.d_model) as c_int);
+        panic!("FFN gate/up dtypes not both Q4_K (got gate={}, up={}); needs a non-fused fallback",
+            bw.dt_gate, bw.dt_up);
     }
+    dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
     aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
 }
 
@@ -778,15 +806,8 @@ impl QwenSession {
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
             self.cfg.norm_eps, 1, self.cfg.d_model as c_int);
-        if self.lm_dt == 14 {
-            aether_op_fused_q6k_matmul_seq1_v2_cuda(
-                self.act.x_norm, self.lm_head, self.act.logits,
-                self.cfg.vocab as c_int, (self.lm_n_blocks / self.cfg.vocab) as c_int);
-        } else {
-            aether_op_fused_q4k_matmul_seq1_v2_cuda(
-                self.act.x_norm, self.lm_head, self.act.logits,
-                self.cfg.vocab as c_int, (self.lm_n_blocks / self.cfg.vocab) as c_int);
-        }
+        dispatch_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
+            self.cfg.vocab as c_int, self.cfg.d_model as c_int);
         let rc = aether_dev_graph_end();
         assert_eq!(rc, 0, "aether_dev_graph_end failed: {}", rc);
         self.graph_captured = true;

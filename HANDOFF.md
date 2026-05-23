@@ -1,7 +1,74 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-25 (**Bigger-models foundation LANDED: runtime ModelConfig from
+2026-05-25 evening (**Qwen3-8B running end-to-end through Aether — first
+non-Qwen2.5 model.**
+
+Per-arch dispatch for `qwen3` shipped AND verified on real GPU.  Output
+of `aether-serve --gguf <Qwen3-8B>` + curl POST:
+
+```
+[aether-serve] loading GGUF: ...sha256-a3de86cd...
+[QwenSession] arch=qwen3 layers=36 d_model=4096 heads_q=32 heads_kv=8
+              head_dim=128 d_ff=12288 vocab=151936 rope=1000000 eps=1e-6
+[aether-serve] model loaded in 3.39s
+POST /v1/chat/completions {"prompt_ids":[9707,11,1879,0],"max_tokens":8}
+→ "content":" I'm a new user. How can"
+→ 11.41 tok/s
+```
+
+Components landed this turn:
+
+(1) **F16 weight loading + matmul kernel** (FR-17-extra-f16-fwd).  Qwen3
+    GGUFs store some tensors (V projections, in this case) as raw F16
+    (dtype=1, 2 bytes/elem) while the rest are Q4_K_M.
+    `upload_tensor_u8` now accepts dtype 1 alongside 12/14 and copies
+    n_elems × 2 raw bytes to the device.
+    New CUDA kernel `fused_f16_matmul_seq1` in KERNEL_SRC does the dot
+    product against F16 weights via `aether_f16_to_f32_dev` per element,
+    256-thread CTAs with warp-reduce + cross-warp reduce.
+
+(2) **Per-tensor dtype dispatch** (FR-17-extra-mixed-quant).
+    `BlockGpu` gained `dt_q/dt_k/dt_v/dt_o/dt_gate/dt_up/dt_down` fields.
+    New helper `dispatch_matmul(x, w, dt, y, n_out, n_in)` routes by
+    dtype to the right kernel (Q4_K→fused_q4k, Q6_K→fused_q6k,
+    F16→fused_f16).  All Q/K/V/O/down matmuls + LM head now route
+    through this helper.  Mixed-precision GGUFs (any combination of
+    Q4_K + Q6_K + F16 weights across the block tensors) work as long as
+    gate+up are both Q4_K (the fused gate_up_silu_mul kernel is still
+    Q4_K-only, panics otherwise — a non-fused fallback is the next stage).
+
+(3) **Qwen3 arch dispatch** (FR-17-extra-qwen3-fwd).
+    `BlockGpu` gained `attn_q_norm_g / attn_k_norm_g` (Option<i64> as 0/non-0).
+    `load_block` reads `attn_q_norm.weight` + `attn_k_norm.weight` via
+    `upload_f32_tensor_opt` (returns 0 if absent; qwen2 has none).
+    `block_forward_devarg` applies per-head RMS norm to Q and K when the
+    gain tensors are present (rows=n_heads, d=head_dim).  Skips
+    `bias_add` for Q/K/V when the bias tensor is absent (qwen3 has none).
+    Llama-style models (no biases, no Q/K norm) are now automatically
+    supported by this same dispatch.
+
+Regression checks (RTX 3070 Ti):
+- `qwen25_paged_parity` and `qwen25_multitenant_pool` both still pass
+  bit-identically.  Qwen2.5-7B's tokens unchanged.
+- The F16 dispatch branch only activates when `dt == 1`; Qwen2.5 GGUFs
+  hit `dt == 12 || 14` and continue using the original fused kernels.
+
+**Architecture compatibility status after this commit:**
+
+| Model | Arch | Status |
+|---|---|---|
+| Qwen2.5-7B | qwen2 | ✅ baseline working |
+| Qwen2.5-14B | qwen2 | ✅ would work (not local to test) |
+| **Qwen3-8B** | qwen3 | **✅ generating real text @ 11 tok/s on 3070 Ti** |
+| Qwen3-VL | qwen3vl | ⚠ qwen3 LLM works; vision tower path needed |
+| Llama (any size) | llama | ✅ should work (no biases/norms — handled by optional fields) |
+| Qwen3-Coder 30B | qwen3moe | ⚠ MoE FFN kernel needed |
+| DeepSeek-Coder-V2 | deepseek2 | ⚠ MLA attention + MoE |
+| Gemma3 27B | gemma3 | ❌ head_dim=168 + sliding-window |
+
+### 2026-05-25 (Bigger-models foundation: runtime ModelConfig)
+**Bigger-models foundation LANDED: runtime ModelConfig from
 GGUF metadata + multi-arch probe.**  Every hardcoded Qwen2.5-7B
 dimension in `runtime/src/serving.rs` is now a runtime parameter read
 from the GGUF metadata at session construction.

@@ -73,6 +73,7 @@ struct CudaCtx {
     attention_seq1_devarg: CudaFunction,
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
+    fused_f16_matmul_seq1: CudaFunction,
 }
 
 /// FR-19.4-extra paged-KV kernels — held in a separate `OnceCell` so the
@@ -1701,6 +1702,43 @@ extern "C" __global__ void fused_q6k_matmul_seq1_v2(
     }
 }
 
+// FR-17-extra-f16-fwd — F16-weight matmul for seq=1 autoregressive decode.
+// Layout: weights stored as raw F16 (2 bytes/elem) in row-major order
+// [n_out * n_in].  Input x is F32 [n_in].  Output y is F32 [n_out].
+// One CTA per output row; 256 threads/CTA stride-loop over n_in.
+extern "C" __global__ void fused_f16_matmul_seq1(
+    const float*         __restrict__ x,
+    const unsigned short* __restrict__ w_f16,
+    float*               __restrict__ y,
+    int n_in, int n_out)
+{
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    const unsigned short* w_row = w_f16 + (size_t)o * n_in;
+    float acc = 0.0f;
+    for (int i = tid; i < n_in; i += blockDim.x) {
+        float w = aether_f16_to_f32_dev(w_row[i]);
+        acc += x[i] * w;
+    }
+    // Warp-reduce then single-warp reduce.
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    __shared__ float warp_sums[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float w_acc = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            w_acc += __shfl_down_sync(0xFFFFFFFFu, w_acc, off);
+        }
+        if (lane == 0) y[o] = w_acc;
+    }
+}
+
 extern "C" __global__ void dequant_q6_k(
     const unsigned char* __restrict__ blocks,
     float*               __restrict__ out,
@@ -1815,7 +1853,8 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_ffn_gate_up_silu_mul",
               "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
-              "append_kv", "attention_seq1"])
+              "append_kv", "attention_seq1",
+              "fused_f16_matmul_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -1852,6 +1891,7 @@ fn ctx() -> &'static CudaCtx {
         let attention_seq1_devarg = device.get_func("aether_kernels", "attention_seq1_devarg").unwrap();
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
+        let fused_f16_matmul_seq1 = device.get_func("aether_kernels", "fused_f16_matmul_seq1").unwrap();
 
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
@@ -1865,7 +1905,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
-                  append_kv, attention_seq1 }
+                  append_kv, attention_seq1, fused_f16_matmul_seq1 }
     })
 }
 
@@ -2952,6 +2992,33 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().paged_attention_seq1_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, sv))
             .expect("launch paged_attention_seq1_devarg");
+    }
+    0
+}
+
+/// FR-17-extra-f16-fwd — matmul against F16-stored weights.
+/// y[o] = sum_i x[i] * f16_to_f32(w[o, i])  for o in 0..n_out, x in F32.
+#[no_mangle] pub extern "C" fn aether_op_fused_f16_matmul_seq1_cuda(
+    x: i64, w_f16: i64, y: i64, n_in: c_int, n_out: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_f16) else { return -1; };
+    if n_in <= 0 || n_out <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_f16_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_in, n_out))
+            .expect("launch fused_f16_matmul_seq1");
     }
     0
 }
