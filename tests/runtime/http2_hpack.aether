@@ -1,0 +1,25 @@
+// roadmap: P19.2
+// expect: exit=42
+//
+// FR-19.2-extra — HTTP/2 frame codec + HPACK static table + Huffman decode.
+//
+// The witness calls `aether_http2_self_loopback_smoke` which:
+//   1. Builds a SETTINGS frame, parses it back, verifies type + payload length
+//   2. HPACK-encodes a server response header set with status+content-type+content-length,
+//      decodes it, verifies all three (name, value) pairs round-trip exactly
+//   3. Decodes the RFC 7541 §C.4.1 Huffman test string "www.example.com" from its
+//      canonical encoded form (f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff)
+//
+// SCOPE: server-side HTTP/2 — DATA, HEADERS, SETTINGS, WINDOW_UPDATE, PING,
+// GOAWAY, RST_STREAM frame codecs; HPACK static table (61 entries) decode
+// indexed/literal-with-indexing/literal-without-indexing/never-indexed
+// representations, Huffman DECODE; encode emits literal-without-indexing with
+// static-table name compression. No dynamic table indexing, no Huffman ENCODE
+// on output (curl interop only needs decode-side).
+use runtime;
+
+extern fn aether_http2_self_loopback_smoke() -> i32;
+
+fn main() -> i32 {
+    aether_http2_self_loopback_smoke()
+}

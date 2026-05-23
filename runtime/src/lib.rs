@@ -22,6 +22,8 @@ pub mod nccl_real;
 
 pub mod tls13;
 
+pub mod http2;
+
 // Single-threaded tape for the bootstrap runtime. Originally `thread_local!`
 // — the TLS init hook for that drags Rust's `std::thread` machinery into the
 // cdylib's DllMain, which in turn calls `bcryptprimitives.dll!ProcessPrng`
@@ -5781,10 +5783,14 @@ pub(crate) fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
     let h3 = (h3 & nmask) | (g3 & mask);
     let h4 = (h4 & nmask) | (g4 & mask);
     // h = (h0 | h1<<26 | h2<<52 | h3<<78 | h4<<104) + s
+    // Pack the 5 × 26-bit limbs into 4 × 32-bit limbs.  Each `_full` value
+    // MUST be masked to 32 bits — without the mask the shifted upper limbs
+    // leak data bits into the >32 range, which then gets misinterpreted as
+    // carry when we add `s`, producing an incorrect tag.
     let mut h0_full = ((h0 as u64) | ((h1 as u64) << 26)) & 0xffffffff;
-    let mut h1_full = ((h1 as u64) >> 6) | ((h2 as u64) << 20);
-    let mut h2_full = ((h2 as u64) >> 12) | ((h3 as u64) << 14);
-    let mut h3_full = ((h3 as u64) >> 18) | ((h4 as u64) << 8);
+    let mut h1_full = (((h1 as u64) >> 6) | ((h2 as u64) << 20)) & 0xffffffff;
+    let mut h2_full = (((h2 as u64) >> 12) | ((h3 as u64) << 14)) & 0xffffffff;
+    let mut h3_full = (((h3 as u64) >> 18) | ((h4 as u64) << 8)) & 0xffffffff;
     let s = &key[16..32];
     let s0 = u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64;
     let s1 = u32::from_le_bytes([s[4], s[5], s[6], s[7]]) as u64;
@@ -7030,6 +7036,54 @@ fn sc_muladd(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
     *out_path_len = path.len() as c_int;
     body_off as c_int
 }
+// =====================================================================
+// aether_random_bytes — OS-provided cryptographic randomness.
+//
+// Backs server_random / x25519_priv / ed25519_seed generation in TLS 1.3
+// servers, and any other consumer that needs unpredictable bytes.
+// =====================================================================
+#[cfg(target_os = "windows")]
+#[link(name = "bcrypt")]
+extern "system" {
+    fn BCryptGenRandom(
+        hAlgorithm: *mut c_void,
+        pbBuffer: *mut u8,
+        cbBuffer: u32,
+        dwFlags: u32,
+    ) -> i32;
+}
+#[cfg(target_os = "windows")]
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
+
+/// Fill `out[..n]` with cryptographically-strong random bytes.
+/// Returns `n` on success or -1 on system error.
+#[no_mangle] pub unsafe extern "C" fn aether_random_bytes(
+    out: *mut c_void, n: c_int,
+) -> c_int {
+    if out.is_null() || n <= 0 { return -1; }
+    let buf = std::slice::from_raw_parts_mut(out as *mut u8, n as usize);
+    #[cfg(target_os = "windows")]
+    {
+        let r = BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            n as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        );
+        if r != 0 { return -1; }
+        return n;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::io::Read;
+        let mut f = match std::fs::File::open("/dev/urandom") {
+            Ok(f) => f, Err(_) => return -1,
+        };
+        if f.read_exact(buf).is_err() { return -1; }
+        return n;
+    }
+}
+
 /// Write a minimal HTTP/1.1 200 OK response with the given body.
 /// Format: "HTTP/1.1 200 OK\r\nContent-Length: N\r\n\r\n<body>".
 /// Returns total bytes written or -1 on overflow.

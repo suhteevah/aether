@@ -14,7 +14,7 @@
 //!
 //! roadmap: P19.1-extra
 
-use aether_rt::tls13::{client_for_test::TestClient, record, TlsServerSession, State};
+use aether_rt::tls13::{client_for_test::TestClient, record, TlsServerSession, State, TlsClientSession, ClientState};
 use aether_rt::tls13::REC_APPLICATION_DATA;
 
 /// Drive a full TLS 1.3 handshake + 1 round-trip of app data.
@@ -92,6 +92,59 @@ fn tls13_full_loopback() {
     assert_eq!(recovered, c_to_s_msg);
 
     println!("[loopback] TLS 1.3 handshake + 2 app data records — PASS");
+}
+
+/// Drive both halves via the public TlsServerSession + TlsClientSession state
+/// machines (no direct use of client_for_test).
+#[test]
+fn tls13_client_session_loopback() {
+    let server_seed = [0xa1u8; 32];
+    let server_random = [0xa2u8; 32];
+    let server_x25519_priv = [0xa3u8; 32];
+    let client_x25519_priv = [0xa4u8; 32];
+    let client_random = [0xa5u8; 32];
+    let client_session_id: Vec<u8> = (0..16u8).collect();
+
+    let mut server = TlsServerSession::new(
+        &server_seed, &server_random, &server_x25519_priv,
+        "aether-client-session-test", b"\x03",
+    );
+    let mut client = TlsClientSession::new(client_x25519_priv, client_random, client_session_id);
+    assert_eq!(client.state(), ClientState::ExpectServerFlight);
+
+    // Client → server: ClientHello
+    let to_server = client.take_outbound();
+    assert!(!to_server.is_empty());
+    let app1 = server.feed(&to_server).unwrap();
+    assert!(app1.is_empty());
+    assert_eq!(server.state(), State::SentServerFlight);
+
+    // Server → client: full flight
+    let to_client = server.take_outbound();
+    assert!(!to_client.is_empty());
+    let app2 = client.feed(&to_client).unwrap();
+    assert!(app2.is_empty());
+    assert!(client.is_handshake_done(), "client should be Connected after server flight");
+
+    // Client → server: client Finished
+    let fin = client.take_outbound();
+    assert!(!fin.is_empty());
+    let app3 = server.feed(&fin).unwrap();
+    assert!(app3.is_empty());
+    assert_eq!(server.state(), State::Connected);
+
+    // Application data round-trip (both ways).
+    let s2c = b"server->client via TlsClientSession";
+    server.send_app_data(s2c).unwrap();
+    let bytes = server.take_outbound();
+    let got = client.feed(&bytes).unwrap();
+    assert_eq!(got, s2c);
+
+    let c2s = b"client->server via TlsClientSession";
+    client.send_app_data(c2s).unwrap();
+    let bytes = client.take_outbound();
+    let got = server.feed(&bytes).unwrap();
+    assert_eq!(got, c2s);
 }
 
 /// Negative test: a tampered server flight (single byte flipped) must fail the

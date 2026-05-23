@@ -1,7 +1,61 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-22 evening (**TLS 1.3 server-side handshake state machine SHIPPED — FR-19.1-extra**. `runtime/src/tls13.rs` implements RFC 8446 server end-to-end on top of Aether's from-scratch crypto: TLSPlaintext/TLSCiphertext record layer with per-record nonce derivation (IV XOR seq big-endian) + AAD construction, key schedule (Early/Handshake/Master + 4 traffic secrets per §7.1), handshake message codecs (parse ClientHello, encode ServerHello/EncryptedExtensions/Certificate/CertificateVerify/Finished, parse client Finished), minimal X.509 self-signed Ed25519 cert generator (OID 1.3.101.112, full DER tree), and a `TlsServerSession` state-machine driver. Profile: TLS_CHACHA20_POLY1305_SHA256 + X25519 + Ed25519 only; no PSK / 0-RTT / resumption / ALPN. Witness: `runtime/tests/tls13_loopback.rs` (in-process server + matching client; full handshake + 2 app-data records round-trip; tamper test rejects flipped server flight). `.aether` audit witness: `tests/runtime/tls13_handshake.aether` exits 42 via `aether_tls13_self_loopback_smoke`. FFI surface: `aether_tls13_server_new/feed/take_outbound/send/is_done/free`. Audit clean.
+2026-05-23 (**Path D landing — full TLS 1.3 + HTTP/2 + aether-serve HTTPS interop.**
+Pickup from "go on 1" → completed every tractable Path D item.  Highlights:
+(1) **aether-serve has a working `--tls` mode**: generates fresh Ed25519 + X25519
+on startup via `aether_random_bytes` (BCryptGenRandom on Windows), self-signs
+an X.509 cert, drives a `TlsStream` adapter over each accepted TCP socket,
+runs HTTP/1.1 on the decrypted bytes.  GET /health, GET /v1/models, and POST
+/v1/chat/completions all round-trip through TLS with `openssl s_client`
+(RFC-conformant interop verified end-to-end — `Cipher is TLS_CHACHA20_POLY1305_SHA256`
++ `Peer Temp Key: X25519` + cert chain validated + real HTTP/1.1 response body
+decrypted).  Schannel-backed curl on Windows refuses Ed25519 sigs
+(`SEC_E_ALGORITHM_MISMATCH`) — a known Windows Schannel limitation, not a
+server bug.
+(2) **TlsClientSession** is now a public streaming state machine (mirrors
+TlsServerSession), plus FFI (`aether_tls13_client_*`).  Loopback test
+`tls13_client_session_loopback` drives a full handshake + 2 app-data records
+through both `TlsServerSession` and `TlsClientSession` end-to-end.
+(3) **HTTP/2 + HPACK shipped** (`runtime/src/http2.rs`, ~600 LOC).  Frame
+codec (DATA, HEADERS, SETTINGS, WINDOW_UPDATE, PING, GOAWAY, RST_STREAM),
+HPACK static table (61 entries), HPACK integer codec, Huffman DECODER
+(RFC 7541 Appendix B — full 257-symbol table; decodes
+`www.example.com` per §C.4.1).  6 unit tests pass; `.aether` witness
+`tests/runtime/http2_hpack.aether` exits 42 via
+`aether_http2_self_loopback_smoke`.
+(4) **TLS 1.3 record layer made streaming-tolerant** — `TlsServerSession.feed`
+now buffers partial records across calls (essential for real TCP delivery
+which doesn't honor record boundaries).
+(5) **Caught a real Poly1305 bug en route** — RFC 7539 §2.8.2 vector test
+exposed unmasked spurious bits in the 5×26→4×32 limb conversion at MAC
+finalization (round-trip tests pass because the bug was self-consistent).
+Fix: mask each `h_full_i` to 32 bits before the final s-addition.  Without
+this fix, openssl rejects with `bad_record_mac` on the first encrypted
+record.
+(6) **Real RNG primitive** `aether_random_bytes` shipped (BCryptGenRandom
+on Windows, `/dev/urandom` on Unix).  No external deps.
+Items DEFERRED (multi-session): real GPU-backed paged KV cache + continuous
+batching require kernel changes to attention to walk page tables at seq>1
+reads; the existing FR-19.4/FR-19.5 simulations stay closed.  Audit 169/196
+unchanged (all this is FR-x-extra per the parent-tag convention).)
+
+### 2026-05-22 evening (prior — TLS 1.3 handshake landing)
+**TLS 1.3 server-side handshake state machine SHIPPED — FR-19.1-extra.**
+`runtime/src/tls13.rs` implements RFC 8446 server end-to-end on top of Aether's
+from-scratch crypto: TLSPlaintext/TLSCiphertext record layer with per-record
+nonce derivation (IV XOR seq big-endian) + AAD construction, key schedule
+(Early/Handshake/Master + 4 traffic secrets per §7.1), handshake message
+codecs (parse ClientHello, encode ServerHello/EncryptedExtensions/Certificate/
+CertificateVerify/Finished, parse client Finished), minimal X.509 self-signed
+Ed25519 cert generator (OID 1.3.101.112, full DER tree), and a
+`TlsServerSession` state-machine driver. Profile: TLS_CHACHA20_POLY1305_SHA256
++ X25519 + Ed25519 only; no PSK / 0-RTT / resumption / ALPN. Witness:
+`runtime/tests/tls13_loopback.rs` (in-process server + matching client; full
+handshake + 2 app-data records round-trip; tamper test rejects flipped server
+flight). `.aether` audit witness: `tests/runtime/tls13_handshake.aether`
+exits 42 via `aether_tls13_self_loopback_smoke`. FFI surface:
+`aether_tls13_server_new/feed/take_outbound/send/is_done/free`. Audit clean.
 
 ### 2026-05-22 morning (prior in same day)
 **aether-serve generates real Qwen text via HTTP**. End-to-end Qwen2.5-7B hosting on localhost: `aether-serve --gguf <path> --warmup 6` → curl POST `/v1/chat/completions` returns OpenAI-shaped JSON with real generated text at 24 tok/s warm (capped by GPU power state on bursty single-request workloads; same kernels reach 37 tok/s warm in the sustained `qwen25_graph_decode` bench). SSE streaming (`"stream":true`) emits per-token delta chunks. Plus FR-19.1-extra crypto primitives (SHA-256/512, HMAC, HKDF, X25519, Ed25519) — the foundation underneath the TLS 1.3 handshake shipped this evening.

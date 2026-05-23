@@ -33,6 +33,8 @@ use aether_rt::{
     aether_tcp_send, aether_tcp_recv, aether_tcp_close, aether_tcp_stream_close,
     aether_http_parse_request, aether_http_write_response_200,
     aether_openai_render_completion,
+    aether_random_bytes,
+    tls13::TlsServerSession,
 };
 
 #[cfg(feature = "cuda")]
@@ -46,6 +48,8 @@ struct Cli {
     max_tokens_default: usize,
     stop_token: Option<usize>,
     warmup: usize,
+    tls: bool,
+    tls_cn: String,
 }
 
 fn parse_cli() -> Cli {
@@ -54,8 +58,10 @@ fn parse_cli() -> Cli {
         model: "qwen2.5-7b-instruct".into(),
         gguf: None,
         max_tokens_default: 64,
-        stop_token: None,  // QwenSession.eos_token used as default
+        stop_token: None,
         warmup: 4,
+        tls: false,
+        tls_cn: "aether-serve.local".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -71,13 +77,17 @@ fn parse_cli() -> Cli {
                                  else { Some(s.parse().expect("stop-token int")) };
             }
             "--warmup" => cli.warmup = it.next().expect("--warmup N").parse().expect("warmup int"),
+            "--tls" => { cli.tls = true; if cli.port == 8080 { cli.port = 8443; } }
+            "--tls-cn" => cli.tls_cn = it.next().expect("--tls-cn NAME"),
             "-h" | "--help" => {
-                eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N]");
+                eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME]");
                 eprintln!();
                 eprintln!("  Listens on 0.0.0.0:port for OpenAI-compat /v1/chat/completions.");
                 eprintln!("  --gguf points at any Qwen2.5-7B-Instruct Q4_K_M model file.");
                 eprintln!("  --warmup N runs N synthetic decode steps on startup to drive");
                 eprintln!("    the GPU into P0/P2 power state and pre-capture the graph.");
+                eprintln!("  --tls enables TLS 1.3 (self-signed Ed25519 cert generated on startup");
+                eprintln!("        with --tls-cn as the cert CN; default port becomes 8443).");
                 eprintln!("  Without --gguf, returns a stub response (HTTP/JSON plumbing only).");
                 std::process::exit(0);
             }
@@ -85,6 +95,100 @@ fn parse_cli() -> Cli {
         }
     }
     cli
+}
+
+// ============================================================================
+// TLS adapter: wraps a TCP stream + TlsServerSession.  Drives the handshake
+// at open time, then exposes read_app / write_app over decrypted bytes.
+// ============================================================================
+
+unsafe fn rand32() -> [u8; 32] {
+    let mut a = [0u8; 32];
+    let n = aether_random_bytes(a.as_mut_ptr() as *mut c_void, 32);
+    assert_eq!(n, 32, "BCryptGenRandom failed");
+    a
+}
+
+struct TlsStream {
+    fd: i64,
+    sess: TlsServerSession,
+    app_buf: Vec<u8>,
+    eof: bool,
+}
+
+impl TlsStream {
+    /// Build a TLS session bound to the given socket fd.  Generates fresh
+    /// Ed25519 + X25519 keys + server_random + serial.  Does NOT run the
+    /// handshake — call `handshake()` next.
+    unsafe fn accept(fd: i64, cn: &str) -> Self {
+        let ed_seed = rand32();
+        let server_random = rand32();
+        let x25519_priv = rand32();
+        let mut serial = [0u8; 16];
+        let _ = aether_random_bytes(serial.as_mut_ptr() as *mut c_void, 16);
+        // Clear top bit so DER INTEGER stays positive without an extra leading 0x00.
+        serial[0] &= 0x7f;
+        if serial[0] == 0 { serial[0] = 1; }
+        let sess = TlsServerSession::new(&ed_seed, &server_random, &x25519_priv, cn, &serial);
+        Self { fd, sess, app_buf: Vec::new(), eof: false }
+    }
+
+    /// Drive the TLS handshake by ping-ponging recv/send until session is Connected.
+    unsafe fn handshake(&mut self) -> Result<(), &'static str> {
+        let mut tmp = vec![0u8; 16 * 1024];
+        loop {
+            if self.sess.is_handshake_done() { return Ok(()); }
+            let n = aether_tcp_recv(self.fd, tmp.as_mut_ptr() as i64, tmp.len() as i64);
+            if n <= 0 { return Err("tcp recv during handshake failed"); }
+            let plain = self.sess.feed(&tmp[..n as usize]).map_err(|_| "tls feed error")?;
+            self.app_buf.extend_from_slice(&plain);
+            let out = self.sess.take_outbound();
+            if !out.is_empty() {
+                let sent = aether_tcp_send(self.fd, out.as_ptr() as i64, out.len() as i64);
+                if sent != out.len() as i64 { return Err("tcp send during handshake failed"); }
+            }
+        }
+    }
+
+    /// Read up to `dst.len()` decrypted application-data bytes.  Returns 0
+    /// on clean close, byte count otherwise.
+    unsafe fn read_app(&mut self, dst: &mut [u8]) -> Result<usize, &'static str> {
+        loop {
+            if !self.app_buf.is_empty() {
+                let n = self.app_buf.len().min(dst.len());
+                dst[..n].copy_from_slice(&self.app_buf[..n]);
+                self.app_buf.drain(..n);
+                return Ok(n);
+            }
+            if self.eof { return Ok(0); }
+            let mut tmp = vec![0u8; 16 * 1024];
+            let n = aether_tcp_recv(self.fd, tmp.as_mut_ptr() as i64, tmp.len() as i64);
+            if n == 0 { self.eof = true; return Ok(0); }
+            if n < 0 { return Err("tcp recv app failed"); }
+            let plain = self.sess.feed(&tmp[..n as usize]).map_err(|_| "tls feed app error")?;
+            self.app_buf.extend_from_slice(&plain);
+            let out = self.sess.take_outbound();
+            if !out.is_empty() {
+                let _ = aether_tcp_send(self.fd, out.as_ptr() as i64, out.len() as i64);
+            }
+        }
+    }
+
+    /// Encrypt + send application-data bytes.  Records are 16 KiB max in
+    /// TLS 1.3; we fragment if needed.
+    unsafe fn write_app(&mut self, src: &[u8]) -> Result<usize, &'static str> {
+        const CHUNK: usize = 16 * 1024 - 32;
+        let mut i = 0;
+        while i < src.len() {
+            let take = (src.len() - i).min(CHUNK);
+            self.sess.send_app_data(&src[i..i + take]).map_err(|_| "tls send_app_data failed")?;
+            let out = self.sess.take_outbound();
+            let sent = aether_tcp_send(self.fd, out.as_ptr() as i64, out.len() as i64);
+            if sent != out.len() as i64 { return Err("tcp send app failed"); }
+            i += take;
+        }
+        Ok(src.len())
+    }
 }
 
 // ---- minimal JSON body parser (only the fields we care about) ----
@@ -274,67 +378,141 @@ impl ServerState {
     }
 }
 
-unsafe fn handle_request(state: &ServerState, stream: i64) {
-    // 1. Read request bytes (one buffer for now; Content-Length must fit).
-    let mut req_buf = vec![0u8; 65536];
-    let got = aether_tcp_recv(stream, req_buf.as_mut_ptr() as i64, req_buf.len() as i64);
-    if got <= 0 {
-        eprintln!("[serve] recv returned {}", got);
-        return;
-    }
-    let req_bytes = &req_buf[..got as usize];
+// ----------------------------------------------------------------------------
+// Transport trait — uniform read/write over plain TCP or TLS.
+// ----------------------------------------------------------------------------
 
-    // 2. Parse method + path.
+trait Transport {
+    unsafe fn read(&mut self, dst: &mut [u8]) -> Result<usize, &'static str>;
+    unsafe fn write(&mut self, src: &[u8]) -> Result<usize, &'static str>;
+}
+
+struct PlainTcp { pub fd: i64 }
+
+impl Transport for PlainTcp {
+    unsafe fn read(&mut self, dst: &mut [u8]) -> Result<usize, &'static str> {
+        let n = aether_tcp_recv(self.fd, dst.as_mut_ptr() as i64, dst.len() as i64);
+        if n < 0 { Err("tcp recv failed") } else { Ok(n as usize) }
+    }
+    unsafe fn write(&mut self, src: &[u8]) -> Result<usize, &'static str> {
+        let n = aether_tcp_send(self.fd, src.as_ptr() as i64, src.len() as i64);
+        if n != src.len() as i64 { Err("tcp send short") } else { Ok(n as usize) }
+    }
+}
+
+impl Transport for TlsStream {
+    unsafe fn read(&mut self, dst: &mut [u8]) -> Result<usize, &'static str> {
+        TlsStream::read_app(self, dst)
+    }
+    unsafe fn write(&mut self, src: &[u8]) -> Result<usize, &'static str> {
+        TlsStream::write_app(self, src)
+    }
+}
+
+/// Read bytes until we have full HTTP/1.1 headers + the declared Content-Length
+/// body, returning the assembled buffer (headers + body) or an error.
+unsafe fn read_full_http_request(t: &mut dyn Transport, max: usize) -> Result<Vec<u8>, &'static str> {
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = vec![0u8; 8192];
+    // Phase 1: read until CRLF CRLF.
+    let mut header_end: Option<usize> = None;
+    while header_end.is_none() {
+        if buf.len() >= max { return Err("request too large"); }
+        let n = t.read(&mut tmp)?;
+        if n == 0 { return Err("eof before headers"); }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(p) = find_crlf_crlf(&buf) { header_end = Some(p + 4); }
+    }
+    let body_start = header_end.unwrap();
+    // Parse Content-Length out of headers.
+    let head = &buf[..body_start];
+    let content_length = parse_content_length(head).unwrap_or(0);
+    let need = body_start + content_length;
+    while buf.len() < need {
+        if buf.len() >= max { return Err("request body too large"); }
+        let n = t.read(&mut tmp)?;
+        if n == 0 { return Err("eof in body"); }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    buf.truncate(need);
+    Ok(buf)
+}
+
+fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn parse_content_length(head: &[u8]) -> Option<usize> {
+    let s = std::str::from_utf8(head).ok()?;
+    for line in s.split("\r\n") {
+        let mut parts = line.splitn(2, ':');
+        let k = parts.next()?.trim();
+        if !k.eq_ignore_ascii_case("content-length") { continue; }
+        let v = parts.next()?.trim();
+        return v.parse().ok();
+    }
+    None
+}
+
+unsafe fn handle_request(state: &ServerState, t: &mut dyn Transport) {
+    let req_bytes = match read_full_http_request(t, 1 << 20) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[serve] {}", e);
+            let _ = send_text_t(t, 400, e);
+            return;
+        }
+    };
+
+    // Parse method + path.
     let mut strings = vec![0u8; 512];
     let mut m_len: c_int = 0;
     let mut p_len: c_int = 0;
     let body_off = aether_http_parse_request(
-        req_bytes.as_ptr() as *const c_void, got as c_int,
+        req_bytes.as_ptr() as *const c_void, req_bytes.len() as c_int,
         strings.as_mut_ptr() as *mut c_void, strings.len() as c_int,
         &mut m_len, &mut p_len,
     );
     if body_off <= 0 {
-        send_text(stream, 400, "bad request");
+        let _ = send_text_t(t, 400, "bad request");
         return;
     }
-    let method = std::str::from_utf8(&strings[..m_len as usize]).unwrap_or("");
-    let path = std::str::from_utf8(&strings[m_len as usize..(m_len + p_len) as usize]).unwrap_or("");
+    let method = std::str::from_utf8(&strings[..m_len as usize]).unwrap_or("").to_string();
+    let path = std::str::from_utf8(&strings[m_len as usize..(m_len + p_len) as usize]).unwrap_or("").to_string();
     let body = &req_bytes[body_off as usize..];
     eprintln!("[serve] {} {} body_len={}", method, path, body.len());
 
-    match (method, path) {
-        ("GET", "/health") => send_text(stream, 200, "ok"),
-        ("GET", "/v1/models") => handle_list_models(state, stream),
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/health") => { let _ = send_text_t(t, 200, "ok"); }
+        ("GET", "/v1/models") => handle_list_models_t(state, t),
         ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
-            handle_completion(state, stream, body)
+            handle_completion_t(state, t, body)
         }
-        _ => send_text(stream, 404, "not found"),
+        _ => { let _ = send_text_t(t, 404, "not found"); }
     }
 }
 
-unsafe fn handle_list_models(state: &ServerState, stream: i64) {
+unsafe fn handle_list_models_t(state: &ServerState, t: &mut dyn Transport) {
     let body = format!(
         "{{\"object\":\"list\",\"data\":[{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"aether\"}}]}}",
         state.cli.model);
-    send_json(stream, 200, &body);
+    let _ = send_json_t(t, 200, &body);
 }
 
-unsafe fn handle_completion(state: &ServerState, stream: i64, body: &[u8]) {
+unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: &[u8]) {
     let req = match parse_body(body, state.cli.max_tokens_default) {
         Ok(r) => r,
-        Err(e) => { send_text(stream, 400, e); return; }
+        Err(e) => { let _ = send_text_t(t, 400, e); return; }
     };
 
     if req.text_prompt.is_some() && req.prompt_ids.is_empty() {
-        // FR-x-extra: BPE encode pending. For now, reject with a useful
-        // hint so the caller knows what to send.
-        send_text(stream, 501,
+        let _ = send_text_t(t, 501,
             "text-prompt encode not wired yet; pass prompt_ids (token ids) for now");
         return;
     }
 
     if req.stream {
-        handle_completion_streaming(state, stream, &req);
+        handle_completion_streaming_t(state, t, &req);
         return;
     }
 
@@ -392,7 +570,7 @@ unsafe fn handle_completion(state: &ServerState, stream: i64, body: &[u8]) {
         json_buf.as_mut_ptr() as *mut c_void, json_buf.len() as c_int,
     );
     if n_json <= 0 {
-        send_text(stream, 500, "render failed");
+        let _ = send_text_t(t, 500, "render failed");
         return;
     }
 
@@ -402,14 +580,11 @@ unsafe fn handle_completion(state: &ServerState, stream: i64, body: &[u8]) {
         http_buf.as_mut_ptr() as *mut c_void, http_buf.len() as c_int,
     );
     if n_http <= 0 {
-        send_text(stream, 500, "http write failed");
+        let _ = send_text_t(t, 500, "http write failed");
         return;
     }
 
-    let _ = aether_tcp_send(stream, http_buf.as_ptr() as i64, n_http as i64);
-
-    // SSE streaming knob is wired (req.stream) — Phase 3 task will emit
-    // real `data: {...}\n\n` chunks per token. Single-shot today.
+    let _ = t.write(&http_buf[..n_http as usize]);
     let _ = req.stream;
 }
 
@@ -429,21 +604,16 @@ fn format_id_list(ids: &[usize]) -> String {
 }
 
 /// SSE streaming variant of /v1/chat/completions. Sends one `data:` chunk
-/// per generated token, decoded to real text via the loaded BPE
-/// tokenizer + GPT-2 byte fixup. Terminates with `data: [DONE]\n\n`.
-///
-/// Uses HTTP/1.1 chunked transfer encoding so the response can stream
-/// without knowing the final length in advance.
-unsafe fn handle_completion_streaming(state: &ServerState, stream: i64, req: &JsonBody) {
-    // Send headers immediately.
+/// per generated token via HTTP/1.1 chunked transfer encoding.
+unsafe fn handle_completion_streaming_t(state: &ServerState, t: &mut dyn Transport, req: &JsonBody) {
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
-    let _ = aether_tcp_send(stream, headers.as_ptr() as i64, headers.len() as i64);
+    let _ = t.write(headers.as_bytes());
 
-    let send_chunk = |s: &str| {
+    let mut send_chunk = |t: &mut dyn Transport, s: &str| {
         let hex_len = format!("{:x}\r\n", s.len());
-        let _ = aether_tcp_send(stream, hex_len.as_ptr() as i64, hex_len.len() as i64);
-        let _ = aether_tcp_send(stream, s.as_ptr() as i64, s.len() as i64);
-        let _ = aether_tcp_send(stream, "\r\n".as_ptr() as i64, 2);
+        let _ = t.write(hex_len.as_bytes());
+        let _ = t.write(s.as_bytes());
+        let _ = t.write(b"\r\n");
     };
 
     #[cfg(feature = "cuda")]
@@ -464,24 +634,23 @@ unsafe fn handle_completion_streaming(state: &ServerState, stream: i64, req: &Js
                 let chunk = format!(
                     "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
                     escaped);
-                send_chunk(&chunk);
+                send_chunk(t, &chunk);
                 last = id;
             }
-            send_chunk("data: [DONE]\n\n");
+            send_chunk(t, "data: [DONE]\n\n");
         } else {
-            send_chunk("data: {\"error\":\"--gguf not supplied\"}\n\n");
-            send_chunk("data: [DONE]\n\n");
+            send_chunk(t, "data: {\"error\":\"--gguf not supplied\"}\n\n");
+            send_chunk(t, "data: [DONE]\n\n");
         }
     }
     #[cfg(not(feature = "cuda"))]
     {
         let _ = state; let _ = req;
-        send_chunk("data: {\"error\":\"built without --features cuda\"}\n\n");
-        send_chunk("data: [DONE]\n\n");
+        send_chunk(t, "data: {\"error\":\"built without --features cuda\"}\n\n");
+        send_chunk(t, "data: [DONE]\n\n");
     }
 
-    // Final zero-length chunk to terminate transfer-encoding.
-    let _ = aether_tcp_send(stream, "0\r\n\r\n".as_ptr() as i64, 5);
+    let _ = t.write(b"0\r\n\r\n");
 }
 
 fn json_escape(s: &str) -> String {
@@ -500,18 +669,18 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-unsafe fn send_text(stream: i64, code: i32, msg: &str) {
+unsafe fn send_text_t(t: &mut dyn Transport, code: i32, msg: &str) -> Result<(), &'static str> {
     let resp = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         code, http_status_text(code), msg.len(), msg);
-    let _ = aether_tcp_send(stream, resp.as_ptr() as i64, resp.len() as i64);
+    t.write(resp.as_bytes()).map(|_| ())
 }
 
-unsafe fn send_json(stream: i64, code: i32, body: &str) {
+unsafe fn send_json_t(t: &mut dyn Transport, code: i32, body: &str) -> Result<(), &'static str> {
     let resp = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         code, http_status_text(code), body.len(), body);
-    let _ = aether_tcp_send(stream, resp.as_ptr() as i64, resp.len() as i64);
+    t.write(resp.as_bytes()).map(|_| ())
 }
 
 fn http_status_text(code: i32) -> &'static str {
@@ -524,6 +693,8 @@ fn http_status_text(code: i32) -> &'static str {
 
 fn main() {
     let cli = parse_cli();
+    let tls_on = cli.tls;
+    let tls_cn = cli.tls_cn.clone();
     let state = match ServerState::new(cli) {
         Ok(s) => s,
         Err(e) => { eprintln!("[aether-serve] startup error: {}", e); std::process::exit(1); }
@@ -535,13 +706,18 @@ fn main() {
             std::process::exit(1);
         }
         let bound_port = aether_tcp_listener_port(listener);
-        eprintln!("[aether-serve] listening on 0.0.0.0:{} (model={})", bound_port, state.cli.model);
-        eprintln!("[aether-serve] try:");
-        eprintln!("  curl http://localhost:{}/v1/models", bound_port);
-        eprintln!("  curl http://localhost:{}/health", bound_port);
-        eprintln!("  curl -X POST http://localhost:{}/v1/chat/completions \\", bound_port);
-        eprintln!("       -H 'Content-Type: application/json' \\");
-        eprintln!("       -d '{{\"prompt_ids\":[9707,11,1879,0],\"max_tokens\":16}}'");
+        let scheme = if tls_on { "https" } else { "http" };
+        eprintln!("[aether-serve] listening on 0.0.0.0:{} ({}, model={})", bound_port, scheme, state.cli.model);
+        if tls_on {
+            eprintln!("[aether-serve] TLS 1.3 enabled; fresh self-signed Ed25519 cert per session (CN={})", tls_cn);
+            eprintln!("[aether-serve] try:");
+            eprintln!("  curl -k --tlsv1.3 https://localhost:{}/health", bound_port);
+            eprintln!("  curl -k --tlsv1.3 https://localhost:{}/v1/models", bound_port);
+        } else {
+            eprintln!("[aether-serve] try:");
+            eprintln!("  curl http://localhost:{}/v1/models", bound_port);
+            eprintln!("  curl http://localhost:{}/health", bound_port);
+        }
 
         loop {
             let stream = aether_tcp_accept_one(listener);
@@ -549,7 +725,16 @@ fn main() {
                 eprintln!("[serve] accept returned {} (continuing)", stream);
                 continue;
             }
-            handle_request(&state, stream);
+            if tls_on {
+                let mut tls = TlsStream::accept(stream, &tls_cn);
+                match tls.handshake() {
+                    Ok(_) => handle_request(&state, &mut tls),
+                    Err(e) => eprintln!("[serve] tls handshake failed: {}", e),
+                }
+            } else {
+                let mut plain = PlainTcp { fd: stream };
+                handle_request(&state, &mut plain);
+            }
             aether_tcp_stream_close(stream);
         }
         #[allow(unreachable_code)]

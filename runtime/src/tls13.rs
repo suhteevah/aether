@@ -689,6 +689,9 @@ pub struct TlsServerSession {
 
     /// Bytes queued to send to the peer.
     out_buf: Vec<u8>,
+    /// Inbound bytes received but not yet consumed as a complete record.
+    /// Lets `feed()` tolerate streaming TCP that may deliver partial records.
+    pending: Vec<u8>,
 }
 
 impl TlsServerSession {
@@ -727,6 +730,7 @@ impl TlsServerSession {
             transcript_at_server_fin: Vec::new(),
             server_finished_verify_data: [0u8; 32],
             out_buf: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -738,64 +742,51 @@ impl TlsServerSession {
         std::mem::take(&mut self.out_buf)
     }
 
-    /// Feed inbound TCP bytes.  Returns Ok(()) on success, Err(&str) on protocol
-    /// errors (caller should drop the connection).
+    /// Feed inbound TCP bytes.  Buffers partial records across calls.
+    /// Returns Ok(decrypted_app_data) or Err(&str) on protocol error.
     pub fn feed(&mut self, input: &[u8]) -> Result<Vec<u8>, &'static str> {
+        self.pending.extend_from_slice(input);
         let mut decrypted_app: Vec<u8> = Vec::new();
-        let mut pos = 0;
-        while pos < input.len() {
+        loop {
+            if self.pending.len() < 5 { break; } // need at least the record header
+            let len = u16::from_be_bytes([self.pending[3], self.pending[4]]) as usize;
+            if self.pending.len() < 5 + len { break; } // partial record body
+            // Snapshot the full record bytes so we don't borrow self.pending across the body.
+            let record_total = 5 + len;
+            let record_bytes: Vec<u8> = self.pending[..record_total].to_vec();
+            // Drain consumed bytes from pending up front.
+            self.pending.drain(..record_total);
             match self.state {
                 State::ExpectClientHello => {
-                    let (rt, body, consumed) = match record::parse_plaintext(&input[pos..]) {
-                        Some(t) => t,
-                        None => return Err("incomplete ClientHello record"),
-                    };
+                    let (rt, body, _consumed) = record::parse_plaintext(&record_bytes)
+                        .ok_or("malformed ClientHello record")?;
                     if rt != REC_HANDSHAKE { return Err("expected handshake record"); }
-                    pos += consumed;
                     self.handle_client_hello_record(body)?;
                 }
                 State::SentServerFlight => {
-                    // Expect encrypted Finished (or CCS, which we tolerate-and-skip).
-                    if input[pos] == REC_CHANGE_CIPHER_SPEC {
-                        // RFC 8446 §5: tolerate a single CCS post-CH.
-                        let (_t, _b, consumed) = match record::parse_plaintext(&input[pos..]) {
-                            Some(t) => t,
-                            None => return Err("incomplete CCS"),
-                        };
-                        pos += consumed;
-                        continue;
-                    }
+                    // Tolerate a CCS record (RFC 8446 §5 middlebox-compat).
+                    if record_bytes[0] == REC_CHANGE_CIPHER_SPEC { continue; }
                     let keys = self.client_hs_keys.as_ref().ok_or("no client hs keys")?;
                     let seq = self.client_hs_seq;
-                    let (inner_type, plain, consumed) =
-                        record::open_record(&input[pos..], &keys.key, &keys.iv, seq)
+                    let (inner_type, plain, _consumed) =
+                        record::open_record(&record_bytes, &keys.key, &keys.iv, seq)
                             .ok_or("decryption failure on client Finished")?;
                     self.client_hs_seq += 1;
-                    pos += consumed;
                     if inner_type != REC_HANDSHAKE { return Err("expected handshake inner type"); }
                     self.handle_client_finished(&plain)?;
                 }
                 State::Connected => {
-                    // Application data records.
-                    if input[pos] == REC_CHANGE_CIPHER_SPEC {
-                        let (_t, _b, consumed) = match record::parse_plaintext(&input[pos..]) {
-                            Some(t) => t,
-                            None => return Err("incomplete CCS"),
-                        };
-                        pos += consumed;
-                        continue;
-                    }
+                    if record_bytes[0] == REC_CHANGE_CIPHER_SPEC { continue; }
                     let keys = self.client_app_keys.as_ref().ok_or("no client app keys")?;
                     let seq = self.client_app_seq;
-                    let (inner_type, plain, consumed) =
-                        record::open_record(&input[pos..], &keys.key, &keys.iv, seq)
+                    let (inner_type, plain, _consumed) =
+                        record::open_record(&record_bytes, &keys.key, &keys.iv, seq)
                             .ok_or("decryption failure on app data")?;
                     self.client_app_seq += 1;
-                    pos += consumed;
                     match inner_type {
                         REC_APPLICATION_DATA => decrypted_app.extend_from_slice(&plain),
                         REC_ALERT => { self.state = State::Closed; }
-                        _ => {} // ignore handshake post-handshake msgs (NewSessionTicket, KeyUpdate not supported)
+                        _ => {} // post-handshake messages (NewSessionTicket, KeyUpdate) ignored
                     }
                 }
                 State::Closed => return Err("session closed"),
@@ -1123,12 +1114,240 @@ unsafe fn sessions() -> &'static mut SessionTable { &mut *SESSIONS.0.get() }
 }
 
 // ============================================================================
-// Self-test client (for the loopback integration test)
+// TlsClientSession — streaming client state machine.
 //
-// A matching client harness that crafts a ClientHello, drives the session,
-// verifies the server flight, sends Finished, then exchanges 1 app-data record.
-// Kept #[cfg(test)] in lib (tests/tls13_loopback.rs) — but useful as a regular
-// function to share with the FFI integration test.
+// `TlsClientSession::new(...)` -> ExpectServerHello (after a ClientHello is
+// queued in out_buf).  feed(server_bytes) advances through the server flight,
+// verifies CV signature + server Finished MAC, emits client Finished, and
+// transitions to Connected.  send_app_data + take_outbound mirror the server.
+//
+// Internally reuses `client_for_test::TestClient` for the actual byte-shovelling
+// (build_client_hello_record + process_server_flight_and_build_client_finished),
+// but exposes a clean state-machine façade analogous to TlsServerSession.
+// ============================================================================
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ClientState {
+    ExpectServerFlight,
+    Connected,
+    Closed,
+}
+
+pub struct TlsClientSession {
+    state: ClientState,
+    client: client_for_test::TestClient,
+    client_hello_record: Vec<u8>,
+    /// Bytes received from server but not yet a complete flight.
+    pending: Vec<u8>,
+    /// Bytes to send to server.
+    out_buf: Vec<u8>,
+    /// App data not yet read by caller.
+    app_buf: Vec<u8>,
+
+    server_app_keys: Option<key_schedule::DirKeys>,
+    client_app_keys: Option<key_schedule::DirKeys>,
+    server_app_seq: u64,
+    client_app_seq: u64,
+}
+
+impl TlsClientSession {
+    /// Construct a client and queue the ClientHello in the outbound buffer.
+    /// Caller should `take_outbound()` and send those bytes to the server, then
+    /// `feed()` server responses until `is_handshake_done()`.
+    pub fn new(x25519_priv: [u8; 32], random: [u8; 32], session_id: Vec<u8>) -> Self {
+        let client = client_for_test::TestClient::new(x25519_priv, random, session_id);
+        let ch = client.build_client_hello_record();
+        Self {
+            state: ClientState::ExpectServerFlight,
+            client,
+            client_hello_record: ch.clone(),
+            pending: Vec::new(),
+            out_buf: ch,
+            app_buf: Vec::new(),
+            server_app_keys: None,
+            client_app_keys: None,
+            server_app_seq: 0,
+            client_app_seq: 0,
+        }
+    }
+
+    pub fn state(&self) -> ClientState { self.state }
+    pub fn is_handshake_done(&self) -> bool { self.state == ClientState::Connected }
+    pub fn take_outbound(&mut self) -> Vec<u8> { std::mem::take(&mut self.out_buf) }
+
+    /// Feed inbound server bytes.  Returns Ok(decrypted_app_data) or Err on protocol error.
+    pub fn feed(&mut self, input: &[u8]) -> Result<Vec<u8>, &'static str> {
+        self.pending.extend_from_slice(input);
+        match self.state {
+            ClientState::ExpectServerFlight => {
+                // Walk records: we need ServerHello (cleartext) + 1+ encrypted records ending in Finished.
+                // The existing process_server_flight_and_build_client_finished expects the FULL flight.
+                // Heuristic: keep buffering until the first encrypted record contains Finished
+                // (i.e., when the encrypted record's last decrypted handshake msg is type 20).
+                // Simple approximation: try to process; if it returns "fin peel" type errors, wait.
+                let attempt = self.client.process_server_flight_and_build_client_finished(
+                    &self.pending, &self.client_hello_record);
+                match attempt {
+                    Ok((c_app, s_app, c_fin, _transcript)) => {
+                        self.out_buf.extend_from_slice(&c_fin);
+                        self.server_app_keys = Some(s_app);
+                        self.client_app_keys = Some(c_app);
+                        self.state = ClientState::Connected;
+                        self.pending.clear(); // server flight consumed
+                        Ok(Vec::new())
+                    }
+                    Err(e) => {
+                        // Distinguish "need more bytes" vs "fatal".  process_server_flight_...
+                        // returns errors like "no SH record" / "fin peel" when bytes are missing.
+                        // Heuristic: if message mentions "peel" or "no SH" or "open server flight failed",
+                        // treat as transient (need more data).
+                        if e.contains("peel") || e.contains("no SH") || e.contains("open server flight failed") {
+                            Ok(Vec::new())
+                        } else {
+                            Err("client flight processing failed")
+                        }
+                    }
+                }
+            }
+            ClientState::Connected => {
+                let keys = self.server_app_keys.as_ref().ok_or("no server app keys")?;
+                let mut decrypted = Vec::new();
+                loop {
+                    if self.pending.len() < 5 { break; }
+                    let len = u16::from_be_bytes([self.pending[3], self.pending[4]]) as usize;
+                    if self.pending.len() < 5 + len { break; }
+                    let rec_total = 5 + len;
+                    let rec: Vec<u8> = self.pending[..rec_total].to_vec();
+                    self.pending.drain(..rec_total);
+                    if rec[0] == REC_CHANGE_CIPHER_SPEC { continue; }
+                    let (inner_type, plain, _n) =
+                        record::open_record(&rec, &keys.key, &keys.iv, self.server_app_seq)
+                            .ok_or("client app decrypt failed")?;
+                    self.server_app_seq += 1;
+                    match inner_type {
+                        REC_APPLICATION_DATA => decrypted.extend_from_slice(&plain),
+                        REC_ALERT => { self.state = ClientState::Closed; }
+                        _ => {} // post-handshake messages ignored
+                    }
+                }
+                self.app_buf.extend_from_slice(&decrypted);
+                Ok(decrypted)
+            }
+            ClientState::Closed => Err("session closed"),
+        }
+    }
+
+    /// Encrypt + queue application-data bytes for sending.
+    pub fn send_app_data(&mut self, plaintext: &[u8]) -> Result<(), &'static str> {
+        if self.state != ClientState::Connected { return Err("not connected"); }
+        let keys = self.client_app_keys.as_ref().ok_or("no client app keys")?;
+        const CHUNK: usize = 16 * 1024 - 32;
+        let mut i = 0;
+        while i < plaintext.len() {
+            let take = (plaintext.len() - i).min(CHUNK);
+            record::seal_record(&mut self.out_buf, &keys.key, &keys.iv,
+                self.client_app_seq, REC_APPLICATION_DATA, &plaintext[i..i + take]);
+            self.client_app_seq += 1;
+            i += take;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// FFI for TlsClientSession
+// ============================================================================
+
+struct ClientTable {
+    items: Vec<Option<Box<TlsClientSession>>>,
+}
+struct ClientTableCell(UnsafeCell<ClientTable>);
+unsafe impl Sync for ClientTableCell {}
+static CLIENTS: ClientTableCell = ClientTableCell(UnsafeCell::new(ClientTable { items: Vec::new() }));
+#[inline] unsafe fn clients() -> &'static mut ClientTable { &mut *CLIENTS.0.get() }
+
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_client_new(
+    x25519_priv_ptr: *const c_void,
+    random_ptr: *const c_void,
+    session_id_ptr: *const c_void, n_session_id: c_int,
+) -> i64 {
+    if x25519_priv_ptr.is_null() || random_ptr.is_null() || n_session_id < 0 { return -1; }
+    let priv_ = {
+        let s = std::slice::from_raw_parts(x25519_priv_ptr as *const u8, 32);
+        let mut a = [0u8; 32]; a.copy_from_slice(s); a
+    };
+    let rand = {
+        let s = std::slice::from_raw_parts(random_ptr as *const u8, 32);
+        let mut a = [0u8; 32]; a.copy_from_slice(s); a
+    };
+    let sid = if session_id_ptr.is_null() || n_session_id == 0 { Vec::new() }
+              else { std::slice::from_raw_parts(session_id_ptr as *const u8, n_session_id as usize).to_vec() };
+    let c = TlsClientSession::new(priv_, rand, sid);
+    let t = clients();
+    for (i, slot) in t.items.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(Box::new(c)); return i as i64; }
+    }
+    t.items.push(Some(Box::new(c)));
+    (t.items.len() - 1) as i64
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_client_feed(
+    handle: i64, in_ptr: *const c_void, n_in: c_int,
+    out_app: *mut c_void, max_app: c_int,
+) -> c_int {
+    let t = clients();
+    if handle < 0 || (handle as usize) >= t.items.len() { return -2; }
+    let Some(sess) = t.items[handle as usize].as_mut() else { return -2; };
+    let buf = std::slice::from_raw_parts(in_ptr as *const u8, n_in as usize);
+    let plain = match sess.feed(buf) { Ok(p) => p, Err(_) => return -1, };
+    if plain.len() > max_app as usize { return -1; }
+    if !plain.is_empty() && !out_app.is_null() {
+        std::slice::from_raw_parts_mut(out_app as *mut u8, plain.len()).copy_from_slice(&plain);
+    }
+    plain.len() as c_int
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_client_take_outbound(
+    handle: i64, out: *mut c_void, max_out: c_int,
+) -> c_int {
+    let t = clients();
+    if handle < 0 || (handle as usize) >= t.items.len() { return -2; }
+    let Some(sess) = t.items[handle as usize].as_mut() else { return -2; };
+    let v = sess.take_outbound();
+    if v.len() > max_out as usize { return -1; }
+    if !v.is_empty() && !out.is_null() {
+        std::slice::from_raw_parts_mut(out as *mut u8, v.len()).copy_from_slice(&v);
+    }
+    v.len() as c_int
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_client_send(
+    handle: i64, app: *const c_void, n_app: c_int,
+) -> c_int {
+    let t = clients();
+    if handle < 0 || (handle as usize) >= t.items.len() { return -2; }
+    let Some(sess) = t.items[handle as usize].as_mut() else { return -2; };
+    let buf = std::slice::from_raw_parts(app as *const u8, n_app as usize);
+    match sess.send_app_data(buf) { Ok(_) => n_app, Err(_) => -1 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_client_is_done(handle: i64) -> c_int {
+    let t = clients();
+    if handle < 0 || (handle as usize) >= t.items.len() { return -1; }
+    let Some(sess) = t.items[handle as usize].as_ref() else { return -1; };
+    if sess.is_handshake_done() { 1 } else { 0 }
+}
+
+#[no_mangle] pub unsafe extern "C" fn aether_tls13_client_free(handle: i64) -> c_int {
+    let t = clients();
+    if handle < 0 || (handle as usize) >= t.items.len() { return -1; }
+    t.items[handle as usize] = None;
+    0
+}
+
+// ============================================================================
+// Self-test client (kept as a public module — `TlsClientSession` builds on top
+// of `client_for_test::TestClient`).
 // ============================================================================
 
 pub mod client_for_test {
@@ -1457,6 +1676,65 @@ mod tests {
         let n256 = record::build_nonce(&iv, 256);
         let expected256 = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0a, 0x0c];
         assert_eq!(n256, expected256);
+    }
+
+    /// RFC 7539 §2.8.2 — known ciphertext + tag for the canonical test vector.
+    /// Catches any self-consistent bug in our chacha20-poly1305 impl.
+    #[test]
+    fn aead_rfc7539_2_8_2_vector() {
+        let key: [u8; 32] = [
+            0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87,
+            0x88,0x89,0x8a,0x8b,0x8c,0x8d,0x8e,0x8f,
+            0x90,0x91,0x92,0x93,0x94,0x95,0x96,0x97,
+            0x98,0x99,0x9a,0x9b,0x9c,0x9d,0x9e,0x9f,
+        ];
+        let nonce: [u8; 12] = [
+            0x07,0x00,0x00,0x00,0x40,0x41,0x42,0x43,
+            0x44,0x45,0x46,0x47,
+        ];
+        let aad: [u8; 12] = [
+            0x50,0x51,0x52,0x53,0xc0,0xc1,0xc2,0xc3,
+            0xc4,0xc5,0xc6,0xc7,
+        ];
+        let plain = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let expected_ct_tag = hex_decode(concat!(
+            "d31a8d34648e60db7b86afbc53ef7ec2",
+            "a4aded51296e08fea9e2b5a736ee62d6",
+            "3dbea45e8ca9671282fafb69da92728b",
+            "1a71de0a9e060b2905d6a5b67ecd3b36",
+            "92ddbd7f2d778b8c9803aee328091b58",
+            "fab324e4fad675945585808b4831d7bc",
+            "3ff4def08e4b7a9de576d26586cec64b",
+            "6116",
+            // Poly1305 tag (RFC 7539 §2.8.2):
+            "1ae10b594f09e26a7e902ecbd0600691",
+        ));
+        let got = aead_chacha20_poly1305_seal(&key, &nonce, &aad, plain);
+        if got != expected_ct_tag {
+            // Find first differing byte for triage.
+            for i in 0..got.len().min(expected_ct_tag.len()) {
+                if got[i] != expected_ct_tag[i] {
+                    panic!("RFC 7539 mismatch at byte {}: got {:02x} expected {:02x}\n  got first 32 = {}\n  exp first 32 = {}",
+                        i, got[i], expected_ct_tag[i],
+                        got[..32.min(got.len())].iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                        expected_ct_tag[..32.min(expected_ct_tag.len())].iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                    );
+                }
+            }
+            panic!("length mismatch: got {} expected {}", got.len(), expected_ct_tag.len());
+        }
+    }
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let bytes = s.as_bytes();
+        for i in (0..bytes.len()).step_by(2) {
+            let h = char::from(bytes[i]).to_digit(16).unwrap() as u8;
+            let l = char::from(bytes[i + 1]).to_digit(16).unwrap() as u8;
+            out.push((h << 4) | l);
+        }
+        out
     }
 
     #[test]
