@@ -49,10 +49,14 @@ use crate::cuda::{
     aether_op_paged_append_kv_devarg_f32_cuda,
     aether_op_paged_attention_seq1_devarg_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
+    aether_op_mul_inplace_f32_cuda, aether_op_silu_f32_cuda,
+    aether_op_scale_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
+    aether_op_fused_q4k_expert_matmul_seq1_cuda,
+    aether_op_matmul_f32_cuda,
     aether_dev_graph_begin, aether_dev_graph_end,
     aether_dev_graph_launch, aether_dev_graph_destroy,
 };
@@ -114,6 +118,11 @@ pub struct ModelConfig {
     pub rope_base: f32,
     pub norm_eps: f32,
     pub arch: String, // "qwen2", "llama", etc.  Used for metadata-key namespacing.
+    /// FR-17-extra-moe-fwd: Mixture-of-Experts.  0 = dense FFN; >0 = MoE
+    /// with this many total experts.
+    pub n_experts: usize,
+    /// MoE top-k: number of experts routed per token.  Unused when n_experts=0.
+    pub n_experts_used: usize,
 }
 
 impl ModelConfig {
@@ -126,6 +135,7 @@ impl ModelConfig {
             d_ff: D_FF, vocab: VOCAB,
             rope_base: ROPE_BASE, norm_eps: NORM_EPS,
             arch: "qwen2".to_string(),
+            n_experts: 0, n_experts_used: 0,
         }
     }
 
@@ -161,9 +171,16 @@ impl ModelConfig {
         let norm_eps = read_meta_f32(gguf_handle,
             &format!("{}.attention.layer_norm_rms_epsilon", prefix))
             .unwrap_or(NORM_EPS);
+        // MoE — present in qwen3moe / qwen3vlmoe / deepseek2 / mixtral / etc.
+        // `expert_count` is the total expert pool; `expert_used_count` is top-k.
+        let n_experts = read_meta_u32(gguf_handle, &format!("{}.expert_count", prefix))
+            .map(|v| v as usize).unwrap_or(0);
+        let n_experts_used = read_meta_u32(gguf_handle, &format!("{}.expert_used_count", prefix))
+            .map(|v| v as usize).unwrap_or(0);
         Self {
             d_model, n_layers, n_q_heads, n_kv_heads, head_dim, d_kv,
             d_ff, vocab, rope_base, norm_eps, arch,
+            n_experts, n_experts_used,
         }
     }
 }
@@ -205,6 +222,13 @@ struct BlockGpu {
     /// `nb_*` semantics: for Q4_K/Q6_K, # of 256-elem super-blocks;
     /// for F16, # of elements.  See `upload_tensor_u8` for the contract.
     nb_qo: usize, nb_kv: usize, nb_gate_up: usize, nb_down: usize,
+    /// FR-17-extra-moe-fwd — MoE expert weights.  All 0 when arch is dense.
+    /// w_router: F32 device buffer [d_model × n_experts], stored as f32.
+    /// w_*_exps: u8 device buffer holding n_experts concatenated expert
+    /// weights in the underlying quant dtype (typically Q4_K).
+    w_router: i64,
+    w_gate_exps: i64, w_up_exps: i64, w_down_exps: i64,
+    dt_gate_exps: i32, dt_up_exps: i32, dt_down_exps: i32,
 }
 
 struct ActivationGpu {
@@ -351,29 +375,60 @@ unsafe fn upload_f32_tensor_opt(h: i64, name: &str) -> i64 {
     d
 }
 
+/// Optional u8 tensor loader for MoE expert weights.  Returns (handle, n_units, dt)
+/// where n_units is 256-elem blocks for Q4_K/Q6_K and elem count for F16.
+/// Returns (0, 0, 0) if absent.
+unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
+    let needle = name.as_bytes();
+    let idx = aether_gguf_find_tensor_by_name(h, needle.as_ptr() as i64, needle.len() as c_int);
+    if idx < 0 { return (0, 0, 0); }
+    let dt = aether_gguf_get_tensor_dtype(h, idx);
+    let n_elems = aether_gguf_get_tensor_n_elems(h, idx) as usize;
+    let (n_units, bytes) = match dt {
+        12 => { let nb = n_elems / 256; (nb, nb * 144) }
+        14 => { let nb = n_elems / 256; (nb, nb * 210) }
+        1  => { (n_elems, n_elems * 2) }
+        _  => return (0, 0, 0),
+    };
+    let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
+    let d_handle = aether_dev_alloc_u8(bytes as c_int);
+    aether_dev_h2d_u8(dptr, d_handle, bytes as c_int);
+    (d_handle, n_units, dt)
+}
+
 unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     let p = format!("blk.{}.", b);
     let (w_q, nb_qo, dt_q)         = upload_tensor_u8(h, &format!("{}attn_q.weight", p));
     let (w_k, nb_kv, dt_k)         = upload_tensor_u8(h, &format!("{}attn_k.weight", p));
     let (w_v, _, dt_v)             = upload_tensor_u8(h, &format!("{}attn_v.weight", p));
     let (w_o, _, dt_o)             = upload_tensor_u8(h, &format!("{}attn_output.weight", p));
-    let (w_gate, nb_gate_up, dt_gate) = upload_tensor_u8(h, &format!("{}ffn_gate.weight", p));
-    let (w_up, _, dt_up)           = upload_tensor_u8(h, &format!("{}ffn_up.weight", p));
-    let (w_down, nb_down, dt_down) = upload_tensor_u8(h, &format!("{}ffn_down.weight", p));
+    // For DENSE FFN the three tensors live under ffn_gate/up/down.  For MoE
+    // they live under ffn_gate_exps/up_exps/down_exps and there's a router
+    // tensor ffn_gate_inp.  Try DENSE first; fall back to MoE.
+    let (w_gate, nb_gate_up, dt_gate) = upload_tensor_u8_opt(h, &format!("{}ffn_gate.weight", p));
+    let (w_up, _, dt_up)           = upload_tensor_u8_opt(h, &format!("{}ffn_up.weight", p));
+    let (w_down, nb_down, dt_down) = upload_tensor_u8_opt(h, &format!("{}ffn_down.weight", p));
+    let (w_gate_exps, _, dt_gate_exps) = upload_tensor_u8_opt(h, &format!("{}ffn_gate_exps.weight", p));
+    let (w_up_exps,   _, dt_up_exps)   = upload_tensor_u8_opt(h, &format!("{}ffn_up_exps.weight", p));
+    let (w_down_exps, _, dt_down_exps) = upload_tensor_u8_opt(h, &format!("{}ffn_down_exps.weight", p));
+    let w_router = upload_f32_tensor_opt(h, &format!("{}ffn_gate_inp.weight", p));
+    if w_gate == 0 && w_gate_exps == 0 {
+        panic!("blk.{} has neither dense ffn_gate nor MoE ffn_gate_exps", b);
+    }
     BlockGpu {
         attn_norm_g: upload_f32_tensor(h, &format!("{}attn_norm.weight", p)),
         ffn_norm_g:  upload_f32_tensor(h, &format!("{}ffn_norm.weight", p)),
         w_q, w_k, w_o, w_gate, w_up,
         w_v, w_down,
         dt_q, dt_k, dt_v, dt_o, dt_gate, dt_up, dt_down,
-        // Qwen2 has biases on Q/K/V; Qwen3 doesn't.  Load as optional.
         b_q: upload_f32_tensor_opt(h, &format!("{}attn_q.bias", p)),
         b_k: upload_f32_tensor_opt(h, &format!("{}attn_k.bias", p)),
         b_v: upload_f32_tensor_opt(h, &format!("{}attn_v.bias", p)),
-        // Qwen3 has per-head Q/K RMS norm; Qwen2 doesn't.  Load as optional.
         attn_q_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_q_norm.weight", p)),
         attn_k_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_k_norm.weight", p)),
         nb_qo, nb_kv, nb_gate_up, nb_down,
+        w_router, w_gate_exps, w_up_exps, w_down_exps,
+        dt_gate_exps, dt_up_exps, dt_down_exps,
     }
 }
 
@@ -451,19 +506,121 @@ unsafe fn block_forward_devarg(
     dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, d_model);
     aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
-    // gate+up fused (Q4_K only).  If either is F16/Q6_K we'd need to fall
-    // back to separate matmuls — not exercised on Qwen2.5 / Qwen3 where
-    // gate/up are always Q4_K in the typical Q4_K_M quants.
-    if bw.dt_gate == 12 && bw.dt_up == 12 {
-        aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
-            act.x_norm, bw.w_gate, bw.w_up, act.gate,
-            d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
+
+    // FFN dispatch: dense (Qwen2/3/Llama) vs MoE (Qwen3-MoE/DeepSeek-V2).
+    if bw.w_router != 0 {
+        moe_ffn_forward(bw, act, cfg);
     } else {
-        panic!("FFN gate/up dtypes not both Q4_K (got gate={}, up={}); needs a non-fused fallback",
-            bw.dt_gate, bw.dt_up);
+        // Dense FFN — gate+up fused (Q4_K only).  If either is F16/Q6_K
+        // we'd need a non-fused fallback (FR-17-extra-non-fused-ffn).
+        if bw.dt_gate == 12 && bw.dt_up == 12 {
+            aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
+                act.x_norm, bw.w_gate, bw.w_up, act.gate,
+                d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
+        } else {
+            panic!("FFN gate/up dtypes not both Q4_K (got gate={}, up={}); needs a non-fused fallback",
+                bw.dt_gate, bw.dt_up);
+        }
+        dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
+        aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
     }
-    dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
-    aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
+}
+
+/// FR-17-extra-moe-fwd — Mixture-of-Experts FFN forward pass.
+///
+/// Per-token decode path:
+///   1. router_logits = W_router @ x_norm                 [n_experts]
+///   2. d2h → sort top-k experts on host → softmax routing weights
+///   3. For each selected expert e_i with weight w_i:
+///        gate_e = Q4K_expert_matmul(x_norm, W_gate_exps, e_i)  [d_ff]
+///        up_e   = Q4K_expert_matmul(x_norm, W_up_exps, e_i)    [d_ff]
+///        gate_e = silu(gate_e) * up_e                          [d_ff]
+///        down_e = quant_matmul(gate_e, W_down_exps_slice_e)    [d_model]
+///        out += w_i * down_e
+///   4. x += out  (residual)
+///
+/// This is the SLOW PATH — per-expert dispatch via separate kernel launches
+/// (1 router matmul + 2*n_experts_used expert gate/up + n_experts_used down
+/// + n_experts_used silu/mul/scale/add per token).  CUDA graph capture
+/// disabled while this is active (top-k selection happens on the host).
+/// Future stage: fused MoE kernel that does router + top-k + per-expert
+/// + combine in one launch with a router-aware dispatcher.
+unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig) {
+    let d_model = cfg.d_model;
+    let d_ff = cfg.d_ff;
+    let n_experts = cfg.n_experts;
+    let n_used = cfg.n_experts_used.max(1);
+    assert!(n_experts > 0, "moe_ffn_forward called on dense block");
+
+    // Workspace allocations.  These are small and short-lived; we re-alloc
+    // per call rather than thread per-session through every kernel signature.
+    // TODO: cache them on QwenSession.
+    let router_logits = aether_dev_alloc_f32(n_experts as c_int);
+    let gate_e = aether_dev_alloc_f32(d_ff as c_int);
+    let up_e = aether_dev_alloc_f32(d_ff as c_int);
+    let down_e = aether_dev_alloc_f32(d_model as c_int);
+    let out_acc = aether_dev_alloc_f32(d_model as c_int);
+    // Zero out_acc by H2D of a zero vector (small, ~16 KB).
+    let zero = vec![0f32; d_model];
+    aether_dev_h2d_f32(zero.as_ptr() as i64, out_acc, d_model as c_int);
+
+    // 1. router_logits = w_router @ x_norm.  w_router is row-major
+    // [n_experts × d_model] f32.  aether_op_matmul_f32_cuda computes
+    // out = a @ b with a: [m, k], b: [k, n], out: [m, n].
+    // We want logits = w_router @ x (column vec).  Set m=n_experts, k=d_model,
+    // n=1, a=w_router, b=x_norm.
+    aether_op_matmul_f32_cuda(
+        bw.w_router, act.x_norm, router_logits,
+        n_experts as c_int, d_model as c_int, 1);
+
+    // 2. D2H + top-k + softmax on host.
+    let mut logits = vec![0f32; n_experts];
+    aether_dev_sync();
+    aether_dev_d2h_f32(router_logits, logits.as_mut_ptr() as i64, n_experts as c_int);
+    let mut idx_sorted: Vec<usize> = (0..n_experts).collect();
+    idx_sorted.sort_unstable_by(|a, b|
+        logits[*b].partial_cmp(&logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    let selected = &idx_sorted[..n_used];
+    let max_l = selected.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
+    let mut weights: Vec<f32> = selected.iter().map(|&i| (logits[i] - max_l).exp()).collect();
+    let sum: f32 = weights.iter().sum();
+    for w in &mut weights { *w /= sum; }
+
+    // 3. Per-expert forward.  blocks_per_row_gate_up = d_model/256 (input dim).
+    // blocks_per_row_down = d_ff/256.
+    let bpr_in = (d_model / 256) as c_int;
+    let bpr_ff = (d_ff / 256) as c_int;
+    for (k, &expert_idx) in selected.iter().enumerate() {
+        let w_i = weights[k];
+        // gate_e = expert_matmul(x_norm, w_gate_exps, expert_idx)  [d_ff]
+        aether_op_fused_q4k_expert_matmul_seq1_cuda(
+            act.x_norm, bw.w_gate_exps, gate_e,
+            d_ff as c_int, bpr_in, expert_idx as c_int);
+        // up_e = expert_matmul(x_norm, w_up_exps, expert_idx)  [d_ff]
+        aether_op_fused_q4k_expert_matmul_seq1_cuda(
+            act.x_norm, bw.w_up_exps, up_e,
+            d_ff as c_int, bpr_in, expert_idx as c_int);
+        // silu(gate_e); gate_e *= up_e
+        aether_op_silu_f32_cuda(gate_e, d_ff as c_int);
+        aether_op_mul_inplace_f32_cuda(gate_e, up_e, d_ff as c_int);
+        // down_e = expert_matmul(gate_e, w_down_exps, expert_idx)  [d_model]
+        aether_op_fused_q4k_expert_matmul_seq1_cuda(
+            gate_e, bw.w_down_exps, down_e,
+            d_model as c_int, bpr_ff, expert_idx as c_int);
+        // out_acc += w_i * down_e
+        aether_op_scale_f32_cuda(down_e, w_i, d_model as c_int);
+        aether_op_add_inplace_f32_cuda(out_acc, down_e, d_model as c_int);
+    }
+
+    // 4. x += out_acc (residual).
+    aether_op_add_inplace_f32_cuda(act.x, out_acc, d_model as c_int);
+
+    // Free workspaces.
+    let _ = aether_dev_free_f32(router_logits);
+    let _ = aether_dev_free_f32(gate_e);
+    let _ = aether_dev_free_f32(up_e);
+    let _ = aether_dev_free_f32(down_e);
+    let _ = aether_dev_free_f32(out_acc);
 }
 
 /// Owns the entire decode-ready GPU state for one Qwen2.5-7B model.
@@ -789,6 +946,22 @@ impl QwenSession {
         }
     }
 
+    /// FR-17-extra-moe-fwd: imperative (non-graph-captured) forward pass.
+    /// Used when host-side dispatch is required (MoE routing).  Runs all
+    /// 28+ block forwards + final norm + LM head + argmax inputs in the
+    /// current call.
+    unsafe fn run_forward_imperative(&mut self) {
+        for b in 0..self.cfg.n_layers {
+            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b],
+                self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+        }
+        aether_op_rms_norm_f32_cuda(
+            self.act.x, self.final_norm_g, self.act.x_norm,
+            self.cfg.norm_eps, 1, self.cfg.d_model as c_int);
+        dispatch_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
+            self.cfg.vocab as c_int, self.cfg.d_model as c_int);
+    }
+
     /// Capture the per-step decode into a CUDA graph. Lazy: called on
     /// the first `decode_step` of the first request after the session
     /// is loaded. Subsequent decode steps reuse the graph.
@@ -825,25 +998,28 @@ impl QwenSession {
     pub fn decode_step(&mut self, last_id: usize) -> usize {
         unsafe {
             let pos = self.next_pos;
-            // Shared-pool mode may need a fresh block when pos crosses a
-            // block_size boundary; no-op otherwise.
             if let Err(e) = self.ensure_block_for_position(pos) {
                 panic!("[QwenSession.decode_step] pool allocation failed at pos {}: {}", pos, e);
             }
-            // Feed input embedding + step args.
             let emb = self.dequant_embd_row(last_id);
             aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, self.cfg.d_model as c_int);
             let cur_seq = pos + 1;
             let step_host = [pos, cur_seq, 0i32, 0i32];
             aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
 
-            if !self.graph_captured {
-                aether_dev_sync();
-                self.capture_graph_now();
-                // Capture only RECORDS — explicit launch needed to execute.
+            if self.cfg.n_experts > 0 {
+                // FR-17-extra-moe-fwd: MoE forward involves host-side top-k
+                // routing per layer, which can't be captured into a CUDA
+                // graph.  Run the forward imperatively each step.
+                self.run_forward_imperative();
+            } else {
+                if !self.graph_captured {
+                    aether_dev_sync();
+                    self.capture_graph_now();
+                }
+                let rc = aether_dev_graph_launch();
+                assert_eq!(rc, 0, "aether_dev_graph_launch failed: {}", rc);
             }
-            let rc = aether_dev_graph_launch();
-            assert_eq!(rc, 0, "aether_dev_graph_launch failed: {}", rc);
             aether_dev_sync();
 
             let mut logits = vec![0.0f32; self.cfg.vocab];
@@ -912,15 +1088,21 @@ impl Drop for QwenSession {
                 let _ = aether_dev_free_u8(b.w_k);
                 let _ = aether_dev_free_u8(b.w_v);
                 let _ = aether_dev_free_u8(b.w_o);
-                let _ = aether_dev_free_u8(b.w_gate);
-                let _ = aether_dev_free_u8(b.w_up);
-                let _ = aether_dev_free_u8(b.w_down);
+                // Dense ffn tensors — may be 0 on MoE archs (which use the _exps variants).
+                if b.w_gate != 0 { let _ = aether_dev_free_u8(b.w_gate); }
+                if b.w_up   != 0 { let _ = aether_dev_free_u8(b.w_up); }
+                if b.w_down != 0 { let _ = aether_dev_free_u8(b.w_down); }
                 // Optional tensors — only free if present.
                 if b.b_q != 0 { let _ = aether_dev_free_f32(b.b_q); }
                 if b.b_k != 0 { let _ = aether_dev_free_f32(b.b_k); }
                 if b.b_v != 0 { let _ = aether_dev_free_f32(b.b_v); }
                 if b.attn_q_norm_g != 0 { let _ = aether_dev_free_f32(b.attn_q_norm_g); }
                 if b.attn_k_norm_g != 0 { let _ = aether_dev_free_f32(b.attn_k_norm_g); }
+                // MoE expert weights — only present on qwen3moe/deepseek2.
+                if b.w_router != 0 { let _ = aether_dev_free_f32(b.w_router); }
+                if b.w_gate_exps != 0 { let _ = aether_dev_free_u8(b.w_gate_exps); }
+                if b.w_up_exps != 0 { let _ = aether_dev_free_u8(b.w_up_exps); }
+                if b.w_down_exps != 0 { let _ = aether_dev_free_u8(b.w_down_exps); }
             }
             let _ = aether_dev_free_f32(self.final_norm_g);
             let _ = aether_dev_free_u8(self.lm_head);

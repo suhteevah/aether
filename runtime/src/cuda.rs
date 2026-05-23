@@ -74,6 +74,7 @@ struct CudaCtx {
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
     fused_f16_matmul_seq1: CudaFunction,
+    fused_q4k_expert_matmul_seq1: CudaFunction,
 }
 
 /// FR-19.4-extra paged-KV kernels — held in a separate `OnceCell` so the
@@ -1702,6 +1703,76 @@ extern "C" __global__ void fused_q6k_matmul_seq1_v2(
     }
 }
 
+// FR-17-extra-moe-fwd — Q4_K matmul against ONE expert's slice of a
+// concatenated MoE expert weight buffer (gate_exps / up_exps / down_exps).
+// `expert_offset_blocks` selects the per-expert slice: each expert occupies
+// `n_out * (n_in/256)` consecutive 256-elem super-blocks.  Otherwise
+// identical to fused_q4k_matmul_seq1 (single-warp split-K design).
+// Used by qwen3moe + deepseek2 MoE FFN.
+extern "C" __global__ void fused_q4k_expert_matmul_seq1(
+    const float*         __restrict__ x,
+    const unsigned char* __restrict__ w_base,
+    float*               __restrict__ y,
+    int n_out, int blocks_per_row, int expert_offset_blocks)
+{
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    // Per-expert weight base = w_base + expert_offset * 144 bytes.
+    // Per-output-row base = expert_base + o * blocks_per_row * 144.
+    size_t exp_off_bytes = (size_t)expert_offset_blocks * 144;
+    size_t row_off_bytes = (size_t)o * (size_t)blocks_per_row * 144;
+    const unsigned char* w_row = w_base + exp_off_bytes + row_off_bytes;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += blockDim.x) {
+        const unsigned char* blk = w_row + (size_t)b * 144;
+        unsigned short d_bits  = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        unsigned short dmin_bits = ((unsigned short)blk[3] << 8) | (unsigned short)blk[2];
+        float d    = aether_f16_to_f32_dev(d_bits);
+        float dmin = aether_f16_to_f32_dev(dmin_bits);
+        const unsigned char* scales = blk + 4;     // 12 bytes
+        const unsigned char* qs     = blk + 16;    // 128 bytes
+        const float* x_blk = x + (size_t)b * 256;
+        float blk_acc = 0.0f;
+        for (int si = 0; si < 8; si++) {
+            int sc6, m6;
+            if (si < 4) {
+                sc6 = scales[si] & 0x3F;
+                m6  = scales[si + 4] & 0x3F;
+            } else {
+                int j = si - 4;
+                sc6 = ((scales[8 + j] & 0xF) | ((scales[j] >> 6) << 4)) & 0x3F;
+                m6  = ((scales[8 + j] >> 4) | ((scales[j + 4] >> 6) << 4)) & 0x3F;
+            }
+            float scale = d * (float)sc6;
+            float bias  = dmin * (float)m6;
+            for (int k = 0; k < 32; k++) {
+                int byte_idx = si * 16 + (k >> 1);
+                unsigned char by = qs[byte_idx];
+                int q = (k & 1) == 0 ? (by & 0xF) : (by >> 4);
+                float dq = scale * (float)q - bias;
+                blk_acc += x_blk[si * 32 + k] * dq;
+            }
+        }
+        acc += blk_acc;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    __shared__ float warp_sums[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float w_acc = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            w_acc += __shfl_down_sync(0xFFFFFFFFu, w_acc, off);
+        }
+        if (lane == 0) y[o] = w_acc;
+    }
+}
+
 // FR-17-extra-f16-fwd — F16-weight matmul for seq=1 autoregressive decode.
 // Layout: weights stored as raw F16 (2 bytes/elem) in row-major order
 // [n_out * n_in].  Input x is F32 [n_in].  Output y is F32 [n_out].
@@ -1854,7 +1925,8 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
-              "fused_f16_matmul_seq1"])
+              "fused_f16_matmul_seq1",
+              "fused_q4k_expert_matmul_seq1"])
             .expect("load_ptx");
         let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
         let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
@@ -1892,6 +1964,7 @@ fn ctx() -> &'static CudaCtx {
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         let fused_f16_matmul_seq1 = device.get_func("aether_kernels", "fused_f16_matmul_seq1").unwrap();
+        let fused_q4k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_expert_matmul_seq1").unwrap();
 
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
@@ -1905,7 +1978,8 @@ fn ctx() -> &'static CudaCtx {
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
-                  append_kv, attention_seq1, fused_f16_matmul_seq1 }
+                  append_kv, attention_seq1, fused_f16_matmul_seq1,
+                  fused_q4k_expert_matmul_seq1 }
     })
 }
 
@@ -2992,6 +3066,37 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().paged_attention_seq1_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, sv))
             .expect("launch paged_attention_seq1_devarg");
+    }
+    0
+}
+
+/// FR-17-extra-moe-fwd — Q4_K matmul against ONE expert's slice of a
+/// concatenated MoE expert weight buffer.  `expert_idx ∈ [0, n_experts)`.
+/// Per-expert slice byte offset is computed internally as
+/// `expert_idx * n_out * (n_in/256) * 144`.
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_expert_matmul_seq1_cuda(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_base) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 || expert_idx < 0 { return -1; }
+    let expert_offset_blocks = expert_idx * n_out * blocks_per_row;
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_q4k_expert_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
+            .expect("launch fused_q4k_expert_matmul_seq1");
     }
     0
 }
