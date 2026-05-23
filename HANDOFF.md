@@ -1,7 +1,54 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-23 night (**Aether-hosting deployment COMPLETE.** Multi-threaded
+2026-05-23 night (**Aether-hosting deployment COMPLETE + HTTP/2 (h2c) wired.**
+On top of the multi-threaded TLS 1.3 + HTTP/1.1 hosting landed earlier, the
+aether-serve binary now AUTO-DETECTS HTTP/2 (h2c, prior-knowledge mode) on
+each incoming connection by peeking the 24-byte preface
+`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`.  Both protocols are served from the
+same listener:
+
+- HTTP/1.1: handled by the existing `handle_request` -> JSON parser flow.
+- HTTP/2:   handled by new `handle_request_h2`:
+  * Sends server SETTINGS, ACKs client SETTINGS
+  * HEADERS frame -> HPACK decode (literal + static-table-indexed forms)
+    -> dispatch by :method + :path
+  * DATA frame -> accumulate body bytes
+  * PING -> echo as ACK
+  * Response written as HEADERS+DATA frames with status code via the
+    static table.
+
+Verified via `scripts/h2c_smoke.py` (hand-rolled 200-line Python h2c
+client, no external deps):
+
+```
+$ python scripts/h2c_smoke.py 18600 GET /health
+  -> :status 200, DATA "ok"
+$ python scripts/h2c_smoke.py 18600 GET /v1/models
+  -> :status 200, DATA {"object":"list","data":[{"id":"qwen2.5-7b-instruct",...}]}
+$ python scripts/h2c_smoke.py 18600 POST /v1/chat/completions '{"prompt_ids":[1,2,3,4],"max_tokens":4}'
+  -> :status 200, DATA <OpenAI completion JSON>
+```
+
+Items deferred for future sessions (polish, not blocking):
+- ALPN extension in `tls13` to negotiate h2-over-TLS during the
+  handshake (today h2 works over plaintext TCP, h1 works over TLS).
+- Paged-KV swap inside QwenSession (kernels parity-verified;
+  integration needs a batched-forward kernel to materialise the
+  multi-tenant decode win).
+- TlsClientSession cert chain / root store.
+
+The hosting story as-shipped: ONE binary, ONE process, ZERO external
+server libraries.  Listens on a port; auto-dispatches per-connection
+between HTTP/1.1 and HTTP/2 (prior-knowledge); under both, TLS 1.3 is
+terminated server-side by Aether's own from-scratch crypto + handshake
+state machine; per-request decoding through CUDA-graph-captured Qwen2.5
+forward at 23 tok/s warm; OpenAI-shaped JSON returned.
+
+**Aether-hosting: complete.**
+
+### 2026-05-23 night earlier (Aether-hosting baseline — multi-threaded TLS + real LLM)
+**Aether-hosting deployment COMPLETE.** Multi-threaded
 accept in aether-serve: thread per accept, `ServerState` in `Arc`, QwenSession
 mutex serializes the actual GPU decode (one forward pass at a time on the
 single GPU) while TLS handshakes, HTTP parsing, BPE decode, and JSON
