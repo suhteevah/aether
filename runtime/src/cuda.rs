@@ -88,6 +88,7 @@ struct CudaCtx {
     fused_q5_0_expert_matmul_seq1: CudaFunction,
     fused_iq3_s_expert_matmul_seq1: CudaFunction,
     fused_iq4_xs_expert_matmul_seq1: CudaFunction,
+    fused_iq3_xxs_expert_matmul_seq1: CudaFunction,
     bert_self_attention_fwd: CudaFunction,
     bert_embed_sum: CudaFunction,
 }
@@ -3291,6 +3292,124 @@ extern "C" __global__ void fused_iq4_xs_expert_matmul_seq1(
     }
 }
 
+// FR-17-extra-moe-quant-dispatch-iq3xxs — MoE expert-variant of IQ3_XXS matmul.
+// 98-byte 256-elem blocks (f16 d + 64-byte qs + 32-byte scales_and_signs),
+// 256-entry iq3xxs_grid lookup + 128-entry ksigns_iq2xs indirection +
+// per-sub-block scale (0.5 + (aux32 >> 28)) * 0.5.  Per-expert offset =
+// `expert_offset_blocks * 98` bytes from w_base.  Used by GLM-4.7-flash MoE
+// expert tensors quantised to IQ3_XXS (dt=18) — the third non-Q4_K dtype
+// the IQ3_XXS GGUF hits after IQ4_XS and IQ3_S.  One CTA per output row;
+// 256 threads stride-loop the blocks; warp-reduce then cross-warp-reduce.
+extern "C" __global__ void fused_iq3_xxs_expert_matmul_seq1(
+    const float*         __restrict__ x,
+    const unsigned char* __restrict__ w_base,
+    float*               __restrict__ y,
+    int n_out, int blocks_per_row, int expert_offset_blocks)
+{
+    static const unsigned char ksigns[128] = {
+          0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+        144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+        160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+         48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+        192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+         80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+         96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+        240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
+    };
+    static const unsigned int iq3xxs_grid[256] = {
+        0x04040404u, 0x04040414u, 0x04040424u, 0x04040c0cu, 0x04040c1cu, 0x04040c3eu, 0x04041404u, 0x04041414u,
+        0x04041c0cu, 0x04042414u, 0x04043e1cu, 0x04043e2cu, 0x040c040cu, 0x040c041cu, 0x040c0c04u, 0x040c0c14u,
+        0x040c140cu, 0x040c142cu, 0x040c1c04u, 0x040c1c14u, 0x040c240cu, 0x040c2c24u, 0x040c3e04u, 0x04140404u,
+        0x04140414u, 0x04140424u, 0x04140c0cu, 0x04141404u, 0x04141414u, 0x04141c0cu, 0x04141c1cu, 0x04141c3eu,
+        0x04142c0cu, 0x04142c3eu, 0x04143e2cu, 0x041c040cu, 0x041c043eu, 0x041c0c04u, 0x041c0c14u, 0x041c142cu,
+        0x041c3e04u, 0x04240c1cu, 0x04241c3eu, 0x04242424u, 0x04242c3eu, 0x04243e1cu, 0x04243e2cu, 0x042c040cu,
+        0x042c043eu, 0x042c1c14u, 0x042c2c14u, 0x04341c2cu, 0x04343424u, 0x043e0c04u, 0x043e0c24u, 0x043e0c34u,
+        0x043e241cu, 0x043e340cu, 0x0c04040cu, 0x0c04041cu, 0x0c040c04u, 0x0c040c14u, 0x0c04140cu, 0x0c04141cu,
+        0x0c041c04u, 0x0c041c14u, 0x0c041c24u, 0x0c04243eu, 0x0c042c04u, 0x0c0c0404u, 0x0c0c0414u, 0x0c0c0c0cu,
+        0x0c0c1404u, 0x0c0c1414u, 0x0c14040cu, 0x0c14041cu, 0x0c140c04u, 0x0c140c14u, 0x0c14140cu, 0x0c141c04u,
+        0x0c143e14u, 0x0c1c0404u, 0x0c1c0414u, 0x0c1c1404u, 0x0c1c1c0cu, 0x0c1c2434u, 0x0c1c3434u, 0x0c24040cu,
+        0x0c24042cu, 0x0c242c04u, 0x0c2c1404u, 0x0c2c1424u, 0x0c2c2434u, 0x0c2c3e0cu, 0x0c34042cu, 0x0c3e1414u,
+        0x0c3e2404u, 0x14040404u, 0x14040414u, 0x14040c0cu, 0x14040c1cu, 0x14041404u, 0x14041414u, 0x14041434u,
+        0x14041c0cu, 0x14042414u, 0x140c040cu, 0x140c041cu, 0x140c042cu, 0x140c0c04u, 0x140c0c14u, 0x140c140cu,
+        0x140c1c04u, 0x140c341cu, 0x140c343eu, 0x140c3e04u, 0x14140404u, 0x14140414u, 0x14140c0cu, 0x14140c3eu,
+        0x14141404u, 0x14141414u, 0x14141c3eu, 0x14142404u, 0x14142c2cu, 0x141c040cu, 0x141c0c04u, 0x141c0c24u,
+        0x141c3e04u, 0x141c3e24u, 0x14241c2cu, 0x14242c1cu, 0x142c041cu, 0x142c143eu, 0x142c240cu, 0x142c3e24u,
+        0x143e040cu, 0x143e041cu, 0x143e0c34u, 0x143e242cu, 0x1c04040cu, 0x1c040c04u, 0x1c040c14u, 0x1c04140cu,
+        0x1c04141cu, 0x1c042c04u, 0x1c04342cu, 0x1c043e14u, 0x1c0c0404u, 0x1c0c0414u, 0x1c0c1404u, 0x1c0c1c0cu,
+        0x1c0c2424u, 0x1c0c2434u, 0x1c14040cu, 0x1c14041cu, 0x1c140c04u, 0x1c14142cu, 0x1c142c14u, 0x1c143e14u,
+        0x1c1c0c0cu, 0x1c1c1c1cu, 0x1c241c04u, 0x1c24243eu, 0x1c243e14u, 0x1c2c0404u, 0x1c2c0434u, 0x1c2c1414u,
+        0x1c2c2c2cu, 0x1c340c24u, 0x1c341c34u, 0x1c34341cu, 0x1c3e1c1cu, 0x1c3e3404u, 0x24040424u, 0x24040c3eu,
+        0x24041c2cu, 0x24041c3eu, 0x24042c1cu, 0x24042c3eu, 0x240c3e24u, 0x24141404u, 0x24141c3eu, 0x24142404u,
+        0x24143404u, 0x24143434u, 0x241c043eu, 0x241c242cu, 0x24240424u, 0x24242c0cu, 0x24243424u, 0x242c142cu,
+        0x242c241cu, 0x242c3e04u, 0x243e042cu, 0x243e0c04u, 0x243e0c14u, 0x243e1c04u, 0x2c040c14u, 0x2c04240cu,
+        0x2c043e04u, 0x2c0c0404u, 0x2c0c0434u, 0x2c0c1434u, 0x2c0c2c2cu, 0x2c140c24u, 0x2c141c14u, 0x2c143e14u,
+        0x2c1c0414u, 0x2c1c2c1cu, 0x2c240c04u, 0x2c24141cu, 0x2c24143eu, 0x2c243e14u, 0x2c2c0414u, 0x2c2c1c0cu,
+        0x2c342c04u, 0x2c3e1424u, 0x2c3e2414u, 0x34041424u, 0x34042424u, 0x34042434u, 0x34043424u, 0x340c140cu,
+        0x340c340cu, 0x34140c3eu, 0x34143424u, 0x341c1c04u, 0x341c1c34u, 0x34242424u, 0x342c042cu, 0x342c2c14u,
+        0x34341c1cu, 0x343e041cu, 0x343e140cu, 0x3e04041cu, 0x3e04042cu, 0x3e04043eu, 0x3e040c04u, 0x3e041c14u,
+        0x3e042c14u, 0x3e0c1434u, 0x3e0c2404u, 0x3e140c14u, 0x3e14242cu, 0x3e142c14u, 0x3e1c0404u, 0x3e1c0c2cu,
+        0x3e1c1c1cu, 0x3e1c3404u, 0x3e24140cu, 0x3e24240cu, 0x3e2c0404u, 0x3e2c0414u, 0x3e2c1424u, 0x3e341c04u
+    };
+
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    size_t exp_off_bytes = (size_t)expert_offset_blocks * 98;
+    size_t row_off_bytes = (size_t)o * (size_t)blocks_per_row * 98;
+    const unsigned char* w_row = w_base + exp_off_bytes + row_off_bytes;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += blockDim.x) {
+        const unsigned char* blk = w_row + (size_t)b * 98;
+        unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        float d = aether_f16_to_f32_dev(d_bits);
+        const unsigned char* qs  = blk + 2;       // 64 bytes
+        const unsigned char* sas = blk + 2 + 64;  // 32 bytes
+        const float* x_blk = x + (size_t)b * 256;
+        float blk_acc = 0.0f;
+        #pragma unroll
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            unsigned int aux32 =
+                  (unsigned int)sas[4 * ib32 + 0]
+                | ((unsigned int)sas[4 * ib32 + 1] << 8)
+                | ((unsigned int)sas[4 * ib32 + 2] << 16)
+                | ((unsigned int)sas[4 * ib32 + 3] << 24);
+            float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                unsigned int sign_idx = (aux32 >> (7 * l)) & 127u;
+                unsigned int signs    = (unsigned int)ksigns[sign_idx];
+                unsigned int grid1 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 0]];
+                unsigned int grid2 = iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    unsigned int q0 = (grid1 >> (8 * j)) & 0xFFu;
+                    unsigned int q1 = (grid2 >> (8 * j)) & 0xFFu;
+                    float s0 = (signs & (1u << (j + 0))) ? -1.0f : 1.0f;
+                    float s1 = (signs & (1u << (j + 4))) ? -1.0f : 1.0f;
+                    blk_acc += x_blk[32 * ib32 + 8 * l + j + 0] * (db * (float)q0 * s0);
+                    blk_acc += x_blk[32 * ib32 + 8 * l + j + 4] * (db * (float)q1 * s1);
+                }
+            }
+        }
+        acc += blk_acc;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    __shared__ float warp_sums[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float w_acc = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            w_acc += __shfl_down_sync(0xFFFFFFFFu, w_acc, off);
+        }
+        if (lane == 0) y[o] = w_acc;
+    }
+}
+
 // FR-17-extra-f16-fwd — F16-weight matmul for seq=1 autoregressive decode.
 // Layout: weights stored as raw F16 (2 bytes/elem) in row-major order
 // [n_out * n_in].  Input x is F32 [n_in].  Output y is F32 [n_out].
@@ -3629,6 +3748,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q5_0_expert_matmul_seq1",
               "fused_iq3_s_expert_matmul_seq1",
               "fused_iq4_xs_expert_matmul_seq1",
+              "fused_iq3_xxs_expert_matmul_seq1",
               "bert_self_attention_fwd",
               "bert_embed_sum"])
             .expect("load_ptx");
@@ -3682,6 +3802,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q5_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_expert_matmul_seq1").unwrap();
         let fused_iq3_s_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_s_expert_matmul_seq1").unwrap();
         let fused_iq4_xs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq4_xs_expert_matmul_seq1").unwrap();
+        let fused_iq3_xxs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_xxs_expert_matmul_seq1").unwrap();
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
         let bert_embed_sum = device.get_func("aether_kernels", "bert_embed_sum").unwrap();
 
@@ -3711,6 +3832,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q5_0_expert_matmul_seq1,
                   fused_iq3_s_expert_matmul_seq1,
                   fused_iq4_xs_expert_matmul_seq1,
+                  fused_iq3_xxs_expert_matmul_seq1,
                   bert_self_attention_fwd, bert_embed_sum }
     })
 }
@@ -4948,6 +5070,37 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_iq4_xs_expert_matmul_seq1.clone()
             .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
             .expect("launch fused_iq4_xs_expert_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17-extra-moe-quant-dispatch-iq3xxs MoE — IQ3_XXS expert-variant matmul.
+/// 98-byte 256-elem blocks.  Per-expert offset = `expert_idx * n_out *
+/// blocks_per_row * 98` bytes.  Third non-Q4_K dtype to surface in the GLM
+/// IQ3_XXS GGUF — namesake quant, used for many gate/up/down expert tensors.
+#[no_mangle] pub extern "C" fn aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_base) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 || expert_idx < 0 { return -1; }
+    let expert_offset_blocks = expert_idx * n_out * blocks_per_row;
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_iq3_xxs_expert_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
+            .expect("launch fused_iq3_xxs_expert_matmul_seq1");
     }
     0
 }
