@@ -56,6 +56,8 @@ use crate::cuda::{
     aether_op_mla_extract_v_f32_cuda,
     aether_op_mla_rope_q_partial_f32_cuda,
     aether_op_mla_rope_k_shared_f32_cuda,
+    aether_op_mla_rope_q_partial_yarn_f32_cuda,
+    aether_op_mla_rope_k_shared_yarn_f32_cuda,
     aether_op_matmul_nt_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
     aether_op_mul_inplace_f32_cuda, aether_op_silu_f32_cuda,
@@ -167,6 +169,23 @@ pub struct ModelConfig {
     /// experts).  DeepSeek-V2-Lite uses 2 shared experts.  0 = no shared
     /// experts (Qwen3-MoE).  Unused when n_experts == 0.
     pub n_shared_experts: i32,
+    /// FR-17-extra-mla-fwd YaRN — RoPE scaling factor (s).  0 or 1 = no
+    /// scaling (standard RoPE).  > 1 = YaRN-by-parts scaling with this
+    /// factor.  DeepSeek-V2-Lite uses 40.
+    pub yarn_factor: f32,
+    /// YaRN attention temperature coefficient.  Final temperature mscale =
+    /// 1 + yarn_log_multiplier * ln(yarn_factor).  Applied to attention
+    /// scale: final_scale = (1/sqrt(qk_head_dim)) * mscale * mscale.
+    /// DeepSeek-V2-Lite stores 0.0707; HF config calls this "mscale_all_dim"
+    /// (sometimes pre-multiplied by 0.1).
+    pub yarn_log_multiplier: f32,
+    /// YaRN original context length (pre-extension).  DeepSeek-V2-Lite uses
+    /// 4096.  Used in the per-frequency-dim correction-dim formula.
+    pub yarn_orig_ctx: f32,
+    /// YaRN ramp bounds in rotation counts.  Defaults from the paper:
+    /// beta_fast=32 (high frequency cutoff), beta_slow=1 (low frequency).
+    pub yarn_beta_fast: f32,
+    pub yarn_beta_slow: f32,
 }
 
 impl ModelConfig {
@@ -184,6 +203,9 @@ impl ModelConfig {
             kv_lora_rank: 0, q_lora_rank: 0,
             qk_head_dim: 0, qk_rope_head_dim: 0, v_head_dim: 0,
             leading_dense_blocks: 0, n_shared_experts: 0,
+            yarn_factor: 1.0, yarn_log_multiplier: 0.0,
+            yarn_orig_ctx: 4096.0,
+            yarn_beta_fast: 32.0, yarn_beta_slow: 1.0,
         }
     }
 
@@ -257,6 +279,36 @@ impl ModelConfig {
         let n_shared_experts = read_meta_u32(gguf_handle,
             &format!("{}.expert_shared_count", prefix))
             .map(|v| v as i32).unwrap_or(0);
+        // FR-17-extra-mla-fwd YaRN — long-context RoPE scaling.  Only active
+        // when `<arch>.rope.scaling.type == "yarn"`; for "linear" / absent
+        // we keep the standard RoPE path.  Defaults match the YaRN paper +
+        // DeepSeek-V2 conventions.
+        let scaling_type = read_meta_string(gguf_handle,
+            &format!("{}.rope.scaling.type", prefix)).unwrap_or_default();
+        let (yarn_factor, yarn_log_multiplier, yarn_orig_ctx) =
+            if scaling_type == "yarn" {
+                let s = read_meta_f32(gguf_handle,
+                    &format!("{}.rope.scaling.factor", prefix)).unwrap_or(1.0);
+                let log_m = read_meta_f32(gguf_handle,
+                    &format!("{}.rope.scaling.yarn_log_multiplier", prefix))
+                    .unwrap_or(0.0);
+                let orig = read_meta_u32(gguf_handle,
+                    &format!("{}.rope.scaling.original_context_length", prefix))
+                    .map(|v| v as f32)
+                    // Fall back to context_length / factor when the original
+                    // isn't stored explicitly.
+                    .unwrap_or_else(|| {
+                        let ctx = read_meta_u32(gguf_handle,
+                            &format!("{}.context_length", prefix))
+                            .map(|v| v as f32).unwrap_or(4096.0 * s);
+                        ctx / s.max(1.0)
+                    });
+                (s, log_m, orig)
+            } else { (1.0, 0.0, 4096.0) };
+        let yarn_beta_fast = read_meta_f32(gguf_handle,
+            &format!("{}.rope.scaling.beta_fast", prefix)).unwrap_or(32.0);
+        let yarn_beta_slow = read_meta_f32(gguf_handle,
+            &format!("{}.rope.scaling.beta_slow", prefix)).unwrap_or(1.0);
         Self {
             d_model, n_layers, n_q_heads, n_kv_heads, head_dim, d_kv,
             d_ff, vocab, rope_base, norm_eps, arch,
@@ -265,6 +317,8 @@ impl ModelConfig {
             kv_lora_rank, q_lora_rank,
             qk_head_dim, qk_rope_head_dim, v_head_dim,
             leading_dense_blocks, n_shared_experts,
+            yarn_factor, yarn_log_multiplier, yarn_orig_ctx,
+            yarn_beta_fast, yarn_beta_slow,
         }
     }
 }
@@ -797,9 +851,17 @@ unsafe fn mla_attention_forward(
     aether_op_mla_extract_v_f32_cuda(kv_b, v_row,
         n_heads, qk_nope_head_dim, v_head_dim);
 
-    // 6. Partial RoPE on shared k_rope.
-    aether_op_mla_rope_k_shared_f32_cuda(k_rope, qk_rope_head_dim,
-        rope_base, step_args);
+    // 6. Partial RoPE on shared k_rope.  Use YaRN-aware kernel when the
+    // model's RoPE scaling type is YaRN (deepseek2 / glm-4.7-flash).
+    let yarn_active = cfg.yarn_factor > 1.0;
+    if yarn_active {
+        aether_op_mla_rope_k_shared_yarn_f32_cuda(k_rope, qk_rope_head_dim,
+            rope_base, cfg.yarn_factor, cfg.yarn_orig_ctx,
+            cfg.yarn_beta_fast, cfg.yarn_beta_slow, step_args);
+    } else {
+        aether_op_mla_rope_k_shared_f32_cuda(k_rope, qk_rope_head_dim,
+            rope_base, step_args);
+    }
 
     // 7. Assemble per-head K row = [K_nope | k_rope_shared] per head.
     aether_op_mla_assemble_k_f32_cuda(kv_b, k_rope, k_row,
@@ -824,15 +886,30 @@ unsafe fn mla_attention_forward(
             q_full, n_heads * qk_head_dim, d_model);
     }
 
-    // 9. Partial RoPE on Q's rope sub-region.
-    aether_op_mla_rope_q_partial_f32_cuda(q_full,
-        n_heads, qk_head_dim, qk_nope_head_dim, rope_base, step_args);
+    // 9. Partial RoPE on Q's rope sub-region (YaRN-aware).
+    if yarn_active {
+        aether_op_mla_rope_q_partial_yarn_f32_cuda(q_full,
+            n_heads, qk_head_dim, qk_nope_head_dim, rope_base,
+            cfg.yarn_factor, cfg.yarn_orig_ctx,
+            cfg.yarn_beta_fast, cfg.yarn_beta_slow, step_args);
+    } else {
+        aether_op_mla_rope_q_partial_f32_cuda(q_full,
+            n_heads, qk_head_dim, qk_nope_head_dim, rope_base, step_args);
+    }
 
     // 10. Paged append + paged MLA attention.  Caller's KV cache MUST be
     // sized to MLA dims — see top-of-fn contract.
+    //
+    // YaRN attention temperature: mscale = 1 + log_multiplier * ln(s),
+    // applied to BOTH Q and K → mscale^2 multiplies the dot product.
+    // Equivalently, fold mscale^2 into the standard 1/sqrt(qk_head_dim) scale.
     let d_k_row = n_heads * qk_head_dim;
     let d_v_row = n_heads * v_head_dim;
-    let scale = 1.0f32 / (qk_head_dim as f32).sqrt();
+    let base_scale = 1.0f32 / (qk_head_dim as f32).sqrt();
+    let scale = if yarn_active {
+        let mscale = 1.0 + cfg.yarn_log_multiplier * cfg.yarn_factor.ln();
+        base_scale * mscale * mscale
+    } else { base_scale };
     let (page_table_dev, block_size) = paged_cfg.expect(
         "FR-17-extra-mla-fwd: MLA path requires --paged mode today \
          (contiguous-KV variant is follow-on).");

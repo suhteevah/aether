@@ -99,6 +99,8 @@ struct PagedCtx {
     mla_extract_v: CudaFunction,
     mla_rope_q_partial: CudaFunction,
     mla_rope_k_shared: CudaFunction,
+    mla_rope_q_partial_yarn: CudaFunction,
+    mla_rope_k_shared_yarn: CudaFunction,
 }
 
 static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
@@ -118,7 +120,9 @@ fn paged_ctx() -> &'static PagedCtx {
               "mla_assemble_k",
               "mla_extract_v",
               "mla_rope_q_partial",
-              "mla_rope_k_shared"])
+              "mla_rope_k_shared",
+              "mla_rope_q_partial_yarn",
+              "mla_rope_k_shared_yarn"])
             .expect("load_ptx paged");
         PagedCtx {
             paged_append_kv_devarg:
@@ -145,6 +149,10 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "mla_rope_q_partial").unwrap(),
             mla_rope_k_shared:
                 device.get_func("aether_paged_kernels", "mla_rope_k_shared").unwrap(),
+            mla_rope_q_partial_yarn:
+                device.get_func("aether_paged_kernels", "mla_rope_q_partial_yarn").unwrap(),
+            mla_rope_k_shared_yarn:
+                device.get_func("aether_paged_kernels", "mla_rope_k_shared_yarn").unwrap(),
         }
     })
 }
@@ -786,6 +794,98 @@ extern "C" __global__ void mla_rope_k_shared(
     float pos = (float)step_args[0];
     float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
     float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    float x0 = k_rope[i], x1 = k_rope[i + hd_half];
+    k_rope[i] = x0 * c - x1 * s;
+    k_rope[i + hd_half] = x0 * s + x1 * c;
+}
+
+// FR-17-extra-mla-fwd YaRN: YaRN-by-parts RoPE scaling for DeepSeek-V2 /
+// GLM-4.7-flash long-context.  For each frequency dim i:
+//   wavelength_i = 2π * base^(2i/d)
+//   - "low frequency" dims (long wavelength) get FULL linear interpolation
+//     (pos / s)
+//   - "high frequency" dims (short wavelength) get NO interpolation
+//     (pos as-is, extrapolation)
+//   - in between: smooth linear ramp
+// The ramp bounds are expressed in `rotation counts` β (beta_fast=32,
+// beta_slow=1 are the YaRN paper defaults) and converted to dim indices via:
+//   find_correction_dim(β) = d * ln(orig_ctx / (β * 2π)) / (2 * ln(base))
+//
+// Result: theta_yarn = pos * scale_factor_i * base^(-2i/d)
+// where scale_factor_i = (1 - ramp_i) + ramp_i / s.
+extern "C" __device__ float yarn_correction_dim(
+    float num_rotations, float head_dim, float base, float orig_ctx)
+{
+    return head_dim * logf(orig_ctx / (num_rotations * 6.283185307179586f))
+           / (2.0f * logf(base));
+}
+
+extern "C" __device__ float yarn_scale_factor(
+    int i, int head_dim, float base, float yarn_s,
+    float yarn_orig_ctx, float yarn_beta_fast, float yarn_beta_slow)
+{
+    float i_high = yarn_correction_dim(yarn_beta_fast, (float)head_dim, base, yarn_orig_ctx);
+    float i_low  = yarn_correction_dim(yarn_beta_slow, (float)head_dim, base, yarn_orig_ctx);
+    // The ramp goes from "no interpolation" (small i, high freq, ramp=0) to
+    // "full interpolation" (large i, low freq, ramp=1).  HF/llama.cpp use:
+    //   ramp = clip((i - i_low) / (i_high - i_low), 0, 1)  — but with the
+    //   roles flipped depending on which end is "high freq".  In this
+    //   parametrization (i increases → lower freq → longer wavelength):
+    //     ramp = clip((i - i_low) / (i_high - i_low), 0, 1)
+    //     scale_factor = (1 - ramp) + ramp / s
+    float denom = fmaxf(i_high - i_low, 1e-3f);
+    float ramp = ((float)i - i_low) / denom;
+    ramp = fmaxf(0.0f, fminf(1.0f, ramp));
+    return (1.0f - ramp) + ramp / yarn_s;
+}
+
+extern "C" __global__ void mla_rope_q_partial_yarn(
+    float*       __restrict__ q,
+    int n_heads, int qk_head_dim, int qk_nope_head_dim,
+    float base, float yarn_s, float yarn_orig_ctx,
+    float yarn_beta_fast, float yarn_beta_slow,
+    const int* __restrict__ step_args)
+{
+    int qk_rope_head_dim = qk_head_dim - qk_nope_head_dim;
+    int hd_half = qk_rope_head_dim / 2;
+    int total = n_heads * hd_half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int h = idx / hd_half;
+    int i = idx - h * hd_half;
+    int base_off = h * qk_head_dim + qk_nope_head_dim;
+    float pos = (float)step_args[0];
+    // For YaRN, the per-pair dim index used in correction_dim is the
+    // half-index doubled (i.e. 2*i), which corresponds to the "true" rotary
+    // frequency index in [0, qk_rope_head_dim).
+    float scale_factor = yarn_scale_factor(2 * i, qk_rope_head_dim, base,
+        yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow);
+    float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
+    float theta = pos * scale_factor * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float x0 = q[i0], x1 = q[i1];
+    q[i0] = x0 * c - x1 * s;
+    q[i1] = x0 * s + x1 * c;
+}
+
+extern "C" __global__ void mla_rope_k_shared_yarn(
+    float*       __restrict__ k_rope,
+    int qk_rope_head_dim,
+    float base, float yarn_s, float yarn_orig_ctx,
+    float yarn_beta_fast, float yarn_beta_slow,
+    const int* __restrict__ step_args)
+{
+    int hd_half = qk_rope_head_dim / 2;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hd_half) return;
+    float pos = (float)step_args[0];
+    float scale_factor = yarn_scale_factor(2 * i, qk_rope_head_dim, base,
+        yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow);
+    float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
+    float theta = pos * scale_factor * powf(base, exp);
     float c = cosf(theta), s = sinf(theta);
     float x0 = k_rope[i], x1 = k_rope[i + hd_half];
     k_rope[i] = x0 * c - x1 * s;
@@ -3989,6 +4089,66 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().mla_rope_k_shared.clone()
             .launch(cfg, (kv, qk_rope_head_dim, base, sv))
             .expect("launch mla_rope_k_shared");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd YaRN — partial-dim RoPE on Q with per-frequency-dim
+/// scale factor for YaRN-style long-context extension.
+#[no_mangle] pub extern "C" fn aether_op_mla_rope_q_partial_yarn_f32_cuda(
+    q: i64,
+    n_heads: c_int, qk_head_dim: c_int, qk_nope_head_dim: c_int,
+    base: f32,
+    yarn_s: f32, yarn_orig_ctx: f32,
+    yarn_beta_fast: f32, yarn_beta_slow: f32,
+    step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q) else { return -1; };
+    let Some(is) = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_heads <= 0 || qk_head_dim <= 0 || qk_nope_head_dim < 0
+        || qk_nope_head_dim >= qk_head_dim { return -1; }
+    let qk_rope_head_dim = qk_head_dim - qk_nope_head_dim;
+    if (qk_rope_head_dim & 1) != 0 { return -2; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let s_p = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let total = (n_heads * (qk_rope_head_dim / 2)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let qv = &mut *q_p; let sv = &*s_p;
+        paged_ctx().mla_rope_q_partial_yarn.clone()
+            .launch(cfg, (qv, n_heads, qk_head_dim, qk_nope_head_dim, base,
+                          yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow, sv))
+            .expect("launch mla_rope_q_partial_yarn");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd YaRN — partial-dim RoPE on the shared K vector with
+/// per-frequency-dim YaRN scale factor.
+#[no_mangle] pub extern "C" fn aether_op_mla_rope_k_shared_yarn_f32_cuda(
+    k_rope: i64, qk_rope_head_dim: c_int,
+    base: f32,
+    yarn_s: f32, yarn_orig_ctx: f32,
+    yarn_beta_fast: f32, yarn_beta_slow: f32,
+    step_args_i32: i64,
+) -> c_int {
+    let Some(i_k) = handle_to_idx(k_rope) else { return -1; };
+    let Some(is) = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if qk_rope_head_dim <= 0 || (qk_rope_head_dim & 1) != 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let k_p = bs[i_k].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let s_p = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let total = (qk_rope_head_dim / 2) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let kv = &mut *k_p; let sv = &*s_p;
+        paged_ctx().mla_rope_k_shared_yarn.clone()
+            .launch(cfg, (kv, qk_rope_head_dim, base,
+                          yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow, sv))
+            .expect("launch mla_rope_k_shared_yarn");
     }
     0
 }

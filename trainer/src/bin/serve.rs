@@ -1228,6 +1228,17 @@ unsafe fn run_probe(path: &str) {
     if cfg.sliding_window > 0 {
         println!("  sliding_window: {}", cfg.sliding_window);
     }
+    if cfg.yarn_factor > 1.0 {
+        let mscale = 1.0 + cfg.yarn_log_multiplier * cfg.yarn_factor.ln();
+        println!();
+        println!("YaRN RoPE scaling detected:");
+        println!("  yarn_factor         : {}  (s, context multiplier)", cfg.yarn_factor);
+        println!("  yarn_log_multiplier : {}", cfg.yarn_log_multiplier);
+        println!("  yarn_orig_ctx       : {}", cfg.yarn_orig_ctx);
+        println!("  yarn_beta_fast      : {}", cfg.yarn_beta_fast);
+        println!("  yarn_beta_slow      : {}", cfg.yarn_beta_slow);
+        println!("  → attention mscale  : {:.4} (Q*K^T scores ×{:.4})", mscale, mscale * mscale);
+    }
     println!();
     // Kernel-constraint check (mirrors new_with_mode's checks).
     let mut violations = Vec::<String>::new();
@@ -1294,8 +1305,14 @@ unsafe fn run_probe(path: &str) {
             "     MLA layout today and panics with a clear pointer rather than producing",
             "     garbage activations.  MoE FFN is shipped via FR-17-extra-moe-fwd (above).",
             "     End-to-end is also blocked on (c) Q4_0 dispatch — DeepSeek-V2-Lite",
-            "     ships in Q4_0 not Q4_K — and (d) YaRN RoPE scaling (V2 uses",
-            "     rope.scaling.type=yarn, factor=40).",
+            "     ships in Q4_0 not Q4_K (cnc has Q4_K_M which is supported).",
+            "  ✅ YaRN RoPE scaling — landed (FR-17-extra-mla-fwd YaRN).  Per-",
+            "     frequency-dim scale factor (ramp between beta_fast=32 and",
+            "     beta_slow=1) + attention mscale = 1 + log_mult*ln(s) applied",
+            "     to Q*K scores.  CPU↔GPU witnessed in cuda_yarn_rope_parity.rs.",
+            "  ⚠ MoE shared experts (expert_shared_count=2 on V2-Lite) — pending.",
+            "  ⚠ Q4_K unaligned-d_ff fallback (d_ff=10944, expert_ff=1408 both",
+            "     non-multiples of 256) — pending.",
         ]),
         "gemma3" => (true, &[
             "  ✅ Gemma3 dispatch shipped (FR-17-extra-gemma-fwd):",
