@@ -71,6 +71,8 @@ use crate::cuda::{
     aether_op_fused_q8_0_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_matmul_seq1_cuda,
     aether_op_fused_q4k_expert_matmul_seq1_cuda,
+    aether_op_fused_q8_0_expert_matmul_seq1_cuda,
+    aether_op_fused_q5_0_expert_matmul_seq1_cuda,
     aether_op_matmul_f32_cuda,
     aether_dev_graph_begin, aether_dev_graph_end,
     aether_dev_graph_launch, aether_dev_graph_destroy,
@@ -1002,28 +1004,29 @@ fn matmul_nt_f32_cuda_unused() -> i32 {
 
 unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig) {
     let d_model = cfg.d_model;
-    let d_ff = cfg.d_ff;
+    // Per-expert FFN hidden dim.  DeepSeek-V2 / GLM-4.7-flash store this in
+    // `<arch>.expert_feed_forward_length`; we cached it as cfg.expert_ff_dim.
+    // For older Qwen3-MoE GGUFs where the metadata is absent (we default
+    // expert_ff_dim to 0), fall back to cfg.d_ff to preserve legacy behavior.
+    let expert_ff = if cfg.expert_ff_dim > 0 { cfg.expert_ff_dim } else { cfg.d_ff };
     let n_experts = cfg.n_experts;
     let n_used = cfg.n_experts_used.max(1);
     assert!(n_experts > 0, "moe_ffn_forward called on dense block");
 
-    // Workspace allocations.  These are small and short-lived; we re-alloc
-    // per call rather than thread per-session through every kernel signature.
-    // TODO: cache them on QwenSession.
+    // Workspace allocations sized to PER-EXPERT FFN dim (not cfg.d_ff).
+    // The previous bug: V2-Lite has d_ff=10944 (dense) and expert_ff=1408,
+    // and treating d_ff as the per-expert n_out makes the kernel walk the
+    // per-expert pointer 7.77× too far into adjacent memory → garbage →
+    // NaN cascades through every MoE block.
     let router_logits = aether_dev_alloc_f32(n_experts as c_int);
-    let gate_e = aether_dev_alloc_f32(d_ff as c_int);
-    let up_e = aether_dev_alloc_f32(d_ff as c_int);
+    let gate_e = aether_dev_alloc_f32(expert_ff as c_int);
+    let up_e = aether_dev_alloc_f32(expert_ff as c_int);
     let down_e = aether_dev_alloc_f32(d_model as c_int);
     let out_acc = aether_dev_alloc_f32(d_model as c_int);
-    // Zero out_acc by H2D of a zero vector (small, ~16 KB).
     let zero = vec![0f32; d_model];
     aether_dev_h2d_f32(zero.as_ptr() as i64, out_acc, d_model as c_int);
 
-    // 1. router_logits = w_router @ x_norm.  w_router is row-major
-    // [n_experts × d_model] f32.  aether_op_matmul_f32_cuda computes
-    // out = a @ b with a: [m, k], b: [k, n], out: [m, n].
-    // We want logits = w_router @ x (column vec).  Set m=n_experts, k=d_model,
-    // n=1, a=w_router, b=x_norm.
+    // 1. router_logits = w_router @ x_norm.
     aether_op_matmul_f32_cuda(
         bw.w_router, act.x_norm, router_logits,
         n_experts as c_int, d_model as c_int, 1);
@@ -1041,30 +1044,60 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
     let sum: f32 = weights.iter().sum();
     for w in &mut weights { *w /= sum; }
 
-    // 3. Per-expert forward.  blocks_per_row_gate_up = d_model/256 (input dim).
-    // blocks_per_row_down = d_ff/256.
-    let bpr_in = (d_model / 256) as c_int;
-    let bpr_ff = (d_ff / 256) as c_int;
+    // 3. Per-expert forward.  Q4_K kernels need n_in % 256; the Q8_0/Q5_0
+    // expert variants work in 32-elem blocks so they cover the cases where
+    // expert_ff isn't a multiple of 256 (V2-Lite: expert_ff=1408 / 32 = 44,
+    // not a multiple of 256).  Dispatch on dt per tensor.
+    //
+    // Q4_K block_per_row = n_in / 256.   Q8_0/Q5_0 block_per_row = n_in / 32.
+    let bpr_q4k_in = (d_model / 256) as c_int;       // gate/up: n_in = d_model
+    let bpr_q4k_ff = (expert_ff / 256) as c_int;     // down: n_in = expert_ff (only if Q4_K + aligned)
+    let bpr_q8_in  = (d_model / 32)  as c_int;
+    let bpr_q8_ff  = (expert_ff / 32)  as c_int;
+    let exp_ff_c = expert_ff as c_int;
+    let d_model_c = d_model as c_int;
+
+    let dispatch_expert = |x_in: i64, w_base: i64, dt: i32, y: i64,
+                            n_out: c_int, n_in_d_model: bool, expert_idx: c_int| {
+        // n_in_d_model=true → n_in = d_model.  Else n_in = expert_ff.
+        match dt {
+            12 => {
+                // Q4_K — n_in must be a multiple of 256.
+                let bpr = if n_in_d_model { bpr_q4k_in } else { bpr_q4k_ff };
+                aether_op_fused_q4k_expert_matmul_seq1_cuda(
+                    x_in, w_base, y, n_out, bpr, expert_idx);
+            }
+            8 => {
+                let bpr = if n_in_d_model { bpr_q8_in } else { bpr_q8_ff };
+                aether_op_fused_q8_0_expert_matmul_seq1_cuda(
+                    x_in, w_base, y, n_out, bpr, expert_idx);
+            }
+            6 => {
+                let bpr = if n_in_d_model { bpr_q8_in } else { bpr_q8_ff };
+                aether_op_fused_q5_0_expert_matmul_seq1_cuda(
+                    x_in, w_base, y, n_out, bpr, expert_idx);
+            }
+            _ => panic!("moe expert matmul: unsupported dtype {} (only Q4_K=12, Q5_0=6, Q8_0=8 today)", dt),
+        }
+    };
+
     for (k, &expert_idx) in selected.iter().enumerate() {
         let w_i = weights[k];
-        // gate_e = expert_matmul(x_norm, w_gate_exps, expert_idx)  [d_ff]
-        aether_op_fused_q4k_expert_matmul_seq1_cuda(
-            act.x_norm, bw.w_gate_exps, gate_e,
-            d_ff as c_int, bpr_in, expert_idx as c_int);
-        // up_e = expert_matmul(x_norm, w_up_exps, expert_idx)  [d_ff]
-        aether_op_fused_q4k_expert_matmul_seq1_cuda(
-            act.x_norm, bw.w_up_exps, up_e,
-            d_ff as c_int, bpr_in, expert_idx as c_int);
+        // gate_e = expert_matmul(x_norm, w_gate_exps, expert_idx)  [expert_ff]
+        dispatch_expert(act.x_norm, bw.w_gate_exps, bw.dt_gate_exps,
+            gate_e, exp_ff_c, true, expert_idx as c_int);
+        // up_e = expert_matmul(x_norm, w_up_exps, expert_idx)
+        dispatch_expert(act.x_norm, bw.w_up_exps, bw.dt_up_exps,
+            up_e, exp_ff_c, true, expert_idx as c_int);
         // silu(gate_e); gate_e *= up_e
-        aether_op_silu_f32_cuda(gate_e, d_ff as c_int);
-        aether_op_mul_inplace_f32_cuda(gate_e, up_e, d_ff as c_int);
+        aether_op_silu_f32_cuda(gate_e, exp_ff_c);
+        aether_op_mul_inplace_f32_cuda(gate_e, up_e, exp_ff_c);
         // down_e = expert_matmul(gate_e, w_down_exps, expert_idx)  [d_model]
-        aether_op_fused_q4k_expert_matmul_seq1_cuda(
-            gate_e, bw.w_down_exps, down_e,
-            d_model as c_int, bpr_ff, expert_idx as c_int);
+        dispatch_expert(gate_e, bw.w_down_exps, bw.dt_down_exps,
+            down_e, d_model_c, false, expert_idx as c_int);
         // out_acc += w_i * down_e
-        aether_op_scale_f32_cuda(down_e, w_i, d_model as c_int);
-        aether_op_add_inplace_f32_cuda(out_acc, down_e, d_model as c_int);
+        aether_op_scale_f32_cuda(down_e, w_i, d_model_c);
+        aether_op_add_inplace_f32_cuda(out_acc, down_e, d_model_c);
     }
 
     // 4. Shared experts (FR-17-extra-mla-fwd MoE shared).  DeepSeek-V2 /
@@ -1503,9 +1536,31 @@ impl QwenSession {
     /// 28+ block forwards + final norm + LM head + argmax inputs in the
     /// current call.
     unsafe fn run_forward_imperative(&mut self) {
+        let dump_blocks = std::env::var("AETHER_DUMP_BLOCKS").is_ok();
         for b in 0..self.cfg.n_layers {
             block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b],
                 self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+            // FR-17-extra-mla-fwd debug — dump `act.x` stats after each
+            // block to bisect where NaN first appears in the V2-Lite
+            // forward.  AETHER_DUMP_BLOCKS=1 to enable.  Adds one D2H
+            // per layer; only set during diagnostic runs.
+            if dump_blocks && b < 4 {
+                aether_dev_sync();
+                let mut x_host = vec![0.0f32; self.cfg.d_model];
+                aether_dev_d2h_f32(self.act.x, x_host.as_mut_ptr() as i64,
+                    self.cfg.d_model as c_int);
+                let n_nan = x_host.iter().filter(|x| x.is_nan()).count();
+                let n_inf = x_host.iter().filter(|x| x.is_infinite()).count();
+                let finite: Vec<f32> = x_host.iter().cloned()
+                    .filter(|x| x.is_finite()).collect();
+                let mn = finite.iter().cloned().fold(f32::INFINITY, f32::min);
+                let mx = finite.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mean = if !finite.is_empty() {
+                    finite.iter().sum::<f32>() / finite.len() as f32
+                } else { 0.0 };
+                eprintln!("[BLOCK b={}] x: nan={} inf={} min={:.4e} max={:.4e} mean={:.4e}",
+                    b, n_nan, n_inf, mn, mx, mean);
+            }
         }
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
