@@ -115,6 +115,9 @@ struct PagedCtx {
     mla_rope_k_shared: CudaFunction,
     mla_rope_q_partial_yarn: CudaFunction,
     mla_rope_k_shared_yarn: CudaFunction,
+    mla_absorb_q_q8_0: CudaFunction,
+    mla_absorb_v_q8_0: CudaFunction,
+    mla_broadcast_kv_for_mqa: CudaFunction,
 }
 
 static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
@@ -136,7 +139,10 @@ fn paged_ctx() -> &'static PagedCtx {
               "mla_rope_q_partial",
               "mla_rope_k_shared",
               "mla_rope_q_partial_yarn",
-              "mla_rope_k_shared_yarn"])
+              "mla_rope_k_shared_yarn",
+              "mla_absorb_q_q8_0",
+              "mla_absorb_v_q8_0",
+              "mla_broadcast_kv_for_mqa"])
             .expect("load_ptx paged");
         PagedCtx {
             paged_append_kv_devarg:
@@ -167,6 +173,12 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "mla_rope_q_partial_yarn").unwrap(),
             mla_rope_k_shared_yarn:
                 device.get_func("aether_paged_kernels", "mla_rope_k_shared_yarn").unwrap(),
+            mla_absorb_q_q8_0:
+                device.get_func("aether_paged_kernels", "mla_absorb_q_q8_0").unwrap(),
+            mla_absorb_v_q8_0:
+                device.get_func("aether_paged_kernels", "mla_absorb_v_q8_0").unwrap(),
+            mla_broadcast_kv_for_mqa:
+                device.get_func("aether_paged_kernels", "mla_broadcast_kv_for_mqa").unwrap(),
         }
     })
 }
@@ -184,6 +196,33 @@ fn paged_ctx() -> &'static PagedCtx {
 /// position `pos` ↔ physical row `page_table[pos / block_size] * block_size
 /// + (pos % block_size)`.
 const PAGED_KERNEL_SRC: &str = r#"
+// Device-side F16→F32 conversion (copied from KERNEL_SRC since this is a
+// separate nvrtc compilation unit and cross-PTX symbol resolution isn't set
+// up).  Used by the absorbed-MLA Q8_0 dequant kernels below.
+extern "C" __device__ float aether_f16_to_f32_dev(unsigned short h) {
+    unsigned int sign = (h >> 15) & 1u;
+    unsigned int exp  = (h >> 10) & 0x1Fu;
+    unsigned int mant = h & 0x3FFu;
+    unsigned int bits;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign << 31; return __int_as_float(bits); }
+        unsigned int m = mant;
+        int e = -14;
+        while ((m & 0x0400u) == 0u) { m <<= 1; e -= 1; }
+        m &= 0x03FFu;
+        bits = (sign << 31) | ((unsigned int)(e + 127) << 23) | (m << 13);
+        return __int_as_float(bits);
+    }
+    if (exp == 0x1Fu) {
+        bits = (sign << 31) | (0xFFu << 23) | (mant << 13);
+        return __int_as_float(bits);
+    }
+    unsigned int f32_exp  = (exp - 15u + 127u) << 23;
+    unsigned int f32_mant = mant << 13;
+    bits = (sign << 31) | f32_exp | f32_mant;
+    return __int_as_float(bits);
+}
+
 // FR-19.5-extra-deep — batched paged append_kv. B (k_new, v_new) pairs at
 // position step_args[0] of B independent page tables, all writing into the
 // same shared pool.  Grid (d_kv, B).
@@ -907,6 +946,123 @@ extern "C" __global__ void mla_rope_k_shared_yarn(
     float x0 = k_rope[i], x1 = k_rope[i + hd_half];
     k_rope[i] = x0 * c - x1 * s;
     k_rope[i + hd_half] = x0 * s + x1 * c;
+}
+
+// FR-17-extra-mla-absorbed — GLM-4.7-flash absorbed-MLA Q-side absorption.
+// Combines per-head Q-nope absorption via Q8_0 w_k_b + q_pe concat in one
+// launch.  Output layout per head: [q_nope_absorbed (kv_lora_rank) || q_pe
+// (qk_rope)] = qk_head_dim total.
+//
+// w_k_b GGUF shape: [q_nope_per_head, kv_lora_rank, n_heads] (Q8_0).
+//   Per head matrix viewed as [kv_lora_rank rows × q_nope_per_head cols]:
+//     row stride bytes = (q_nope_per_head/32) * 34
+//     per-head bytes  = kv_lora_rank * row_stride
+//
+// Grid: (kv_lora_rank + qk_rope, n_heads).  One CTA per (output_col, head)
+// pair, threadIdx.x lanes cooperatively reduce over the q_nope dim if
+// needed.  For first witness we use 1 thread per CTA — adequate when
+// q_nope_per_head ≤ 192 (4 Q8_0 blocks).
+extern "C" __global__ void mla_absorb_q_q8_0(
+    const float*         __restrict__ q_proj,     // [n_heads * key_mla]
+    const unsigned char* __restrict__ w_k_b,      // [n_heads * kv_lora_rank * (q_nope/32) * 34]
+    float*               __restrict__ q_out,      // [n_heads * (kv_lora_rank + qk_rope)]
+    int n_heads, int key_mla, int qk_rope, int kv_lora_rank, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    int q_nope = key_mla - qk_rope;
+    int out_per_head = kv_lora_rank + qk_rope;
+    if (oi >= out_per_head || h >= n_heads) return;
+
+    if (oi < kv_lora_rank) {
+        // Per-head Q8_0 matmul: q_out[h, oi] = sum_j w_k_b[h, oi, j] * q_proj[h, j].
+        size_t base_bytes = (size_t)h * kv_lora_rank * blocks_per_row * 34
+                          + (size_t)oi * blocks_per_row * 34;
+        const unsigned char* base = w_k_b + base_bytes;
+        const float* qin = q_proj + (size_t)h * key_mla;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const unsigned char* blk = base + (size_t)b * 34;
+            unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+            float d = aether_f16_to_f32_dev(d_bits);
+            const signed char* qs = (const signed char*)(blk + 2);
+            #pragma unroll
+            for (int k = 0; k < 32; k++) {
+                acc += qin[b * 32 + k] * (d * (float)(int)qs[k]);
+            }
+        }
+        q_out[(size_t)h * out_per_head + oi] = acc;
+    } else {
+        // q_pe concat: q_out[h, kv_lora_rank + j] = q_proj[h, q_nope + j].
+        int j = oi - kv_lora_rank;
+        q_out[(size_t)h * out_per_head + oi] =
+            q_proj[(size_t)h * key_mla + q_nope + j];
+    }
+}
+
+// FR-17-extra-mla-absorbed — GLM-4.7-flash absorbed-MLA V-side reduction.
+// Per-head attn_v (kv_lora_rank dim) → per-head attn_out (value_mla dim)
+// via Q8_0 w_v_b per head.
+//
+// w_v_b GGUF shape: [kv_lora_rank, value_mla, n_heads] (Q8_0).
+//   Per head matrix [value_mla rows × kv_lora_rank cols]:
+//     row stride bytes = (kv_lora_rank/32) * 34
+//     per-head bytes = value_mla * row_stride
+extern "C" __global__ void mla_absorb_v_q8_0(
+    const float*         __restrict__ attn_v,     // [n_heads * kv_lora_rank]
+    const unsigned char* __restrict__ w_v_b,      // [n_heads * value_mla * (kv_lora_rank/32) * 34]
+    float*               __restrict__ attn_out,   // [n_heads * value_mla]
+    int n_heads, int kv_lora_rank, int value_mla, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    if (oi >= value_mla || h >= n_heads) return;
+
+    size_t base_bytes = (size_t)h * value_mla * blocks_per_row * 34
+                      + (size_t)oi * blocks_per_row * 34;
+    const unsigned char* base = w_v_b + base_bytes;
+    const float* ain = attn_v + (size_t)h * kv_lora_rank;
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const unsigned char* blk = base + (size_t)b * 34;
+        unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        float d = aether_f16_to_f32_dev(d_bits);
+        const signed char* qs = (const signed char*)(blk + 2);
+        #pragma unroll
+        for (int k = 0; k < 32; k++) {
+            acc += ain[b * 32 + k] * (d * (float)(int)qs[k]);
+        }
+    }
+    attn_out[(size_t)h * value_mla + oi] = acc;
+}
+
+// FR-17-extra-mla-absorbed — broadcast compressed c_kv (+ k_pe for K) to
+// all n_q_heads slots.  Used to fit absorbed-MLA's MQA-style shared
+// K/V cache into the per-head paged_attention_mla kernel that expects
+// per-head K/V data already laid out per head.
+//
+// k_row[h, j in 0..kv_lora_rank]   = c_kv[j]
+// k_row[h, j in kv_lora_rank..]    = k_pe[j - kv_lora_rank]
+// v_row[h, j in 0..kv_lora_rank]   = c_kv[j]
+extern "C" __global__ void mla_broadcast_kv_for_mqa(
+    const float* __restrict__ c_kv,        // [kv_lora_rank]
+    const float* __restrict__ k_pe,        // [qk_rope]
+    float*       __restrict__ k_row,       // [n_heads * (kv_lora_rank + qk_rope)]
+    float*       __restrict__ v_row,       // [n_heads * kv_lora_rank]
+    int n_heads, int kv_lora_rank, int qk_rope)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int k_per_head = kv_lora_rank + qk_rope;
+    int total_k = n_heads * k_per_head;
+    int total_v = n_heads * kv_lora_rank;
+    if (idx < total_k) {
+        int j = idx % k_per_head;
+        k_row[idx] = (j < kv_lora_rank) ? c_kv[j] : k_pe[j - kv_lora_rank];
+    }
+    if (idx < total_v) {
+        int j = idx % kv_lora_rank;
+        v_row[idx] = c_kv[j];
+    }
 }
 "#;
 
@@ -5527,6 +5683,100 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
             .launch(cfg, (kv, qk_rope_head_dim, base,
                           yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow, sv))
             .expect("launch mla_rope_k_shared_yarn");
+    }
+    0
+}
+
+/// FR-17-extra-mla-absorbed — GLM-4.7-flash absorbed-MLA Q absorption +
+/// q_pe concat in one launch.  q_proj is the w_q_b output [n_heads * key_mla];
+/// w_k_b is the Q8_0-packed per-head [q_nope_per_head × kv_lora_rank × n_heads]
+/// weight tensor.  Output q_out has shape [n_heads * (kv_lora_rank + qk_rope)],
+/// matching the existing paged_attention_mla kernel's Q layout.
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_q_q8_0_cuda(
+    q_proj: i64, w_k_b: i64, q_out: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_q), Some(i_o)) = (handle_to_idx(q_proj), handle_to_idx(q_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_k_b) else { return -1; };
+    if n_heads <= 0 || key_mla <= 0 || qk_rope <= 0 || kv_lora_rank <= 0
+        || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: ((kv_lora_rank + qk_rope) as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv = &*q_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_q_q8_0.clone()
+            .launch(cfg, (qv, wv, ov, n_heads, key_mla, qk_rope,
+                          kv_lora_rank, blocks_per_row))
+            .expect("launch mla_absorb_q_q8_0");
+    }
+    0
+}
+
+/// FR-17-extra-mla-absorbed — GLM-4.7-flash absorbed-MLA V absorption.
+/// attn_v is the paged-attention output [n_heads * kv_lora_rank]; w_v_b is
+/// the Q8_0-packed per-head [kv_lora_rank × value_mla × n_heads] weight.
+/// Output attn_out has shape [n_heads * value_mla] = post-w_o input.
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_v_q8_0_cuda(
+    attn_v: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, value_mla: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_a), Some(i_o)) = (handle_to_idx(attn_v), handle_to_idx(attn_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_v_b) else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || value_mla <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (value_mla as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_v_q8_0.clone()
+            .launch(cfg, (av, wv, ov, n_heads, kv_lora_rank, value_mla, blocks_per_row))
+            .expect("launch mla_absorb_v_q8_0");
+    }
+    0
+}
+
+/// FR-17-extra-mla-absorbed — broadcast compressed c_kv (and k_pe for K) to
+/// per-head MQA slots in k_row / v_row, so existing paged_attention_mla
+/// kernel (which assumes per-head K/V) can run unchanged.
+#[no_mangle] pub extern "C" fn aether_op_mla_broadcast_kv_for_mqa_f32_cuda(
+    c_kv: i64, k_pe: i64, k_row: i64, v_row: i64,
+    n_heads: c_int, kv_lora_rank: c_int, qk_rope: c_int,
+) -> c_int {
+    let (Some(i_c), Some(i_p), Some(i_k), Some(i_v)) =
+        (handle_to_idx(c_kv), handle_to_idx(k_pe),
+         handle_to_idx(k_row), handle_to_idx(v_row))
+        else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || qk_rope <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let c_p = bs[i_c].as_ref().unwrap() as *const CudaSlice<f32>;
+    let p_p = bs[i_p].as_ref().unwrap() as *const CudaSlice<f32>;
+    let k_p = bs[i_k].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let v_p = bs[i_v].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (n_heads * (kv_lora_rank + qk_rope)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let cv = &*c_p; let pv = &*p_p; let kv = &mut *k_p; let vv = &mut *v_p;
+        paged_ctx().mla_broadcast_kv_for_mqa.clone()
+            .launch(cfg, (cv, pv, kv, vv, n_heads, kv_lora_rank, qk_rope))
+            .expect("launch mla_broadcast_kv_for_mqa");
     }
     0
 }

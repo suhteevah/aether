@@ -58,6 +58,9 @@ use crate::cuda::{
     aether_op_mla_rope_k_shared_f32_cuda,
     aether_op_mla_rope_q_partial_yarn_f32_cuda,
     aether_op_mla_rope_k_shared_yarn_f32_cuda,
+    aether_op_mla_absorb_q_q8_0_cuda,
+    aether_op_mla_absorb_v_q8_0_cuda,
+    aether_op_mla_broadcast_kv_for_mqa_f32_cuda,
     aether_op_matmul_nt_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
     aether_op_mul_inplace_f32_cuda, aether_op_silu_f32_cuda,
@@ -231,6 +234,15 @@ pub struct ModelConfig {
     /// SHARED across heads in MLA (a single qk_rope_head_dim vector per
     /// token), while Q_rope is per-head.  0 = N/A.
     pub qk_rope_head_dim: i32,
+    /// MLA-absorbed mode: per-head Q proj dim that w_q_b OUTPUTS.  For
+    /// GLM-4.7-flash this is 256 (= q_nope_in 192 + q_pe 64), not the
+    /// full 576 of qk_head_dim.  When > 0, GGUF metadata signals absorbed
+    /// MLA — w_k_b / w_v_b absorb per-head decompression into the Q/V paths.
+    /// Read from `<arch>.attention.key_length_mla`.
+    pub key_length_mla: i32,
+    /// MLA-absorbed mode: per-head V output dim from w_v_b.  For
+    /// GLM-4.7-flash this is 256.  Read from `<arch>.attention.value_length_mla`.
+    pub value_length_mla: i32,
     /// MLA: per-head V dim (e.g. 128 for V2-Lite).  Different from qk_head_dim.
     /// 0 = N/A.
     pub v_head_dim: i32,
@@ -282,6 +294,7 @@ impl ModelConfig {
             sliding_window: 0,
             kv_lora_rank: 0, q_lora_rank: 0,
             qk_head_dim: 0, qk_rope_head_dim: 0, v_head_dim: 0,
+            key_length_mla: 0, value_length_mla: 0,
             leading_dense_blocks: 0, n_shared_experts: 0,
             expert_ff_dim: 0,
             yarn_factor: 1.0, yarn_log_multiplier: 0.0,
@@ -354,6 +367,12 @@ impl ModelConfig {
         let qk_rope_head_dim = read_meta_u32(gguf_handle,
             &format!("{}.rope.dimension_count", prefix))
             .map(|v| v as i32).unwrap_or(0);
+        let key_length_mla = read_meta_u32(gguf_handle,
+            &format!("{}.attention.key_length_mla", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        let value_length_mla = read_meta_u32(gguf_handle,
+            &format!("{}.attention.value_length_mla", prefix))
+            .map(|v| v as i32).unwrap_or(0);
         let leading_dense_blocks = read_meta_u32(gguf_handle,
             &format!("{}.leading_dense_block_count", prefix))
             .map(|v| v as i32).unwrap_or(0);
@@ -400,10 +419,19 @@ impl ModelConfig {
             sliding_window,
             kv_lora_rank, q_lora_rank,
             qk_head_dim, qk_rope_head_dim, v_head_dim,
+            key_length_mla, value_length_mla,
             leading_dense_blocks, n_shared_experts, expert_ff_dim,
             yarn_factor, yarn_log_multiplier, yarn_orig_ctx,
             yarn_beta_fast, yarn_beta_slow,
         }
+    }
+    /// MLA absorbed-mode detector.  When both `key_length_mla` and
+    /// `value_length_mla` GGUF fields are present (> 0), this arch stores
+    /// the per-head K/V decompression matrices as separate `attn_k_b` /
+    /// `attn_v_b` tensors and uses MQA-style shared compressed KV in
+    /// attention.  GLM-4.7-flash sets this; V2-Lite does not.
+    pub fn is_mla_absorbed(&self) -> bool {
+        self.key_length_mla > 0 && self.value_length_mla > 0
     }
 }
 
@@ -474,6 +502,16 @@ struct BlockGpu {
     attn_q_a_norm_g: i64,
     w_q_b: i64,
     dt_kv_a_mqa: i32, dt_kv_b: i32, dt_q_a: i32, dt_q_b: i32,
+    /// MLA-absorbed mode per-head decompression matrices (GLM-4.7-flash).
+    /// w_k_b: GGUF [n_embd_head_qk_nope, kv_lora_rank, n_heads] — per head,
+    ///   absorbs Q-side K decompression: q_nope_absorbed[h] = w_k_b[h] @ q_nope[h]
+    ///   producing kv_lora_rank dims that match the compressed K cache.
+    /// w_v_b: GGUF [kv_lora_rank, n_embd_head_v_mla, n_heads] — per head,
+    ///   absorbs V decompression: attn_out_real[h] = w_v_b[h] @ attn_v[h]
+    ///   reducing the kv_lora_rank-dim attention output back to n_embd_head_v_mla.
+    /// Both are 0 in non-absorbed mode (V2-Lite, Qwen2.5, etc.).
+    w_k_b: i64, dt_k_b: i32,
+    w_v_b: i64, dt_v_b: i32,
     /// FR-17-extra-mla-fwd MoE shared experts — DeepSeek-V2 / GLM-4.7-flash
     /// have `expert_shared_count > 0` always-on experts that are FUSED into
     /// a single MLP with hidden dim = n_shared * expert_ff_dim
@@ -731,9 +769,19 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         upload_tensor_u8(h, &format!("{}attn_v.weight", p))
     };
     let (w_o, _, dt_o)             = upload_tensor_u8(h, &format!("{}attn_output.weight", p));
+    // MLA-absorbed variant (GLM-4.7-flash): per-head K/V decompression matrices.
+    // Stored as 3D tensors [n_embd_head_qk_nope, kv_lora_rank, n_heads] and
+    // [kv_lora_rank, n_embd_head_v_mla, n_heads] respectively.  0 for archs
+    // that use the combined attn_kv_b (V2-Lite, etc.).
+    let (w_k_b, _, dt_k_b) = if is_mla {
+        upload_tensor_u8_opt(h, &format!("{}attn_k_b.weight", p))
+    } else { (0, 0, 0) };
+    let (w_v_b, _, dt_v_b) = if is_mla {
+        upload_tensor_u8_opt(h, &format!("{}attn_v_b.weight", p))
+    } else { (0, 0, 0) };
     if std::env::var("AETHER_DUMP_ATTN_DTYPES").is_ok() && b < 4 {
-        eprintln!("[ATTN-DT b={}] kv_a_mqa={} kv_b={} q_a={} q_b={} q={} k={} v={} o={}",
-            b, dt_kv_a_mqa, dt_kv_b, dt_q_a, dt_q_b, dt_q, dt_k, dt_v, dt_o);
+        eprintln!("[ATTN-DT b={}] kv_a_mqa={} kv_b={} q_a={} q_b={} q={} k={} v={} o={} k_b={} v_b={}",
+            b, dt_kv_a_mqa, dt_kv_b, dt_q_a, dt_q_b, dt_q, dt_k, dt_v, dt_o, dt_k_b, dt_v_b);
     }
     // For DENSE FFN the three tensors live under ffn_gate/up/down.  For MoE
     // they live under ffn_gate_exps/up_exps/down_exps and there's a router
@@ -780,6 +828,7 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         attn_q_a_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_q_a_norm.weight", p)),
         w_q_b,
         dt_kv_a_mqa, dt_kv_b, dt_q_a, dt_q_b,
+        w_k_b, dt_k_b, w_v_b, dt_v_b,
         w_gate_shexp, w_up_shexp, w_down_shexp,
         dt_gate_shexp, dt_up_shexp, dt_down_shexp,
     }
@@ -817,7 +866,13 @@ unsafe fn block_forward_devarg(
     let is_mla = cfg.kv_lora_rank > 0 || bw.w_kv_a_mqa != 0;
     let attn_out_n_in: c_int = if is_mla {
         mla_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
-        (cfg.n_q_heads * cfg.v_head_dim as usize) as c_int
+        // Absorbed MLA reduces per-head attn_out to value_length_mla via wv_b;
+        // non-absorbed leaves it at v_head_dim.
+        if cfg.is_mla_absorbed() {
+            (cfg.n_q_heads * cfg.value_length_mla as usize) as c_int
+        } else {
+            (cfg.n_q_heads * cfg.v_head_dim as usize) as c_int
+        }
     } else {
         standard_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
         d_model
@@ -990,6 +1045,10 @@ unsafe fn mla_attention_forward(
     cfg: &ModelConfig,
     max_seq: usize,
 ) {
+    if cfg.is_mla_absorbed() {
+        mla_attention_forward_absorbed(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
+        return;
+    }
     let d_model = cfg.d_model as c_int;
     let kv_lora_rank = cfg.kv_lora_rank as c_int;
     let qk_head_dim = cfg.qk_head_dim as c_int;
@@ -1125,6 +1184,179 @@ unsafe fn mla_attention_forward(
 
     // Free per-call workspace.  (Drop on QwenSession owns persistent bufs.)
     for h in [kv_a, c_kv, c_kv_n, k_rope, kv_b, k_row, v_row, q_full] {
+        let _ = aether_dev_free_f32(h);
+    }
+}
+
+/// FR-17-extra-mla-absorbed — GLM-4.7-flash absorbed-MLA forward.
+///
+/// Differs from the non-absorbed path (V2-Lite) in three places:
+/// 1. w_q_b outputs per-head `key_length_mla` (e.g. 256 for GLM) — split into
+///    q_nope (192) + q_pe (64).
+/// 2. Per-head wk_b absorbs Q-side K decompression: q_nope_absorbed[h] =
+///    wk_b[h] @ q_nope[h] producing kv_lora_rank (512) per head.  Combined with
+///    q_pe → Qcur per head (kv_lora_rank + qk_rope = 576).
+/// 3. K and V in cache are the SHARED compressed c_kv (+ k_pe for K) broadcast
+///    across all heads (MQA semantics).  After attention, wv_b reduces the
+///    kv_lora_rank-dim attn_v back to per-head value_length_mla (256).
+///
+/// The existing paged_attention_mla / paged_append_kv_mla kernels are reused
+/// after the broadcast — they're shape-agnostic, just need consistent dims.
+unsafe fn mla_attention_forward_absorbed(
+    bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, step_args: i64,
+    paged_cfg: Option<(i64, i32)>,
+    cfg: &ModelConfig,
+    max_seq: usize,
+) {
+    let d_model = cfg.d_model as c_int;
+    let kv_lora_rank = cfg.kv_lora_rank as c_int;
+    let qk_rope = cfg.qk_rope_head_dim as c_int;
+    let key_mla = cfg.key_length_mla as c_int;
+    let val_mla = cfg.value_length_mla as c_int;
+    let q_nope_per_head = key_mla - qk_rope;
+    let n_heads = cfg.n_q_heads as c_int;
+    let rope_base = cfg.rope_base;
+    let norm_eps = cfg.norm_eps;
+    assert!(bw.w_q_a != 0 && bw.w_q_b != 0,
+        "absorbed MLA requires Q-LoRA (q_lora_rank > 0)");
+    assert!(bw.w_k_b != 0 && bw.w_v_b != 0,
+        "absorbed MLA requires attn_k_b + attn_v_b tensors");
+    assert!(bw.dt_k_b == 8 && bw.dt_v_b == 8,
+        "absorbed MLA currently supports Q8_0 (dt=8) for w_k_b/w_v_b only; \
+         got dt_k_b={} dt_v_b={}", bw.dt_k_b, bw.dt_v_b);
+    assert!(q_nope_per_head % 32 == 0,
+        "q_nope_per_head ({}) must be a multiple of 32 for Q8_0 wk_b kernel",
+        q_nope_per_head);
+    assert!(kv_lora_rank % 32 == 0,
+        "kv_lora_rank ({}) must be a multiple of 32 for Q8_0 wv_b kernel",
+        kv_lora_rank);
+
+    // Per-call workspace (drops at end of fn).  Sizes:
+    //   kv_a            = kv_lora_rank + qk_rope
+    //   c_kv, c_kv_n    = kv_lora_rank
+    //   k_pe            = qk_rope
+    //   q_a, q_a_n      = q_lora_rank
+    //   q_proj          = n_heads * key_mla (output of w_q_b)
+    //   q_full          = n_heads * (kv_lora_rank + qk_rope) (post-absorption + q_pe concat)
+    //   k_row           = n_heads * (kv_lora_rank + qk_rope) (broadcast K for cache)
+    //   v_row           = n_heads * kv_lora_rank             (broadcast V for cache)
+    //   attn_v_out      = n_heads * kv_lora_rank (paged_attention output)
+    let kv_a   = aether_dev_alloc_f32(kv_lora_rank + qk_rope);
+    let c_kv   = aether_dev_alloc_f32(kv_lora_rank);
+    let c_kv_n = aether_dev_alloc_f32(kv_lora_rank);
+    let k_pe   = aether_dev_alloc_f32(qk_rope);
+    let q_a_dim = cfg.q_lora_rank as c_int;
+    let q_a    = aether_dev_alloc_f32(q_a_dim);
+    let q_a_n  = aether_dev_alloc_f32(q_a_dim);
+    let q_proj = aether_dev_alloc_f32(n_heads * key_mla);
+    let q_full = aether_dev_alloc_f32(n_heads * (kv_lora_rank + qk_rope));
+    let k_row  = aether_dev_alloc_f32(n_heads * (kv_lora_rank + qk_rope));
+    let v_row  = aether_dev_alloc_f32(n_heads * kv_lora_rank);
+    let attn_v_out = aether_dev_alloc_f32(n_heads * kv_lora_rank);
+
+    let dump_mla = std::env::var("AETHER_DUMP_MLA").is_ok();
+    let probe = |label: &str, h: i64, n: usize| {
+        if !dump_mla { return; }
+        aether_dev_sync();
+        let mut v = vec![0.0f32; n];
+        aether_dev_d2h_f32(h, v.as_mut_ptr() as i64, n as c_int);
+        let nan = v.iter().filter(|x| x.is_nan()).count();
+        let inf = v.iter().filter(|x| x.is_infinite()).count();
+        let fin: Vec<f32> = v.iter().cloned().filter(|x| x.is_finite()).collect();
+        let mn = fin.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = fin.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[MLA-A {}] n={} nan={} inf={} min={:.4e} max={:.4e}",
+            label, n, nan, inf, mn, mx);
+    };
+
+    probe("x_norm_IN", act.x_norm, d_model as usize);
+
+    // Step 1: KV-A projection (shared latent + k_pe).  Same as non-absorbed.
+    dispatch_matmul(act.x_norm, bw.w_kv_a_mqa, bw.dt_kv_a_mqa,
+        kv_a, kv_lora_rank + qk_rope, d_model);
+    aether_op_mla_split_kv_a_f32_cuda(kv_a, c_kv, k_pe, kv_lora_rank, qk_rope);
+    aether_op_rms_norm_f32_cuda(c_kv, bw.attn_kv_a_norm_g, c_kv_n,
+        norm_eps, 1, kv_lora_rank);
+    probe("c_kv_n", c_kv_n, kv_lora_rank as usize);
+
+    let yarn_active = cfg.yarn_factor > 1.0;
+    if yarn_active {
+        aether_op_mla_rope_k_shared_yarn_f32_cuda(k_pe, qk_rope,
+            rope_base, cfg.yarn_factor, cfg.yarn_orig_ctx,
+            cfg.yarn_beta_fast, cfg.yarn_beta_slow, step_args);
+    } else {
+        aether_op_mla_rope_k_shared_f32_cuda(k_pe, qk_rope,
+            rope_base, step_args);
+    }
+
+    // Step 2: Q-LoRA chain.  Output q_proj has per-head key_mla dims.
+    dispatch_matmul(act.x_norm, bw.w_q_a, bw.dt_q_a, q_a, q_a_dim, d_model);
+    aether_op_rms_norm_f32_cuda(q_a, bw.attn_q_a_norm_g, q_a_n, norm_eps, 1, q_a_dim);
+    dispatch_matmul(q_a_n, bw.w_q_b, bw.dt_q_b, q_proj, n_heads * key_mla, q_a_dim);
+    probe("q_proj", q_proj, (n_heads * key_mla) as usize);
+
+    // Step 3: Apply RoPE to q_proj's per-head rope sub-region (positions
+    // q_nope_per_head .. key_mla).  Existing kernel takes (n_heads, qk_head_dim,
+    // qk_nope_head_dim) so pass (n_heads, key_mla, q_nope_per_head).
+    if yarn_active {
+        aether_op_mla_rope_q_partial_yarn_f32_cuda(q_proj,
+            n_heads, key_mla, q_nope_per_head, rope_base,
+            cfg.yarn_factor, cfg.yarn_orig_ctx,
+            cfg.yarn_beta_fast, cfg.yarn_beta_slow, step_args);
+    } else {
+        aether_op_mla_rope_q_partial_f32_cuda(q_proj,
+            n_heads, key_mla, q_nope_per_head, rope_base, step_args);
+    }
+
+    // Step 4: Per-head Q absorption + q_pe concat via Q8_0 wk_b.  Output
+    // q_full has per-head dim (kv_lora_rank + qk_rope) — matches Kcur per
+    // head in the broadcast cache.
+    let wk_blocks_per_row = q_nope_per_head / 32;
+    aether_op_mla_absorb_q_q8_0_cuda(
+        q_proj, bw.w_k_b, q_full,
+        n_heads, key_mla, qk_rope, kv_lora_rank, wk_blocks_per_row);
+    probe("q_full_absorbed", q_full, (n_heads * (kv_lora_rank + qk_rope)) as usize);
+
+    // Step 5: Broadcast c_kv (+ k_pe for K) to per-head MQA slots.
+    aether_op_mla_broadcast_kv_for_mqa_f32_cuda(
+        c_kv_n, k_pe, k_row, v_row, n_heads, kv_lora_rank, qk_rope);
+    probe("k_row", k_row, (n_heads * (kv_lora_rank + qk_rope)) as usize);
+    probe("v_row", v_row, (n_heads * kv_lora_rank) as usize);
+
+    // Step 6: Paged append + attention.  Per-head K = kv_lora_rank + qk_rope,
+    // per-head V = kv_lora_rank.  These are the SAME numbers as the
+    // non-absorbed path's qk_head_dim and v_head_dim for GLM (576 and 512),
+    // so the existing KV cache sizing works as-is.
+    let d_k_row = n_heads * (kv_lora_rank + qk_rope);
+    let d_v_row = n_heads * kv_lora_rank;
+    let q_head_dim = kv_lora_rank + qk_rope;
+    let v_head_dim_eff = kv_lora_rank;
+    let base_scale = 1.0f32 / (q_head_dim as f32).sqrt();
+    let scale = if yarn_active {
+        let mscale = 1.0 + cfg.yarn_log_multiplier * cfg.yarn_factor.ln();
+        base_scale * mscale * mscale
+    } else { base_scale };
+    let (page_table_dev, block_size) = paged_cfg.expect(
+        "absorbed MLA requires --paged mode (contiguous KV not implemented).");
+    aether_op_paged_append_kv_mla_devarg_f32_cuda(
+        k_row, v_row, kv.k_cache, kv.v_cache, page_table_dev,
+        d_k_row, d_v_row, block_size, step_args);
+    aether_op_paged_attention_mla_devarg_f32_cuda(
+        q_full, kv.k_cache, kv.v_cache, page_table_dev, attn_v_out,
+        n_heads, q_head_dim, v_head_dim_eff, block_size,
+        scale, max_seq as c_int, step_args);
+    probe("attn_v_out", attn_v_out, (n_heads * kv_lora_rank) as usize);
+
+    // Step 7: Per-head V absorption via Q8_0 wv_b — reduces kv_lora_rank to
+    // value_mla per head.  Writes into act.attn_out (first n_heads*val_mla floats).
+    let wv_blocks_per_row = kv_lora_rank / 32;
+    aether_op_mla_absorb_v_q8_0_cuda(
+        attn_v_out, bw.w_v_b, act.attn_out,
+        n_heads, kv_lora_rank, val_mla, wv_blocks_per_row);
+    probe("attn_out", act.attn_out, (n_heads * val_mla) as usize);
+
+    // Free per-call workspace.
+    for h in [kv_a, c_kv, c_kv_n, k_pe, q_a, q_a_n, q_proj, q_full, k_row, v_row, attn_v_out] {
         let _ = aether_dev_free_f32(h);
     }
 }
@@ -1928,6 +2160,8 @@ impl Drop for QwenSession {
                 if b.w_gate_exps != 0 { let _ = aether_dev_free_u8(b.w_gate_exps); }
                 if b.w_up_exps != 0 { let _ = aether_dev_free_u8(b.w_up_exps); }
                 if b.w_down_exps != 0 { let _ = aether_dev_free_u8(b.w_down_exps); }
+                if b.w_k_b != 0 { let _ = aether_dev_free_u8(b.w_k_b); }
+                if b.w_v_b != 0 { let _ = aether_dev_free_u8(b.w_v_b); }
             }
             let _ = aether_dev_free_f32(self.final_norm_g);
             let _ = aether_dev_free_u8(self.lm_head);
