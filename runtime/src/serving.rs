@@ -1576,6 +1576,34 @@ impl QwenSession {
 
             let mut logits = vec![0.0f32; self.cfg.vocab];
             aether_dev_d2h_f32(self.act.logits, logits.as_mut_ptr() as i64, self.cfg.vocab as c_int);
+            // FR-17-extra-mla-fwd debug: on the FIRST decode step, dump
+            // logits statistics so we can diagnose the "all-tokens=vocab-1"
+            // degenerate output we hit on the cnc V2-Lite Q4_K_M load.
+            // Remove once decode is witnessed.
+            if pos < 32 && std::env::var("AETHER_DUMP_LOGITS").is_ok() {
+                let n_nan = logits.iter().filter(|x| x.is_nan()).count();
+                let n_inf = logits.iter().filter(|x| x.is_infinite()).count();
+                let n_zero = logits.iter().filter(|x| **x == 0.0).count();
+                let finite: Vec<f32> = logits.iter().cloned()
+                    .filter(|x| x.is_finite()).collect();
+                let mn = finite.iter().cloned().fold(f32::INFINITY, f32::min);
+                let mx = finite.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = finite.iter().sum();
+                let mean = if !finite.is_empty() { sum / finite.len() as f32 } else { 0.0 };
+                let var = finite.iter().map(|x| (x - mean).powi(2))
+                    .sum::<f32>() / finite.len().max(1) as f32;
+                let std_ = var.sqrt();
+                // top-5 argmax
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.sort_unstable_by(|a, b|
+                    logits[*b].partial_cmp(&logits[*a])
+                        .unwrap_or(std::cmp::Ordering::Equal));
+                let top: Vec<(usize, f32)> = idx[..5.min(idx.len())].iter()
+                    .map(|&i| (i, logits[i])).collect();
+                eprintln!(
+                    "[DUMP pos={}] vocab={} nan={} inf={} zero={} min={:.4e} max={:.4e} mean={:.4e} std={:.4e} top5={:?}",
+                    pos, self.cfg.vocab, n_nan, n_inf, n_zero, mn, mx, mean, std_, top);
+            }
             self.next_pos += 1;
             argmax(&logits)
         }
