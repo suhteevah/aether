@@ -76,7 +76,6 @@ struct CudaCtx {
     fused_q6k_matmul_seq1_v2: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul: CudaFunction,
     fused_q4k_matmul_seq1_v3: CudaFunction,
-    fused_q4k_matmul_seqB_v3: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
     rope_apply_devarg: CudaFunction,
     append_kv_devarg: CudaFunction,
@@ -109,6 +108,7 @@ struct PagedCtx {
     batched_paged_append_kv_seqB_devarg: CudaFunction,
     batched_paged_attention_hetero_devarg: CudaFunction,
     batched_paged_append_kv_hetero_devarg: CudaFunction,
+    fused_q4k_matmul_seqB_v3: CudaFunction,
     paged_attention_flex_devarg: CudaFunction,
     paged_attention_mla_devarg: CudaFunction,
     paged_append_kv_mla_devarg: CudaFunction,
@@ -147,6 +147,7 @@ fn paged_ctx() -> &'static PagedCtx {
               "batched_paged_append_kv_seqB_devarg",
               "batched_paged_attention_hetero_devarg",
               "batched_paged_append_kv_hetero_devarg",
+              "fused_q4k_matmul_seqB_v3",
               "paged_attention_flex_devarg",
               "paged_attention_mla_devarg",
               "paged_append_kv_mla_devarg",
@@ -184,6 +185,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "batched_paged_attention_hetero_devarg").unwrap(),
             batched_paged_append_kv_hetero_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_append_kv_hetero_devarg").unwrap(),
+            fused_q4k_matmul_seqB_v3:
+                device.get_func("aether_paged_kernels", "fused_q4k_matmul_seqB_v3").unwrap(),
             paged_attention_flex_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_flex_devarg").unwrap(),
             paged_attention_mla_devarg:
@@ -648,6 +651,124 @@ extern "C" __global__ void batched_paged_attention_hetero_devarg(
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         if (i < per_lane) out_ptr[lane * per_lane + i] = out_local[i];
+    }
+}
+
+// FR-19.5-extra-deep Phase 2 — WEIGHT-REUSE batched Q4_K matmul.
+//
+// The decode throughput lever for continuous batching: at batch=1 the
+// seq1 matmul is DRAM-bandwidth-bound on the Q4_K weights (each output
+// row reads its whole 144-byte-per-block weight strip once for only 256
+// FMAs/block against it).  This kernel dequantizes each weight block
+// EXACTLY ONCE (byte-once layout identical to KERNEL_SRC's seq1_v3) and
+// applies it to `batch` activation rows held in shared memory — weight
+// memory traffic unchanged while FMA throughput scales with batch.
+//
+// LIVES IN PAGED_KERNEL_SRC (a SEPARATE, lazily-loaded nvrtc module) on
+// purpose: adding it to KERNEL_SRC regressed the single-stream seq1
+// decode path ~7% via nvrtc register-allocation pressure (see
+// BENCH_LEDGER 02fca19 → fix; the same class as f40d259).  Here it never
+// touches the main decode ctx() and only compiles when paged/batched
+// kernels are first used.  The q4k_get_scale/min helpers are duplicated
+// below (same reason aether_f16_to_f32_dev is duplicated in this module).
+//
+// a    : [batch * n_blocks*256]   (row-major; row b at b*n_blocks*256)
+// w    : [n * n_blocks * 144]     (same Q4_K weight layout as seq1)
+// out  : [batch * n]              (row-major; row b at b*n)
+// FMA order per (b, ni) is bit-identical to seq1_v3 → exact parity.
+extern "C" __device__ unsigned int q4k_get_scale_paged(int sub, const unsigned char* sc) {
+    if (sub < 4) return sc[sub] & 63u;
+    return (sc[sub + 4] & 0xFu) | (((unsigned int)(sc[sub - 4] >> 6)) << 4);
+}
+extern "C" __device__ unsigned int q4k_get_min_paged(int sub, const unsigned char* sc) {
+    if (sub < 4) return sc[sub + 4] & 63u;
+    return (sc[sub + 4] >> 4) | (((unsigned int)(sc[sub] >> 6)) << 4);
+}
+extern "C" __global__ void fused_q4k_matmul_seqB_v3(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks, int batch)   // batch in [1, 8]
+{
+    __shared__ float a_tile[8 * 256];   // up to batch=8 rows × 256-elem K-tile
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    // Split lo/hi accumulators per row to expose ILP (matches seq1_v3).
+    float acc_lo[8]; float acc_hi[8];
+    #pragma unroll
+    for (int b = 0; b < 8; b++) { acc_lo[b] = 0.0f; acc_hi[b] = 0.0f; }
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // CTA-wide cooperative load of `batch` activation tiles.
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            if (b < batch) {
+                a_tile[b * 256 + threadIdx.x] =
+                    a[(size_t)b * n_blocks * 256 + bi * 256 + threadIdx.x];
+            }
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w
+                + (size_t)ni * n_blocks * 144
+                + (size_t)bi * 144;
+            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* scales = base + 4;
+            const unsigned char* qs     = base + 16;
+
+            // Dequant scale/min computed ONCE per (ni, bi) tile, reused
+            // across all `batch` activation rows.
+            float d_eff[8], m_eff[8];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                unsigned int sc = q4k_get_scale_paged(s, scales);
+                unsigned int mn = q4k_get_min_paged(s, scales);
+                d_eff[s] = d * (float)sc;
+                m_eff[s] = dmin * (float)mn;
+            }
+
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int sub_lo = i * 2;
+                int sub_hi = i * 2 + 1;
+                unsigned char byte = qs[i * 32 + lane];        // weight byte: read ONCE
+                unsigned int nib_lo = ((unsigned int)byte) & 0xFu;
+                unsigned int nib_hi = (((unsigned int)byte) >> 4) & 0xFu;
+                float w_lo = d_eff[sub_lo] * (float)nib_lo - m_eff[sub_lo];
+                float w_hi = d_eff[sub_hi] * (float)nib_hi - m_eff[sub_hi];
+                int k_lo = sub_lo * 32 + lane;
+                int k_hi = sub_hi * 32 + lane;
+                #pragma unroll
+                for (int b = 0; b < 8; b++) {
+                    if (b < batch) {
+                        acc_lo[b] += a_tile[b * 256 + k_lo] * w_lo;
+                        acc_hi[b] += a_tile[b * 256 + k_hi] * w_hi;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        if (b < batch) {
+            float acc = acc_lo[b] + acc_hi[b];
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
+            }
+            if (lane == 0 && ni < n) {
+                out[(size_t)b * n + ni] = acc;
+            }
+        }
     }
 }
 
@@ -3343,111 +3464,6 @@ extern "C" __global__ void fused_q4k_matmul_seq1_v3(
     }
 }
 
-// FR-19.5-extra-deep Phase 2 — WEIGHT-REUSE batched Q4_K matmul.
-//
-// The decode throughput lever for continuous batching: at batch=1 the
-// seq1 matmul is DRAM-bandwidth-bound on the Q4_K weights (each output
-// row reads its whole 144-byte-per-block weight strip once and does only
-// 256 FMAs per block against it).  This kernel dequantizes each weight
-// block EXACTLY ONCE (identical byte-once layout to seq1_v3) and applies
-// it to `batch` independent activation rows held in shared memory — so
-// weight memory traffic is unchanged while FMA throughput scales ~batch×.
-// For a memory-bound GEMV that's a near-linear speedup until the kernel
-// becomes compute-bound (typically a handful of rows on Ampere).
-//
-// a    : [batch * n_blocks*256]   (row-major; row b at b*n_blocks*256)
-// w    : [n * n_blocks * 144]     (same Q4_K weight layout as seq1)
-// out  : [batch * n]              (row-major; row b at b*n)
-// FMA order per (b, ni) is bit-identical to seq1_v3, so the parity test
-// asserts EXACT equality against batch sequential seq1 calls.
-extern "C" __global__ void fused_q4k_matmul_seqB_v3(
-    const float*         __restrict__ a,
-    const unsigned char* __restrict__ w,
-    float*               __restrict__ out,
-    int n, int n_blocks, int batch)   // batch in [1, 8]
-{
-    __shared__ float a_tile[8 * 256];   // up to batch=8 rows × 256-elem K-tile
-
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int ni = blockIdx.x * 8 + warp;
-
-    // Split lo/hi accumulators per row to expose ILP (matches seq1_v3).
-    float acc_lo[8]; float acc_hi[8];
-    #pragma unroll
-    for (int b = 0; b < 8; b++) { acc_lo[b] = 0.0f; acc_hi[b] = 0.0f; }
-
-    for (int bi = 0; bi < n_blocks; bi++) {
-        // CTA-wide cooperative load of `batch` activation tiles.
-        #pragma unroll
-        for (int b = 0; b < 8; b++) {
-            if (b < batch) {
-                a_tile[b * 256 + threadIdx.x] =
-                    a[(size_t)b * n_blocks * 256 + bi * 256 + threadIdx.x];
-            }
-        }
-        __syncthreads();
-
-        if (ni < n) {
-            const unsigned char* base = w
-                + (size_t)ni * n_blocks * 144
-                + (size_t)bi * 144;
-            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
-            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
-            float d    = aether_f16_to_f32_dev(d_bits);
-            float dmin = aether_f16_to_f32_dev(dmin_bits);
-            const unsigned char* scales = base + 4;
-            const unsigned char* qs     = base + 16;
-
-            // Dequant scale/min computed ONCE per (ni, bi) tile, reused
-            // across all `batch` activation rows.
-            float d_eff[8], m_eff[8];
-            #pragma unroll
-            for (int s = 0; s < 8; s++) {
-                unsigned int sc = q4k_get_scale(s, scales);
-                unsigned int mn = q4k_get_min(s, scales);
-                d_eff[s] = d * (float)sc;
-                m_eff[s] = dmin * (float)mn;
-            }
-
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                int sub_lo = i * 2;
-                int sub_hi = i * 2 + 1;
-                unsigned char byte = qs[i * 32 + lane];        // weight byte: read ONCE
-                unsigned int nib_lo = ((unsigned int)byte) & 0xFu;
-                unsigned int nib_hi = (((unsigned int)byte) >> 4) & 0xFu;
-                float w_lo = d_eff[sub_lo] * (float)nib_lo - m_eff[sub_lo];
-                float w_hi = d_eff[sub_hi] * (float)nib_hi - m_eff[sub_hi];
-                int k_lo = sub_lo * 32 + lane;
-                int k_hi = sub_hi * 32 + lane;
-                #pragma unroll
-                for (int b = 0; b < 8; b++) {
-                    if (b < batch) {
-                        acc_lo[b] += a_tile[b * 256 + k_lo] * w_lo;
-                        acc_hi[b] += a_tile[b * 256 + k_hi] * w_hi;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int b = 0; b < 8; b++) {
-        if (b < batch) {
-            float acc = acc_lo[b] + acc_hi[b];
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset);
-            }
-            if (lane == 0 && ni < n) {
-                out[(size_t)b * n + ni] = acc;
-            }
-        }
-    }
-}
-
 // matt-voice / FR-17.14-extra-deepest-v3 -- FUSED FFN gate+up+silu+mul.
 //
 // Replaces 4 separate kernels (gate matmul, up matmul, silu, mul_inplace)
@@ -4808,7 +4824,6 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
               "fused_q4k_ffn_gate_up_silu_mul",
               "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
-              "fused_q4k_matmul_seqB_v3",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
               "fused_f16_matmul_seq1",
@@ -4860,7 +4875,6 @@ fn ctx() -> &'static CudaCtx {
         let fused_q6k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_v2").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul").unwrap();
         let fused_q4k_matmul_seq1_v3 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v3").unwrap();
-        let fused_q4k_matmul_seqB_v3 = device.get_func("aether_kernels", "fused_q4k_matmul_seqB_v3").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
         let rope_apply_devarg = device.get_func("aether_kernels", "rope_apply_devarg").unwrap();
         let append_kv_devarg = device.get_func("aether_kernels", "append_kv_devarg").unwrap();
@@ -4896,7 +4910,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_iq3_s_matmul_seq1,
                   fused_q4k_matmul_seq1_v2,
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
-                  fused_q4k_matmul_seq1_v3, fused_q4k_matmul_seqB_v3,
+                  fused_q4k_matmul_seq1_v3,
                   fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1, fused_f16_matmul_seq1,
@@ -7804,7 +7818,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     };
     unsafe {
         let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
-        ctx().fused_q4k_matmul_seqB_v3.clone()
+        paged_ctx().fused_q4k_matmul_seqB_v3.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks, batch))
             .expect("launch fused_q4k_matmul_seqB_v3");
     }
