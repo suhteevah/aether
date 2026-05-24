@@ -1010,9 +1010,25 @@ unsafe fn mla_attention_forward(
     let v_row      = aether_dev_alloc_f32(n_heads * v_head_dim);
     let q_full     = aether_dev_alloc_f32(n_heads * qk_head_dim);
 
+    let dump_mla = std::env::var("AETHER_DUMP_MLA").is_ok();
+    let probe = |label: &str, h: i64, n: usize| {
+        if !dump_mla { return; }
+        aether_dev_sync();
+        let mut v = vec![0.0f32; n];
+        aether_dev_d2h_f32(h, v.as_mut_ptr() as i64, n as c_int);
+        let nan = v.iter().filter(|x| x.is_nan()).count();
+        let inf = v.iter().filter(|x| x.is_infinite()).count();
+        let fin: Vec<f32> = v.iter().cloned().filter(|x| x.is_finite()).collect();
+        let mn = fin.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = fin.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        eprintln!("[MLA {}] n={} nan={} inf={} min={:.4e} max={:.4e}",
+            label, n, nan, inf, mn, mx);
+    };
+    probe("x_norm_IN", act.x_norm, d_model as usize);
     // 1. kv_a_mqa: x_norm @ W → [kv_lora_rank + qk_rope_head_dim]
     dispatch_matmul(act.x_norm, bw.w_kv_a_mqa, bw.dt_kv_a_mqa,
         kv_a, kv_lora_rank + qk_rope_head_dim, d_model);
+    probe("kv_a", kv_a, (kv_lora_rank + qk_rope_head_dim) as usize);
 
     // 2. Split kv_a into c_kv + k_rope_shared.
     aether_op_mla_split_kv_a_f32_cuda(kv_a, c_kv, k_rope,
@@ -1022,9 +1038,11 @@ unsafe fn mla_attention_forward(
     aether_op_rms_norm_f32_cuda(c_kv, bw.attn_kv_a_norm_g, c_kv_n,
         norm_eps, 1, kv_lora_rank);
 
+    probe("c_kv_n", c_kv_n, kv_lora_rank as usize);
     // 4. kv_b: c_kv_normed @ W → [n_heads * (qk_nope + v_head)]
     dispatch_matmul(c_kv_n, bw.w_kv_b, bw.dt_kv_b,
         kv_b, n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank);
+    probe("kv_b", kv_b, (n_heads * (qk_nope_head_dim + v_head_dim)) as usize);
 
     // 5. Extract V from kv_b → v_row.
     aether_op_mla_extract_v_f32_cuda(kv_b, v_row,
@@ -1054,10 +1072,13 @@ unsafe fn mla_attention_forward(
         let q_a = aether_dev_alloc_f32(q_a_dim);
         let q_a_n = aether_dev_alloc_f32(q_a_dim);
         dispatch_matmul(act.x_norm, bw.w_q_a, bw.dt_q_a, q_a, q_a_dim, d_model);
+        probe("q_a", q_a, q_a_dim as usize);
         aether_op_rms_norm_f32_cuda(q_a, bw.attn_q_a_norm_g, q_a_n,
             norm_eps, 1, q_a_dim);
+        probe("q_a_n", q_a_n, q_a_dim as usize);
         dispatch_matmul(q_a_n, bw.w_q_b, bw.dt_q_b,
             q_full, n_heads * qk_head_dim, q_a_dim);
+        probe("q_full", q_full, (n_heads * qk_head_dim) as usize);
         let _ = aether_dev_free_f32(q_a);
         let _ = aether_dev_free_f32(q_a_n);
     } else {
@@ -1099,6 +1120,7 @@ unsafe fn mla_attention_forward(
         q_full, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
         n_heads, qk_head_dim, v_head_dim, block_size,
         scale, max_seq as c_int, step_args);
+    probe("attn_out", act.attn_out, (n_heads * v_head_dim) as usize);
     let _ = matmul_nt_f32_cuda_unused();  // silence dead-import warning
 
     // Free per-call workspace.  (Drop on QwenSession owns persistent bufs.)
