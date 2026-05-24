@@ -600,32 +600,67 @@ unsafe fn block_forward_devarg(
     let rope_base = cfg.rope_base;
     let norm_eps = cfg.norm_eps;
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
-    // FR-17-extra-mla-fwd — DeepSeek-V2 / GLM-4.7-flash MLA branch.
-    //
-    // All component kernels are landed and CPU↔GPU witnessed:
-    //   - paged_attention_mla_devarg / paged_append_kv_mla_devarg
-    //     (runtime/tests/cuda_attention_mla_parity.rs, 4 tests)
-    //   - mla_split_kv_a / mla_assemble_k / mla_extract_v
-    //     mla_rope_q_partial / mla_rope_k_shared
-    //     (runtime/tests/cuda_mla_e2e_synthetic.rs proves the full chain
-    //      matches a CPU reference to ≤ 6e-7 across multi-step KV-cache
-    //      decode).
-    //
-    // This branch wires those kernels through QwenSession's per-block
-    // KvCacheGpu / ActivationGpu — caller is responsible for sizing
-    // kv.k_cache and kv.v_cache for MLA's larger K (n_heads × qk_head_dim)
-    // and smaller V (n_heads × v_head_dim) row strides.  The Qwen2.5
-    // construction path sizes them for `d_kv = n_kv_heads * head_dim`
-    // which under-allocates K for MLA — a real DeepSeek-V2 / GLM-4.7-flash
-    // serving path needs a separate construction route that allocates
-    // those buffers using `cfg.qk_head_dim` / `cfg.v_head_dim`.  Until
-    // then this branch panics on the existing QwenSession's buffers.
-    if bw.w_kv_a_mqa != 0 || cfg.kv_lora_rank > 0 {
-        return mla_block_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
+    // FR-17-extra-mla-fwd — pre-attention dispatch.  MLA path runs the
+    // compressed-KV → decompression → partial-RoPE → MLA-attention chain;
+    // non-MLA path runs the standard Q/K/V → RoPE → attention chain.  Both
+    // paths write to act.attn_out so the common O-proj + residual + FFN
+    // tail below works for either.
+    let is_mla = cfg.kv_lora_rank > 0 || bw.w_kv_a_mqa != 0;
+    let attn_out_n_in: c_int = if is_mla {
+        mla_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
+        (cfg.n_q_heads * cfg.v_head_dim as usize) as c_int
+    } else {
+        standard_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
+        d_model
+    };
+
+    // ---- Common post-attention tail: O proj + residual + LN + FFN ----
+    dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, attn_out_n_in);
+    if bw.post_attn_norm_g != 0 {
+        aether_op_rms_norm_f32_cuda(act.proj, bw.post_attn_norm_g, act.proj,
+            norm_eps, 1, d_model);
     }
+    aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
+    aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
+    if bw.w_router != 0 {
+        moe_ffn_forward(bw, act, cfg);
+    } else {
+        if bw.dt_gate == 12 && bw.dt_up == 12 {
+            aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
+                act.x_norm, bw.w_gate, bw.w_up, act.gate,
+                d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
+        } else {
+            panic!("FFN gate/up dtypes not both Q4_K (got gate={}, up={}); needs a non-fused fallback",
+                bw.dt_gate, bw.dt_up);
+        }
+        dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
+        if bw.post_ffn_norm_g != 0 {
+            aether_op_rms_norm_f32_cuda(act.down, bw.post_ffn_norm_g, act.down,
+                norm_eps, 1, d_model);
+        }
+        aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
+    }
+}
+
+/// Standard Qwen/Llama/Gemma3 attention path: Q/K/V matmul → optional bias →
+/// optional Q/K RMSnorm (Qwen3) → RoPE → paged or contiguous attention,
+/// writing the per-head attention output to `act.attn_out`.
+unsafe fn standard_attention_forward(
+    bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, step_args: i64,
+    paged_cfg: Option<(i64, i32)>,
+    cfg: &ModelConfig,
+    max_seq: usize,
+) {
+    let d_model = cfg.d_model as c_int;
+    let d_kv = cfg.d_kv as c_int;
+    let n_q_heads = cfg.n_q_heads as c_int;
+    let n_kv_heads = cfg.n_kv_heads as c_int;
+    let head_dim = cfg.head_dim as c_int;
+    let rope_base = cfg.rope_base;
+    let norm_eps = cfg.norm_eps;
+
     dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, d_model, d_model);
     if bw.b_q != 0 {
-        // Qwen2 has Q bias; Qwen3 doesn't (BlockGpu.b_q == 0 for qwen3).
         aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, d_model);
     }
     dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
@@ -636,17 +671,12 @@ unsafe fn block_forward_devarg(
     if bw.b_v != 0 {
         aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
     }
-    // FR-17-extra-qwen3-fwd — per-head Q/K RMS norm (Qwen3-style).
-    // gamma shape [head_dim] is broadcast across heads; applied to each head's
-    // head_dim-sized slice via rms_norm with rows=n_q_heads, d=head_dim.
     if bw.attn_q_norm_g != 0 {
-        aether_op_rms_norm_f32_cuda(
-            act.q, bw.attn_q_norm_g, act.q,
+        aether_op_rms_norm_f32_cuda(act.q, bw.attn_q_norm_g, act.q,
             norm_eps, n_q_heads, head_dim);
     }
     if bw.attn_k_norm_g != 0 {
-        aether_op_rms_norm_f32_cuda(
-            act.k_step, bw.attn_k_norm_g, act.k_step,
+        aether_op_rms_norm_f32_cuda(act.k_step, bw.attn_k_norm_g, act.k_step,
             norm_eps, n_kv_heads, head_dim);
     }
     aether_op_rope_apply_devarg_f32_cuda(act.q,
@@ -654,9 +684,6 @@ unsafe fn block_forward_devarg(
     aether_op_rope_apply_devarg_f32_cuda(act.k_step,
         1, n_kv_heads, head_dim, rope_base, step_args);
     let scale: f32 = 1.0 / (cfg.head_dim as f32).sqrt();
-    // FR-17-extra-gemma-fwd: route via the flex attention kernel when the
-    // arch requires features the seq1 kernels don't support: head_dim
-    // that isn't a multiple of 32, or sliding-window scope.
     let needs_flex = (cfg.head_dim % 32) != 0 || cfg.sliding_window > 0;
     if let Some((page_table_dev, block_size)) = paged_cfg {
         aether_op_paged_append_kv_devarg_f32_cuda(
@@ -685,40 +712,6 @@ unsafe fn block_forward_devarg(
             act.q, kv.k_cache, kv.v_cache, act.attn_out,
             n_q_heads, n_kv_heads, head_dim, scale,
             max_seq as c_int, step_args);
-    }
-    dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, d_model);
-    // FR-17-extra-gemma-fwd: Gemma3 applies a POST-attention RMS norm to
-    // the output projection BEFORE adding to the residual.  Qwen archs
-    // skip this (post_attn_norm_g == 0).
-    if bw.post_attn_norm_g != 0 {
-        aether_op_rms_norm_f32_cuda(act.proj, bw.post_attn_norm_g, act.proj,
-            norm_eps, 1, d_model);
-    }
-    aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
-    aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
-
-    // FFN dispatch: dense (Qwen2/3/Llama) vs MoE (Qwen3-MoE/DeepSeek-V2).
-    if bw.w_router != 0 {
-        moe_ffn_forward(bw, act, cfg);
-    } else {
-        // Dense FFN — gate+up fused (Q4_K only).  If either is F16/Q6_K
-        // we'd need a non-fused fallback (FR-17-extra-non-fused-ffn).
-        if bw.dt_gate == 12 && bw.dt_up == 12 {
-            aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
-                act.x_norm, bw.w_gate, bw.w_up, act.gate,
-                d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
-        } else {
-            panic!("FFN gate/up dtypes not both Q4_K (got gate={}, up={}); needs a non-fused fallback",
-                bw.dt_gate, bw.dt_up);
-        }
-        dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
-        // FR-17-extra-gemma-fwd: Gemma3 applies a POST-FFN RMS norm to
-        // the down output BEFORE the residual add.  Qwen archs skip.
-        if bw.post_ffn_norm_g != 0 {
-            aether_op_rms_norm_f32_cuda(act.down, bw.post_ffn_norm_g, act.down,
-                norm_eps, 1, d_model);
-        }
-        aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
     }
 }
 
@@ -758,7 +751,7 @@ unsafe fn block_forward_devarg(
 /// cfg.v_head_dim for these allocations.  Until that constructor exists,
 /// this path will write out-of-bounds.  Component kernels are all CPU↔GPU
 /// witnessed in tests/cuda_mla_e2e_synthetic.rs (multi-step end-to-end).
-unsafe fn mla_block_forward(
+unsafe fn mla_attention_forward(
     bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, step_args: i64,
     paged_cfg: Option<(i64, i32)>,
     cfg: &ModelConfig,
@@ -1031,6 +1024,17 @@ impl QwenSession {
         gguf_path: &str, pool: std::sync::Arc<SharedKvPool>,
     ) -> Result<Self, String> {
         let mut s = Self::new_with_mode(gguf_path, true)?;
+        if s.cfg.kv_lora_rank > 0 {
+            return Err(format!(
+                "FR-17-extra-mla-fwd: SharedKvPool doesn't support MLA archs yet \
+                 (deepseek2 / glm-4.7-flash).  MLA needs asymmetric K-row \
+                 (n_heads * qk_head_dim = {}) and V-row (n_heads * v_head_dim = {}) \
+                 strides; SharedKvPool currently allocates both at the same d_kv. \
+                 Either use --paged (no --pool-blocks) for single-tenant MLA, \
+                 or wait for FR-17-extra-mla-pool.",
+                s.cfg.n_q_heads * s.cfg.qk_head_dim as usize,
+                s.cfg.n_q_heads * s.cfg.v_head_dim as usize));
+        }
         unsafe { s.rebind_to_shared_pool(pool)?; }
         Ok(s)
     }
@@ -1088,30 +1092,73 @@ impl QwenSession {
                     cfg.d_model));
             }
             if cfg.d_ff == 0 || cfg.d_ff % 256 != 0 {
-                return Err(format!(
-                    "FR-17-extra-runtime-shape: d_ff({}) must be a multiple of 256 (Q4_K super-block).",
-                    cfg.d_ff));
+                // FR-17-extra-mla-fwd: relax the d_ff alignment check for MLA
+                // archs.  DeepSeek-V2-Lite's dense d_ff (10944) and per-expert
+                // ffn (1408) are both non-multiples of 256; the dense layer-0
+                // matmul will fail at runtime when it hits the unaligned Q4_K
+                // kernel (a separate FR-17-extra-q4k-pad work item).  We let
+                // construction proceed so the MLA attention path can still
+                // be exercised on dense-FFN-skipping flows / tests.
+                if cfg.kv_lora_rank == 0 {
+                    return Err(format!(
+                        "FR-17-extra-runtime-shape: d_ff({}) must be a multiple of 256 (Q4_K super-block).",
+                        cfg.d_ff));
+                } else {
+                    eprintln!("[QwenSession] WARN d_ff({}) not multiple of 256; \
+                        FFN will fail at runtime — MLA attention path is still constructible. \
+                        FR-17-extra-q4k-pad tracks the unaligned-FFN fix.",
+                        cfg.d_ff);
+                }
             }
 
             let blocks: Vec<BlockGpu> = (0..cfg.n_layers).map(|b| load_block(h, b)).collect();
             let final_norm_g = upload_f32_tensor(h, "output_norm.weight");
             let (lm_head, lm_n_blocks, lm_dt) = upload_tensor_u8(h, "output.weight");
 
+            // FR-17-extra-mla-fwd: MLA archs (deepseek2, glm-4.7-flash) need
+            // bigger Q (per-head qk_head_dim instead of head_dim) and an
+            // asymmetric K-row / V-row stride.  Non-MLA archs collapse to
+            // n_kv_heads * head_dim = cfg.d_kv for both.
+            let is_mla = cfg.kv_lora_rank > 0;
+            let q_total = if is_mla {
+                cfg.n_q_heads * cfg.qk_head_dim as usize
+            } else {
+                cfg.d_model
+            };
+            let d_k_row = if is_mla {
+                cfg.n_q_heads * cfg.qk_head_dim as usize
+            } else {
+                cfg.d_kv
+            };
+            let d_v_row = if is_mla {
+                cfg.n_q_heads * cfg.v_head_dim as usize
+            } else {
+                cfg.d_kv
+            };
+            let attn_out_dim = if is_mla {
+                cfg.n_q_heads * cfg.v_head_dim as usize
+            } else {
+                cfg.d_model
+            };
+            if is_mla {
+                eprintln!("[QwenSession] MLA mode: q_total={} d_k_row={} d_v_row={} attn_out_dim={}",
+                    q_total, d_k_row, d_v_row, attn_out_dim);
+            }
             let act = ActivationGpu {
                 x: aether_dev_alloc_f32(cfg.d_model as c_int),
                 x_norm: aether_dev_alloc_f32(cfg.d_model as c_int),
-                q: aether_dev_alloc_f32(cfg.d_model as c_int),
-                k_step: aether_dev_alloc_f32(cfg.d_kv as c_int),
-                v_step: aether_dev_alloc_f32(cfg.d_kv as c_int),
-                attn_out: aether_dev_alloc_f32(cfg.d_model as c_int),
+                q: aether_dev_alloc_f32(q_total as c_int),
+                k_step: aether_dev_alloc_f32(d_k_row as c_int),
+                v_step: aether_dev_alloc_f32(d_v_row as c_int),
+                attn_out: aether_dev_alloc_f32(attn_out_dim as c_int),
                 proj: aether_dev_alloc_f32(cfg.d_model as c_int),
                 gate: aether_dev_alloc_f32(cfg.d_ff as c_int),
                 down: aether_dev_alloc_f32(cfg.d_model as c_int),
                 logits: aether_dev_alloc_f32(cfg.vocab as c_int),
             };
             let kvs: Vec<KvCacheGpu> = (0..cfg.n_layers).map(|_| KvCacheGpu {
-                k_cache: aether_dev_alloc_f32((MAX_SEQ * cfg.d_kv) as c_int),
-                v_cache: aether_dev_alloc_f32((MAX_SEQ * cfg.d_kv) as c_int),
+                k_cache: aether_dev_alloc_f32((MAX_SEQ * d_k_row) as c_int),
+                v_cache: aether_dev_alloc_f32((MAX_SEQ * d_v_row) as c_int),
             }).collect();
             let step_args = aether_dev_alloc_i32(4);  // [pos, cur_seq, 0, 0]
 
