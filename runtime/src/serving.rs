@@ -731,6 +731,10 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         upload_tensor_u8(h, &format!("{}attn_v.weight", p))
     };
     let (w_o, _, dt_o)             = upload_tensor_u8(h, &format!("{}attn_output.weight", p));
+    if std::env::var("AETHER_DUMP_ATTN_DTYPES").is_ok() && b < 4 {
+        eprintln!("[ATTN-DT b={}] kv_a_mqa={} kv_b={} q_a={} q_b={} q={} k={} v={} o={}",
+            b, dt_kv_a_mqa, dt_kv_b, dt_q_a, dt_q_b, dt_q, dt_k, dt_v, dt_o);
+    }
     // For DENSE FFN the three tensors live under ffn_gate/up/down.  For MoE
     // they live under ffn_gate_exps/up_exps/down_exps and there's a router
     // tensor ffn_gate_inp.  Try DENSE first; fall back to MoE.
