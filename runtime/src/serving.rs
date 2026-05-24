@@ -87,6 +87,7 @@ use crate::cuda::{
     aether_op_fused_q5_0_matmul_seq1_cuda,
     aether_op_fused_q8_0_matmul_seq1_cuda,
     aether_op_fused_q5_k_matmul_seq1_cuda,
+    aether_op_fused_q3_k_matmul_seq1_cuda,
     aether_op_fused_iq4_nl_matmul_seq1_cuda,
     aether_op_fused_iq4_xs_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_matmul_seq1_cuda,
@@ -156,6 +157,13 @@ unsafe fn dispatch_matmul(
             // Q5_K_M, Llama-3 Q5_K_M, GLM-4.7-flash (~51 tensors), and
             // most modern Q5_K_M GGUFs.
             aether_op_fused_q5_k_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
+        }
+        11 => {
+            // Q3_K (FR-17-extra-q3_k-fwd).  110-byte 256-elem super-blocks:
+            // 32-byte hmask + 64-byte qs + 12-byte scales + f16 d.
+            // Used by Qwen3-MoE-30B-Q3_K_M (198 tensors), DeepSeek-R1-
+            // Distill Q3_K_M, Llama-3 Q3_K_M variants.
+            aether_op_fused_q3_k_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
         }
         18 => {
             // IQ3_XXS (FR-17-extra-iq3_xxs-fwd).  98-byte 256-elem blocks:
