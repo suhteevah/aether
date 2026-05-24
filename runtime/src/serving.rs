@@ -69,6 +69,8 @@ use crate::cuda::{
     aether_op_fused_q4_0_matmul_seq1_cuda,
     aether_op_fused_q5_0_matmul_seq1_cuda,
     aether_op_fused_q8_0_matmul_seq1_cuda,
+    aether_op_fused_q5_k_matmul_seq1_cuda,
+    aether_op_fused_iq4_nl_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_matmul_seq1_cuda,
     aether_op_fused_q4k_expert_matmul_seq1_cuda,
     aether_op_fused_q8_0_expert_matmul_seq1_cuda,
@@ -117,11 +119,26 @@ unsafe fn dispatch_matmul(
             // ffn_down (d_in=10944) and the other half of ffn_down_exps.
             aether_op_fused_q8_0_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 32);
         }
+        13 => {
+            // Q5_K (FR-17-extra-q5_k-fwd).  176-byte 256-elem super-blocks:
+            // f16 d + f16 dmin + 12-byte scales (Q4_K shape) + 32-byte qh
+            // (high-bits) + 128-byte qs (nibbles).  Used by Qwen2.5-32B
+            // Q5_K_M, Llama-3 Q5_K_M, GLM-4.7-flash (~51 tensors), and
+            // most modern Q5_K_M GGUFs.
+            aether_op_fused_q5_k_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
+        }
         18 => {
             // IQ3_XXS (FR-17-extra-iq3_xxs-fwd).  98-byte 256-elem blocks:
             // f16 d + 64-byte codebook indices + 32-byte scales_and_signs.
             // Used by cnc's glm-4.7-flash-UD-IQ3_XXS GGUF.
             aether_op_fused_iq3_xxs_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
+        }
+        20 => {
+            // IQ4_NL (FR-17-extra-iq4_nl-fwd).  18-byte 32-elem blocks:
+            // f16 d + 16-byte nibble-packed indices into a 16-entry
+            // non-linear codebook of signed int8 values.  Used by
+            // GLM-4.7-flash for ~72 tensors.
+            aether_op_fused_iq4_nl_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 32);
         }
         _ => panic!("dispatch_matmul: unsupported weight dtype {}", dt),
     }
@@ -553,7 +570,9 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
         2  => { let nb = n_elems / 32; (nb, nb * 18) }       // Q4_0 (FR-17-extra-q4_0-fwd)
         6  => { let nb = n_elems / 32; (nb, nb * 22) }       // Q5_0 (FR-17-extra-q5_0-fwd)
         8  => { let nb = n_elems / 32; (nb, nb * 34) }       // Q8_0 (FR-17-extra-q8_0-fwd)
+        13 => { let nb = n_elems / 256; (nb, nb * 176) }     // Q5_K (FR-17-extra-q5_k-fwd)
         18 => { let nb = n_elems / 256; (nb, nb * 98) }      // IQ3_XXS (FR-17-extra-iq3_xxs-fwd)
+        20 => { let nb = n_elems / 32; (nb, nb * 18) }       // IQ4_NL (FR-17-extra-iq4_nl-fwd)
         _  => panic!("unsupported dtype {} for tensor {}", dt, name),
     };
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
@@ -604,7 +623,9 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
         2  => { let nb = n_elems / 32; (nb, nb * 18) }
         6  => { let nb = n_elems / 32; (nb, nb * 22) }
         8  => { let nb = n_elems / 32; (nb, nb * 34) }
+        13 => { let nb = n_elems / 256; (nb, nb * 176) }
         18 => { let nb = n_elems / 256; (nb, nb * 98) }
+        20 => { let nb = n_elems / 32; (nb, nb * 18) }
         _  => return (0, 0, 0),
     };
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
