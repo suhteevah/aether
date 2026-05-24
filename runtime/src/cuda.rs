@@ -94,6 +94,11 @@ struct PagedCtx {
     paged_attention_flex_devarg: CudaFunction,
     paged_attention_mla_devarg: CudaFunction,
     paged_append_kv_mla_devarg: CudaFunction,
+    mla_split_kv_a: CudaFunction,
+    mla_assemble_k: CudaFunction,
+    mla_extract_v: CudaFunction,
+    mla_rope_q_partial: CudaFunction,
+    mla_rope_k_shared: CudaFunction,
 }
 
 static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
@@ -108,7 +113,12 @@ fn paged_ctx() -> &'static PagedCtx {
               "batched_paged_append_kv_seqB_devarg",
               "paged_attention_flex_devarg",
               "paged_attention_mla_devarg",
-              "paged_append_kv_mla_devarg"])
+              "paged_append_kv_mla_devarg",
+              "mla_split_kv_a",
+              "mla_assemble_k",
+              "mla_extract_v",
+              "mla_rope_q_partial",
+              "mla_rope_k_shared"])
             .expect("load_ptx paged");
         PagedCtx {
             paged_append_kv_devarg:
@@ -125,6 +135,16 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "paged_attention_mla_devarg").unwrap(),
             paged_append_kv_mla_devarg:
                 device.get_func("aether_paged_kernels", "paged_append_kv_mla_devarg").unwrap(),
+            mla_split_kv_a:
+                device.get_func("aether_paged_kernels", "mla_split_kv_a").unwrap(),
+            mla_assemble_k:
+                device.get_func("aether_paged_kernels", "mla_assemble_k").unwrap(),
+            mla_extract_v:
+                device.get_func("aether_paged_kernels", "mla_extract_v").unwrap(),
+            mla_rope_q_partial:
+                device.get_func("aether_paged_kernels", "mla_rope_q_partial").unwrap(),
+            mla_rope_k_shared:
+                device.get_func("aether_paged_kernels", "mla_rope_k_shared").unwrap(),
         }
     })
 }
@@ -654,6 +674,122 @@ extern "C" __global__ void paged_attention_mla_devarg(
         int col = lane * per_lane_v + i;
         if (i < per_lane_v && col < v_head_dim) out_ptr[col] = out_local[i];
     }
+}
+
+// FR-17-extra-mla-fwd — glue kernels for the MLA forward path.
+//
+// Step 1: split the kv_a_mqa output into the latent c_kv and the shared
+// k_rope vector.  kv_a_mqa produces [kv_lora_rank + qk_rope_head_dim] per
+// token; we just need contiguous slices, so this is a memcpy fan-out.
+extern "C" __global__ void mla_split_kv_a(
+    const float* __restrict__ kv_a,   // [kv_lora_rank + qk_rope_head_dim]
+    float*       __restrict__ c_kv,   // [kv_lora_rank]
+    float*       __restrict__ k_rope, // [qk_rope_head_dim]
+    int kv_lora_rank, int qk_rope_head_dim)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = kv_lora_rank + qk_rope_head_dim;
+    if (i >= total) return;
+    if (i < kv_lora_rank) c_kv[i] = kv_a[i];
+    else k_rope[i - kv_lora_rank] = kv_a[i];
+}
+
+// Step 2: assemble the per-head K row from K_nope (per-head, taken from
+// the first qk_nope_head_dim columns of each per-head kv_b slice) and the
+// shared k_rope vector broadcast across all heads.
+//   kv_b_out layout: [n_heads * (qk_nope_head_dim + v_head_dim)] where each
+//   per-head chunk is [K_nope (qk_nope_head_dim) | V (v_head_dim)].
+//   k_row layout:    [n_heads * qk_head_dim] where qk_head_dim =
+//   qk_nope_head_dim + qk_rope_head_dim and each per-head chunk is
+//   [K_nope | k_rope_shared].
+// Grid spans (n_heads × qk_head_dim) so each thread writes one f32.
+extern "C" __global__ void mla_assemble_k(
+    const float* __restrict__ kv_b_out,    // [n_heads * (qk_nope+v_head)]
+    const float* __restrict__ k_rope,      // [qk_rope_head_dim]
+    float*       __restrict__ k_row,       // [n_heads * qk_head_dim]
+    int n_heads, int qk_nope_head_dim,
+    int qk_rope_head_dim, int v_head_dim)
+{
+    int qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+    int kv_b_stride = qk_nope_head_dim + v_head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_heads * qk_head_dim;
+    if (idx >= total) return;
+    int h = idx / qk_head_dim;
+    int j = idx - h * qk_head_dim;
+    if (j < qk_nope_head_dim) {
+        // K_nope from kv_b's per-head [0, qk_nope_head_dim) slice.
+        k_row[idx] = kv_b_out[h * kv_b_stride + j];
+    } else {
+        // K_rope shared across heads.
+        k_row[idx] = k_rope[j - qk_nope_head_dim];
+    }
+}
+
+// Step 3: extract V from kv_b_out — V is per-head [qk_nope_head_dim,
+// qk_nope+v_head) of each per-head chunk.  Result is [n_heads * v_head_dim].
+extern "C" __global__ void mla_extract_v(
+    const float* __restrict__ kv_b_out,
+    float*       __restrict__ v_row,
+    int n_heads, int qk_nope_head_dim, int v_head_dim)
+{
+    int kv_b_stride = qk_nope_head_dim + v_head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_heads * v_head_dim;
+    if (idx >= total) return;
+    int h = idx / v_head_dim;
+    int j = idx - h * v_head_dim;
+    v_row[idx] = kv_b_out[h * kv_b_stride + qk_nope_head_dim + j];
+}
+
+// Step 4: partial-dim RoPE.
+//   Q layout: [n_heads * qk_head_dim] where qk_head_dim = nope + rope.
+//   For each head, rotate the LAST qk_rope_head_dim elements as a pair-
+//   wise (i, i + qk_rope_head_dim/2) rotation — exactly the same shape as
+//   the standard rope_apply kernel, just scoped to the rope sub-region.
+// Single-token (seq=1) only — same shape as the decode-step rope_apply.
+// step_args[0] = pos.
+extern "C" __global__ void mla_rope_q_partial(
+    float*       __restrict__ q,            // [n_heads * qk_head_dim]
+    int n_heads, int qk_head_dim, int qk_nope_head_dim,
+    float base, const int* __restrict__ step_args)
+{
+    int qk_rope_head_dim = qk_head_dim - qk_nope_head_dim;
+    int hd_half = qk_rope_head_dim / 2;
+    int total = n_heads * hd_half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int h = idx / hd_half;
+    int i = idx - h * hd_half;
+    int base_off = h * qk_head_dim + qk_nope_head_dim;
+    float pos = (float)step_args[0];
+    float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float x0 = q[i0], x1 = q[i1];
+    q[i0] = x0 * c - x1 * s;
+    q[i1] = x0 * s + x1 * c;
+}
+
+// Same partial RoPE but on the SHARED k_rope vector ([qk_rope_head_dim],
+// single instance — not per-head).  Used right before the kv_b path.
+extern "C" __global__ void mla_rope_k_shared(
+    float*       __restrict__ k_rope,    // [qk_rope_head_dim]
+    int qk_rope_head_dim,
+    float base, const int* __restrict__ step_args)
+{
+    int hd_half = qk_rope_head_dim / 2;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= hd_half) return;
+    float pos = (float)step_args[0];
+    float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    float x0 = k_rope[i], x1 = k_rope[i + hd_half];
+    k_rope[i] = x0 * c - x1 * s;
+    k_rope[i + hd_half] = x0 * s + x1 * c;
 }
 "#;
 
@@ -3727,6 +3863,132 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
             .launch(cfg, (knv, vnv, kpv, vpv, ptv,
                           d_k_row, d_v_row, block_size, sv))
             .expect("launch paged_append_kv_mla_devarg");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd — split the kv_a_mqa output [kv_lora_rank +
+/// qk_rope_head_dim] into the latent c_kv slice and the shared k_rope slice.
+#[no_mangle] pub extern "C" fn aether_op_mla_split_kv_a_f32_cuda(
+    kv_a: i64, c_kv: i64, k_rope: i64,
+    kv_lora_rank: c_int, qk_rope_head_dim: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(kv_a) else { return -1; };
+    let Some(i_c) = handle_to_idx(c_kv) else { return -1; };
+    let Some(i_k) = handle_to_idx(k_rope) else { return -1; };
+    if kv_lora_rank <= 0 || qk_rope_head_dim <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let c_p = bs[i_c].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let k_p = bs[i_k].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (kv_lora_rank + qk_rope_head_dim) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let av = &*a_p; let cv = &mut *c_p; let kv = &mut *k_p;
+        paged_ctx().mla_split_kv_a.clone()
+            .launch(cfg, (av, cv, kv, kv_lora_rank, qk_rope_head_dim))
+            .expect("launch mla_split_kv_a");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd — assemble per-head K = [K_nope | k_rope_shared].
+#[no_mangle] pub extern "C" fn aether_op_mla_assemble_k_f32_cuda(
+    kv_b_out: i64, k_rope: i64, k_row: i64,
+    n_heads: c_int, qk_nope_head_dim: c_int,
+    qk_rope_head_dim: c_int, v_head_dim: c_int,
+) -> c_int {
+    let Some(i_b) = handle_to_idx(kv_b_out) else { return -1; };
+    let Some(i_kr) = handle_to_idx(k_rope) else { return -1; };
+    let Some(i_o) = handle_to_idx(k_row) else { return -1; };
+    if n_heads <= 0 || qk_nope_head_dim <= 0 || qk_rope_head_dim <= 0
+        || v_head_dim <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let b_p = bs[i_b].as_ref().unwrap() as *const CudaSlice<f32>;
+    let r_p = bs[i_kr].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (n_heads * (qk_nope_head_dim + qk_rope_head_dim)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let bv = &*b_p; let rv = &*r_p; let ov = &mut *o_p;
+        paged_ctx().mla_assemble_k.clone()
+            .launch(cfg, (bv, rv, ov, n_heads, qk_nope_head_dim,
+                          qk_rope_head_dim, v_head_dim))
+            .expect("launch mla_assemble_k");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd — extract V from kv_b_out [n_heads * (qk_nope +
+/// v_head)].
+#[no_mangle] pub extern "C" fn aether_op_mla_extract_v_f32_cuda(
+    kv_b_out: i64, v_row: i64,
+    n_heads: c_int, qk_nope_head_dim: c_int, v_head_dim: c_int,
+) -> c_int {
+    let Some(i_b) = handle_to_idx(kv_b_out) else { return -1; };
+    let Some(i_v) = handle_to_idx(v_row) else { return -1; };
+    if n_heads <= 0 || qk_nope_head_dim <= 0 || v_head_dim <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let b_p = bs[i_b].as_ref().unwrap() as *const CudaSlice<f32>;
+    let v_p = bs[i_v].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (n_heads * v_head_dim) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let bv = &*b_p; let vv = &mut *v_p;
+        paged_ctx().mla_extract_v.clone()
+            .launch(cfg, (bv, vv, n_heads, qk_nope_head_dim, v_head_dim))
+            .expect("launch mla_extract_v");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd — partial-dim RoPE on Q's rope sub-region
+/// (the last qk_rope_head_dim columns of each per-head qk_head_dim slice).
+#[no_mangle] pub extern "C" fn aether_op_mla_rope_q_partial_f32_cuda(
+    q: i64,
+    n_heads: c_int, qk_head_dim: c_int, qk_nope_head_dim: c_int,
+    base: f32, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q) else { return -1; };
+    let Some(is) = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_heads <= 0 || qk_head_dim <= 0 || qk_nope_head_dim < 0
+        || qk_nope_head_dim >= qk_head_dim { return -1; }
+    let qk_rope_head_dim = qk_head_dim - qk_nope_head_dim;
+    if (qk_rope_head_dim & 1) != 0 { return -2; }  // half-pair requires even
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let s_p = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let total = (n_heads * (qk_rope_head_dim / 2)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let qv = &mut *q_p; let sv = &*s_p;
+        paged_ctx().mla_rope_q_partial.clone()
+            .launch(cfg, (qv, n_heads, qk_head_dim, qk_nope_head_dim, base, sv))
+            .expect("launch mla_rope_q_partial");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd — partial-dim RoPE on the shared k_rope vector.
+#[no_mangle] pub extern "C" fn aether_op_mla_rope_k_shared_f32_cuda(
+    k_rope: i64, qk_rope_head_dim: c_int,
+    base: f32, step_args_i32: i64,
+) -> c_int {
+    let Some(i_k) = handle_to_idx(k_rope) else { return -1; };
+    let Some(is) = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if qk_rope_head_dim <= 0 || (qk_rope_head_dim & 1) != 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let k_p = bs[i_k].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let s_p = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let total = (qk_rope_head_dim / 2) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let kv = &mut *k_p; let sv = &*s_p;
+        paged_ctx().mla_rope_k_shared.clone()
+            .launch(cfg, (kv, qk_rope_head_dim, base, sv))
+            .expect("launch mla_rope_k_shared");
     }
     0
 }

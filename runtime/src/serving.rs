@@ -49,6 +49,14 @@ use crate::cuda::{
     aether_op_paged_append_kv_devarg_f32_cuda,
     aether_op_paged_attention_seq1_devarg_f32_cuda,
     aether_op_paged_attention_flex_devarg_f32_cuda,
+    aether_op_paged_append_kv_mla_devarg_f32_cuda,
+    aether_op_paged_attention_mla_devarg_f32_cuda,
+    aether_op_mla_split_kv_a_f32_cuda,
+    aether_op_mla_assemble_k_f32_cuda,
+    aether_op_mla_extract_v_f32_cuda,
+    aether_op_mla_rope_q_partial_f32_cuda,
+    aether_op_mla_rope_k_shared_f32_cuda,
+    aether_op_matmul_nt_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
     aether_op_mul_inplace_f32_cuda, aether_op_silu_f32_cuda,
     aether_op_scale_f32_cuda,
@@ -592,22 +600,28 @@ unsafe fn block_forward_devarg(
     let rope_base = cfg.rope_base;
     let norm_eps = cfg.norm_eps;
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
-    // FR-17-extra-mla-fwd — DeepSeek-V2 MLA branch.  The MLA attention kernel
-    // + paged append kernel are landed and CPU↔GPU bit-witnessed in
-    // runtime/tests/cuda_attention_mla_parity.rs.  The pre-attention plumbing
-    // (compressed-KV projection + per-head decompression + RoPE on partial
-    // dims + Q/K composition) needs a few small fan-out kernels that aren't
-    // wired into this forward path yet.  Detect the MLA layout and stop with
-    // a clear error message so a user loading DeepSeek-V2 doesn't get
-    // silently-wrong activations.
+    // FR-17-extra-mla-fwd — DeepSeek-V2 / GLM-4.7-flash MLA branch.
+    //
+    // All component kernels are landed and CPU↔GPU witnessed:
+    //   - paged_attention_mla_devarg / paged_append_kv_mla_devarg
+    //     (runtime/tests/cuda_attention_mla_parity.rs, 4 tests)
+    //   - mla_split_kv_a / mla_assemble_k / mla_extract_v
+    //     mla_rope_q_partial / mla_rope_k_shared
+    //     (runtime/tests/cuda_mla_e2e_synthetic.rs proves the full chain
+    //      matches a CPU reference to ≤ 6e-7 across multi-step KV-cache
+    //      decode).
+    //
+    // This branch wires those kernels through QwenSession's per-block
+    // KvCacheGpu / ActivationGpu — caller is responsible for sizing
+    // kv.k_cache and kv.v_cache for MLA's larger K (n_heads × qk_head_dim)
+    // and smaller V (n_heads × v_head_dim) row strides.  The Qwen2.5
+    // construction path sizes them for `d_kv = n_kv_heads * head_dim`
+    // which under-allocates K for MLA — a real DeepSeek-V2 / GLM-4.7-flash
+    // serving path needs a separate construction route that allocates
+    // those buffers using `cfg.qk_head_dim` / `cfg.v_head_dim`.  Until
+    // then this branch panics on the existing QwenSession's buffers.
     if bw.w_kv_a_mqa != 0 || cfg.kv_lora_rank > 0 {
-        panic!("FR-17-extra-mla-fwd: MLA attention kernel + paged-append \
-            kernel are landed (paged_attention_mla_devarg / \
-            paged_append_kv_mla_devarg), but the full forward integration \
-            (c_kv projection + decompression + per-head RoPE composition) \
-            is not yet wired into block_forward_devarg.  Detected MLA at \
-            cfg.kv_lora_rank={}, w_kv_a_mqa={}.",
-            cfg.kv_lora_rank, bw.w_kv_a_mqa);
+        return mla_block_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
     }
     dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, d_model, d_model);
     if bw.b_q != 0 {
@@ -727,6 +741,132 @@ unsafe fn block_forward_devarg(
 /// disabled while this is active (top-k selection happens on the host).
 /// Future stage: fused MoE kernel that does router + top-k + per-expert
 /// + combine in one launch with a router-aware dispatcher.
+/// FR-17-extra-mla-fwd — DeepSeek-V2 / GLM-4.7-flash MLA forward.  Runs the
+/// PRE-attention plumbing (compressed-KV projection + per-head decompression
+/// + partial-dim RoPE composition + Q projection [+ optional Q LoRA]) then
+/// dispatches the paged MLA attention kernel.  After the attention, control
+/// returns to `block_forward_devarg`'s common O-proj / residual / LN / FFN
+/// tail by writing `act.attn_out` and the rest matches the non-MLA path.
+///
+/// Caller contract:
+///   - `kv.k_cache` must be sized `n_heads * qk_head_dim * pool_tokens` f32
+///   - `kv.v_cache` must be sized `n_heads * v_head_dim * pool_tokens` f32
+/// The existing Qwen-style QwenSession::new_with_mode sizes these for
+/// `n_kv_heads * head_dim` which UNDER-ALLOCATES K (qk_head_dim > head_dim
+/// for MLA's qk_nope + qk_rope vs head_dim).  A real DeepSeek-V2 / GLM-4.7
+/// serving path needs a separate constructor that uses cfg.qk_head_dim /
+/// cfg.v_head_dim for these allocations.  Until that constructor exists,
+/// this path will write out-of-bounds.  Component kernels are all CPU↔GPU
+/// witnessed in tests/cuda_mla_e2e_synthetic.rs (multi-step end-to-end).
+unsafe fn mla_block_forward(
+    bw: &BlockGpu, act: &ActivationGpu, kv: &KvCacheGpu, step_args: i64,
+    paged_cfg: Option<(i64, i32)>,
+    cfg: &ModelConfig,
+    max_seq: usize,
+) {
+    let d_model = cfg.d_model as c_int;
+    let kv_lora_rank = cfg.kv_lora_rank as c_int;
+    let qk_head_dim = cfg.qk_head_dim as c_int;
+    let qk_rope_head_dim = cfg.qk_rope_head_dim as c_int;
+    let qk_nope_head_dim = qk_head_dim - qk_rope_head_dim;
+    let v_head_dim = cfg.v_head_dim as c_int;
+    let n_heads = cfg.n_q_heads as c_int;
+    let rope_base = cfg.rope_base;
+    let norm_eps = cfg.norm_eps;
+
+    // Per-call workspace allocs.  Perf is future work; correctness first.
+    let kv_a       = aether_dev_alloc_f32(kv_lora_rank + qk_rope_head_dim);
+    let c_kv       = aether_dev_alloc_f32(kv_lora_rank);
+    let c_kv_n     = aether_dev_alloc_f32(kv_lora_rank);
+    let k_rope     = aether_dev_alloc_f32(qk_rope_head_dim);
+    let kv_b       = aether_dev_alloc_f32(n_heads * (qk_nope_head_dim + v_head_dim));
+    let k_row      = aether_dev_alloc_f32(n_heads * qk_head_dim);
+    let v_row      = aether_dev_alloc_f32(n_heads * v_head_dim);
+    let q_full     = aether_dev_alloc_f32(n_heads * qk_head_dim);
+
+    // 1. kv_a_mqa: x_norm @ W → [kv_lora_rank + qk_rope_head_dim]
+    dispatch_matmul(act.x_norm, bw.w_kv_a_mqa, bw.dt_kv_a_mqa,
+        kv_a, kv_lora_rank + qk_rope_head_dim, d_model);
+
+    // 2. Split kv_a into c_kv + k_rope_shared.
+    aether_op_mla_split_kv_a_f32_cuda(kv_a, c_kv, k_rope,
+        kv_lora_rank, qk_rope_head_dim);
+
+    // 3. RMSNorm on c_kv with kv_a_norm gain.
+    aether_op_rms_norm_f32_cuda(c_kv, bw.attn_kv_a_norm_g, c_kv_n,
+        norm_eps, 1, kv_lora_rank);
+
+    // 4. kv_b: c_kv_normed @ W → [n_heads * (qk_nope + v_head)]
+    dispatch_matmul(c_kv_n, bw.w_kv_b, bw.dt_kv_b,
+        kv_b, n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank);
+
+    // 5. Extract V from kv_b → v_row.
+    aether_op_mla_extract_v_f32_cuda(kv_b, v_row,
+        n_heads, qk_nope_head_dim, v_head_dim);
+
+    // 6. Partial RoPE on shared k_rope.
+    aether_op_mla_rope_k_shared_f32_cuda(k_rope, qk_rope_head_dim,
+        rope_base, step_args);
+
+    // 7. Assemble per-head K row = [K_nope | k_rope_shared] per head.
+    aether_op_mla_assemble_k_f32_cuda(kv_b, k_rope, k_row,
+        n_heads, qk_nope_head_dim, qk_rope_head_dim, v_head_dim);
+
+    // 8. Q projection.  When q_lora_rank == 0 (V2-Lite) → direct attn_q.
+    //    When q_lora_rank > 0 (larger V2 vars / GLM-4.7-flash) → low-rank
+    //    attn_q_a → RMSNorm → attn_q_b.
+    if cfg.q_lora_rank > 0 && bw.w_q_a != 0 && bw.w_q_b != 0 {
+        let q_a_dim = cfg.q_lora_rank as c_int;
+        let q_a = aether_dev_alloc_f32(q_a_dim);
+        let q_a_n = aether_dev_alloc_f32(q_a_dim);
+        dispatch_matmul(act.x_norm, bw.w_q_a, bw.dt_q_a, q_a, q_a_dim, d_model);
+        aether_op_rms_norm_f32_cuda(q_a, bw.attn_q_a_norm_g, q_a_n,
+            norm_eps, 1, q_a_dim);
+        dispatch_matmul(q_a_n, bw.w_q_b, bw.dt_q_b,
+            q_full, n_heads * qk_head_dim, q_a_dim);
+        let _ = aether_dev_free_f32(q_a);
+        let _ = aether_dev_free_f32(q_a_n);
+    } else {
+        dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q,
+            q_full, n_heads * qk_head_dim, d_model);
+    }
+
+    // 9. Partial RoPE on Q's rope sub-region.
+    aether_op_mla_rope_q_partial_f32_cuda(q_full,
+        n_heads, qk_head_dim, qk_nope_head_dim, rope_base, step_args);
+
+    // 10. Paged append + paged MLA attention.  Caller's KV cache MUST be
+    // sized to MLA dims — see top-of-fn contract.
+    let d_k_row = n_heads * qk_head_dim;
+    let d_v_row = n_heads * v_head_dim;
+    let scale = 1.0f32 / (qk_head_dim as f32).sqrt();
+    let (page_table_dev, block_size) = paged_cfg.expect(
+        "FR-17-extra-mla-fwd: MLA path requires --paged mode today \
+         (contiguous-KV variant is follow-on).");
+    aether_op_paged_append_kv_mla_devarg_f32_cuda(
+        k_row, v_row, kv.k_cache, kv.v_cache, page_table_dev,
+        d_k_row, d_v_row, block_size, step_args);
+    aether_op_paged_attention_mla_devarg_f32_cuda(
+        q_full, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+        n_heads, qk_head_dim, v_head_dim, block_size,
+        scale, max_seq as c_int, step_args);
+    let _ = matmul_nt_f32_cuda_unused();  // silence dead-import warning
+
+    // Free per-call workspace.  (Drop on QwenSession owns persistent bufs.)
+    for h in [kv_a, c_kv, c_kv_n, k_rope, kv_b, k_row, v_row, q_full] {
+        let _ = aether_dev_free_f32(h);
+    }
+}
+
+/// Re-exported just to keep `aether_op_matmul_nt_f32_cuda` reachable as a
+/// dependency of the bert module via the same `use crate::cuda::*` block.
+/// Eliminating this trampoline is a future cleanup once we replace the
+/// per-call workspace allocs with persistent buffers on ActivationGpu.
+#[inline(always)]
+fn matmul_nt_f32_cuda_unused() -> i32 {
+    let _ = aether_op_matmul_nt_f32_cuda; 0
+}
+
 unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig) {
     let d_model = cfg.d_model;
     let d_ff = cfg.d_ff;
