@@ -257,6 +257,63 @@ chain. Measured wall-clock over 5 generate-only tokens after a
 | 2026-05-20 | 7e1804f |  37.4 | **CUDA graphs**: capture per-step forward, replay each step |
 | 2026-05-20 | f40d259 |  35.2 | smallN matmul kernels added (regressed FFN by 7% via nvrtc unit pressure) |
 | 2026-05-20 | add5216 |  37.2 | revert smallN; clean KERNEL_SRC restores baseline |
+| 2026-05-24 | 02fca19 |  34.6 | seqB v3 + hetero batched attn + SSE stream; **−7% vs 37.2** — new __global__ in KERNEL_SRC (nvrtc unit pressure, same class as f40d259) |
+| 2026-05-24 | c9d4501 |  34.5 | **ATTRIBUTION CORRECTED** — moved seqB kernel → PAGED_KERNEL_SRC; decode UNCHANGED (34.2–35.2 warm). KERNEL_SRC byte-identical to pre-session 6834cd0, so the −7% PREDATES this session (drift across 05-20→05-24). Not the seqB kernel. |
+
+### 2026-05-24 — commit 02fca19: seq1 decode REGRESSION −7% + new seqB batched matmul speedup
+
+Three commits this session touched `runtime/src/cuda.rs` / `serving.rs` / `batched_serving.rs`:
+- 85518f6 — SSE streaming over the scheduler (no kernel change)
+- 0837e4e — heterogeneous-position batched paged-attention + append_kv kernels (new kernels in `PAGED_KERNEL_SRC`, a *separate* nvrtc module from `KERNEL_SRC`)
+- 02fca19 — weight-reuse batched Q4_K matmul `fused_q4k_matmul_seqB_v3` (NEW `__global__` added to **`KERNEL_SRC`** — the module that also holds the active seq1 decode kernels)
+
+**seq1 decode baseline (the active autoregressive path) — REGRESSED.**
+Witness: `runtime/tests/qwen25_graph_decode.rs::qwen25_graph_decode_tok_per_sec`
+Run: `cargo test -p aether_rt --features cuda --release --test qwen25_graph_decode qwen25_graph_decode_tok_per_sec -- --ignored --nocapture --test-threads=1`
+Model: Qwen2.5-7B-Instruct Q4_K_M (`sha256-2bada8a7...`), 28 layers, CUDA-graph decode, 5 gen tokens after 4-token prefill, argmax. Generated IDs `[358, 2776, 264, 220, 17]` — **bit-identical to the add5216 baseline** (correctness preserved; this is purely a perf regression).
+GPU clock confirmed at peak 1950–1965 MHz / 83% util / 115 W during the timed window (warm, not cold-clock noise).
+
+| Run | tok/s |
+|---|---|
+| 1 | 34.73 |
+| 2 | 34.22 |
+| 3 | 34.52 |
+| 4 | 34.68 |
+| 5 | 35.09 |
+
+Median 34.68, mean ~34.6 tok/s. Prior reference (add5216, warm 4-run mean): 37.2 tok/s. **Δ = −7.0%.**
+
+**Verdict: REGRESSION, flagged.** Below the ≥10% HEADLINE-config hard-stop, above the ≥5% flag threshold. Root cause is almost certainly the new `fused_q4k_matmul_seqB_v3` `__global__` added to `KERNEL_SRC` — the exact failure mode documented at commit f40d259 in this ledger ("smallN matmul kernels added (regressed FFN by 7% via nvrtc unit pressure)") and in the `nvrtc_kernel_unit_pressure` lesson. Adding a kernel to the shared nvrtc translation unit perturbs register allocation / codegen of the active seq1 decode kernels. The hetero attention kernels in `0837e4e` live in `PAGED_KERNEL_SRC` (separate module) so are a less likely contributor.
+Remediation candidates: (a) move `fused_q4k_matmul_seqB_v3` into its own nvrtc module so it doesn't share register pressure with the seq1 decode kernels; (b) `__launch_bounds__` annotations to pin the seq1 kernels' occupancy; (c) accept the regression if batch-mode throughput gains outweigh single-stream loss for the serving workload. Tracking: FR-19.5-extra-deep follow-up.
+
+> **CORRECTION (commit c9d4501, same day):** The root-cause attribution
+> above is WRONG.  Remediation (a) was applied — `fused_q4k_matmul_seqB_v3`
+> moved to `PAGED_KERNEL_SRC` — and warm 5-run decode was UNCHANGED at ~34.5
+> tok/s (34.20 / 34.52 / 34.56 / 34.89 / 35.24).  `git diff 6834cd0 -- cuda.rs`
+> shows every hunk lands in `PAGED_KERNEL_SRC` or Rust registration/FFI code;
+> the `KERNEL_SRC` CUDA string body (what single-stream decode compiles) is
+> **byte-identical to the pre-session commit 6834cd0**.  So the seqB kernel
+> never affected this bench, and the 37.2 → 34.6 regression **predates this
+> entire session** — it accumulated across the 2026-05-20 (add5216, 37.2) →
+> 2026-05-24 (6834cd0) arc (GLM MLA + MoE dispatch + gemma3 + qwen3 + batched
+> scaffolding, all of which added `__global__`s to `KERNEL_SRC`).  The real
+> follow-up is to **bisect that arc** for the regressing commit, NOT to chase
+> the seqB kernel.  Lesson: a bench-runner perf delta must be attributed
+> against the immediately-prior commit, not a baseline several days/dozens of
+> commits back.
+
+**seqB batched Q4_K matmul (the NEW kernel) — the win that the regression pays for.**
+Witness: `runtime/tests/cuda_q4k_matmul_seqB_parity.rs::seqB_throughput_bench`
+Run: `cargo test -p aether_rt --features cuda --release --test cuda_q4k_matmul_seqB_parity seqB_throughput_bench -- --ignored --nocapture --test-threads=1`
+Config: n=3584 (Qwen2.5-7B d_model, 14 super-blocks), batch=4, 400 iters, 40-iter warmup. Output bit-identical to 4× sequential seq1_v3 (FMA order preserved; parity test asserts max_abs_diff == 0).
+
+| metric | µs/step |
+|---|---|
+| serial (4× seq1_v3 launches) | 291.85 |
+| batched (1× seqB_v3 launch) | 156.31 |
+| **speedup** | **1.87×** |
+
+(Task-reported figure was 1.80× / 291.62µs→162.14µs on a prior run; this run measured 1.87× / 291.85µs→156.31µs — same ballpark, run-to-run variance on the batched leg.) The seqB kernel reads the weight matrix from DRAM once and reuses it across the batch, so at batch=4 it approaches the memory-bound 4× ceiling. This is the continuous-batching multi-slot decode win; it only helps when ≥2 requests decode concurrently. For single-stream decode (the seq1 bench above) it does nothing but add nvrtc pressure — hence the trade-off.
 
 llama.cpp reference on the same hardware: ~30 tok/s.
 Aether at commit add5216 is at **124% of llama.cpp** with matching
