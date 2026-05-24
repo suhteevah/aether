@@ -1,16 +1,262 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 overnight (**GLM-4.7-flash GATE CLOSED — first real generated
-tokens end-to-end through Aether's runtime.  Aether-serve deployed live on
-cnc:18913 hosting GLM.  Qwen3-MoE + Gemma3 GGUFs downloading for the
-remaining two per-arch smokes.**)
+2026-05-24 morning (**8-item priority sweep done — text-prompt encode
+WIRED + verified live on aether-serve:18913, --bind flag fixed, MLA
+absorbed-mode dtype dispatch + persistent workspace buffers landed,
+dispatch_expert generalized to table-driven, Q-LoRA CPU parity test
+shipped, Gemma3 + Qwen3-MoE GGUFs landed and probed.  aether-serve runs
+under systemd on cnc:18913 hosting Qwen2.5-Math-7B in parallel with the
+:8081 llama-server workhorse — no production disruption.**)
 
 ## Project Status
-🟢 GLM-4.7-flash producing real, prompt-dependent generated tokens with
-clean `finish_reason=stop`.  6 archs now verified end-to-end: Qwen2/2.5,
-Qwen3, Qwen3-VL (text), Llama, DeepSeek-V2-Lite, GLM-4.7-flash.  2 archs
-(Qwen3-MoE, Gemma3) code-complete and pending GGUF download to smoke.
+🟢 8/8 priority-list items closed in one batch (commit db7ee55).  Text
+encode is verified live end-to-end against a real consumer: POST
+/v1/chat/completions {"messages":[{"role":"user","content":"Compute
+17+25"}]} → 7 prompt tokens → math continuation → finish_reason=stop.
+Bind defaults to 0.0.0.0 (was silently loopback-only).  6 archs e2e
+verified previously stand: Qwen2/2.5, Qwen3, Qwen3-VL, Llama, V2-Lite,
+GLM-4.7-flash.  Qwen3-MoE + Gemma3 probes ran cleanly — metadata
+detection works, full-forward smoke gated on (a) Q3_K standalone
+matmul (Qwen3-MoE Q3_K_M has 198 Q3_K tensors outside the supported
+matmul dtype set) and (b) GPU memory (each 14.7 GB / 7.3 GB model needs
+a dedicated P100 with the workhorse stopped).
+
+## What Was Done This Session (2026-05-24 morning, 8-item sweep)
+
+Single commit `db7ee55` lands everything below.  Pre-commit state was
+the prior overnight commit `4d63af7` (GLM gate-close + nohup deploy at
+:18913 that has since been replaced).
+
+### #0 — Text-prompt encode wired (THE blocker from kokonoe findings)
+
+- `runtime/src/lib.rs`:  `aether_bpe_encode_ids(handle, initial_ids,
+  n_initial, out_ids, max_ids)` — runs the BPE merge loop on pre-
+  resolved initial token ids.  `aether_bpe_lookup_bytes(handle, bytes,
+  n_bytes) → i32` — linear scan the decode_table for an exact byte-
+  sequence match.  Together these let serving.rs map GPT-2-byte-mapped
+  surface chars → vocab ids → merged ids without changing the
+  existing `aether_bpe_encode` (raw-byte) entry point.
+- `runtime/src/serving.rs`:  `QwenSession::encode_text(&str) →
+  Vec<usize>` at the bottom of the file in a new impl block.  Lazy
+  256-entry byte→id cache via `OnceLock<Box<[i32; 256]>>` on QwenSession.
+- `trainer/src/bin/serve.rs`:  chat completion path runs encode_text
+  when `prompt_ids` empty + `messages[*].content` present.  Both
+  HTTP/1.1 (handle_completion_t) and HTTP/2 (h2 dispatcher into
+  render_completion_json) wired.  Old 501 "text-prompt encode not
+  wired yet" path is GONE.
+- `runtime/tests/qwen25_tokenizer_roundtrip.rs`:
+  `qwen25_tokenizer_encode_roundtrip` — encode "hello world" via the
+  new chain (byte→id cache + encode_ids + decode), assert the surface
+  bytes round-trip exactly.  PASS: 2 ids `[14990, 1879]` → byte-exact
+  "hello world".
+- **Live verified on cnc:18913**: `messages: [{"role":"user","content":
+  "Compute 17+25"}]` → 200 OK, 7 prompt_tokens, math continuation,
+  finish_reason=stop.  Same path also accepts `prompt_ids: [...]` for
+  legacy clients.
+
+**Known follow-up bug**: aether-serve panics on out-of-vocab prompt_ids
+(witnessed at `serving.rs:2139:9`).  Should return 400 to client
+instead.  systemd `Restart=on-failure` recovers in ~10s but every
+invalid id-list takes the server down briefly.
+
+### #0b — Bind defaults to 0.0.0.0 (was silently 127.0.0.1)
+
+- `trainer/src/bin/serve.rs`:  added `--bind ADDR` flag, default
+  "0.0.0.0".  Route to `aether_tcp_listen_addr` instead of the legacy
+  loopback-only `aether_tcp_listen`.  The log line used to claim
+  "0.0.0.0:port" but the runtime actually bound 127.0.0.1 — kokonoe
+  substrate-swap finding #3.  Now matches.
+- **Live verified**: `ss -tln` on cnc shows `LISTEN 0.0.0.0:18913` (not
+  127.0.0.1).  Reachable from podman bridges, other hosts, etc.
+
+### #1 — Gemma3 + Qwen3-MoE GGUFs landed
+
+- `gemma-3-12b-it-Q4_K_M.gguf` (7.3 GB) — full size matches HF
+  Content-Length.  Prior wget hung on the HF Xet redirect; switching
+  to `curl --location --continue-at -` resolved it.
+- `Qwen3-30B-A3B-Instruct-2507-Q3_K_M.gguf` (14.7 GB).  Switched to
+  Q3_K_M from Q4_K_M (18.5 GB) because Q4_K_M does not fit on a P100
+  16 GB.
+
+### #2 — Qwen3-MoE + Gemma3 probed (full smoke deferred)
+
+`aether-serve --probe` on both:
+
+| Arch       | Result                                                              |
+|------------|---------------------------------------------------------------------|
+| qwen3moe   | n_layers=48 d_model=2048 n_q_heads=32 n_kv_heads=4 head_dim=64 vocab=151936 |
+|            | MoE dispatch shipped (FR-17-extra-moe-fwd).                          |
+|            | **198 tensors at Q3_K / Q5_K outside the standalone matmul dispatch table** (Q4_K + Q6_K + F32 today). |
+| gemma3     | n_layers=48 d_model=3840 n_q_heads=16 n_kv_heads=8 head_dim=240 vocab=262208 sliding=1024 |
+|            | Gemma3 dispatch shipped (FR-17-extra-gemma-fwd, requires --paged).  |
+|            | All 626 tensors in supported dtype set.  Probe still flags         |
+|            | head_dim=240 as "not supported (need multiple of 32, ≤ 256)" but   |
+|            | paged_attention_flex_devarg actually handles ∈ [1, 256] — the      |
+|            | constraint-check message is stale.                                  |
+
+**To complete the full forward smokes**: Qwen3-MoE needs a Q3_K
+standalone matmul kernel + dispatch entry (FR-17-extra-q3k-fwd, new).
+Gemma3 only needs the constraint-check message updated + actually
+trying the load; the kernel is reported shipped.  Both also need GPU
+memory the parallel deploy doesn't have right now — full smoke would
+require stopping the :8081 workhorse first.
+
+### #3 — Restart with correct stop-token
+
+Folded into #4.  The systemd unit launches with `--stop-token 151645`
+(Qwen2.5 EOS).  GLM uses 154822 (BOS), Qwen2.5/Qwen3 use 151645 — the
+prior `--stop-token 154820` setting (GLM EOS, not BOS) caused every
+GLM completion to hit max_tokens instead of clean-stopping.
+
+### #4 — aether-serve under systemd (parallel deploy)
+
+`/etc/systemd/system/aether-serve.service` installed on cnc.  Survives
+reboot, auto-restarts on crash (already proved during the smoke when
+invalid prompt_ids panicked the process — systemd brought it back in
+~10s).  Currently hosts `Qwen2.5-Math-7B-Instruct-Q4_K_M.gguf` on GPU 0
+at port 18913, alongside the :8081 llama-server workhorse on GPU 1.
+
+Key env vars:
+- `CUDA_VISIBLE_DEVICES=0` — GPU 0 (matt-voice neighbour)
+- `LD_LIBRARY_PATH=/opt/ml-venv/.../cuda_nvrtc/lib:/usr/local/cuda-12.8/lib64:/usr/local/lib`
+  — libnvrtc-builtins.so.12.1 ONLY lives at the ml-venv path; without
+  it nvrtc panics with `NVRTC_ERROR_BUILTIN_OPERATION_FAILURE`
+  (kokonoe finding).
+
+To live-swap to take over :8081 + GLM: stop the workhorse, drop in a
+new systemd unit (or `systemctl edit aether-serve`) with `--gguf
+glm-4.7-flash-UD-IQ3_XXS.gguf --port 8081 --stop-token 154822
+CUDA_VISIBLE_DEVICES=1`.  Bridge sockets (`aether-workhorse-bridge.*`)
+are still in place on cnc, disabled, ready to re-enable if podman
+clients need them — though with `--bind 0.0.0.0` they may no longer be
+needed.
+
+### #5 — MLA absorbed-mode dtype dispatch extended
+
+`runtime/src/cuda.rs` + `runtime/src/serving.rs`.  Was Q8_0-only — now
+covers F16, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL for both `attn_k_b` and
+`attn_v_b`.  10 new `__global__` kernels in PAGED_KERNEL_SRC + 10
+host-side FFI wrappers + `mla_absorb_q_dispatch` / `mla_absorb_v_
+dispatch` helpers that select on `bw.dt_k_b` / `bw.dt_v_b`.  Panic
+message names the unsupported dt code so the next arch is mechanical.
+
+Drive-by fix:  `qk_head_dim` guard was 256, contradicting the post-
+b6bfacf `q_local[20]` bump (which lifted the cap to 640).  Lifted to
+640.  Side effect: `cuda_attention_mla_parity` went 4/6 → 6/6.
+
+### #6 — Persistent MLA-absorbed workspace buffers
+
+Previously: 11 buffers per call × 47 layers = 517 device allocs per
+token.  Now: 11 `mla_workspace_*` fields on `ActivationGpu`,
+conditionally sized at construction (`cfg.is_mla_absorbed()`).  Zero
+per-call allocs.  Freed in `Drop`.
+
+### #7 — Q-LoRA synthetic CPU parity test
+
+`runtime/tests/mla_q_lora_cpu_parity.rs` (210 lines).  Synthetic shapes
+(n_tokens=1, d_model=256, q_lora_rank=64, n_heads=4, head_dim=128),
+fixed-seed fill, mirrors the exact `mla_attention_forward_absorbed`
+Q-LoRA chain (`matmul → rms_norm → matmul → reshape`).  Max-abs-diff
+per stage: `q_a=3.4e-5, q_a_n=6.0e-7, q_proj=2.4e-6`, all under the
+1e-4 bound.  CPU-only, no `--features cuda`, no external deps.
+
+### #8 — dispatch_expert generalized to table-driven
+
+Was 6 explicit per-dtype match arms.  Now a `MOE_EXPERT_DISPATCH` table
+of `ExpertDtype { dt, block_n_elems, kernel }` rows looked up via
+`lookup_expert_kernel(dt)`.  Adding a new dtype is one row.  Panic
+message on miss names the supported set and prints the exact one-line
+template.  Same 6 kernels (Q4_K, Q5_0, Q8_0, IQ3_S, IQ4_XS, IQ3_XXS)
+retained — no perf regression.
+
+All 4 CUDA expert-parity tests pass on the 3070 Ti.
+
+## Current Live State
+
+| Service       | Host       | Port  | GPU | Model                          | Status |
+|---------------|-----------|-------|-----|--------------------------------|--------|
+| workhorse     | cnc       | 8081  | 1   | Qwen2.5-14B-Instruct (llama-server) | running |
+| aether-serve  | cnc       | 18913 | 0   | Qwen2.5-Math-7B-Instruct (aether)   | running |
+
+Smoke witness against `aether-serve:18913`:
+```
+POST /v1/chat/completions
+{"model":"qwen2.5-math-7b","messages":[{"role":"user","content":"Compute 17+25"}],"max_tokens":24}
+→ {"id":"chatcmpl-aether-serve-1","choices":[{"message":{"content":"+34+46+58+69+70+71+72+73"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":24}}
+```
+
+Build: `cargo build --workspace --release` + `--features cuda` both
+green.  `cargo test --workspace --release` — 72 lib tests + 79 test
+groups all pass.  `scripts\audit.ps1` — 0 errors, 169/196 roadmap items
+witnessed (unchanged baseline).
+
+## What's Next (priority order)
+
+1. **400-on-bad-prompt_ids** instead of panic-and-restart at
+   `serving.rs:2139:9` (`token_id N out of vocab V`).  Validate prompt
+   ids against `cfg.vocab_size` at body-parse time, return 400 for any
+   id ≥ vocab.
+
+2. **Q3_K standalone matmul** (FR-17-extra-q3k-fwd).  Mirror the
+   existing `aether_op_fused_q4_k_*` shape with the Q3_K dequant
+   (already present in `aether_dequant_q3_k`).  Unblocks Qwen3-MoE
+   Q3_K_M (198 Q3_K tensors) end-to-end.
+
+3. **Gemma3 head_dim=240 smoke**.  The probe flags it as "not
+   supported" but paged_attention_flex_devarg actually handles 240.
+   Either fix the probe message OR add an explicit head_dim assert in
+   the flex kernel + try a real load.  No new code likely needed —
+   just verify.
+
+4. **Live-swap aether-serve onto :8081 with GLM-4.7-flash** when the
+   user wants to retire llama-server.  Steps documented in #4 above.
+   Smoke first against the parallel :18913 path to validate any new
+   code; never directly cut over without a witness.
+
+5. **Pre-tokenization regex** for chat encode (FR-x-extra-text-encode-
+   regex).  Current path skips GPT-2's `'s|'t|'re|...` pre-split, so
+   tokenization isn't byte-exact with HF's `AutoTokenizer`.  For
+   typical English prompts it still works — model handles arbitrary
+   token sequences — but contractions / punctuation edges may
+   tokenize sub-optimally.
+
+6. **Async / TLS smoke** for aether-serve.  Existing tls13_loopback
+   covers the runtime, but the running serve doesn't have `--tls` on.
+   Try with `--tls --tls-cn aether-serve.local` once the bind story is
+   stable.
+
+7. **Other `attn_k_b` / `attn_v_b` dtypes**: when a future arch uses
+   non-{Q8_0, F16, Q4_K, Q5_K, Q6_K, IQ4_NL} here, extend the dispatch.
+   IQ3_S / IQ3_XXS / IQ4_XS / Q5_0 absorb variants are filed as known
+   TODOs in `mla_absorb_q_dispatch`'s panic message.
+
+## Notes for Next Session
+
+- **aether-serve:18913 is live; don't break it.**  Smoke and iterate
+  there before any live swap.
+- **The systemd unit at `/etc/systemd/system/aether-serve.service`
+  has Environment= for LD_LIBRARY_PATH inline in the main unit.**  If
+  a `.service.d/` drop-in appears later, it overrides — see kokonoe
+  finding for the gotcha.
+- **`--bind` defaults to `0.0.0.0`** now.  Pass `--bind 127.0.0.1` to
+  restore loopback if needed for a private deployment.
+- **Out-of-vocab prompt_ids panic the server** — known follow-up #1.
+  Until fixed, any client that sends rogue id arrays takes the
+  server down for ~10s (systemd recovers).  Validate client-side or
+  fence it server-side ASAP.
+- **The aether-workhorse-bridge.{socket,service} units on cnc are
+  still in place, disabled.**  With `--bind 0.0.0.0` shipped they're
+  probably moot, but kept as a fallback if podman semantics surprise
+  us during the live swap.
+- **scratch/aether-serve.service, scratch/aether-serve-deploy.sh,
+  scratch/aether-serve-smoke.sh** are kept as the canonical
+  deployment artifacts.  scratch/ is gitignored — the systemd unit on
+  cnc is what's authoritative.
+
+---
+
+
 
 ## What Was Done This Session (2026-05-24 overnight)
 
@@ -2457,3 +2703,73 @@ attackable.
 Phases at 100%: 6-14 + 17 + 19  (10 phases)
 honesty-auditor claims: 51/51 verified
 ```
+
+---
+
+## External findings — substrate-swap attempt (kokonoe session, 2026-05-24 ~04:30-09:50 PDT)
+
+A separate Claude session on kokonoe attempted Phase 1 of the openclaw-inference fleet substrate swap (workhorse: llama-server → aether-serve hosting GLM-4.7-flash UD-IQ3_XXS). **Swap was reverted at the user's call.** Surfacing the findings here so next aether-side session has them before re-attempting.
+
+### TL;DR
+
+The swap was **technically operational** — aether-serve hosted GLM under systemd, routed end-to-end through LiteLLM — but **functionally unusable for chat consumers** because aether-serve's text→token encoding isn't wired. Every LiteLLM consumer (school teams, redteam adversaries, anything passing `messages: [...]`) got `text-prompt encode not wired yet; pass prompt_ids (token ids) for now`. Anthropic OAuth fallback also broken (separate ~8h-cliff issue). Workhorse reverted to llama-server.
+
+### Three concrete blockers to fix before retrying
+
+**1. aether-serve text-prompt encoding (THE blocker).** `POST /v1/chat/completions` with `{"messages":[{"role":"user","content":"hi"}]}` against GLM-4.7-flash returns `text-prompt encode not wired yet; pass prompt_ids (token ids) for now`. Validated against the live :8081 deployment and against the earlier :18913 nohup launch — same error path. Per the commit history, WordPiece + BPE exist for BERT (`92a5054`, `8985d85`) but the chat path for GLM/Qwen/DeepSeek doesn't tokenize text. Either wire the tokenizer into the chat-completion handler, or add a tokenizer sidecar in front.
+
+**2. cnc systemd `.service.d/` drop-in overrides main unit `Environment=` silently.** Each `openclaw-inference-<name>.service` has a drop-in at `/etc/systemd/system/openclaw-inference-<name>.service.d/ld-library-path.conf` that was originally set to `LD_LIBRARY_PATH=/opt/llama/llama-b8182:/usr/local/cuda-12/lib64` (llama.cpp's bundled libs). **Drop-ins win over main-unit `Environment=` lines**, so rewriting the main unit's LD_LIBRARY_PATH and `daemon-reload`-ing did NOT change the effective env. Cost three crash-loops before `systemctl cat <unit>` (which shows ALL files contributing in apply order) revealed it. When retrying, edit the drop-in, not the main unit:
+
+```ini
+# /etc/systemd/system/openclaw-inference-workhorse.service.d/ld-library-path.conf
+[Service]
+# aether-serve needs NVRTC builtins from the ml-venv pip-installed nvidia package
+# (libnvrtc-builtins.so.12.1 lives only there; not in any system path)
+Environment=LD_LIBRARY_PATH=/opt/ml-venv/lib/python3.13/site-packages/nvidia/cuda_nvrtc/lib:/usr/local/cuda-12.8/lib64:/usr/local/lib
+```
+
+The `libnvrtc-builtins.so.12.1` lives ONLY at the ml-venv path above. Without it in LD_LIBRARY_PATH, aether-serve panics at `runtime/src/cuda.rs:3876:43` with `NVRTC_ERROR_BUILTIN_OPERATION_FAILURE`.
+
+**3. aether-serve binds `127.0.0.1` only, despite `--help` claiming `0.0.0.0`.** `--help` says "Listens on 0.0.0.0:port for OpenAI-compat /v1/chat/completions." Actual binding (`ss -tlnp` on PID 1646339 + the earlier :18913 nohup launch): `127.0.0.1:8081` only. No `--host` flag. Binary `strings` contains both `127.0.0.1` and `0.0.0.0`, so this looks like an actual aether-serve binary bug, not a missed CLI option. **This blocks LiteLLM in podman bridge mode from reaching aether-serve**, because `host.containers.internal → 10.88.0.1` (podman0 bridge) which can't reach host loopback.
+
+**Workaround that worked: `systemd-socket-proxyd` bridge.** Two unit files left in place on cnc, **disabled**, ready to re-enable on retry:
+
+- `/etc/systemd/system/aether-workhorse-bridge.socket` — listens on `10.88.0.1:8081`
+- `/etc/systemd/system/aether-workhorse-bridge.service` — runs `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8081`
+
+Reusable for scout + embed bridges by copying with port substitution. (socat would be cleaner but isn't installed on MicroOS and needs `transactional-update + reboot`.)
+
+### Side-effect: ~14-min cold load due to memory pressure
+
+cnc has **15 GiB RAM**, not 8 (the "8 GB box" line in earlier aether-session handoffs likely refers to one P100's VRAM, not host memory). GLM-4.7-flash UD-IQ3_XXS takes **~10 GiB resident + ~2 GiB swap** during load while scout + embed llama-servers also hold host RAM. The process sits in state `D` (disk sleep) for most of the 14 minutes; don't kill it — watch GPU VRAM grow as the progress signal. **Stop scout + embed before starting the aether workhorse next time** — frees ~5 GiB RAM and should cut load to a few minutes.
+
+### Independent issue: Anthropic OAuth fallback was down at smoke time
+
+LiteLLM tried to fall back to `claude-sonnet-4-6` when aether-serve returned 501; that also failed: `upstream connect error or disconnect/reset before headers. reset reason: connection termination`. Consistent with the OpenClaw fleet's ~8h OAuth refresh cliff (see kokonoe memory `reference_openclaw_oauth_refresh_400`). Refresh the fleet main's OAuth before retrying so consumers cleanly fall back during any future swap attempt.
+
+### Retry checklist
+
+1. **Wire text-prompt encoding in aether-serve** — the only real blocker. (Without this, the swap is operational but every chat consumer 501s.)
+2. **Refresh Anthropic OAuth** on fleet main (`openclaw agents add main`) so fallbacks work during the retry window.
+3. **Stop scout + embed before starting aether workhorse** — cuts cold-load from ~14 min to ~3 min.
+4. **Update the `.service.d/` drop-in**, not the main unit, for LD_LIBRARY_PATH (the ml-venv NVRTC path above).
+5. **Re-enable the bridge socket**: `sudo systemctl enable --now aether-workhorse-bridge.socket`.
+6. **Smoke via LiteLLM with `model: llama-3.3-70b-versatile`** (the consumer-facing alias; raw `qwen2.5-14b` is the upstream name and gets rejected by LiteLLM's `model_list`).
+
+### Files left on cnc (kept for retry)
+
+- `/etc/systemd/system/openclaw-inference-workhorse.service.bak.1779635911` — original llama-server unit (current main was restored from this)
+- `/etc/systemd/system/openclaw-inference-workhorse.service.d/ld-library-path.conf.bak.1779636381` — original llama-server drop-in (current was restored from this)
+- `/etc/systemd/system/aether-workhorse-bridge.{socket,service}` — disabled, ready to re-enable
+
+### Concrete fleet → aether endpoint map (validated at smoke time)
+
+```
+LiteLLM container (bridge mode, 10.88.0.2)
+  → host.containers.internal (10.88.0.1, podman0)
+  → systemd-socket-proxyd on 10.88.0.1:8081
+  → aether-serve on 127.0.0.1:8081
+  → GLM-4.7-flash UD-IQ3_XXS on P100 #2 (CUDA_VISIBLE_DEVICES=1, ~12.7 GiB VRAM)
+```
+
+The route works. The cargo doesn't survive aether-serve's tokenization gap.
