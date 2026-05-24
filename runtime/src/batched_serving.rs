@@ -58,6 +58,23 @@ use crate::serving::{
     QwenSession, SamplingParams, SharedKvPool,
 };
 
+/// Per-token streaming event delivered from the scheduler worker thread
+/// to a blocked HTTP handler over an `mpsc` channel.  One `Token` is
+/// sent per generated token (the stop-token itself is NOT emitted,
+/// matching `generate_sampled_v2` semantics);  exactly one terminal
+/// `Done` or `Error` follows.  The HTTP layer drains the receiver,
+/// writing an SSE `data:` chunk per `Token`, then `[DONE]` on `Done`.
+pub enum StreamEvent {
+    /// A freshly sampled token id + its decoded UTF-8 piece.
+    Token { id: usize, piece: String },
+    /// Generation finished cleanly (stop token / stop string / max
+    /// tokens / max sequence).  Carries the full generated id list so
+    /// the HTTP layer can compute usage counts without a second pass.
+    Done { generated: Vec<usize> },
+    /// Generation aborted (pool exhausted, prefill failure, shutdown).
+    Error(String),
+}
+
 /// One in-flight chat request.  All mutable per-request state lives
 /// here; the scheduler walks active slots round-robin under the GPU
 /// mutex but does sampling + stop-checking outside the lock.
@@ -93,9 +110,14 @@ pub struct SessionSlot {
     /// Per-slot repetition-penalty token counts.
     pub seen: HashMap<usize, u32>,
     /// Optional stream callback: token + decoded piece per generated
-    /// token.  Phase-1 just buffers; the streaming HTTP path is left
-    /// to the existing single-session streaming code.
+    /// token.  In-process consumers (tests) can use this;  the HTTP
+    /// streaming path uses `stream_tx` instead (cross-thread channel).
     pub stream_callback: Option<Box<dyn FnMut(usize, &str) + Send>>,
+    /// Optional cross-thread streaming channel.  When `Some`, the
+    /// scheduler worker sends a `StreamEvent::Token` per generated
+    /// token and a terminal `Done`/`Error` on retirement.  Used by the
+    /// SSE HTTP handler to stream deltas as they're produced.
+    pub stream_tx: Option<mpsc::Sender<StreamEvent>>,
 }
 
 impl SessionSlot {
@@ -117,6 +139,7 @@ impl SessionSlot {
             rng: 0,
             seen: HashMap::new(),
             stream_callback: None,
+            stream_tx: None,
         }
     }
 }
@@ -135,6 +158,13 @@ pub struct BatchRequest {
     /// slot retires.  `Err` if the scheduler couldn't admit the request
     /// (e.g. pool exhausted, prefill failed) or shut down mid-flight.
     pub done: mpsc::Sender<Result<Vec<usize>, String>>,
+    /// Optional per-token streaming channel.  When `Some`, the
+    /// scheduler emits a `StreamEvent::Token` for each generated token
+    /// and a terminal `Done`/`Error`.  The `done` channel is still
+    /// fired on retirement (carrying the same id list / error), so a
+    /// streaming caller may either drain `stream_rx` for deltas or
+    /// block on `done` for the final list — both are consistent.
+    pub stream_tx: Option<mpsc::Sender<StreamEvent>>,
 }
 
 /// Internal shared state between the scheduler worker and submitters.
@@ -232,8 +262,40 @@ impl BatchScheduler {
             prompt_ids, max_tokens, stop_token,
             params, stop_strings,
             done: tx,
+            stream_tx: None,
         })?;
         rx.recv().map_err(|e| format!("scheduler done channel: {}", e))?
+    }
+
+    /// Submit a streaming request.  Returns a `Receiver<StreamEvent>`
+    /// the caller drains for per-token deltas;  the worker sends one
+    /// `Token` per generated token and exactly one terminal
+    /// `Done`/`Error`.  The `done` one-shot still fires on retirement
+    /// (its result is identical to the terminal stream event) but a
+    /// streaming caller normally only reads the stream channel.
+    ///
+    /// Returns Err if the scheduler has already shut down.
+    pub fn submit_streaming(
+        &self,
+        prompt_ids: Vec<usize>,
+        max_tokens: usize,
+        stop_token: Option<usize>,
+        params: SamplingParams,
+        stop_strings: Vec<String>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, String> {
+        let (stream_tx, stream_rx) = mpsc::channel();
+        // The `done` sender is required by the request envelope but the
+        // streaming caller ignores it (terminal info arrives via the
+        // stream channel).  A throwaway channel keeps the worker's
+        // retirement path uniform.
+        let (done_tx, _done_rx) = mpsc::channel();
+        self.submit(BatchRequest {
+            prompt_ids, max_tokens, stop_token,
+            params, stop_strings,
+            done: done_tx,
+            stream_tx: Some(stream_tx),
+        })?;
+        Ok(stream_rx)
     }
 }
 
@@ -275,7 +337,11 @@ fn run_worker(
             let mut sess = session.lock().unwrap();
             for mut e in active.drain(..) {
                 sess.slot_release_blocks(&mut e.slot.owned_blocks);
-                let _ = e.done.send(Err("scheduler shut down mid-flight".into()));
+                let msg = "scheduler shut down mid-flight".to_string();
+                if let Some(tx) = &e.slot.stream_tx {
+                    let _ = tx.send(StreamEvent::Error(msg.clone()));
+                }
+                let _ = e.done.send(Err(msg));
             }
             drop(sess);
             let mut g = shared.pending.lock().unwrap();
@@ -310,30 +376,41 @@ fn run_worker(
         //    sampling + stop-string decode for slot N can run while
         //    slot N+1's HTTP encoder holds the session for tokenizer
         //    work — minimizes scheduler-vs-encoder contention.
-        let mut retired: Vec<usize> = Vec::new();
+        // Each retired entry carries its outcome: Ok(()) for a clean
+        // finish, Err(msg) for a fault.  Terminal delivery (to both the
+        // `done` one-shot and the optional `stream_tx`) happens once, in
+        // step 5 — never double-send.
+        let mut retired: Vec<(usize, Result<(), String>)> = Vec::new();
         for (i, entry) in active.iter_mut().enumerate() {
-            let done = match step_slot(&session, &mut entry.slot) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = entry.done.send(Err(e));
-                    retired.push(i);
-                    continue;
-                }
-            };
-            if done {
-                retired.push(i);
+            match step_slot(&session, &mut entry.slot) {
+                Ok(true)  => retired.push((i, Ok(()))),
+                Ok(false) => { /* slot continues */ }
+                Err(e)    => retired.push((i, Err(e))),
             }
         }
 
         // 5. Retire finished slots (reverse-iterate to keep indices valid).
-        for &idx in retired.iter().rev() {
+        for (idx, outcome) in retired.into_iter().rev() {
             let mut entry = active.swap_remove(idx);
             {
                 let sess = session.lock().unwrap();
                 sess.slot_release_blocks(&mut entry.slot.owned_blocks);
             }
-            let result = std::mem::take(&mut entry.slot.generated);
-            let _ = entry.done.send(Ok(result));
+            match outcome {
+                Ok(()) => {
+                    let result = std::mem::take(&mut entry.slot.generated);
+                    if let Some(tx) = &entry.slot.stream_tx {
+                        let _ = tx.send(StreamEvent::Done { generated: result.clone() });
+                    }
+                    let _ = entry.done.send(Ok(result));
+                }
+                Err(e) => {
+                    if let Some(tx) = &entry.slot.stream_tx {
+                        let _ = tx.send(StreamEvent::Error(e.clone()));
+                    }
+                    let _ = entry.done.send(Err(e));
+                }
+            }
         }
     }
 }
@@ -346,22 +423,32 @@ fn admit_request(
 ) -> Result<SlotEntry, ()> {
     let BatchRequest {
         prompt_ids, max_tokens, stop_token,
-        params, stop_strings, done,
+        params, stop_strings, done, stream_tx,
     } = req;
 
+    // Admission errors must reach BOTH the `done` one-shot (legacy
+    // blocking callers) and the stream channel (SSE callers), since a
+    // streaming caller only drains `stream_rx`.
+    let fail = |msg: String, stream_tx: &Option<mpsc::Sender<StreamEvent>>,
+                done: &mpsc::Sender<Result<Vec<usize>, String>>| {
+        let _ = done.send(Err(msg.clone()));
+        if let Some(tx) = stream_tx { let _ = tx.send(StreamEvent::Error(msg)); }
+    };
+
     if prompt_ids.is_empty() {
-        let _ = done.send(Err("prompt_ids empty".into()));
+        fail("prompt_ids empty".into(), &stream_tx, &done);
         return Err(());
     }
     let vocab = session.lock().unwrap().vocab();
     if let Some(&bad) = prompt_ids.iter().find(|&&i| i >= vocab) {
-        let _ = done.send(Err(format!(
+        fail(format!(
             "prompt_ids contains token id {} out of vocab (vocab_size={})",
-            bad, vocab)));
+            bad, vocab), &stream_tx, &done);
         return Err(());
     }
     if max_tokens == 0 {
         let _ = done.send(Ok(Vec::new()));
+        if let Some(tx) = &stream_tx { let _ = tx.send(StreamEvent::Done { generated: Vec::new() }); }
         return Err(());
     }
 
@@ -373,6 +460,7 @@ fn admit_request(
     slot.stop_strings = stop_strings;
     slot.max_tokens = max_tokens;
     slot.last_token = *prompt_ids.last().unwrap();
+    slot.stream_tx = stream_tx;
 
     // Phase-1 prefill: per-slot serial prefill, GPU lock held for the
     // duration of THIS request's prefill.  Other admitted slots can't
@@ -389,7 +477,9 @@ fn admit_request(
     if let Err(e) = prefill_err {
         let mut sess = session.lock().unwrap();
         sess.slot_release_blocks(&mut slot.owned_blocks);
-        let _ = done.send(Err(format!("prefill failed: {}", e)));
+        let msg = format!("prefill failed: {}", e);
+        let _ = done.send(Err(msg.clone()));
+        if let Some(tx) = &slot.stream_tx { let _ = tx.send(StreamEvent::Error(msg)); }
         return Err(());
     }
 
@@ -447,10 +537,32 @@ fn step_slot(
     *slot.seen.entry(id).or_insert(0) += 1;
     slot.generated.push(id);
 
-    // Stop-strings: decode just the new piece, append to running_text,
-    // check tail-match.  Decoding ONE id is cheap.
+    // Decode the new piece ONCE if any consumer needs it: stop-string
+    // matching, the in-process callback, or the cross-thread stream.
+    let needs_piece = !slot.stop_strings.is_empty()
+        || slot.stream_callback.is_some()
+        || slot.stream_tx.is_some();
+    let piece = if needs_piece {
+        session.lock().unwrap().decode_ids(&[id])
+    } else {
+        String::new()
+    };
+
+    // Emit the streaming token BEFORE the stop-string retraction below.
+    // This matches the legacy single-session SSE path
+    // (handle_completion_streaming_t), which also chunks the piece then
+    // breaks — the already-streamed text isn't retracted, only the
+    // final `done` id list is trimmed.
+    if let Some(cb) = slot.stream_callback.as_mut() {
+        cb(id, &piece);
+    }
+    if let Some(tx) = &slot.stream_tx {
+        let _ = tx.send(StreamEvent::Token { id, piece: piece.clone() });
+    }
+
+    // Stop-strings: append the new piece to running_text, check
+    // tail-match, trim the final id list if hit.
     if !slot.stop_strings.is_empty() {
-        let piece = session.lock().unwrap().decode_ids(&[id]);
         slot.running_text.push_str(&piece);
         let mut hit_len: Option<usize> = None;
         for s in &slot.stop_strings {
@@ -468,12 +580,6 @@ fn step_slot(
             }
             return Ok(true);
         }
-    }
-
-    // Optional streaming hook.
-    if let Some(cb) = slot.stream_callback.as_mut() {
-        let piece = session.lock().unwrap().decode_ids(&[id]);
-        cb(id, &piece);
     }
 
     slot.last_token = id;

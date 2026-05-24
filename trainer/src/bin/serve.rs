@@ -1593,16 +1593,13 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
     }
 
     if req.stream {
-        // FR-19.5-extra-deep: streaming over the BatchScheduler is not
-        // shipped in Phase 1.  Without a scheduler, the legacy path
-        // handles streaming through generate_sampled_v2 + the SSE
-        // chunker in handle_completion_streaming_t.  Reject streaming
-        // when the scheduler owns the session.
+        // FR-19.5-extra-deep Phase 2: streaming over the BatchScheduler
+        // now drains a per-token `StreamEvent` channel from the worker
+        // thread.  Without a scheduler, the legacy single-session SSE
+        // chunker handles it.
         #[cfg(feature = "cuda")]
         if state.scheduler.is_some() {
-            let _ = send_text_t(t, 503,
-                "streaming not yet supported with --max-concurrent > 1; \
-                 retry without 'stream: true', or restart without --max-concurrent");
+            handle_completion_streaming_scheduler_t(state, t, &req);
             return;
         }
         handle_completion_streaming_t(state, t, &req);
@@ -1822,6 +1819,79 @@ unsafe fn handle_completion_streaming_t(state: &ServerState, t: &mut dyn Transpo
         send_chunk(t, "data: [DONE]\n\n");
     }
 
+    let _ = t.write(b"0\r\n\r\n");
+}
+
+/// FR-19.5-extra-deep Phase 2 — SSE streaming over the BatchScheduler.
+/// Submits a streaming request, then drains the worker's per-token
+/// `StreamEvent` channel, writing one OpenAI-compatible `data:` delta
+/// chunk per generated token and `[DONE]` on completion.  Chunk format
+/// is byte-identical to the legacy single-session SSE path so existing
+/// clients (incl. the OpenAI SDK) work unchanged regardless of
+/// --max-concurrent.
+#[cfg(feature = "cuda")]
+unsafe fn handle_completion_streaming_scheduler_t(
+    state: &ServerState, t: &mut dyn Transport, req: &JsonBody,
+) {
+    use aether_rt::batched_serving::StreamEvent;
+    let Some(sched) = &state.scheduler else {
+        let _ = send_text_t(t, 500, "scheduler unavailable");
+        return;
+    };
+    let stop = state.cli.stop_token.or_else(|| {
+        let eos = sched.eos_token();
+        if eos >= 0 { Some(eos as usize) } else { None }
+    });
+    let params = aether_rt::serving::SamplingParams {
+        temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+        top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+        top_k: req.top_k.unwrap_or(0),
+        presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+        frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+        seed: req.seed,
+        logit_bias: req.logit_bias.clone(),
+    };
+    // Submit BEFORE writing any HTTP status — an admission failure here
+    // can still surface as a clean 503 rather than a half-open SSE body.
+    let rx = match sched.submit_streaming(
+        req.prompt_ids.clone(), req.max_tokens, stop, params, req.stop_strings.clone(),
+    ) {
+        Ok(rx) => rx,
+        Err(e) => { let _ = send_text_t(t, 503, &format!("scheduler: {}", e)); return; }
+    };
+
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n";
+    let _ = t.write(headers.as_bytes());
+    let send_chunk = |t: &mut dyn Transport, s: &str| {
+        let hex_len = format!("{:x}\r\n", s.len());
+        let _ = t.write(hex_len.as_bytes());
+        let _ = t.write(s.as_bytes());
+        let _ = t.write(b"\r\n");
+    };
+
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            StreamEvent::Token { piece, .. } => {
+                let escaped = json_escape(&piece);
+                let chunk = format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                    escaped);
+                send_chunk(t, &chunk);
+            }
+            StreamEvent::Done { .. } => {
+                send_chunk(t, "data: [DONE]\n\n");
+                break;
+            }
+            StreamEvent::Error(e) => {
+                let escaped = json_escape(&e);
+                send_chunk(t, &format!("data: {{\"error\":\"{}\"}}\n\n", escaped));
+                send_chunk(t, "data: [DONE]\n\n");
+                break;
+            }
+        }
+    }
+    // Channel closed without a terminal event (worker dropped): still
+    // terminate the SSE stream cleanly.
     let _ = t.write(b"0\r\n\r\n");
 }
 
