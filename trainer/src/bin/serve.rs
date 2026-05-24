@@ -310,6 +310,19 @@ struct JsonBody {
     /// from each previously-seen token's logit.  `None` or `0.0` → no
     /// penalty.
     frequency_penalty: Option<f32>,
+    /// HF / llama.cpp-style top-k cutoff.  `<= 0` disables.
+    top_k: Option<i32>,
+    /// Deterministic generation seed.  `None` → OS-derived seed.
+    seed: Option<u64>,
+    /// OpenAI `logit_bias`: `{token_id_string → bias_float}`.
+    logit_bias: std::collections::HashMap<usize, f32>,
+    /// OpenAI `stop`: list of strings;  generation stops on the first
+    /// suffix-match.  Either a JSON string or a JSON array of strings.
+    stop_strings: Vec<String>,
+    /// OpenAI legacy /v1/completions `prompt` field — a raw string the
+    /// model should continue (no chat template applied).  Present only
+    /// when the caller hit /v1/completions, not /v1/chat/completions.
+    raw_prompt: Option<String>,
     /// FR-x-extra-chat-template: ordered (role, content) pairs from the
     /// request's `messages: [...]` array.  Empty when the client sent
     /// `prompt_ids` directly.  Used by the chat-template apply path.
@@ -335,13 +348,22 @@ fn parse_body(body: &[u8], default_max: usize) -> Result<JsonBody, &'static str>
     let top_p = find_key_float(s, "top_p");
     let presence_penalty = find_key_float(s, "presence_penalty");
     let frequency_penalty = find_key_float(s, "frequency_penalty");
+    let top_k = find_key_int(s, "top_k").map(|v| v as i32);
+    let seed = find_key_int(s, "seed").map(|v| v as u64);
+    let logit_bias = find_logit_bias(s);
+    let stop_strings = find_stop_strings(s);
+    // /v1/completions legacy: `prompt` is a raw string.  We also
+    // accept an array of strings (concatenated newline-separated)
+    // because some clients send `prompt: ["..."]`.
+    let raw_prompt = find_key_string(s, "prompt");
 
-    if prompt_ids.is_empty() && text_prompt.is_none() {
-        return Err("body has neither prompt_ids nor messages[].content");
+    if prompt_ids.is_empty() && text_prompt.is_none() && raw_prompt.is_none() {
+        return Err("body has neither prompt_ids nor messages[].content nor prompt");
     }
 
     Ok(JsonBody { prompt_ids, max_tokens, stream, text_prompt, temperature, top_p,
-                   presence_penalty, frequency_penalty, messages })
+                   presence_penalty, frequency_penalty, top_k, seed,
+                   logit_bias, stop_strings, messages, raw_prompt })
 }
 
 // ============================================================================
@@ -560,6 +582,103 @@ fn find_messages_content(s: &str) -> Option<String> {
         cursor = abs;
     }
     if parts.is_empty() { None } else { Some(parts.join("\n")) }
+}
+
+/// Parse OpenAI `logit_bias` map.  Field shape: `{"50256": -100, ...}`
+/// — JSON object with stringified integer ids → float biases.  We do
+/// a substring-driven scan since we don't have a real JSON parser.
+fn find_logit_bias(s: &str) -> std::collections::HashMap<usize, f32> {
+    let mut out = std::collections::HashMap::new();
+    let key = "\"logit_bias\"";
+    let Some(i) = s.find(key) else { return out; };
+    let after = &s[i + key.len()..];
+    let Some(colon) = after.find(':') else { return out; };
+    let after_colon = after[colon + 1..].trim_start();
+    if !after_colon.starts_with('{') { return out; }
+    // Body of the object lives between { and matching }.  Naive scan —
+    // good enough since logit_bias values are numbers, no nesting.
+    let body_start = (after.as_ptr() as usize) - (s.as_ptr() as usize)
+                    + colon + 1 + (after[colon + 1..].len() - after_colon.len()) + 1;
+    let mut depth = 1i32;
+    let bytes = s.as_bytes();
+    let mut end = body_start;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'{' => depth += 1,
+            b'}' => { depth -= 1; if depth == 0 { break; } }
+            _ => {}
+        }
+        end += 1;
+    }
+    let body = &s[body_start..end];
+    // Walk pairs:  "id": float, ...
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let Some(q1) = body[cursor..].find('"') else { break; };
+        let abs1 = cursor + q1 + 1;
+        let Some(q2_rel) = body[abs1..].find('"') else { break; };
+        let abs2 = abs1 + q2_rel;
+        let id: usize = match body[abs1..abs2].parse() { Ok(v) => v, Err(_) => { cursor = abs2 + 1; continue; } };
+        let after_q2 = &body[abs2 + 1..];
+        let Some(colon) = after_q2.find(':') else { break; };
+        let after_colon = after_q2[colon + 1..].trim_start();
+        let end_v = after_colon.find(|c: char| c == ',' || c == '}' || c == '\n')
+            .unwrap_or(after_colon.len());
+        if let Ok(v) = after_colon[..end_v].trim().parse::<f32>() {
+            out.insert(id, v);
+        }
+        cursor = abs2 + 1 + colon + 1 + (after_q2[colon + 1..].len() - after_colon.len()) + end_v;
+    }
+    out
+}
+
+/// Parse OpenAI `stop` field.  Accepts either a JSON string or a JSON
+/// array of strings.  Returns empty Vec when absent / malformed.
+fn find_stop_strings(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let key = "\"stop\"";
+    let Some(i) = s.find(key) else { return out; };
+    let after = &s[i + key.len()..];
+    let Some(colon) = after.find(':') else { return out; };
+    let after_colon = after[colon + 1..].trim_start();
+    if after_colon.starts_with('"') {
+        // Single string.  Reuse find_key_string semantics — find the
+        // matching closing quote.
+        let q1_abs = (after.as_ptr() as usize) - (s.as_ptr() as usize)
+                    + colon + 1 + (after[colon + 1..].len() - after_colon.len()) + 1;
+        let bytes = s.as_bytes();
+        let mut j = q1_abs;
+        while j < bytes.len() && !(bytes[j] == b'"' && bytes[j - 1] != b'\\') { j += 1; }
+        if j < bytes.len() {
+            out.push(unescape_json_string(&s[q1_abs..j]));
+        }
+    } else if after_colon.starts_with('[') {
+        // Array of strings.  Walk pairs of unescaped quotes.
+        let arr_start = (after.as_ptr() as usize) - (s.as_ptr() as usize)
+                    + colon + 1 + (after[colon + 1..].len() - after_colon.len()) + 1;
+        let bytes = s.as_bytes();
+        let mut cursor = arr_start;
+        let mut depth = 1i32;
+        while cursor < bytes.len() && depth > 0 {
+            match bytes[cursor] {
+                b'[' => depth += 1,
+                b']' => { depth -= 1; if depth == 0 { break; } cursor += 1; continue; }
+                b'"' => {
+                    let q1 = cursor + 1;
+                    let mut j = q1;
+                    while j < bytes.len() && !(bytes[j] == b'"' && bytes[j - 1] != b'\\') { j += 1; }
+                    if j < bytes.len() {
+                        out.push(unescape_json_string(&s[q1..j]));
+                        cursor = j + 1;
+                        continue;
+                    } else { break; }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+    }
+    out
 }
 
 /// Parse `messages: [{role:..., content:...}, ...]` into ordered (role,
@@ -925,12 +1044,17 @@ unsafe fn dispatch_h2_stream(
         body.len());
     let path_str = std::str::from_utf8(&req.path).unwrap_or("").to_string();
     let method_str = std::str::from_utf8(&req.method).unwrap_or("").to_string();
+    let is_chat_path = path_str == "/v1/chat/completions";
     match (method_str.as_str(), path_str.as_str()) {
         ("GET", "/health") => write_h2_text(t, stream_id, 200, b"ok"),
         ("GET", "/v1/models") => {
             let body = format!(
                 "{{\"object\":\"list\",\"data\":[{{\"id\":\"{}\",\"object\":\"model\",\"owned_by\":\"aether\"}}]}}",
                 state.cli.model);
+            write_h2_json(t, stream_id, 200, body.as_bytes());
+        }
+        ("GET", "/props") => {
+            let body = render_props_json(state);
             write_h2_json(t, stream_id, 200, body.as_bytes());
         }
         ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
@@ -944,17 +1068,20 @@ unsafe fn dispatch_h2_stream(
                         {
                             if let Some(sess_mu) = &state.session {
                                 let sess = sess_mu.lock().unwrap();
-                                // Prefer chat-template apply if we have
-                                // structured messages + a template; fall
-                                // back to plain text otherwise.
-                                let encode_input = if !req.messages.is_empty() {
-                                    sess.apply_chat_template(&req.messages)
-                                        .or_else(|| req.text_prompt.clone())
+                                // Chat path applies the per-arch template;
+                                // legacy /v1/completions uses raw `prompt`
+                                // verbatim (no template).
+                                let (encode_input, used_template): (Option<String>, bool) = if is_chat_path && !req.messages.is_empty() {
+                                    match sess.apply_chat_template(&req.messages) {
+                                        Some(s) => (Some(s), true),
+                                        None => (req.text_prompt.clone(), false),
+                                    }
+                                } else if is_chat_path {
+                                    (req.text_prompt.clone(), false)
                                 } else {
-                                    req.text_prompt.clone()
+                                    (req.raw_prompt.clone().or_else(|| req.text_prompt.clone()), false)
                                 };
                                 if let Some(text) = encode_input {
-                                    let used_template = !req.messages.is_empty();
                                     req.prompt_ids = if used_template {
                                         sess.encode_text_with_specials(&text)
                                     } else {
@@ -1033,12 +1160,17 @@ unsafe fn render_completion_json(state: &ServerState, req: &JsonBody) -> String 
                 let stop = state.cli.stop_token.or_else(|| {
                     if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
                 });
-                let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
-                let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
-                let pp = req.presence_penalty.unwrap_or(state.cli.default_presence_penalty);
-                let fp = req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty);
-                let ids = sess.generate_sampled(
-                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p, pp, fp);
+                let params = aether_rt::serving::SamplingParams {
+                    temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                    top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                    top_k: req.top_k.unwrap_or(0),
+                    presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                    frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                    seed: req.seed,
+                    logit_bias: req.logit_bias.clone(),
+                };
+                let ids = sess.generate_sampled_v2(
+                    &req.prompt_ids, req.max_tokens, stop, &params, &req.stop_strings);
                 completion_tokens = ids.len() as c_int;
                 let text = sess.decode_ids(&ids);
                 generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
@@ -1139,8 +1271,12 @@ unsafe fn handle_request(state: &ServerState, t: &mut dyn Transport) {
     match (method.as_str(), path.as_str()) {
         ("GET", "/health") => { let _ = send_text_t(t, 200, "ok"); }
         ("GET", "/v1/models") => handle_list_models_t(state, t),
-        ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
-            handle_completion_t(state, t, body)
+        ("GET", "/props") => handle_props_t(state, t),
+        ("POST", "/v1/chat/completions") => {
+            handle_completion_t(state, t, body, /*is_chat=*/true);
+        }
+        ("POST", "/v1/completions") => {
+            handle_completion_t(state, t, body, /*is_chat=*/false);
         }
         ("POST", "/v1/embeddings") => handle_embeddings_t(state, t, body),
         _ => { let _ = send_text_t(t, 404, "not found"); }
@@ -1164,41 +1300,71 @@ unsafe fn handle_list_models_t(state: &ServerState, t: &mut dyn Transport) {
     let _ = send_json_t(t, 200, &body);
 }
 
-unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: &[u8]) {
+/// llama-server compatibility — /props returns server defaults and
+/// model identity so load balancers / probes can discriminate
+/// deployments without a chat round-trip.
+unsafe fn handle_props_t(state: &ServerState, t: &mut dyn Transport) {
+    let body = render_props_json(state);
+    let _ = send_json_t(t, 200, &body);
+}
+
+fn render_props_json(state: &ServerState) -> String {
+    let model_name = &state.cli.model;
+    let port = state.cli.port;
+    let max_default = state.cli.max_tokens_default;
+    let t_def  = state.cli.default_temperature;
+    let p_def  = state.cli.default_top_p;
+    let pp_def = state.cli.default_presence_penalty;
+    let fp_def = state.cli.default_frequency_penalty;
+    format!(
+        "{{\
+\"runtime\":\"aether\",\
+\"model\":\"{}\",\
+\"port\":{},\
+\"default_generation_settings\":{{\
+\"temperature\":{},\"top_p\":{},\"top_k\":0,\
+\"presence_penalty\":{},\"frequency_penalty\":{},\
+\"max_tokens\":{}\
+}},\
+\"chat_template\":\"per-arch built-in\",\
+\"supports\":[\"chat_completions\",\"completions\",\"embeddings\",\"streaming\",\"top_k\",\"logit_bias\",\"seed\",\"stop_strings\"]\
+}}",
+        model_name, port, t_def, p_def, pp_def, fp_def, max_default)
+}
+
+unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: &[u8], is_chat: bool) {
     let mut req = match parse_body(body, state.cli.max_tokens_default) {
         Ok(r) => r,
         Err(e) => { let _ = send_text_t(t, 400, e); return; }
     };
 
-    // FR-x-extra-text-encode + chat-template: when the client sends
-    // `messages: [...]`, prefer applying the GGUF chat template to the
-    // (role, content) pairs and encoding the rendered text — the model
-    // was trained on that wire format and produces coherent output
-    // when given it.  Fall back to plain-text encode of joined
-    // contents if no template is loaded.
+    // /v1/chat/completions:  prefer chat-template apply over messages.
+    // /v1/completions:  raw prompt continuation, NO chat template (the
+    //   legacy OpenAI endpoint expects the server to model-continue the
+    //   given text verbatim).
     if req.prompt_ids.is_empty() {
         #[cfg(feature = "cuda")]
         {
             match &state.session {
                 Some(sess_mu) => {
                     let sess = sess_mu.lock().unwrap();
-                    // Prefer chat-template apply.
-                    let encode_input: Option<String> = if !req.messages.is_empty() {
+                    let (encode_input, used_template): (Option<String>, bool) = if is_chat && !req.messages.is_empty() {
                         match sess.apply_chat_template(&req.messages) {
-                            Some(rendered) => Some(rendered),
-                            None => req.text_prompt.clone(),
+                            Some(rendered) => (Some(rendered), true),
+                            None => (req.text_prompt.clone(), false),
                         }
+                    } else if is_chat {
+                        (req.text_prompt.clone(), false)
                     } else {
-                        req.text_prompt.clone()
+                        // /v1/completions:  raw prompt path.  Fall back
+                        // to text_prompt or joined-messages text as a
+                        // courtesy when neither is supplied.
+                        (req.raw_prompt.clone().or_else(|| req.text_prompt.clone()), false)
                     };
                     let Some(text) = encode_input else {
                         let _ = send_text_t(t, 400, "body has no usable prompt");
                         return;
                     };
-                    // When the chat-template path produced the text,
-                    // it contains special markers like <|user|> that
-                    // need their special-token ids (not byte BPE).
-                    let used_template = !req.messages.is_empty();
                     let ids = if used_template {
                         sess.encode_text_with_specials(&text)
                     } else {
@@ -1220,6 +1386,7 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
         }
         #[cfg(not(feature = "cuda"))]
         {
+            let _ = is_chat;
             let _ = send_text_t(t, 501,
                 "text encode requires --features cuda build");
             return;
@@ -1264,17 +1431,21 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
                     if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
                 });
                 let t = std::time::Instant::now();
-                // FR-x-extra-sampling: temperature / top_p from request,
-                // fallback to CLI defaults.  temperature <= 0 → greedy.
-                let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
-                let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
-                let pp = req.presence_penalty.unwrap_or(state.cli.default_presence_penalty);
-                let fp = req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty);
-                let ids = sess.generate_sampled(
-                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p, pp, fp);
+                let params = aether_rt::serving::SamplingParams {
+                    temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                    top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                    top_k: req.top_k.unwrap_or(0),
+                    presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                    frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                    seed: req.seed,
+                    logit_bias: req.logit_bias.clone(),
+                };
+                let ids = sess.generate_sampled_v2(
+                    &req.prompt_ids, req.max_tokens, stop, &params, &req.stop_strings);
                 let secs = t.elapsed().as_secs_f32();
-                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2} pp={:.2} fp={:.2})",
-                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6), temperature, top_p, pp, fp);
+                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2} top_k={} pp={:.2} fp={:.2})",
+                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6),
+                    params.temperature, params.top_p, params.top_k, params.presence_penalty, params.frequency_penalty);
                 completion_tokens = ids.len() as c_int;
                 // Decode IDs back to real text via the loaded BPE tokenizer
                 // + GPT-2 byte fixup. Falls back to id list if tokenizer
@@ -1365,40 +1536,55 @@ unsafe fn handle_completion_streaming_t(state: &ServerState, t: &mut dyn Transpo
             let stop = state.cli.stop_token.or_else(|| {
                 if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
             });
-            let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
-            let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
-            let pp = req.presence_penalty.unwrap_or(state.cli.default_presence_penalty);
-            let fp = req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty);
-            // Stream the sampled generation token-by-token.  Use step_logits +
-            // sample_from_logits + apply_repetition_penalty so we can emit
-            // each token as it's produced.  Mirrors generate_sampled's
-            // semantics exactly.
+            let params = aether_rt::serving::SamplingParams {
+                temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                top_k: req.top_k.unwrap_or(0),
+                presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                seed: req.seed,
+                logit_bias: req.logit_bias.clone(),
+            };
+            let stop_strings = req.stop_strings.clone();
+            // Stream the sampled generation token-by-token.  Mirror
+            // generate_sampled_v2 semantics exactly (penalties, top_k,
+            // top_p, stop strings).
             sess.reset();
             sess.prefill(&req.prompt_ids);
             let mut last = *req.prompt_ids.last().unwrap();
-            let mut rng = aether_rt::serving::seed_rng_external();
+            let mut rng = params.seed.unwrap_or_else(aether_rt::serving::seed_rng_external);
+            if rng == 0 { rng = aether_rt::serving::seed_rng_external(); }
             let mut seen: std::collections::HashMap<usize, u32> =
                 std::collections::HashMap::new();
+            let mut running = String::new();
             for _ in 0..req.max_tokens {
                 let mut logits = sess.step_logits(last);
-                if pp != 0.0 || fp != 0.0 {
-                    aether_rt::serving::apply_repetition_penalty(
-                        &mut logits, &seen, pp, fp);
+                if !params.logit_bias.is_empty() {
+                    aether_rt::serving::apply_logit_bias(&mut logits, &params.logit_bias);
                 }
-                let id = if temperature <= 0.0 {
+                if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
+                    aether_rt::serving::apply_repetition_penalty(
+                        &mut logits, &seen, params.presence_penalty, params.frequency_penalty);
+                }
+                let id = if params.temperature <= 0.0 {
                     aether_rt::serving::argmax_external(&logits)
                 } else {
-                    aether_rt::serving::sample_from_logits(&mut logits, temperature, top_p, &mut rng)
+                    aether_rt::serving::sample_from_logits_v2(
+                        &mut logits, params.temperature, params.top_p, params.top_k, &mut rng)
                 };
                 if Some(id) == stop { break; }
                 *seen.entry(id).or_insert(0) += 1;
                 let piece = sess.decode_ids(&[id]);
+                running.push_str(&piece);
                 let escaped = json_escape(&piece);
                 let chunk = format!(
                     "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
                     escaped);
                 send_chunk(t, &chunk);
                 last = id;
+                if !stop_strings.is_empty() && stop_strings.iter().any(|s| running.ends_with(s)) {
+                    break;
+                }
             }
             send_chunk(t, "data: [DONE]\n\n");
         } else {

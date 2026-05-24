@@ -2922,15 +2922,98 @@ impl QwenSession {
         }
     }
 
-    /// FR-x-extra-sampling: temperature + top-p sampler over the
-    /// generation loop.  `temperature <= 0.0` falls back to greedy
-    /// argmax (bit-identical to the existing `generate` / `decode_step`
-    /// path).  `top_p >= 1.0` disables nucleus cutoff.  Optional
-    /// `presence_penalty` subtracts a flat amount from any
-    /// previously-seen-token's logit;  `frequency_penalty` subtracts
-    /// proportional to the seen-count (OpenAI-compatible semantics).
-    /// RNG is seeded from the OS at first call and stepped via
-    /// xorshift64.
+    /// FR-x-extra-sampling: temperature + top-p + top-k sampler over
+    /// the generation loop with optional repetition penalties,
+    /// logit_bias, and stop-strings.  Mirrors the OpenAI v1 chat-
+    /// completions sampler shape so any OpenAI-compatible client
+    /// works without translation.
+    ///
+    /// `params.temperature <= 0.0` falls back to greedy argmax (bit-
+    /// identical to the legacy `generate` path).  `params.top_p >=
+    /// 1.0` disables nucleus cutoff.  `params.top_k <= 0` disables
+    /// top-k cutoff.  `params.seed` if `Some(s)` seeds the per-call
+    /// RNG to `s` for deterministic output;  `None` falls back to OS
+    /// nanos + pid.
+    ///
+    /// `stop_strings` is a list of raw text strings;  generation
+    /// breaks as soon as the decoded running output ends with any of
+    /// them (independent of the token-id stop).
+    pub fn generate_sampled_v2(
+        &mut self,
+        prompt_ids: &[usize],
+        max_tokens: usize,
+        stop_token: Option<usize>,
+        params: &SamplingParams,
+        stop_strings: &[String],
+    ) -> Vec<usize> {
+        self.reset();
+        self.prefill(prompt_ids);
+        let mut generated = Vec::with_capacity(max_tokens);
+        let mut last = *prompt_ids.last().expect("prompt cannot be empty");
+        let mut rng = params.seed.unwrap_or_else(seed_rng);
+        if rng == 0 { rng = seed_rng(); }
+        let mut seen: std::collections::HashMap<usize, u32> =
+            std::collections::HashMap::new();
+        let mut running_text = String::new();
+        for _ in 0..max_tokens {
+            let mut logits = self.step_logits(last);
+            if !params.logit_bias.is_empty() {
+                apply_logit_bias(&mut logits, &params.logit_bias);
+            }
+            if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
+                apply_repetition_penalty(&mut logits, &seen,
+                    params.presence_penalty, params.frequency_penalty);
+            }
+            let id = if params.temperature <= 0.0 {
+                argmax(&logits)
+            } else {
+                sample_from_logits_v2(&mut logits,
+                    params.temperature, params.top_p, params.top_k, &mut rng)
+            };
+            if Some(id) == stop_token { break; }
+            *seen.entry(id).or_insert(0) += 1;
+            generated.push(id);
+            // Stop-string check:  decode just the new piece and append.
+            // Tail-match each configured stop string.  Truncation of
+            // the matched stop string from the output is conventional.
+            if !stop_strings.is_empty() {
+                let piece = self.decode_ids(&[id]);
+                running_text.push_str(&piece);
+                let mut hit: Option<usize> = None;
+                for s in stop_strings {
+                    if running_text.ends_with(s) {
+                        hit = Some(s.len());
+                        break;
+                    }
+                }
+                if let Some(slen) = hit {
+                    // Strip the matched stop string out of the result so
+                    // the client doesn't see it.  Re-encode the trimmed
+                    // running_text → ids?  No — the client side decodes
+                    // ids and sees the trimmed text;  drop trailing tokens
+                    // whose decoded suffix forms the stop string.
+                    let _ = slen;
+                    // Walk back from the tail until we've removed at least
+                    // `slen` characters of decoded text.
+                    let target = running_text.len() - slen;
+                    let mut cur_text = running_text.clone();
+                    while generated.len() > 0 && cur_text.len() > target {
+                        generated.pop();
+                        // Re-decode from scratch — cheap, small.
+                        cur_text = self.decode_ids(&generated);
+                    }
+                    break;
+                }
+            }
+            last = id;
+            if self.next_pos as usize >= MAX_SEQ - 1 { break; }
+        }
+        generated
+    }
+
+    /// FR-x-extra-sampling (legacy signature): forwards to v2 with
+    /// stop_strings empty and seed pulled from OS.  Kept so older
+    /// call sites in the trainer crate don't need to change at once.
     pub fn generate_sampled(
         &mut self,
         prompt_ids: &[usize],
@@ -2941,35 +3024,13 @@ impl QwenSession {
         presence_penalty: f32,
         frequency_penalty: f32,
     ) -> Vec<usize> {
-        self.reset();
-        self.prefill(prompt_ids);
-        let mut generated = Vec::with_capacity(max_tokens);
-        let mut last = *prompt_ids.last().expect("prompt cannot be empty");
-        let mut rng = seed_rng();
-        // Track seen-counts across the GENERATED stream only (matches
-        // OpenAI's reference behaviour — the prompt is context, not
-        // material to penalise against the assistant's output).  Map
-        // is sparse since we touch one new id per step.
-        let mut seen: std::collections::HashMap<usize, u32> =
-            std::collections::HashMap::new();
-        for _ in 0..max_tokens {
-            let mut logits = self.step_logits(last);
-            if presence_penalty != 0.0 || frequency_penalty != 0.0 {
-                apply_repetition_penalty(&mut logits, &seen,
-                    presence_penalty, frequency_penalty);
-            }
-            let id = if temperature <= 0.0 {
-                argmax(&logits)
-            } else {
-                sample_from_logits(&mut logits, temperature, top_p, &mut rng)
-            };
-            if Some(id) == stop_token { break; }
-            *seen.entry(id).or_insert(0) += 1;
-            generated.push(id);
-            last = id;
-            if self.next_pos as usize >= MAX_SEQ - 1 { break; }
-        }
-        generated
+        let params = SamplingParams {
+            temperature, top_p, top_k: 0,
+            presence_penalty, frequency_penalty,
+            seed: None,
+            logit_bias: std::collections::HashMap::new(),
+        };
+        self.generate_sampled_v2(prompt_ids, max_tokens, stop_token, &params, &[])
     }
 
     /// Encode arbitrary UTF-8 text into token ids using the BPE
@@ -3088,9 +3149,108 @@ fn xorshift64(state: &mut u64) -> u64 {
     x
 }
 
+/// FR-x-extra-sampling: OpenAI-compat per-call sampling parameters.
+/// Bundles the optional-set so callers don't carry 7 f32 args around.
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_p: f32,
+    /// `<= 0` disables top-k cutoff.  Typical values 1..=200.
+    pub top_k: i32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    /// If `Some`, the per-call xorshift RNG is initialised to this
+    /// state — produces a deterministic sample sequence.  `None`
+    /// falls back to OS nanos + pid.
+    pub seed: Option<u64>,
+    /// OpenAI `logit_bias`: `{token_id → bias}`.  Added to raw logits
+    /// before any penalty / temperature step.  Special values:
+    /// `+100.0` effectively forces the token, `-100.0` effectively
+    /// blocks it.
+    pub logit_bias: std::collections::HashMap<usize, f32>,
+}
+
+impl SamplingParams {
+    pub fn greedy() -> Self {
+        Self {
+            temperature: 0.0, top_p: 1.0, top_k: 0,
+            presence_penalty: 0.0, frequency_penalty: 0.0,
+            seed: None,
+            logit_bias: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Apply OpenAI-style `logit_bias` map to raw logits.  Out-of-range
+/// ids are silently ignored.
+pub fn apply_logit_bias(
+    logits: &mut [f32],
+    bias: &std::collections::HashMap<usize, f32>,
+) {
+    for (&id, &b) in bias.iter() {
+        if id < logits.len() { logits[id] += b; }
+    }
+}
+
+/// FR-x-extra-sampling v2: like `sample_from_logits` but also supports
+/// `top_k` (filter to the K most-probable tokens before nucleus +
+/// sample).  Order of operations matches HF's reference sampler:
+/// temperature → softmax → top_k → top_p → renormalise → draw.
+pub fn sample_from_logits_v2(
+    logits: &mut [f32],
+    temperature: f32, top_p: f32, top_k: i32,
+    rng: &mut u64,
+) -> usize {
+    // Apply temperature.
+    for x in logits.iter_mut() { *x /= temperature; }
+    // Numerically-stable softmax.
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for x in logits.iter_mut() { *x = (*x - max).exp(); sum += *x; }
+    if sum > 0.0 {
+        for x in logits.iter_mut() { *x /= sum; }
+    }
+    // Sort once if we need top_k OR top_p.  Skip if both disabled.
+    let need_sort = (top_k > 0 && (top_k as usize) < logits.len())
+        || (top_p < 1.0 && top_p > 0.0);
+    if need_sort {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|a, b|
+            logits[*b].partial_cmp(&logits[*a])
+                .unwrap_or(std::cmp::Ordering::Equal));
+        // top_k cutoff:  zero everything past rank K-1.
+        let k_cutoff = if top_k > 0 { (top_k as usize).min(idx.len()) }
+                       else { idx.len() };
+        for &i in &idx[k_cutoff..] { logits[i] = 0.0; }
+        // top_p cutoff over the surviving top-K window.
+        if top_p < 1.0 && top_p > 0.0 {
+            let mut cum = 0.0f32;
+            let mut p_cutoff = k_cutoff;
+            for (rank, &i) in idx[..k_cutoff].iter().enumerate() {
+                cum += logits[i];
+                if cum >= top_p { p_cutoff = rank + 1; break; }
+            }
+            for &i in &idx[p_cutoff..k_cutoff] { logits[i] = 0.0; }
+        }
+        let new_sum: f32 = logits.iter().sum();
+        if new_sum > 0.0 {
+            for x in logits.iter_mut() { *x /= new_sum; }
+        }
+    }
+    // Draw uniform [0,1) and walk cumulative.
+    let r = (xorshift64(rng) as f64 / u64::MAX as f64) as f32;
+    let mut cum = 0.0f32;
+    for (i, &p) in logits.iter().enumerate() {
+        cum += p;
+        if cum >= r { return i; }
+    }
+    logits.len() - 1
+}
+
 /// Multinomial sample over `logits` with temperature + top-p (nucleus)
 /// cutoff.  Mutates `logits` in place (softmax + zeroing for cutoff).
 /// Returns the chosen index.  Caller guarantees temperature > 0.0.
+/// Kept for the legacy v1 streaming call site;  new code should use
+/// `sample_from_logits_v2`.
 pub fn sample_from_logits(
     logits: &mut [f32], temperature: f32, top_p: f32, rng: &mut u64,
 ) -> usize {
