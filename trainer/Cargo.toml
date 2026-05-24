@@ -24,6 +24,11 @@ path = "src/bin/serve.rs"
 name = "aether-allreduce"
 path = "src/bin/allreduce.rs"
 
+[[bin]]
+name = "glm-probe"
+path = "src/bin/glm_probe.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 # `cuda`: enable cuBLAS/cuDNN routing in aether_rt + unlock the
