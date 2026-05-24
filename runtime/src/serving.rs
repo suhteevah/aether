@@ -73,6 +73,7 @@ use crate::cuda::{
     aether_op_fused_iq4_nl_matmul_seq1_cuda,
     aether_op_fused_iq4_xs_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_matmul_seq1_cuda,
+    aether_op_fused_iq3_s_matmul_seq1_cuda,
     aether_op_fused_q4k_expert_matmul_seq1_cuda,
     aether_op_fused_q8_0_expert_matmul_seq1_cuda,
     aether_op_fused_q5_0_expert_matmul_seq1_cuda,
@@ -133,6 +134,13 @@ unsafe fn dispatch_matmul(
             // f16 d + 64-byte codebook indices + 32-byte scales_and_signs.
             // Used by cnc's glm-4.7-flash-UD-IQ3_XXS GGUF.
             aether_op_fused_iq3_xxs_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
+        }
+        21 => {
+            // IQ3_S (FR-17-extra-iq3_s-fwd).  110-byte 256-elem blocks:
+            // f16 d + 64-byte qs + 8-byte qh + 32-byte signs + 4-byte scales.
+            // Per-sub-block odd-integer scale (db = d * (1 + 2*nib)) × 512-entry
+            // codebook lookup.  Used by GLM-4.7-flash-UD-IQ3_XXS for ~44 tensors.
+            aether_op_fused_iq3_s_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
         }
         20 => {
             // IQ4_NL (FR-17-extra-iq4_nl-fwd).  18-byte 32-elem blocks:
@@ -580,6 +588,7 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
         13 => { let nb = n_elems / 256; (nb, nb * 176) }     // Q5_K (FR-17-extra-q5_k-fwd)
         18 => { let nb = n_elems / 256; (nb, nb * 98) }      // IQ3_XXS (FR-17-extra-iq3_xxs-fwd)
         20 => { let nb = n_elems / 32; (nb, nb * 18) }       // IQ4_NL (FR-17-extra-iq4_nl-fwd)
+        21 => { let nb = n_elems / 256; (nb, nb * 110) }     // IQ3_S (FR-17-extra-iq3_s-fwd)
         23 => { let nb = n_elems / 256; (nb, nb * 136) }     // IQ4_XS (FR-17-extra-iq4_xs-fwd)
         _  => panic!("unsupported dtype {} for tensor {}", dt, name),
     };
@@ -634,6 +643,7 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
         13 => { let nb = n_elems / 256; (nb, nb * 176) }
         18 => { let nb = n_elems / 256; (nb, nb * 98) }
         20 => { let nb = n_elems / 32; (nb, nb * 18) }
+        21 => { let nb = n_elems / 256; (nb, nb * 110) }
         23 => { let nb = n_elems / 256; (nb, nb * 136) }
         _  => return (0, 0, 0),
     };
