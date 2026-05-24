@@ -71,6 +71,7 @@ use crate::cuda::{
     aether_op_fused_q8_0_matmul_seq1_cuda,
     aether_op_fused_q5_k_matmul_seq1_cuda,
     aether_op_fused_iq4_nl_matmul_seq1_cuda,
+    aether_op_fused_iq4_xs_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_matmul_seq1_cuda,
     aether_op_fused_q4k_expert_matmul_seq1_cuda,
     aether_op_fused_q8_0_expert_matmul_seq1_cuda,
@@ -139,6 +140,12 @@ unsafe fn dispatch_matmul(
             // non-linear codebook of signed int8 values.  Used by
             // GLM-4.7-flash for ~72 tensors.
             aether_op_fused_iq4_nl_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 32);
+        }
+        23 => {
+            // IQ4_XS (FR-17-extra-iq4_xs-fwd).  136-byte 256-elem blocks
+            // with per-sub-block 6-bit signed scales + kvalues_iq4nl
+            // codebook lookup.  Used by GLM-4.7-flash for ~55 tensors.
+            aether_op_fused_iq4_xs_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 256);
         }
         _ => panic!("dispatch_matmul: unsupported weight dtype {}", dt),
     }
@@ -573,6 +580,7 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
         13 => { let nb = n_elems / 256; (nb, nb * 176) }     // Q5_K (FR-17-extra-q5_k-fwd)
         18 => { let nb = n_elems / 256; (nb, nb * 98) }      // IQ3_XXS (FR-17-extra-iq3_xxs-fwd)
         20 => { let nb = n_elems / 32; (nb, nb * 18) }       // IQ4_NL (FR-17-extra-iq4_nl-fwd)
+        23 => { let nb = n_elems / 256; (nb, nb * 136) }     // IQ4_XS (FR-17-extra-iq4_xs-fwd)
         _  => panic!("unsupported dtype {} for tensor {}", dt, name),
     };
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
@@ -626,6 +634,7 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
         13 => { let nb = n_elems / 256; (nb, nb * 176) }
         18 => { let nb = n_elems / 256; (nb, nb * 98) }
         20 => { let nb = n_elems / 32; (nb, nb * 18) }
+        23 => { let nb = n_elems / 256; (nb, nb * 136) }
         _  => return (0, 0, 0),
     };
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
