@@ -41,7 +41,9 @@ use aether_rt::{
 #[cfg(feature = "cuda")]
 use aether_rt::serving::{QwenSession, SharedKvPool};
 #[cfg(feature = "cuda")]
-use aether_rt::bert::BertSession;
+use aether_rt::bert::{BertSession, WordPieceTokenizer};
+#[cfg(feature = "cuda")]
+use aether_rt::{aether_gguf_open, aether_gguf_close};
 
 #[derive(Debug)]
 struct Cli {
@@ -293,10 +295,15 @@ fn parse_body(body: &[u8], default_max: usize) -> Result<JsonBody, &'static str>
 // ============================================================================
 
 struct EmbeddingsRequest {
-    /// Token IDs.  Must be present (text-input + tokenize is a follow-on).
+    /// Token IDs.  Either passed directly via `"input_ids":[...]` or
+    /// produced by WordPiece-tokenising `"input":"..."` at handle time.
     input_ids: Vec<i32>,
     /// Optional token-type IDs (defaults to all zeros).
     token_type_ids: Vec<i32>,
+    /// Raw text input (when `input_ids` is empty and the body carried
+    /// `"input":"text"`).  Tokenised inside `render_embeddings_json` using
+    /// the WordPiece tokenizer loaded alongside the BGE GGUF.
+    text: Option<String>,
     /// Echo of the request's `model` field, for the response.
     model: Option<String>,
 }
@@ -309,20 +316,24 @@ fn parse_embeddings_body(body: &[u8]) -> Result<EmbeddingsRequest, &'static str>
             .into_iter().map(|v| v as i32).collect(),
         None => Vec::new(),
     };
-    if input_ids.is_empty() {
-        return Err("/v1/embeddings requires \"input_ids\":[...] (text input + BPE tokenize not wired yet)");
+    let text = find_key_string(s, "input");
+    if input_ids.is_empty() && text.is_none() {
+        return Err("/v1/embeddings requires either \"input\":\"text\" or \"input_ids\":[...]");
     }
+    // For input_ids path, accept optional explicit token_type_ids.  For text
+    // input, token_type_ids defaults to all zeros after tokenization.
     let token_type_ids = match find_key_array(s, "token_type_ids") {
         Some(arr) => parse_int_array(arr)
             .map_err(|_| "token_type_ids must be integers")?
             .into_iter().map(|v| v as i32).collect(),
-        None => vec![0i32; input_ids.len()],
+        None => Vec::new(),  // filled in by render_embeddings_json
     };
-    if token_type_ids.len() != input_ids.len() {
+    if !input_ids.is_empty() && !token_type_ids.is_empty()
+        && token_type_ids.len() != input_ids.len() {
         return Err("token_type_ids length must match input_ids");
     }
     let model = find_key_string(s, "model");
-    Ok(EmbeddingsRequest { input_ids, token_type_ids, model })
+    Ok(EmbeddingsRequest { input_ids, token_type_ids, text, model })
 }
 
 fn find_key_string(s: &str, key: &str) -> Option<String> {
@@ -343,15 +354,38 @@ fn render_embeddings_json(state: &ServerState, req: &EmbeddingsRequest) -> Strin
         Some(b) => b,
         None => return "{\"error\":\"no BGE model loaded — pass --bge-gguf PATH on aether-serve startup\"}".to_string(),
     };
+    // Resolve input_ids: prefer the explicit array; otherwise tokenize `text`
+    // via the WordPiece tokenizer built at server startup.
+    let input_ids: Vec<i32> = if !req.input_ids.is_empty() {
+        req.input_ids.clone()
+    } else if let Some(text) = req.text.as_deref() {
+        match &state.bert_tokenizer {
+            Some(tok) => tok.encode(text),
+            None => return "{\"error\":\"BGE tokenizer not initialised\"}".to_string(),
+        }
+    } else {
+        return "{\"error\":\"request had neither input nor input_ids\"}".to_string();
+    };
+    let token_type_ids: Vec<i32> = if req.token_type_ids.is_empty() {
+        vec![0i32; input_ids.len()]
+    } else if req.token_type_ids.len() == input_ids.len() {
+        req.token_type_ids.clone()
+    } else {
+        return format!("{{\"error\":\"token_type_ids length {} != input_ids length {}\"}}",
+            req.token_type_ids.len(), input_ids.len());
+    };
     let mut bert = bert_mu.lock().unwrap();
-    if req.input_ids.len() > bert.max_seq {
-        return format!("{{\"error\":\"input_ids length {} exceeds max_pos {}\"}}",
-            req.input_ids.len(), bert.max_seq);
+    if input_ids.len() > bert.max_seq {
+        return format!("{{\"error\":\"input length {} exceeds max_pos {}\"}}",
+            input_ids.len(), bert.max_seq);
+    }
+    if input_ids.is_empty() {
+        return "{\"error\":\"empty input after tokenization\"}".to_string();
     }
     let t = std::time::Instant::now();
-    let emb = bert.embed(&req.input_ids, &req.token_type_ids);
+    let emb = bert.embed(&input_ids, &token_type_ids);
     eprintln!("[serve] /v1/embeddings: {} tokens -> {}-dim in {:.3}s",
-        req.input_ids.len(), emb.len(), t.elapsed().as_secs_f32());
+        input_ids.len(), emb.len(), t.elapsed().as_secs_f32());
 
     // OpenAI shape: {"object":"list","model":..,"data":[{"object":"embedding",
     // "index":0,"embedding":[...]}],"usage":{"prompt_tokens":N,"total_tokens":N}}
@@ -494,6 +528,10 @@ struct ServerState {
     /// activations is internal.)
     #[cfg(feature = "cuda")]
     bert: Option<std::sync::Mutex<BertSession>>,
+    /// WordPiece tokenizer built from the same bge GGUF as `bert`.  Stateless
+    /// + immutable after construction; shared by reference across requests.
+    #[cfg(feature = "cuda")]
+    bert_tokenizer: Option<WordPieceTokenizer>,
 }
 
 impl ServerState {
@@ -532,18 +570,32 @@ impl ServerState {
                     None
                 }
             };
-            let bert = match &cli.bge_gguf {
+            let (bert, bert_tokenizer) = match &cli.bge_gguf {
                 Some(path) => {
                     eprintln!("[aether-serve] loading BGE GGUF: {}", path);
                     let t = std::time::Instant::now();
                     let s = BertSession::from_gguf(path)?;
                     eprintln!("[aether-serve] BGE loaded in {:.2}s (d_model={} layers={})",
                         t.elapsed().as_secs_f32(), s.cfg.d_model, s.cfg.n_layers);
-                    Some(std::sync::Mutex::new(s))
+                    // Build the WordPiece tokenizer from the same GGUF so
+                    // /v1/embeddings can accept raw text input.
+                    let tok = unsafe {
+                        let h = aether_gguf_open(
+                            path.as_ptr() as i64, path.len() as std::os::raw::c_int);
+                        if h < 0 {
+                            return Err(format!("tokenizer GGUF reopen failed: {}", h));
+                        }
+                        let t = WordPieceTokenizer::from_gguf(h)?;
+                        aether_gguf_close(h);
+                        t
+                    };
+                    eprintln!("[aether-serve] BGE tokenizer: vocab loaded (CLS={} SEP={} UNK={})",
+                        tok.cls_id, tok.sep_id, tok.unk_id);
+                    (Some(std::sync::Mutex::new(s)), Some(tok))
                 }
-                None => None,
+                None => (None, None),
             };
-            return Ok(ServerState { cli, session, pool, bert });
+            return Ok(ServerState { cli, session, pool, bert, bert_tokenizer });
         }
         #[cfg(not(feature = "cuda"))]
         {

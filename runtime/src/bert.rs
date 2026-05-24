@@ -20,11 +20,15 @@
 
 use std::os::raw::c_int;
 
+use std::collections::HashMap;
+
 use crate::{
     aether_gguf_open, aether_gguf_close,
     aether_gguf_find_tensor_by_name, aether_gguf_get_tensor_dtype,
     aether_gguf_get_tensor_data_ptr, aether_gguf_get_tensor_n_elems,
     aether_gguf_get_metadata_u32, aether_gguf_get_metadata_f32,
+    aether_gguf_get_metadata_array_string_n,
+    aether_gguf_get_metadata_array_string_get,
     aether_f16_to_f32,
 };
 use crate::cuda::{
@@ -522,6 +526,212 @@ impl Drop for BertSession {
             for h in self.bufs_to_free.drain(..) {
                 aether_dev_free_f32(h);
             }
+        }
+    }
+}
+
+// ============================================================================
+// WordPiece tokenizer — BERT-style (llama.cpp bge-large convention).
+//
+// llama.cpp's bge-large GGUF re-encodes the BERT WordPiece vocab with
+// SentencePiece-style `▁` (U+2581) prefixes for word-initial pieces.  The
+// `##` continuation prefix from HuggingFace's BertTokenizer is NOT in this
+// vocab — continuation pieces are just bare strings.  Verified by probing
+// the local bge-large GGUF: zero `##*` entries, but `▁the`, `▁quick`, etc.
+// at IDs 1996, 4248, ... (matching HF bert-base-uncased's "the", "quick").
+//
+// Pipeline:
+//   1. Lowercase ASCII (uncased BERT family).
+//   2. Whitespace + punctuation tokenize.  Each punctuation char becomes its
+//      own basic-token (matches HF's BertTokenizer).
+//   3. For each basic-token, prepend `▁` and do greedy LONGEST-match against
+//      the vocab.  If no prefix matches, emit a single [UNK] for the whole
+//      basic-token.  Continuation pieces (after the first match) have no
+//      prefix.
+//   4. Prepend [CLS] (101), append [SEP] (102).
+//
+// Non-ASCII characters are passed through (lowercased only when in ASCII
+// range).  Accent stripping + NFD normalization are NOT implemented yet —
+// callers passing accented text get [UNK] for the accented words.  Fine for
+// the OpenClaw English corpus; tracked as a follow-on.
+// ============================================================================
+
+/// Llama.cpp's BERT vocab uses U+2581 (▁) as the word-initial marker.
+const WORD_PREFIX: &str = "\u{2581}";
+
+pub struct WordPieceTokenizer {
+    vocab: HashMap<String, i32>,
+    pub cls_id: i32,
+    pub sep_id: i32,
+    pub unk_id: i32,
+    pub pad_id: i32,
+    pub mask_id: i32,
+    /// Per-word character cap — words longer than this emit a single [UNK]
+    /// without attempting WordPiece.  Matches bert-base default of 100.
+    pub max_input_chars_per_word: usize,
+}
+
+impl WordPieceTokenizer {
+    /// Build a tokenizer from a bert-arch GGUF.  Reads
+    /// `tokenizer.ggml.tokens` (StringArray) + the cls / sep / unk / pad /
+    /// mask token-id metadata keys.  Defaults match bert-base-uncased when
+    /// any id key is missing.
+    pub unsafe fn from_gguf(h: i64) -> Result<Self, String> {
+        let key = b"tokenizer.ggml.tokens";
+        let n = aether_gguf_get_metadata_array_string_n(
+            h, key.as_ptr() as i64, key.len() as c_int);
+        if n <= 0 {
+            return Err("GGUF missing tokenizer.ggml.tokens array".to_string());
+        }
+        let mut vocab: HashMap<String, i32> = HashMap::with_capacity(n as usize);
+        let mut buf = vec![0u8; 512];
+        for i in 0..n {
+            let got = aether_gguf_get_metadata_array_string_get(
+                h, key.as_ptr() as i64, key.len() as c_int, i,
+                buf.as_mut_ptr() as i64, buf.len() as c_int);
+            if got <= 0 { continue; }
+            if let Ok(s) = std::str::from_utf8(&buf[..got as usize]) {
+                vocab.insert(s.to_string(), i as i32);
+            }
+        }
+        let read_id = |k: &str| -> Option<i32> {
+            let v = aether_gguf_get_metadata_u32(
+                h, k.as_ptr() as i64, k.len() as c_int);
+            if v < 0 { None } else { Some(v as i32) }
+        };
+        Ok(Self {
+            cls_id:  read_id("tokenizer.ggml.cls_token_id").unwrap_or(101),
+            sep_id:  read_id("tokenizer.ggml.seperator_token_id")
+                        .or_else(|| read_id("tokenizer.ggml.sep_token_id"))
+                        .unwrap_or(102),
+            unk_id:  read_id("tokenizer.ggml.unknown_token_id").unwrap_or(100),
+            pad_id:  read_id("tokenizer.ggml.padding_token_id").unwrap_or(0),
+            mask_id: read_id("tokenizer.ggml.mask_token_id").unwrap_or(103),
+            max_input_chars_per_word: 100,
+            vocab,
+        })
+    }
+
+    /// Tokenize `text` into BERT-shape ids: [CLS] + WordPiece(text) + [SEP].
+    /// Does NOT pad — the caller's max_seq cap is enforced by the embedding
+    /// session's range check.  Returns an empty vec only when both CLS/SEP
+    /// are absent and text is empty — never panics.
+    pub fn encode(&self, text: &str) -> Vec<i32> {
+        let basic = self.basic_tokenize(text);
+        let mut ids = Vec::with_capacity(basic.len() + 2);
+        if self.cls_id >= 0 { ids.push(self.cls_id); }
+        for tok in &basic {
+            self.wordpiece(tok, &mut ids);
+        }
+        if self.sep_id >= 0 { ids.push(self.sep_id); }
+        ids
+    }
+
+    /// Basic split: lowercase ASCII letters in-place, treat every ASCII
+    /// punctuation character as its own basic-token, split on whitespace.
+    /// Non-ASCII characters flow through verbatim (no NFD / accent
+    /// stripping yet).
+    fn basic_tokenize(&self, text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let flush = |cur: &mut String, out: &mut Vec<String>| {
+            if !cur.is_empty() {
+                out.push(std::mem::take(cur));
+            }
+        };
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                flush(&mut cur, &mut out);
+            } else if is_bert_punct(ch) {
+                flush(&mut cur, &mut out);
+                out.push(ch.to_string());
+            } else {
+                // ASCII-lowercase; pass non-ASCII through (NFD / accent
+                // strip is a follow-on).
+                let lo = if ch.is_ascii_uppercase() {
+                    ch.to_ascii_lowercase()
+                } else { ch };
+                cur.push(lo);
+            }
+        }
+        flush(&mut cur, &mut out);
+        out
+    }
+
+    /// Greedy longest-match on `word`.  First piece is looked up with the
+    /// `▁` (U+2581) prefix that marks word-initial pieces in this vocab;
+    /// continuation pieces have no prefix.  If no prefix matches at any
+    /// step, the whole word emits a single [UNK].
+    fn wordpiece(&self, word: &str, out: &mut Vec<i32>) {
+        if word.is_empty() { return; }
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() > self.max_input_chars_per_word {
+            out.push(self.unk_id);
+            return;
+        }
+        let mut sub_tokens = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = chars.len();
+            let mut found: Option<(i32, usize)> = None;
+            while start < end {
+                let substr: String = chars[start..end].iter().collect();
+                let key = if start == 0 {
+                    format!("{}{}", WORD_PREFIX, substr)
+                } else {
+                    substr
+                };
+                if let Some(&id) = self.vocab.get(&key) {
+                    found = Some((id, end));
+                    break;
+                }
+                end -= 1;
+            }
+            match found {
+                Some((id, new_start)) => {
+                    sub_tokens.push(id);
+                    start = new_start;
+                }
+                None => {
+                    // No match for ANY prefix → emit [UNK] for the whole word.
+                    out.push(self.unk_id);
+                    return;
+                }
+            }
+        }
+        out.extend(sub_tokens);
+    }
+}
+
+fn is_bert_punct(ch: char) -> bool {
+    // Match HuggingFace's BertTokenizer punctuation set: ASCII punct (codes
+    // !".../09:?@[\\]^_` etc.) PLUS Unicode categories P*/S* — but we only
+    // implement the ASCII slice here; the unicode-category check is the same
+    // follow-on as accent stripping.
+    if ch.is_ascii() && !ch.is_ascii_alphanumeric() && !ch.is_ascii_whitespace() {
+        return true;
+    }
+    false
+}
+
+impl BertSession {
+    /// Build a WordPiece tokenizer from this session's GGUF and use it to
+    /// embed a raw text string.  Only available when the session was loaded
+    /// from a GGUF (the synthetic constructor doesn't carry a tokenizer).
+    /// Re-opens the GGUF — for repeat calls callers should keep a
+    /// WordPieceTokenizer in hand and reuse it across embed() calls.
+    pub fn embed_text(
+        &mut self, gguf_path: &str, text: &str,
+    ) -> Result<Vec<f32>, String> {
+        unsafe {
+            let h = aether_gguf_open(
+                gguf_path.as_ptr() as i64, gguf_path.len() as c_int);
+            if h < 0 { return Err(format!("aether_gguf_open: {}", h)); }
+            let tok = WordPieceTokenizer::from_gguf(h)?;
+            aether_gguf_close(h);
+            let ids = tok.encode(text);
+            let token_type_ids = vec![0i32; ids.len()];
+            Ok(self.embed(&ids, &token_type_ids))
         }
     }
 }
