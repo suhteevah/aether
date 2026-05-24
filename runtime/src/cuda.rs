@@ -87,6 +87,7 @@ struct CudaCtx {
     fused_q8_0_expert_matmul_seq1: CudaFunction,
     fused_q5_0_expert_matmul_seq1: CudaFunction,
     fused_iq3_s_expert_matmul_seq1: CudaFunction,
+    fused_iq4_xs_expert_matmul_seq1: CudaFunction,
     bert_self_attention_fwd: CudaFunction,
     bert_embed_sum: CudaFunction,
 }
@@ -3219,6 +3220,77 @@ extern "C" __global__ void fused_iq3_s_expert_matmul_seq1(
     }
 }
 
+// FR-17-extra-moe-quant-dispatch-iq4xs — MoE expert-variant of IQ4_XS matmul.
+// 136-byte 256-elem blocks (f16 d + 2-byte scales_h + 4-byte scales_l +
+// 128-byte qs), kvalues_iq4nl codebook + per-sub-block 6-bit signed scales.
+// Per-expert offset = `expert_offset_blocks * 136` bytes from w_base.  Used
+// by GLM-4.7-flash MoE expert tensors quantised to IQ4_XS (dt=23) — the
+// second non-Q4_K dtype to surface in the IQ3_XXS GGUF mix.  One CTA per
+// output row; 256 threads stride-loop the blocks; warp-reduce then
+// cross-warp-reduce.
+extern "C" __global__ void fused_iq4_xs_expert_matmul_seq1(
+    const float*         __restrict__ x,
+    const unsigned char* __restrict__ w_base,
+    float*               __restrict__ y,
+    int n_out, int blocks_per_row, int expert_offset_blocks)
+{
+    static const int kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113
+    };
+
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    size_t exp_off_bytes = (size_t)expert_offset_blocks * 136;
+    size_t row_off_bytes = (size_t)o * (size_t)blocks_per_row * 136;
+    const unsigned char* w_row = w_base + exp_off_bytes + row_off_bytes;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += blockDim.x) {
+        const unsigned char* blk = w_row + (size_t)b * 136;
+        unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        float d = aether_f16_to_f32_dev(d_bits);
+        unsigned int scales_h = ((unsigned int)blk[3] << 8) | (unsigned int)blk[2];
+        const unsigned char* scales_l = blk + 4;     // 4 bytes
+        const unsigned char* qs       = blk + 8;     // 128 bytes
+        const float* x_blk = x + (size_t)b * 256;
+        float blk_acc = 0.0f;
+        #pragma unroll
+        for (int ib = 0; ib < 8; ib++) {
+            unsigned int ls_lo = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0xFu;
+            unsigned int ls_hi = (scales_h >> (2 * ib)) & 3u;
+            int ls = (int)(ls_lo | (ls_hi << 4));     // 6-bit unsigned [0, 63]
+            float dl = d * (float)(ls - 32);
+            int qs_off = ib * 16;
+            #pragma unroll 8
+            for (int j = 0; j < 16; j++) {
+                unsigned char byte = qs[qs_off + j];
+                int q_lo = kvalues[byte & 0xF];
+                int q_hi = kvalues[(byte >> 4) & 0xF];
+                blk_acc += x_blk[ib * 32 + j]      * (dl * (float)q_lo);
+                blk_acc += x_blk[ib * 32 + j + 16] * (dl * (float)q_hi);
+            }
+        }
+        acc += blk_acc;
+    }
+    // Same warp-reduce-then-cross-warp-reduce as Q4_K/Q8_0/Q5_0/IQ3_S expert.
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    __shared__ float warp_sums[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float w_acc = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            w_acc += __shfl_down_sync(0xFFFFFFFFu, w_acc, off);
+        }
+        if (lane == 0) y[o] = w_acc;
+    }
+}
+
 // FR-17-extra-f16-fwd — F16-weight matmul for seq=1 autoregressive decode.
 // Layout: weights stored as raw F16 (2 bytes/elem) in row-major order
 // [n_out * n_in].  Input x is F32 [n_in].  Output y is F32 [n_out].
@@ -3556,6 +3628,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q8_0_expert_matmul_seq1",
               "fused_q5_0_expert_matmul_seq1",
               "fused_iq3_s_expert_matmul_seq1",
+              "fused_iq4_xs_expert_matmul_seq1",
               "bert_self_attention_fwd",
               "bert_embed_sum"])
             .expect("load_ptx");
@@ -3608,6 +3681,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q8_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q8_0_expert_matmul_seq1").unwrap();
         let fused_q5_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_expert_matmul_seq1").unwrap();
         let fused_iq3_s_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_s_expert_matmul_seq1").unwrap();
+        let fused_iq4_xs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq4_xs_expert_matmul_seq1").unwrap();
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
         let bert_embed_sum = device.get_func("aether_kernels", "bert_embed_sum").unwrap();
 
@@ -3636,6 +3710,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q8_0_expert_matmul_seq1,
                   fused_q5_0_expert_matmul_seq1,
                   fused_iq3_s_expert_matmul_seq1,
+                  fused_iq4_xs_expert_matmul_seq1,
                   bert_self_attention_fwd, bert_embed_sum }
     })
 }
@@ -4842,6 +4917,37 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_iq3_s_expert_matmul_seq1.clone()
             .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
             .expect("launch fused_iq3_s_expert_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17-extra-moe-quant-dispatch-iq4xs MoE — IQ4_XS expert-variant matmul.
+/// 136-byte 256-elem blocks.  Per-expert offset = `expert_idx * n_out *
+/// blocks_per_row * 136` bytes.  Used by GLM-4.7-flash MoE expert tensors
+/// quantised to IQ4_XS (dt=23) — second non-Q4_K dtype the IQ3_XXS GGUF hits.
+#[no_mangle] pub extern "C" fn aether_op_fused_iq4_xs_expert_matmul_seq1_cuda(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_base) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 || expert_idx < 0 { return -1; }
+    let expert_offset_blocks = expert_idx * n_out * blocks_per_row;
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_iq4_xs_expert_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
+            .expect("launch fused_iq4_xs_expert_matmul_seq1");
     }
     0
 }

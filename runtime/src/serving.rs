@@ -79,6 +79,7 @@ use crate::cuda::{
     aether_op_fused_q8_0_expert_matmul_seq1_cuda,
     aether_op_fused_q5_0_expert_matmul_seq1_cuda,
     aether_op_fused_iq3_s_expert_matmul_seq1_cuda,
+    aether_op_fused_iq4_xs_expert_matmul_seq1_cuda,
     aether_op_matmul_f32_cuda,
     aether_dev_graph_begin, aether_dev_graph_end,
     aether_dev_graph_launch, aether_dev_graph_destroy,
@@ -1155,7 +1156,15 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
                 aether_op_fused_iq3_s_expert_matmul_seq1_cuda(
                     x_in, w_base, y, n_out, bpr, expert_idx);
             }
-            _ => panic!("moe expert matmul: unsupported dtype {} (only Q4_K=12, Q5_0=6, Q8_0=8, IQ3_S=21 today)", dt),
+            23 => {
+                // IQ4_XS — 256-elem blocks; same blocks_per_row math as Q4_K.
+                // GLM-4.7-flash MoE blocks surface this dtype before any
+                // IQ3_S ones.  FR-17-extra-moe-quant-dispatch-iq4xs.
+                let bpr = if n_in_d_model { bpr_q4k_in } else { bpr_q4k_ff };
+                aether_op_fused_iq4_xs_expert_matmul_seq1_cuda(
+                    x_in, w_base, y, n_out, bpr, expert_idx);
+            }
+            _ => panic!("moe expert matmul: unsupported dtype {} (only Q4_K=12, Q5_0=6, Q8_0=8, IQ3_S=21, IQ4_XS=23 today)", dt),
         }
     };
 
