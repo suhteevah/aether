@@ -40,6 +40,8 @@ use aether_rt::{
 
 #[cfg(feature = "cuda")]
 use aether_rt::serving::{QwenSession, SharedKvPool};
+#[cfg(feature = "cuda")]
+use aether_rt::bert::BertSession;
 
 #[derive(Debug)]
 struct Cli {
@@ -66,6 +68,13 @@ struct Cli {
     /// weight upload, no listener.  Useful for confirming the runtime-shape
     /// detector picks up a new model correctly before trying to serve it.
     probe: bool,
+    /// FR-17-extra-bert-fwd: BERT/BGE encoder model for /v1/embeddings.
+    /// Loaded as a sibling to the chat-completions QwenSession; the same
+    /// aether-serve process can host both endpoints if both flags are set.
+    bge_gguf: Option<String>,
+    /// Embedding-model name reported back in /v1/embeddings responses
+    /// (separate from --model which names the chat-completions model).
+    bge_model: String,
 }
 
 fn parse_cli() -> Cli {
@@ -81,6 +90,8 @@ fn parse_cli() -> Cli {
         paged: false,
         pool_blocks: 0,
         probe: false,
+        bge_gguf: None,
+        bge_model: "bge-large-en-v1.5".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -104,6 +115,8 @@ fn parse_cli() -> Cli {
                 cli.paged = true;
             }
             "--probe" => cli.probe = true,
+            "--bge-gguf" => cli.bge_gguf = Some(it.next().expect("--bge-gguf PATH")),
+            "--bge-model" => cli.bge_model = it.next().expect("--bge-model NAME"),
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -270,6 +283,95 @@ fn parse_body(body: &[u8], default_max: usize) -> Result<JsonBody, &'static str>
     Ok(JsonBody { prompt_ids, max_tokens, stream, text_prompt })
 }
 
+// ============================================================================
+// FR-17-extra-bert-fwd — /v1/embeddings request shape.
+//
+// OpenAI's request body is `{"input": "...", "model": "..."}`.  Since BPE
+// encoding from raw text isn't wired through aether-serve yet, callers can
+// alternatively supply `"input_ids":[101, 2003, ...]` directly.  At least one
+// of `input` / `input_ids` must be present.
+// ============================================================================
+
+struct EmbeddingsRequest {
+    /// Token IDs.  Must be present (text-input + tokenize is a follow-on).
+    input_ids: Vec<i32>,
+    /// Optional token-type IDs (defaults to all zeros).
+    token_type_ids: Vec<i32>,
+    /// Echo of the request's `model` field, for the response.
+    model: Option<String>,
+}
+
+fn parse_embeddings_body(body: &[u8]) -> Result<EmbeddingsRequest, &'static str> {
+    let s = std::str::from_utf8(body).map_err(|_| "body not utf-8")?;
+    let input_ids = match find_key_array(s, "input_ids") {
+        Some(arr) => parse_int_array(arr)
+            .map_err(|_| "input_ids must be integers")?
+            .into_iter().map(|v| v as i32).collect(),
+        None => Vec::new(),
+    };
+    if input_ids.is_empty() {
+        return Err("/v1/embeddings requires \"input_ids\":[...] (text input + BPE tokenize not wired yet)");
+    }
+    let token_type_ids = match find_key_array(s, "token_type_ids") {
+        Some(arr) => parse_int_array(arr)
+            .map_err(|_| "token_type_ids must be integers")?
+            .into_iter().map(|v| v as i32).collect(),
+        None => vec![0i32; input_ids.len()],
+    };
+    if token_type_ids.len() != input_ids.len() {
+        return Err("token_type_ids length must match input_ids");
+    }
+    let model = find_key_string(s, "model");
+    Ok(EmbeddingsRequest { input_ids, token_type_ids, model })
+}
+
+fn find_key_string(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\"", key);
+    let i = s.find(&pat)?;
+    let after_key = &s[i + pat.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    let after_q = after_colon.strip_prefix('"')?;
+    let end = after_q.find('"')?;
+    Some(after_q[..end].to_string())
+}
+
+#[cfg(feature = "cuda")]
+fn render_embeddings_json(state: &ServerState, req: &EmbeddingsRequest) -> String {
+    let model_name = req.model.as_deref().unwrap_or(&state.cli.bge_model);
+    let bert_mu = match &state.bert {
+        Some(b) => b,
+        None => return "{\"error\":\"no BGE model loaded — pass --bge-gguf PATH on aether-serve startup\"}".to_string(),
+    };
+    let mut bert = bert_mu.lock().unwrap();
+    if req.input_ids.len() > bert.max_seq {
+        return format!("{{\"error\":\"input_ids length {} exceeds max_pos {}\"}}",
+            req.input_ids.len(), bert.max_seq);
+    }
+    let t = std::time::Instant::now();
+    let emb = bert.embed(&req.input_ids, &req.token_type_ids);
+    eprintln!("[serve] /v1/embeddings: {} tokens -> {}-dim in {:.3}s",
+        req.input_ids.len(), emb.len(), t.elapsed().as_secs_f32());
+
+    // OpenAI shape: {"object":"list","model":..,"data":[{"object":"embedding",
+    // "index":0,"embedding":[...]}],"usage":{"prompt_tokens":N,"total_tokens":N}}
+    let mut emb_json = String::with_capacity(emb.len() * 16);
+    emb_json.push('[');
+    for (i, v) in emb.iter().enumerate() {
+        if i > 0 { emb_json.push(','); }
+        emb_json.push_str(&format!("{:.7}", v));
+    }
+    emb_json.push(']');
+    format!(
+        "{{\"object\":\"list\",\"model\":\"{}\",\"data\":[{{\"object\":\"embedding\",\"index\":0,\"embedding\":{}}}],\"usage\":{{\"prompt_tokens\":{},\"total_tokens\":{}}}}}",
+        model_name, emb_json, req.input_ids.len(), req.input_ids.len())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn render_embeddings_json(_state: &ServerState, _req: &EmbeddingsRequest) -> String {
+    "{\"error\":\"aether-serve built without --features cuda\"}".to_string()
+}
+
 /// Find `"key": [ ... ]` and return the slice inside the brackets.
 fn find_key_array<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("\"{}\"", key);
@@ -385,6 +487,13 @@ struct ServerState {
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
     pool: Option<std::sync::Arc<SharedKvPool>>,
+    /// FR-17-extra-bert-fwd: BERT/BGE encoder for /v1/embeddings, loaded
+    /// when --bge-gguf is supplied.  Held under a Mutex so concurrent
+    /// /v1/embeddings calls serialise.  (BertSession holds no state between
+    /// requests beyond loaded weights; the per-request alloc/free of
+    /// activations is internal.)
+    #[cfg(feature = "cuda")]
+    bert: Option<std::sync::Mutex<BertSession>>,
 }
 
 impl ServerState {
@@ -423,12 +532,23 @@ impl ServerState {
                     None
                 }
             };
-            return Ok(ServerState { cli, session, pool });
+            let bert = match &cli.bge_gguf {
+                Some(path) => {
+                    eprintln!("[aether-serve] loading BGE GGUF: {}", path);
+                    let t = std::time::Instant::now();
+                    let s = BertSession::from_gguf(path)?;
+                    eprintln!("[aether-serve] BGE loaded in {:.2}s (d_model={} layers={})",
+                        t.elapsed().as_secs_f32(), s.cfg.d_model, s.cfg.n_layers);
+                    Some(std::sync::Mutex::new(s))
+                }
+                None => None,
+            };
+            return Ok(ServerState { cli, session, pool, bert });
         }
         #[cfg(not(feature = "cuda"))]
         {
-            if cli.gguf.is_some() {
-                return Err("--gguf requires building with --features cuda".into());
+            if cli.gguf.is_some() || cli.bge_gguf.is_some() {
+                return Err("--gguf / --bge-gguf require building with --features cuda".into());
             }
             Ok(ServerState { cli })
         }
@@ -654,6 +774,13 @@ unsafe fn dispatch_h2_stream(
             };
             write_h2_json(t, stream_id, 200, resp.as_bytes());
         }
+        ("POST", "/v1/embeddings") => {
+            let resp = match parse_embeddings_body(&body) {
+                Ok(req) => render_embeddings_json(state, &req),
+                Err(e) => format!("{{\"error\":\"{}\"}}", e),
+            };
+            write_h2_json(t, stream_id, 200, resp.as_bytes());
+        }
         _ => write_h2_text(t, stream_id, 404, b"not found"),
     }
 }
@@ -795,8 +922,19 @@ unsafe fn handle_request(state: &ServerState, t: &mut dyn Transport) {
         ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
             handle_completion_t(state, t, body)
         }
+        ("POST", "/v1/embeddings") => handle_embeddings_t(state, t, body),
         _ => { let _ = send_text_t(t, 404, "not found"); }
     }
+}
+
+/// FR-17-extra-bert-fwd — HTTP/1.1 handler for /v1/embeddings.
+unsafe fn handle_embeddings_t(state: &ServerState, t: &mut dyn Transport, body: &[u8]) {
+    let req = match parse_embeddings_body(body) {
+        Ok(r) => r,
+        Err(e) => { let _ = send_text_t(t, 400, e); return; }
+    };
+    let json = render_embeddings_json(state, &req);
+    let _ = send_json_t(t, 200, &json);
 }
 
 unsafe fn handle_list_models_t(state: &ServerState, t: &mut dyn Transport) {

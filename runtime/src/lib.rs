@@ -17,6 +17,9 @@ pub mod cuda;
 #[cfg(feature = "cuda")]
 pub mod serving;
 
+#[cfg(feature = "cuda")]
+pub mod bert;
+
 #[cfg(feature = "nccl")]
 pub mod nccl_real;
 

@@ -2171,7 +2171,9 @@ extern "C" __global__ void bert_self_attention_fwd(
     int head  = blockIdx.x;
     int q_pos = blockIdx.y;
     int lane  = threadIdx.x;
-    int per_lane = head_dim >> 5;          // ≤ 8
+    // CEIL so head_dim < 32 (e.g. 16) still loops once per warp; per-element
+    // `col < head_dim` bounds check below filters the over-counted lanes.
+    int per_lane = (head_dim + 31) >> 5;
 
     const float* q_ptr = q + (q_pos * n_heads + head) * head_dim;
 
@@ -3746,7 +3748,10 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let Some(i_v) = handle_to_idx(v_dev) else { return -1; };
     let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
     if seq <= 0 || n_heads <= 0 || head_dim <= 0 { return -1; }
-    if (head_dim & 31) != 0 || head_dim > 256 { return -2; }
+    // head_dim ≤ 256 caps q_local[8] × per_lane=8 lanes worth of storage.
+    // No multiple-of-32 constraint — the kernel uses CEIL per_lane + a
+    // per-element bounds check, same shape as the flex paged kernel.
+    if head_dim > 256 { return -2; }
     let bs = unsafe { bufs() };
     let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
     let k_p = bs[i_k].as_ref().unwrap() as *const CudaSlice<f32>;
