@@ -1313,7 +1313,27 @@ impl QwenSession {
             // The flex attention kernel handles any head_dim in [1, 256]
             // (FR-17-extra-gemma-fwd).  Non-multiples-of-32 trigger the
             // flex path in block_forward_devarg.
-            if cfg.head_dim == 0 || cfg.head_dim > 256 {
+            // For MLA archs (kv_lora_rank > 0) the standard head_dim check
+            // doesn't apply — Q/K/V have asymmetric per-head dims (qk_head_dim
+            // vs v_head_dim) read from `attention.key_length` /
+            // `attention.value_length`.  paged_attention_mla_devarg's register
+            // arrays are sized for up to 640 elements per head (q_local[20] ×
+            // per_lane=20).  GLM-4.7-flash (qk=576, v=512) fits; DeepSeek-V2
+            // (qk=192, v=128) and V2-Lite (qk=192, v=128) also fit.
+            if cfg.kv_lora_rank > 0 {
+                if cfg.qk_head_dim <= 0 || cfg.qk_head_dim > 640 {
+                    return Err(format!(
+                        "FR-17-extra-mla-fwd: qk_head_dim={} out of range [1, 640] \
+                         (MLA attention kernel q_local[20] × per_lane=20 maxes out).",
+                        cfg.qk_head_dim));
+                }
+                if cfg.v_head_dim <= 0 || cfg.v_head_dim > 640 {
+                    return Err(format!(
+                        "FR-17-extra-mla-fwd: v_head_dim={} out of range [1, 640] \
+                         (MLA attention kernel out_local[20] × per_lane=20 maxes out).",
+                        cfg.v_head_dim));
+                }
+            } else if cfg.head_dim == 0 || cfg.head_dim > 256 {
                 return Err(format!(
                     "FR-17-extra-runtime-shape: head_dim={} out of range [1, 256] \
                      (attention kernel q_local[8] × per_lane=8 maxes out).",

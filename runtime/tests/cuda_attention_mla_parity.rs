@@ -344,3 +344,51 @@ fn mla_append_kv_writes_with_independent_strides() {
         aether_dev_free_i32(pt_dev); aether_dev_free_i32(sa_dev);
     }
 }
+
+#[test]
+fn mla_handles_glm_47_flash_class_head_dim() {
+    // GLM-4.7-flash (deepseek2 architecture) uses asymmetric per-head dims
+    // wildly larger than V2-Lite: qk_head_dim=576 (qk_nope=512 + qk_rope=64),
+    // v_head_dim=512.  This exercises the bumped q_local[20] / out_local[20]
+    // register-array ceiling (was 8 → cap 256, now 20 → cap 640).
+    unsafe { assert_eq!(aether_dev_init(), 0); }
+    let n_heads = 2;            // small head count keeps total alloc reasonable
+    let qk_head_dim = 576;
+    let v_head_dim = 512;
+    let cur_seq = 4;
+    let (cpu, gpu) = run_mla_pipeline(n_heads, qk_head_dim, v_head_dim, cur_seq);
+    assert_eq!(cpu.len(), gpu.len());
+    let max_diff = cpu.iter().zip(gpu.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let n_finite = gpu.iter().filter(|x| x.is_finite()).count();
+    println!("[mla] GLM-class n_heads={} qk={} v={} cur_seq={} -> max_diff={:.3e} finite={}/{}",
+        n_heads, qk_head_dim, v_head_dim, cur_seq, max_diff, n_finite, gpu.len());
+    assert_eq!(n_finite, gpu.len(),
+        "non-finite values in MLA output at GLM-class head dim");
+    // Slightly looser bound than V2-Lite (1e-4) — qk_head_dim=576 means deeper
+    // accumulators per dot product, more rounding noise.
+    assert!(max_diff < 5e-4,
+        "MLA at GLM-class head_dim diverged from CPU reference ({:.3e})",
+        max_diff);
+}
+
+#[test]
+fn mla_handles_per_lane_exact_boundary() {
+    // Stress the boundary where per_lane × 32 == head_dim exactly (per_lane=20
+    // → head_dim=640).  No per-lane "tail bounds check" should fire; every
+    // element of q_local/out_local has a real input slot.
+    unsafe { assert_eq!(aether_dev_init(), 0); }
+    let n_heads = 1;
+    let qk_head_dim = 640;
+    let v_head_dim  = 640;
+    let cur_seq = 3;
+    let (cpu, gpu) = run_mla_pipeline(n_heads, qk_head_dim, v_head_dim, cur_seq);
+    let max_diff = cpu.iter().zip(gpu.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let n_finite = gpu.iter().filter(|x| x.is_finite()).count();
+    println!("[mla] boundary qk=v=640 cur_seq={} -> max_diff={:.3e} finite={}/{}",
+        cur_seq, max_diff, n_finite, gpu.len());
+    assert_eq!(n_finite, gpu.len());
+    assert!(max_diff < 5e-4,
+        "MLA at per_lane=20 boundary diverged ({:.3e})", max_diff);
+}

@@ -607,14 +607,17 @@ extern "C" __global__ void paged_attention_mla_devarg(
     int d_k_row = n_heads * qk_head_dim;   // K row stride per token
     int d_v_row = n_heads * v_head_dim;    // V row stride per token
 
-    int per_lane_k = (qk_head_dim + 31) >> 5;   // up to 8
-    int per_lane_v = (v_head_dim  + 31) >> 5;   // up to 8
+    // MLA per-lane register-array bound: 20 covers GLM-4.7-flash's
+    // qk_head_dim=576 (per_lane=18) and v_head_dim=512 (per_lane=16) with
+    // margin.  Bumping from 8 lifts the 256-head-dim cap to 640.
+    int per_lane_k = (qk_head_dim + 31) >> 5;
+    int per_lane_v = (v_head_dim  + 31) >> 5;
 
     // Load Q for this head into thread-local registers.
     const float* q_ptr = q + head * qk_head_dim;
-    float q_local[8];
+    float q_local[20];
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 20; i++) {
         int col = lane * per_lane_k + i;
         q_local[i] = (i < per_lane_k && col < qk_head_dim) ? q_ptr[col] : 0.0f;
     }
@@ -628,7 +631,7 @@ extern "C" __global__ void paged_attention_mla_devarg(
         const float* k_ptr = k_pool + row * d_k_row + head * qk_head_dim;
         float acc = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 20; i++) {
             int col = lane * per_lane_k + i;
             if (i < per_lane_k && col < qk_head_dim) acc += q_local[i] * k_ptr[col];
         }
@@ -672,7 +675,7 @@ extern "C" __global__ void paged_attention_mla_devarg(
 
     // Pass 3: aggregate V over [0, cur_seq).  V has a DIFFERENT per-head dim
     // and a DIFFERENT row stride than K.
-    float out_local[8] = {0.0f};
+    float out_local[20] = {0.0f};
     for (int t = 0; t < cur_seq; t++) {
         int logical_blk = t / block_size;
         int in_blk_pos  = t - logical_blk * block_size;
@@ -681,14 +684,14 @@ extern "C" __global__ void paged_attention_mla_devarg(
         float w = scores[t];
         const float* v_ptr = v_pool + row * d_v_row + head * v_head_dim;
         #pragma unroll
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 20; i++) {
             int col = lane * per_lane_v + i;
             if (i < per_lane_v && col < v_head_dim) out_local[i] += w * v_ptr[col];
         }
     }
     float* out_ptr = attn_out + head * v_head_dim;
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 20; i++) {
         int col = lane * per_lane_v + i;
         if (i < per_lane_v && col < v_head_dim) out_ptr[col] = out_local[i];
     }
