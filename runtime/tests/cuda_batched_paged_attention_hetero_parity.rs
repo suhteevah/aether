@@ -31,6 +31,8 @@ use aether_rt::cuda::{
     aether_op_paged_attention_seq1_devarg_f32_cuda,
     aether_op_batched_paged_attention_hetero_devarg_f32_cuda,
     aether_op_batched_paged_append_kv_hetero_devarg_f32_cuda,
+    aether_op_rope_apply_devarg_f32_cuda,
+    aether_op_batched_rope_apply_devarg_f32_cuda,
 };
 
 const N_Q_HEADS: i32 = 28;
@@ -310,5 +312,70 @@ fn hetero_append_writes_per_request_positions() {
         aether_dev_free_f32(k_new_batch_dev); aether_dev_free_f32(v_new_batch_dev);
         aether_dev_free_i32(pt_a_dev); aether_dev_free_i32(pt_b_dev); aether_dev_free_i32(pt_batch_dev);
         aether_dev_free_i32(pos_batch_dev); aether_dev_free_i32(step_args_dev);
+    }
+}
+
+/// Batched RoPE with per-request positions must equal running the single-
+/// request rope_apply_devarg once per row at that row's own position.
+/// Request 0 at pos=11, request 1 at pos=4 (different) in ONE launch.
+#[test]
+fn batched_rope_matches_per_request_seq1() {
+    unsafe { assert!(aether_dev_init() == 0, "CUDA init"); }
+    const RH: i32 = 4;       // n_heads
+    const HD: i32 = 64;      // head_dim
+    const ROW: i32 = RH * HD;
+    let base = 1_000_000.0f32;
+    let pos0: i32 = 11;
+    let pos1: i32 = 4;
+
+    let q0: Vec<f32> = (0..ROW).map(|i| ((i as f32) * 0.017 - 0.3).sin() * 0.6).collect();
+    let q1: Vec<f32> = (0..ROW).map(|i| ((i as f32) * 0.023 + 0.5).cos() * 0.5).collect();
+
+    // Reference: two seq1 rope_apply_devarg calls, each at its own pos.
+    let r0_dev = unsafe { aether_dev_alloc_f32(ROW) };
+    let r1_dev = unsafe { aether_dev_alloc_f32(ROW) };
+    let sa_dev = unsafe { aether_dev_alloc_i32(4) };
+    unsafe {
+        aether_dev_h2d_f32(q0.as_ptr() as i64, r0_dev, ROW);
+        aether_dev_h2d_f32(q1.as_ptr() as i64, r1_dev, ROW);
+        let s0 = [pos0, pos0 + 1, 0, 0];
+        aether_dev_h2d_i32(s0.as_ptr() as i64, sa_dev, 4);
+        aether_op_rope_apply_devarg_f32_cuda(r0_dev, 1, RH, HD, base, sa_dev);
+        let s1 = [pos1, pos1 + 1, 0, 0];
+        aether_dev_h2d_i32(s1.as_ptr() as i64, sa_dev, 4);
+        aether_op_rope_apply_devarg_f32_cuda(r1_dev, 1, RH, HD, base, sa_dev);
+        aether_dev_sync();
+    }
+
+    // Candidate: ONE batched launch with pos_batch=[11, 4].
+    let qb_dev = unsafe { aether_dev_alloc_f32(2 * ROW) };
+    let pos_dev = unsafe { aether_dev_alloc_i32(2) };
+    unsafe {
+        let mut qb = Vec::with_capacity((2 * ROW) as usize);
+        qb.extend_from_slice(&q0); qb.extend_from_slice(&q1);
+        aether_dev_h2d_f32(qb.as_ptr() as i64, qb_dev, 2 * ROW);
+        let pb: Vec<i32> = vec![pos0, pos1];
+        aether_dev_h2d_i32(pb.as_ptr() as i64, pos_dev, 2);
+        assert_eq!(0, aether_op_batched_rope_apply_devarg_f32_cuda(qb_dev, 2, RH, HD, base, pos_dev));
+        aether_dev_sync();
+    }
+
+    let mut ref0 = vec![0f32; ROW as usize];
+    let mut ref1 = vec![0f32; ROW as usize];
+    let mut cand = vec![0f32; (2 * ROW) as usize];
+    unsafe {
+        aether_dev_d2h_f32(r0_dev, ref0.as_mut_ptr() as i64, ROW);
+        aether_dev_d2h_f32(r1_dev, ref1.as_mut_ptr() as i64, ROW);
+        aether_dev_d2h_f32(qb_dev, cand.as_mut_ptr() as i64, 2 * ROW);
+    }
+    let d0 = ref0.iter().zip(&cand[..ROW as usize]).map(|(r, c)| (r - c).abs()).fold(0f32, f32::max);
+    let d1 = ref1.iter().zip(&cand[ROW as usize..]).map(|(r, c)| (r - c).abs()).fold(0f32, f32::max);
+    println!("[batched-rope] req0(pos=11) diff={:.3e}  req1(pos=4) diff={:.3e}", d0, d1);
+    assert_eq!(d0, 0.0, "req0 rope diverged");
+    assert_eq!(d1, 0.0, "req1 rope diverged");
+
+    unsafe {
+        aether_dev_free_f32(r0_dev); aether_dev_free_f32(r1_dev);
+        aether_dev_free_f32(qb_dev); aether_dev_free_i32(pos_dev); aether_dev_free_i32(sa_dev);
     }
 }

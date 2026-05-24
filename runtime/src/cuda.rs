@@ -109,6 +109,7 @@ struct PagedCtx {
     batched_paged_attention_hetero_devarg: CudaFunction,
     batched_paged_append_kv_hetero_devarg: CudaFunction,
     fused_q4k_matmul_seqB_v3: CudaFunction,
+    batched_rope_apply_devarg: CudaFunction,
     paged_attention_flex_devarg: CudaFunction,
     paged_attention_mla_devarg: CudaFunction,
     paged_append_kv_mla_devarg: CudaFunction,
@@ -148,6 +149,7 @@ fn paged_ctx() -> &'static PagedCtx {
               "batched_paged_attention_hetero_devarg",
               "batched_paged_append_kv_hetero_devarg",
               "fused_q4k_matmul_seqB_v3",
+              "batched_rope_apply_devarg",
               "paged_attention_flex_devarg",
               "paged_attention_mla_devarg",
               "paged_append_kv_mla_devarg",
@@ -187,6 +189,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "batched_paged_append_kv_hetero_devarg").unwrap(),
             fused_q4k_matmul_seqB_v3:
                 device.get_func("aether_paged_kernels", "fused_q4k_matmul_seqB_v3").unwrap(),
+            batched_rope_apply_devarg:
+                device.get_func("aether_paged_kernels", "batched_rope_apply_devarg").unwrap(),
             paged_attention_flex_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_flex_devarg").unwrap(),
             paged_attention_mla_devarg:
@@ -770,6 +774,38 @@ extern "C" __global__ void fused_q4k_matmul_seqB_v3(
             }
         }
     }
+}
+
+// FR-19.5-extra-deep Phase 2 — batched RoPE with PER-REQUEST positions.
+// rope_apply_devarg gives row t position `t + step_args[0]` (consecutive
+// from one base), which is right for prefill but wrong for batched decode
+// where each slot sits at its own arbitrary position.  Here row b (a
+// request) is rotated by `pos_batch[b]`.  x is [batch * n_heads * head_dim]
+// (Q: n_heads=n_q_heads; K: n_heads=n_kv_heads), half-half pair layout,
+// identical per-row math to rope_apply_devarg at seq=1 → exact parity.
+extern "C" __global__ void batched_rope_apply_devarg(
+    float*       __restrict__ x,
+    int batch, int n_heads, int head_dim,
+    float base, const int* __restrict__ pos_batch)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hd_half = head_dim / 2;
+    int total = batch * n_heads * hd_half;
+    if (idx >= total) return;
+    int t = idx / (n_heads * hd_half);          // request index
+    int rem = idx - t * (n_heads * hd_half);
+    int h = rem / hd_half;
+    int i = rem - h * hd_half;
+    int base_off = (t * n_heads + h) * head_dim;
+    float pos = (float)pos_batch[t];            // per-request position
+    float exp = -2.0f * (float)i / (float)head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float x0 = x[i0], x1 = x[i1];
+    x[i0] = x0 * c - x1 * s;
+    x[i1] = x0 * s + x1 * c;
 }
 
 extern "C" __global__ void paged_append_kv_devarg(
@@ -7821,6 +7857,32 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().fused_q4k_matmul_seqB_v3.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks, batch))
             .expect("launch fused_q4k_matmul_seqB_v3");
+    }
+    0
+}
+
+/// FR-19.5-extra-deep Phase 2 — batched RoPE with per-request positions.
+/// x is [batch * n_heads * head_dim] (half-half pair layout); row b is
+/// rotated by `pos_batch_dev[b]` (an i32 device buffer of length batch).
+/// Per-row math is identical to rope_apply_devarg at seq=1.
+#[no_mangle] pub extern "C" fn aether_op_batched_rope_apply_devarg_f32_cuda(
+    x: i64, batch: c_int, n_heads: c_int, head_dim: c_int,
+    base: f32, pos_batch_dev: i64,
+) -> c_int {
+    let Some(ix) = handle_to_idx(x) else { return -1; };
+    let Some(ip) = handle_to_i32_idx(pos_batch_dev) else { return -1; };
+    if batch <= 0 || n_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let p_p = ibs[ip].as_ref().unwrap() as *const CudaSlice<i32>;
+    let total = (batch * n_heads * (head_dim / 2)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let xv = &mut *x_p; let pv = &*p_p;
+        paged_ctx().batched_rope_apply_devarg.clone()
+            .launch(cfg, (xv, batch, n_heads, head_dim, base, pv))
+            .expect("launch batched_rope_apply_devarg");
     }
     0
 }
