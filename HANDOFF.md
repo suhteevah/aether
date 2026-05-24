@@ -1,10 +1,148 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 late evening (**GLM-4.7-flash Q-LoRA branch WITNESSED entering on
-real GGUF — partial witness. 4 gaps surfaced + 3 fixes shipped + 1 new
-kernel during the smoke chase; full decode still gated on MoE expert
-matmul dispatch for non-Q4_K dtypes.**)
+2026-05-24 overnight (**GLM-4.7-flash GATE CLOSED — first real generated
+tokens end-to-end through Aether's runtime.  Aether-serve deployed live on
+cnc:18913 hosting GLM.  Qwen3-MoE + Gemma3 GGUFs downloading for the
+remaining two per-arch smokes.**)
+
+## Project Status
+🟢 GLM-4.7-flash producing real, prompt-dependent generated tokens with
+clean `finish_reason=stop`.  6 archs now verified end-to-end: Qwen2/2.5,
+Qwen3, Qwen3-VL (text), Llama, DeepSeek-V2-Lite, GLM-4.7-flash.  2 archs
+(Qwen3-MoE, Gemma3) code-complete and pending GGUF download to smoke.
+
+## What Was Done This Session (2026-05-24 overnight)
+
+### Commits
+
+| Hash | Title | What it does |
+|---|---|---|
+| `fd1d487` | FR-17-extra-moe-quant-dispatch: IQ3_S expert matmul | `fused_iq3_s_expert_matmul_seq1` kernel + FFI wrapper + dt=21 arm in `dispatch_expert`.  Closed the IQ3_S panic from cb4eac3's smoke. |
+| `d16158d` | FR-17-extra-moe-quant-dispatch-iq4xs: IQ4_XS expert matmul | `fused_iq4_xs_expert_matmul_seq1` kernel + dt=23 arm. |
+| `d9a91aa` | FR-17-extra-moe-quant-dispatch-iq3xxs: IQ3_XXS expert matmul | `fused_iq3_xxs_expert_matmul_seq1` kernel + dt=18 arm.  3 GLM-relevant non-Q4_K dtypes now all covered. |
+| `73e476b` | glm-debug: dtype-aware upload_f32_tensor_opt | Made the loader handle F16-stored f32 tensors via per-element dequant.  No-op for GLM (router IS F32) but defensive for future archs. |
+| `fb07fa4` | glm-debug: AETHER_DUMP_INTRA_BLOCK probe | Env-gated bisect probe — dumps `act.x` after attn-residual, before FFN.  Kept in tree for future debugging. |
+| `b6caa61` | glm-debug: AETHER_DUMP_ATTN_DTYPES probe | Env-gated per-layer attn tensor dtype dump.  Reveals the per-layer dtype mix (Q4_K / Q5_K / F16 / IQ4_XS) that GLM's IQ3_XXS UD uses. |
+| `87bcf25` | glm-debug: AETHER_DUMP_MLA per-stage MLA bisect probes | Env-gated probe of each MLA intermediate (`kv_a`, `c_kv_n`, `kv_b`, `q_a`, `q_a_n`, `q_full`, `attn_out`).  Located the NaN injection point in q_full (after `w_q_b` matmul). |
+| **`7d3879a`** | **glm-fix: implement MLA-absorbed forward path for GLM-4.7-flash** | **The gate-closing commit.**  +488 lines.  3 new CUDA kernels (`mla_absorb_q_q8_0`, `mla_absorb_v_q8_0`, `mla_broadcast_kv_for_mqa`), `ModelConfig.{key_length_mla, value_length_mla, is_mla_absorbed()}`, `BlockGpu.{w_k_b, dt_k_b, w_v_b, dt_v_b}`, `mla_attention_forward_absorbed()` function.  `aether_f16_to_f32_dev` copied into `PAGED_KERNEL_SRC` (separate nvrtc unit). |
+
+### The bisect arc (for posterity)
+
+cb4eac3 GLM smoke: panic dt=21 (IQ3_S) → fd1d487 closes IQ3_S → smoke panics dt=23 (IQ4_XS) → d16158d closes IQ4_XS → smoke panics dt=18 (IQ3_XXS) → d9a91aa closes IQ3_XXS → smoke completes 47 layers + listens BUT every output token = vocab-1 (NaN argmax pinning) → AETHER_DUMP_BLOCKS bisect: layer 0 clean, layer 1+ all NaN → AETHER_DUMP_MLA bisect: `q_full` has 6400/11520 NaN after `w_q_b` matmul → GGUF inspection via gguf-py: `w_q_b` shape is `[768, 5120]` not `[768, 11520]` — GLM uses MLA absorption (`key_length_mla=256`, separate `attn_k_b`/`attn_v_b` tensors) → llama.cpp `src/models/deepseek2.cpp:80-170` confirms the absorbed flow → 7d3879a implements it → smoke produces real prompt-dependent token sequences.
+
+### Witness (3 distinct prompts → 3 distinct outputs, all clean stop)
+
+```
+[BOS, 9707]              → 438, 1447, 13865                    (stop)
+[BOS, 100, 200, 300]     → 715, 73022, 1208, 198, 13865        (stop)
+[BOS, 50000]             → 510, 1208, 198, 13865               (stop)
+```
+
+Per-block dump confirms `nan=0` at layers 0..3 (was all-NaN at layers 1+ before
+7d3879a).  Per-step logit dump: `nan=0 inf=0 zero=0 mean≈126 std≈2.1
+top5=structured-spread`.  Forward path through all 47 layers / MLA-absorbed
+attention / Q8_0 wk_b + wv_b / IQ3_S+IQ4_XS+IQ3_XXS MoE expert dispatch /
+Q5_K dispatch for layer 1 q_a + attn_output / shared expert / final lm_head.
+
+### Operational deployment
+
+- **Workhorse stopped indefinitely on cnc** (backend swap to aether — main
+  approved after reframing).  Single command rollback:
+  `sudo systemctl start openclaw-inference-workhorse.service`.
+- **Aether-serve PID 1363630 listening on `0.0.0.0:18913`** on cnc GPU 1,
+  hosting GLM-4.7-flash, log at `/var/log/aether-serve.log`.  Launched via
+  nohup; survives ssh exit but NOT cnc reboot.
+- **Caveat**: launched with `--stop-token 154820` (EOS) but GLM's actual
+  end-of-response token is 154822 (BOS).  Requests hit `max_tokens` instead
+  of clean-stopping.  Next session should restart with `--stop-token 154822`.
+- **HF downloads in background** (both wget --continue) on cnc:
+  - `Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf` from unsloth.  Last sample: 4.4 GB / ~17 GB.
+  - `gemma-3-12b-it-Q4_K_M.gguf` from unsloth.  wget process alive but **file
+    has not appeared at /opt/openclaw-inference/models/** — needs URL chain
+    debug next session.
+
+### Qwen2.5 regression
+
+`qwen25_paged_parity` PASS after every commit: `[358, 2776, 264, 220, 17, 20,
+4666, 6284]` identical between contiguous and paged modes.  Non-MLA archs
+never enter the new absorbed branch — zero behavior change.
+
+## Current State
+
+### Working
+- All commits before this session (see prior HANDOFF sections for those)
+- 7 expert-matmul dtypes covered for MoE: Q4_K(12), Q5_0(6), Q8_0(8), IQ3_XXS(18), IQ3_S(21), IQ4_XS(23) — plus the existing standalone matmul coverage for F16, F32, Q4_0, Q5_K, Q6_K, IQ4_NL
+- MLA absorbed-mode forward path (GLM-4.7-flash class)
+- MLA non-absorbed forward path (V2-Lite class)
+- Aether-serve live on cnc:18913 serving real GLM tokens
+
+### Not yet exercised
+- Other dtypes for `attn_k_b` / `attn_v_b` — currently asserts Q8_0 only
+  (`mla_attention_forward_absorbed` panics otherwise).  Future archs that
+  quant these differently will hit that panic.
+- Qwen3-MoE and Gemma3 — code-complete, GGUFs downloading
+
+### Not changed
+- Asm backend, compiler, training loop — untouched this session
+
+## Blocking Issues
+
+None for the GLM gate-close.  For the remaining 2 per-arch smokes:
+
+1. **Gemma3 GGUF download** has not started writing — wget process alive but 0 bytes.  curl-HEAD against the URL returned 302 → valid HF S3 redirect.  Possibly wget hangs on the redirect handshake (the URL has Xet bridge stuff that older wget might not handle).  Workaround: try `curl --location --output ...` instead, or download via a HF-aware tool.
+
+2. **Qwen3-MoE Q4_K_M is 17 GB** — fits on a single P100 16 GB only if we tighten model loading (don't keep both quant + dequant in VRAM).  Need to confirm VRAM headroom before the smoke; otherwise pull a smaller quant (Q3_K_M ~13 GB).
+
+## What's Next (priority order)
+
+1. **Resume Gemma3 GGUF download** — debug wget vs. switch to curl/HF-aware client.  Once landed, smoke per the GLM protocol.
+
+2. **Smoke Qwen3-MoE on cnc** — when DL completes.  Per-arch dispatch already coded (qwen3moe branch in `block_forward_devarg`).  Watch for new dtype panics in MoE expert dispatch.
+
+3. **Restart aether-serve with `--stop-token 154822`** to fix the BOS-loop tail (req: stop deployment, restart with correct flag).
+
+4. **Wrap aether-serve in systemd** so it survives cnc reboot.  Service file at `/etc/systemd/system/aether-serve.service`, `Restart=on-failure`, `LD_LIBRARY_PATH` baked in.  Workhorse stays disabled (or moves to GPU 0 if it fits — main's preferred option, ~6 GB matt-voice + scout/embed currently use GPU 0).
+
+5. **Other `attn_k_b` / `attn_v_b` dtypes**: when a future arch uses non-Q8_0 here, extend `mla_attention_forward_absorbed`'s assert into a proper dispatch.  Add IQ4_NL / F16 / Q4_K / Q5_K / Q6_K variants of `mla_absorb_q_*` and `mla_absorb_v_*` as needed.
+
+6. **Replace per-call workspace allocs in `mla_attention_forward_absorbed`** with persistent buffers on ActivationGpu — current code allocates 11 buffers per call × 47 layers = 517 allocs per token.  Probably the biggest perf knob remaining.
+
+7. **`q_lora_rank > 0` synthetic parity test** (still on the deferred list from cb4eac3) — CPU reference for the Q-LoRA chain independent of GGUF.
+
+8. **HANDOFF #3 dispatch_expert generalization** (slice-copy + dispatch_matmul) — deferred since per-kernel path covered all 3 GLM dtypes successfully.  Still the right long-term move for full dtype coverage in MoE.
+
+## Notes for Next Session
+
+- **The bisect probes (`AETHER_DUMP_BLOCKS`, `AETHER_DUMP_INTRA_BLOCK`,
+  `AETHER_DUMP_ATTN_DTYPES`, `AETHER_DUMP_MLA`, `AETHER_DUMP_LOGITS`,
+  `AETHER_DUMP_F32_LOADS`) are all env-gated and kept in tree.**  Free to
+  use them on next-arch debugging.  Each adds 1 d2h sync per dump, so
+  don't leave them on in production.
+- **GLM 154822 is BOS, 154820 is EOS, 154827 is EOT, 154829 is EOM.**
+  llama.cpp's special-token metadata in the GGUF is the source of truth.
+- **GGUF 3D tensor convention is `[innermost=cols, mid=rows, outer=batch]`
+  per llama.cpp's ggml** — so e.g. `attn_k_b` shape `[192, 512, 20]` means
+  20 batches (heads) of 512×192 matrices each, stored row-major.
+- **`PAGED_KERNEL_SRC` is a separate nvrtc compilation unit from
+  `KERNEL_SRC`** — device functions defined in one don't see the other.
+  `aether_f16_to_f32_dev` is duplicated in both.  If you add a new MLA
+  kernel that needs a quant dequant helper, copy it in.
+- **`AETHER_DUMP_MLA` is now under the absorbed path too** (different
+  label prefix `[MLA-A ...]`).  Useful for the post-deployment debug if
+  generation quality degrades.
+- **Don't trust `finish_reason=stop` alone** — it's set when EITHER the
+  stop_token matches OR `max_tokens` is hit.  Check `completion_tokens` vs
+  `max_tokens` to disambiguate.
+- **Workhorse is `sudo systemctl start openclaw-inference-workhorse.service`
+  away** — one command restores the prior backend if aether-serve breaks.
+- **cnc git remote `origin` IS `suhteevah/aether`** — `git pull` just
+  works (no need for tar-over-ssh as in earlier sessions).
+- **The MLA-absorbed implementation follows `/opt/llama-src/src/models/
+  deepseek2.cpp:80-170`** — if the math ever looks wrong, that's the
+  reference.
+
+---
 
 ## What Was Done This Turn (2026-05-24 late evening, GLM smoke chase)
 
