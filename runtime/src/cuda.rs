@@ -86,6 +86,7 @@ struct CudaCtx {
     fused_q4k_expert_matmul_seq1: CudaFunction,
     fused_q8_0_expert_matmul_seq1: CudaFunction,
     fused_q5_0_expert_matmul_seq1: CudaFunction,
+    fused_iq3_s_expert_matmul_seq1: CudaFunction,
     bert_self_attention_fwd: CudaFunction,
     bert_embed_sum: CudaFunction,
 }
@@ -3068,6 +3069,156 @@ extern "C" __global__ void fused_q5_0_expert_matmul_seq1(
     }
 }
 
+// FR-17-extra-moe-quant-dispatch — MoE expert-variant of IQ3_S matmul.
+// 110-byte 256-elem blocks (f16 d + 64-byte qs + 8-byte qh + 32-byte signs +
+// 4-byte scales).  Per-expert offset = `expert_offset_blocks * 110` bytes
+// from w_base.  Used by GLM-4.7-flash MoE expert tensors that quantise to
+// IQ3_S (dt=21) — the dominant non-Q4_K dtype in the IQ3_XXS GGUF mix.
+// One CTA per output row; 256 threads stride-loop the blocks; warp-reduce
+// then cross-warp-reduce.
+extern "C" __global__ void fused_iq3_s_expert_matmul_seq1(
+    const float*         __restrict__ x,
+    const unsigned char* __restrict__ w_base,
+    float*               __restrict__ y,
+    int n_out, int blocks_per_row, int expert_offset_blocks)
+{
+    // Duplicate of the iq3s_grid table from fused_iq3_s_matmul_seq1.
+    // Kept as a per-kernel `static const` so each kernel stays
+    // self-contained (avoids cross-kernel symbol coupling in nvrtc).
+    static const unsigned int iq3s_grid[512] = {
+        0x01010101,0x01010103,0x01010105,0x0101010b,0x0101010f,0x01010301,0x01010303,0x01010305,
+        0x01010309,0x0101030d,0x01010501,0x01010503,0x0101050b,0x01010707,0x01010901,0x01010905,
+        0x0101090b,0x0101090f,0x01010b03,0x01010b07,0x01010d01,0x01010d05,0x01010f03,0x01010f09,
+        0x01010f0f,0x01030101,0x01030103,0x01030105,0x01030109,0x01030301,0x01030303,0x0103030b,
+        0x01030501,0x01030507,0x0103050f,0x01030703,0x0103070b,0x01030909,0x01030d03,0x01030d0b,
+        0x01030f05,0x01050101,0x01050103,0x0105010b,0x0105010f,0x01050301,0x01050307,0x0105030d,
+        0x01050503,0x0105050b,0x01050701,0x01050709,0x01050905,0x0105090b,0x0105090f,0x01050b03,
+        0x01050b07,0x01050f01,0x01050f07,0x01070107,0x01070303,0x0107030b,0x01070501,0x01070505,
+        0x01070703,0x01070707,0x0107070d,0x01070909,0x01070b01,0x01070b05,0x01070d0f,0x01070f03,
+        0x01070f0b,0x01090101,0x01090307,0x0109030f,0x01090503,0x01090509,0x01090705,0x01090901,
+        0x01090907,0x01090b03,0x01090f01,0x010b0105,0x010b0109,0x010b0501,0x010b0505,0x010b050d,
+        0x010b0707,0x010b0903,0x010b090b,0x010b090f,0x010b0d0d,0x010b0f07,0x010d010d,0x010d0303,
+        0x010d0307,0x010d0703,0x010d0b05,0x010d0f03,0x010f0101,0x010f0105,0x010f0109,0x010f0501,
+        0x010f0505,0x010f050d,0x010f0707,0x010f0b01,0x010f0b09,0x03010101,0x03010103,0x03010105,
+        0x03010109,0x03010301,0x03010303,0x03010307,0x0301030b,0x0301030f,0x03010501,0x03010505,
+        0x03010703,0x03010709,0x0301070d,0x03010b09,0x03010b0d,0x03010d03,0x03010f05,0x03030101,
+        0x03030103,0x03030107,0x0303010d,0x03030301,0x03030309,0x03030503,0x03030701,0x03030707,
+        0x03030903,0x03030b01,0x03030b05,0x03030f01,0x03030f0d,0x03050101,0x03050305,0x0305030b,
+        0x0305030f,0x03050501,0x03050509,0x03050705,0x03050901,0x03050907,0x03050b0b,0x03050d01,
+        0x03050f05,0x03070103,0x03070109,0x0307010f,0x03070301,0x03070307,0x03070503,0x0307050f,
+        0x03070701,0x03070709,0x03070903,0x03070d05,0x03070f01,0x03090107,0x0309010b,0x03090305,
+        0x03090309,0x03090703,0x03090707,0x03090905,0x0309090d,0x03090b01,0x03090b09,0x030b0103,
+        0x030b0301,0x030b0307,0x030b0503,0x030b0701,0x030b0705,0x030b0b03,0x030d0501,0x030d0509,
+        0x030d050f,0x030d0909,0x030d090d,0x030f0103,0x030f0107,0x030f0301,0x030f0305,0x030f0503,
+        0x030f070b,0x030f0903,0x030f0d05,0x030f0f01,0x05010101,0x05010103,0x05010107,0x0501010b,
+        0x0501010f,0x05010301,0x05010305,0x05010309,0x0501030d,0x05010503,0x05010507,0x0501050f,
+        0x05010701,0x05010705,0x05010903,0x05010907,0x0501090b,0x05010b01,0x05010b05,0x05010d0f,
+        0x05010f01,0x05010f07,0x05010f0b,0x05030101,0x05030105,0x05030301,0x05030307,0x0503030f,
+        0x05030505,0x0503050b,0x05030703,0x05030709,0x05030905,0x05030b03,0x05050103,0x05050109,
+        0x0505010f,0x05050503,0x05050507,0x05050701,0x0505070f,0x05050903,0x05050b07,0x05050b0f,
+        0x05050f03,0x05050f09,0x05070101,0x05070105,0x0507010b,0x05070303,0x05070505,0x05070509,
+        0x05070703,0x05070707,0x05070905,0x05070b01,0x05070d0d,0x05090103,0x0509010f,0x05090501,
+        0x05090507,0x05090705,0x0509070b,0x05090903,0x05090f05,0x05090f0b,0x050b0109,0x050b0303,
+        0x050b0505,0x050b070f,0x050b0901,0x050b0b07,0x050b0f01,0x050d0101,0x050d0105,0x050d010f,
+        0x050d0503,0x050d0b0b,0x050d0d03,0x050f010b,0x050f0303,0x050f050d,0x050f0701,0x050f0907,
+        0x050f0b01,0x07010105,0x07010303,0x07010307,0x0701030b,0x0701030f,0x07010505,0x07010703,
+        0x07010707,0x0701070b,0x07010905,0x07010909,0x0701090f,0x07010b03,0x07010d07,0x07010f03,
+        0x07030103,0x07030107,0x0703010b,0x07030309,0x07030503,0x07030507,0x07030901,0x07030d01,
+        0x07030f05,0x07030f0d,0x07050101,0x07050305,0x07050501,0x07050705,0x07050709,0x07050b01,
+        0x07070103,0x07070301,0x07070309,0x07070503,0x07070507,0x0707050f,0x07070701,0x07070903,
+        0x07070907,0x0707090f,0x07070b0b,0x07070f07,0x07090107,0x07090303,0x0709030d,0x07090505,
+        0x07090703,0x07090b05,0x07090d01,0x07090d09,0x070b0103,0x070b0301,0x070b0305,0x070b050b,
+        0x070b0705,0x070b0909,0x070b0b0d,0x070b0f07,0x070d030d,0x070d0903,0x070f0103,0x070f0107,
+        0x070f0501,0x070f0505,0x070f070b,0x09010101,0x09010109,0x09010305,0x09010501,0x09010509,
+        0x0901050f,0x09010705,0x09010903,0x09010b01,0x09010f01,0x09030105,0x0903010f,0x09030303,
+        0x09030307,0x09030505,0x09030701,0x0903070b,0x09030907,0x09030b03,0x09030b0b,0x09050103,
+        0x09050107,0x09050301,0x0905030b,0x09050503,0x09050707,0x09050901,0x09050b0f,0x09050d05,
+        0x09050f01,0x09070109,0x09070303,0x09070307,0x09070501,0x09070505,0x09070703,0x0907070b,
+        0x09090101,0x09090105,0x09090509,0x0909070f,0x09090901,0x09090f03,0x090b010b,0x090b010f,
+        0x090b0503,0x090b0d05,0x090d0307,0x090d0709,0x090d0d01,0x090f0301,0x090f030b,0x090f0701,
+        0x090f0907,0x090f0b03,0x0b010105,0x0b010301,0x0b010309,0x0b010505,0x0b010901,0x0b010909,
+        0x0b01090f,0x0b010b05,0x0b010d0d,0x0b010f09,0x0b030103,0x0b030107,0x0b03010b,0x0b030305,
+        0x0b030503,0x0b030705,0x0b030f05,0x0b050101,0x0b050303,0x0b050507,0x0b050701,0x0b05070d,
+        0x0b050b07,0x0b070105,0x0b07010f,0x0b070301,0x0b07050f,0x0b070909,0x0b070b03,0x0b070d0b,
+        0x0b070f07,0x0b090103,0x0b090109,0x0b090501,0x0b090705,0x0b09090d,0x0b0b0305,0x0b0b050d,
+        0x0b0b0b03,0x0b0b0b07,0x0b0d0905,0x0b0f0105,0x0b0f0109,0x0b0f0505,0x0d010303,0x0d010307,
+        0x0d01030b,0x0d010703,0x0d010707,0x0d010d01,0x0d030101,0x0d030501,0x0d03050f,0x0d030d09,
+        0x0d050305,0x0d050709,0x0d050905,0x0d050b0b,0x0d050d05,0x0d050f01,0x0d070101,0x0d070309,
+        0x0d070503,0x0d070901,0x0d09050b,0x0d090907,0x0d090d05,0x0d0b0101,0x0d0b0107,0x0d0b0709,
+        0x0d0b0d01,0x0d0d010b,0x0d0d0901,0x0d0f0303,0x0d0f0307,0x0f010101,0x0f010109,0x0f01010f,
+        0x0f010501,0x0f010505,0x0f01070d,0x0f010901,0x0f010b09,0x0f010d05,0x0f030105,0x0f030303,
+        0x0f030509,0x0f030907,0x0f03090b,0x0f050103,0x0f050109,0x0f050301,0x0f05030d,0x0f050503,
+        0x0f050701,0x0f050b03,0x0f070105,0x0f070705,0x0f07070b,0x0f070b07,0x0f090103,0x0f09010b,
+        0x0f090307,0x0f090501,0x0f090b01,0x0f0b0505,0x0f0b0905,0x0f0d0105,0x0f0d0703,0x0f0f0101
+    };
+
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    // Per-expert weight base = w_base + expert_offset_blocks * 110 bytes.
+    // Per-output-row base = expert_base + o * blocks_per_row * 110.
+    size_t exp_off_bytes = (size_t)expert_offset_blocks * 110;
+    size_t row_off_bytes = (size_t)o * (size_t)blocks_per_row * 110;
+    const unsigned char* w_row = w_base + exp_off_bytes + row_off_bytes;
+    float acc = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += blockDim.x) {
+        const unsigned char* blk = w_row + (size_t)b * 110;
+        unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        float d = aether_f16_to_f32_dev(d_bits);
+        const unsigned char* qs     = blk + 2;             // 64 bytes
+        const unsigned char* qh     = blk + 2 + 64;        // 8 bytes
+        const unsigned char* signs  = blk + 2 + 64 + 8;    // 32 bytes
+        const unsigned char* scales = blk + 2 + 64 + 8 + 32; // 4 bytes
+        const float* x_blk = x + (size_t)b * 256;
+        float blk_acc = 0.0f;
+        #pragma unroll
+        for (int ib32 = 0; ib32 < 8; ib32++) {
+            unsigned int scale_nib =
+                ((unsigned int)scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0xFu;
+            float db = d * (float)(1 + 2 * (int)scale_nib);
+            unsigned int qh_byte = (unsigned int)qh[ib32];
+            #pragma unroll
+            for (int l = 0; l < 4; l++) {
+                unsigned int idx1 =
+                      (unsigned int)qs[ib32 * 8 + 2 * l + 0]
+                    | ((qh_byte << (8 - 2 * l)) & 256u);
+                unsigned int idx2 =
+                      (unsigned int)qs[ib32 * 8 + 2 * l + 1]
+                    | ((qh_byte << (7 - 2 * l)) & 256u);
+                unsigned int grid1 = iq3s_grid[idx1];
+                unsigned int grid2 = iq3s_grid[idx2];
+                unsigned int sign  = (unsigned int)signs[ib32 * 4 + l];
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    unsigned int q0 = (grid1 >> (8 * j)) & 0xFFu;
+                    unsigned int q1 = (grid2 >> (8 * j)) & 0xFFu;
+                    float s0 = (sign & (1u << (j + 0))) ? -1.0f : 1.0f;
+                    float s1 = (sign & (1u << (j + 4))) ? -1.0f : 1.0f;
+                    blk_acc += x_blk[32 * ib32 + 8 * l + j + 0] * (db * (float)q0 * s0);
+                    blk_acc += x_blk[32 * ib32 + 8 * l + j + 4] * (db * (float)q1 * s1);
+                }
+            }
+        }
+        acc += blk_acc;
+    }
+    // Same warp-reduce-then-cross-warp-reduce as Q4_K/Q8_0/Q5_0 expert kernels.
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    __shared__ float warp_sums[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float w_acc = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            w_acc += __shfl_down_sync(0xFFFFFFFFu, w_acc, off);
+        }
+        if (lane == 0) y[o] = w_acc;
+    }
+}
+
 // FR-17-extra-f16-fwd — F16-weight matmul for seq=1 autoregressive decode.
 // Layout: weights stored as raw F16 (2 bytes/elem) in row-major order
 // [n_out * n_in].  Input x is F32 [n_in].  Output y is F32 [n_out].
@@ -3404,6 +3555,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_expert_matmul_seq1",
               "fused_q8_0_expert_matmul_seq1",
               "fused_q5_0_expert_matmul_seq1",
+              "fused_iq3_s_expert_matmul_seq1",
               "bert_self_attention_fwd",
               "bert_embed_sum"])
             .expect("load_ptx");
@@ -3455,6 +3607,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_expert_matmul_seq1").unwrap();
         let fused_q8_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q8_0_expert_matmul_seq1").unwrap();
         let fused_q5_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_expert_matmul_seq1").unwrap();
+        let fused_iq3_s_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_s_expert_matmul_seq1").unwrap();
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
         let bert_embed_sum = device.get_func("aether_kernels", "bert_embed_sum").unwrap();
 
@@ -3482,6 +3635,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_expert_matmul_seq1,
                   fused_q8_0_expert_matmul_seq1,
                   fused_q5_0_expert_matmul_seq1,
+                  fused_iq3_s_expert_matmul_seq1,
                   bert_self_attention_fwd, bert_embed_sum }
     })
 }
@@ -4657,6 +4811,37 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_q5_0_expert_matmul_seq1.clone()
             .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
             .expect("launch fused_q5_0_expert_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17-extra-moe-quant-dispatch MoE — IQ3_S expert-variant matmul.
+/// 110-byte 256-elem blocks.  Per-expert offset = `expert_idx * n_out *
+/// blocks_per_row * 110` bytes.  Used by GLM-4.7-flash MoE expert tensors
+/// quantised to IQ3_S (dt=21).
+#[no_mangle] pub extern "C" fn aether_op_fused_iq3_s_expert_matmul_seq1_cuda(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_base) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 || expert_idx < 0 { return -1; }
+    let expert_offset_blocks = expert_idx * n_out * blocks_per_row;
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_iq3_s_expert_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
+            .expect("launch fused_iq3_s_expert_matmul_seq1");
     }
     0
 }
