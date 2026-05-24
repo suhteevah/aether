@@ -2925,8 +2925,12 @@ impl QwenSession {
     /// FR-x-extra-sampling: temperature + top-p sampler over the
     /// generation loop.  `temperature <= 0.0` falls back to greedy
     /// argmax (bit-identical to the existing `generate` / `decode_step`
-    /// path).  `top_p >= 1.0` disables nucleus cutoff.  RNG is seeded
-    /// from the OS at first call and stepped via xorshift64.
+    /// path).  `top_p >= 1.0` disables nucleus cutoff.  Optional
+    /// `presence_penalty` subtracts a flat amount from any
+    /// previously-seen-token's logit;  `frequency_penalty` subtracts
+    /// proportional to the seen-count (OpenAI-compatible semantics).
+    /// RNG is seeded from the OS at first call and stepped via
+    /// xorshift64.
     pub fn generate_sampled(
         &mut self,
         prompt_ids: &[usize],
@@ -2934,20 +2938,33 @@ impl QwenSession {
         stop_token: Option<usize>,
         temperature: f32,
         top_p: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
     ) -> Vec<usize> {
         self.reset();
         self.prefill(prompt_ids);
         let mut generated = Vec::with_capacity(max_tokens);
         let mut last = *prompt_ids.last().expect("prompt cannot be empty");
         let mut rng = seed_rng();
+        // Track seen-counts across the GENERATED stream only (matches
+        // OpenAI's reference behaviour — the prompt is context, not
+        // material to penalise against the assistant's output).  Map
+        // is sparse since we touch one new id per step.
+        let mut seen: std::collections::HashMap<usize, u32> =
+            std::collections::HashMap::new();
         for _ in 0..max_tokens {
             let mut logits = self.step_logits(last);
+            if presence_penalty != 0.0 || frequency_penalty != 0.0 {
+                apply_repetition_penalty(&mut logits, &seen,
+                    presence_penalty, frequency_penalty);
+            }
             let id = if temperature <= 0.0 {
                 argmax(&logits)
             } else {
                 sample_from_logits(&mut logits, temperature, top_p, &mut rng)
             };
             if Some(id) == stop_token { break; }
+            *seen.entry(id).or_insert(0) += 1;
             generated.push(id);
             last = id;
             if self.next_pos as usize >= MAX_SEQ - 1 { break; }
@@ -3017,6 +3034,29 @@ impl QwenSession {
 /// behaviour exactly.
 pub fn argmax_external(logits: &[f32]) -> usize {
     argmax(logits)
+}
+
+/// OpenAI-compat repetition penalties.  Both apply to logits BEFORE
+/// the temperature/softmax step (i.e. raw logits).  Semantics match
+/// the OpenAI API spec:
+///   - `presence_penalty p`:  `logits[t] -= p`  for any `t` in `seen`
+///     (the indicator of having appeared, regardless of count).
+///   - `frequency_penalty f`: `logits[t] -= f * count[t]`
+///     (proportional to how many times `t` has appeared so far).
+///
+/// Both default to 0.0 (no penalty).  Typical chat values are 0.1..=1.5
+/// for either field;  larger numbers more aggressively avoid repeats.
+pub fn apply_repetition_penalty(
+    logits: &mut [f32],
+    seen: &std::collections::HashMap<usize, u32>,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+) {
+    for (&id, &count) in seen.iter() {
+        if id >= logits.len() { continue; }
+        let penalty = presence_penalty + frequency_penalty * (count as f32);
+        logits[id] -= penalty;
+    }
 }
 
 /// External-callable version of `seed_rng` for the trainer-bin

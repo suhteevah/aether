@@ -89,6 +89,12 @@ struct Cli {
     /// body omits `temperature` / `top_p`.  0.0 → greedy argmax.
     default_temperature: f32,
     default_top_p: f32,
+    /// OpenAI-compat repetition penalty defaults.  0.0 = off.
+    /// `0.3 / 0.3` is a gentle starting point that breaks the
+    /// degenerate "loop on prompt suffix" pattern without making
+    /// outputs jittery.
+    default_presence_penalty: f32,
+    default_frequency_penalty: f32,
 }
 
 fn parse_cli() -> Cli {
@@ -112,6 +118,8 @@ fn parse_cli() -> Cli {
         // OpenAI-standard `temperature` / `top_p` body fields.
         default_temperature: 0.8,
         default_top_p: 0.9,
+        default_presence_penalty: 0.3,
+        default_frequency_penalty: 0.3,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -142,6 +150,10 @@ fn parse_cli() -> Cli {
                 it.next().expect("--temperature F").parse().expect("temperature float"),
             "--top-p" => cli.default_top_p =
                 it.next().expect("--top-p F").parse().expect("top_p float"),
+            "--presence-penalty" => cli.default_presence_penalty =
+                it.next().expect("--presence-penalty F").parse().expect("presence_penalty float"),
+            "--frequency-penalty" => cli.default_frequency_penalty =
+                it.next().expect("--frequency-penalty F").parse().expect("frequency_penalty float"),
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--bind ADDR] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -291,6 +303,13 @@ struct JsonBody {
     temperature: Option<f32>,
     /// Top-p (nucleus) sampling cutoff.  `None` or `1.0` → no cutoff.
     top_p: Option<f32>,
+    /// OpenAI-compat penalty: subtract this from any previously-seen
+    /// token's logit.  `None` or `0.0` → no penalty.
+    presence_penalty: Option<f32>,
+    /// OpenAI-compat penalty: subtract `frequency_penalty * count[t]`
+    /// from each previously-seen token's logit.  `None` or `0.0` → no
+    /// penalty.
+    frequency_penalty: Option<f32>,
     /// FR-x-extra-chat-template: ordered (role, content) pairs from the
     /// request's `messages: [...]` array.  Empty when the client sent
     /// `prompt_ids` directly.  Used by the chat-template apply path.
@@ -314,12 +333,15 @@ fn parse_body(body: &[u8], default_max: usize) -> Result<JsonBody, &'static str>
     let messages = find_messages_pairs(s);
     let temperature = find_key_float(s, "temperature");
     let top_p = find_key_float(s, "top_p");
+    let presence_penalty = find_key_float(s, "presence_penalty");
+    let frequency_penalty = find_key_float(s, "frequency_penalty");
 
     if prompt_ids.is_empty() && text_prompt.is_none() {
         return Err("body has neither prompt_ids nor messages[].content");
     }
 
-    Ok(JsonBody { prompt_ids, max_tokens, stream, text_prompt, temperature, top_p, messages })
+    Ok(JsonBody { prompt_ids, max_tokens, stream, text_prompt, temperature, top_p,
+                   presence_penalty, frequency_penalty, messages })
 }
 
 // ============================================================================
@@ -1013,8 +1035,10 @@ unsafe fn render_completion_json(state: &ServerState, req: &JsonBody) -> String 
                 });
                 let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
                 let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
+                let pp = req.presence_penalty.unwrap_or(state.cli.default_presence_penalty);
+                let fp = req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty);
                 let ids = sess.generate_sampled(
-                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p);
+                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p, pp, fp);
                 completion_tokens = ids.len() as c_int;
                 let text = sess.decode_ids(&ids);
                 generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
@@ -1244,11 +1268,13 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
                 // fallback to CLI defaults.  temperature <= 0 → greedy.
                 let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
                 let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
+                let pp = req.presence_penalty.unwrap_or(state.cli.default_presence_penalty);
+                let fp = req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty);
                 let ids = sess.generate_sampled(
-                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p);
+                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p, pp, fp);
                 let secs = t.elapsed().as_secs_f32();
-                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2})",
-                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6), temperature, top_p);
+                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2} pp={:.2} fp={:.2})",
+                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6), temperature, top_p, pp, fp);
                 completion_tokens = ids.len() as c_int;
                 // Decode IDs back to real text via the loaded BPE tokenizer
                 // + GPT-2 byte fixup. Falls back to id list if tokenizer
@@ -1341,22 +1367,31 @@ unsafe fn handle_completion_streaming_t(state: &ServerState, t: &mut dyn Transpo
             });
             let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
             let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
+            let pp = req.presence_penalty.unwrap_or(state.cli.default_presence_penalty);
+            let fp = req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty);
             // Stream the sampled generation token-by-token.  Use step_logits +
-            // sample_from_logits rather than generate_sampled so we can emit
-            // each token as it's produced.  Mirrors the non-streaming sampled
-            // path's semantics.
+            // sample_from_logits + apply_repetition_penalty so we can emit
+            // each token as it's produced.  Mirrors generate_sampled's
+            // semantics exactly.
             sess.reset();
             sess.prefill(&req.prompt_ids);
             let mut last = *req.prompt_ids.last().unwrap();
             let mut rng = aether_rt::serving::seed_rng_external();
+            let mut seen: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
             for _ in 0..req.max_tokens {
                 let mut logits = sess.step_logits(last);
+                if pp != 0.0 || fp != 0.0 {
+                    aether_rt::serving::apply_repetition_penalty(
+                        &mut logits, &seen, pp, fp);
+                }
                 let id = if temperature <= 0.0 {
                     aether_rt::serving::argmax_external(&logits)
                 } else {
                     aether_rt::serving::sample_from_logits(&mut logits, temperature, top_p, &mut rng)
                 };
                 if Some(id) == stop { break; }
+                *seen.entry(id).or_insert(0) += 1;
                 let piece = sess.decode_ids(&[id]);
                 let escaped = json_escape(&piece);
                 let chunk = format!(
