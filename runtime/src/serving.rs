@@ -66,6 +66,7 @@ use crate::cuda::{
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
+    aether_op_fused_f32_matmul_seq1_cuda,
     aether_op_fused_q4_0_matmul_seq1_cuda,
     aether_op_fused_q5_0_matmul_seq1_cuda,
     aether_op_fused_q8_0_matmul_seq1_cuda,
@@ -90,6 +91,14 @@ unsafe fn dispatch_matmul(
     x_norm: i64, w: i64, dt: i32, y: i64, n_out: c_int, n_in: c_int,
 ) {
     match dt {
+        0 => {
+            // F32 (FR-17-extra-mla-fwd).  Some GLM-4.7-flash tensors are
+            // stored as raw float32 (notably the shared-expert MLPs and a
+            // handful of head-adjacent tensors).  Layout is row-major
+            // [n_out, n_in] in a u8-registered buffer (same upload path as
+            // F16 / Q4_K / etc.).
+            aether_op_fused_f32_matmul_seq1_cuda(x_norm, w, y, n_in, n_out);
+        }
         12 => {
             // Q4_K: 256-elem super-blocks; blocks_per_row = n_in / 256.
             aether_op_fused_q4k_matmul_seq1_v2_cuda(x_norm, w, y, n_out, n_in / 256);
@@ -579,6 +588,7 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
     // so callers can do `nb / d_model` and get the row count regardless of
     // the underlying packing.
     let (n_units, bytes) = match dt {
+        0  => { (n_elems, n_elems * 4) }                     // F32 (4 bytes/elem)
         12 => { let nb = n_elems / 256; (nb, nb * 144) }     // Q4_K
         14 => { let nb = n_elems / 256; (nb, nb * 210) }     // Q6_K
         1  => { (n_elems, n_elems * 2) }                     // F16 (2 bytes/elem)
@@ -634,6 +644,7 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
     let dt = aether_gguf_get_tensor_dtype(h, idx);
     let n_elems = aether_gguf_get_tensor_n_elems(h, idx) as usize;
     let (n_units, bytes) = match dt {
+        0  => { (n_elems, n_elems * 4) }
         12 => { let nb = n_elems / 256; (nb, nb * 144) }
         14 => { let nb = n_elems / 256; (nb, nb * 210) }
         1  => { (n_elems, n_elems * 2) }
@@ -673,7 +684,17 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         upload_tensor_u8_opt(h, &format!("{}attn_q_b.weight", p))
     } else { (0, 0, 0) };
     // For MLA blocks attn_k/attn_v don't exist; for non-MLA blocks they do.
-    let (w_q, nb_qo, dt_q)         = upload_tensor_u8(h, &format!("{}attn_q.weight", p));
+    // For MLA + q_lora_rank > 0 (GLM-4.7-flash, DeepSeek-V2 large) attn_q
+    // doesn't exist either — Q comes from attn_q_a @ attn_q_a_norm @ attn_q_b.
+    // Use the opt loader so MLA-Q-LoRA archs don't panic; non-MLA archs and
+    // V2-Lite (MLA + q_lora_rank == 0) still produce a real w_q.  Forward
+    // pass at serving.rs:978-992 picks the right branch based on
+    // cfg.q_lora_rank + bw.w_q_a/w_q_b presence.
+    let (w_q, nb_qo, dt_q) = if is_mla && w_q_a != 0 && w_q_b != 0 {
+        upload_tensor_u8_opt(h, &format!("{}attn_q.weight", p))
+    } else {
+        upload_tensor_u8(h, &format!("{}attn_q.weight", p))
+    };
     let (w_k, nb_kv, dt_k)         = if is_mla {
         (0, 0, 0)
     } else {
@@ -789,8 +810,16 @@ unsafe fn block_forward_devarg(
                 act.x_norm, bw.w_gate, bw.w_up, act.gate,
                 d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
         } else {
-            panic!("FFN gate/up dtypes not both Q4_K (got gate={}, up={}); needs a non-fused fallback",
-                bw.dt_gate, bw.dt_up);
+            // Non-fused SwiGLU fallback for non-Q4_K gate/up dtypes
+            // (e.g. GLM-4.7-flash layer 0 stores both as IQ4_XS).  Three
+            // separate kernel launches instead of the fused one — same
+            // arithmetic result, slightly more overhead.
+            let up_tmp = aether_dev_alloc_f32(d_ff);
+            dispatch_matmul(act.x_norm, bw.w_gate, bw.dt_gate, act.gate, d_ff, d_model);
+            dispatch_matmul(act.x_norm, bw.w_up,   bw.dt_up,   up_tmp,   d_ff, d_model);
+            aether_op_silu_f32_cuda(act.gate, d_ff);
+            aether_op_mul_inplace_f32_cuda(act.gate, up_tmp, d_ff);
+            let _ = aether_dev_free_f32(up_tmp);
         }
         dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
         if bw.post_ffn_norm_g != 0 {
@@ -1406,6 +1435,14 @@ impl QwenSession {
             if is_mla {
                 eprintln!("[QwenSession] MLA mode: q_total={} d_k_row={} d_v_row={} attn_out_dim={}",
                     q_total, d_k_row, d_v_row, attn_out_dim);
+                let b0 = &blocks[0];
+                let q_branch = if cfg.q_lora_rank > 0 && b0.w_q_a != 0 && b0.w_q_b != 0 {
+                    format!("Q-LoRA (q_lora_rank={}, w_q_a=0x{:x}, w_q_b=0x{:x})",
+                        cfg.q_lora_rank, b0.w_q_a, b0.w_q_b)
+                } else {
+                    format!("direct attn_q (q_lora_rank=0, w_q=0x{:x})", b0.w_q)
+                };
+                eprintln!("[QwenSession] MLA Q branch (layer 0): {}", q_branch);
             }
             let act = ActivationGpu {
                 x: aether_dev_alloc_f32(cfg.d_model as c_int),

@@ -1,15 +1,95 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 evening (**GLM-4.7-flash session-construction WITNESSED on real GGUF.**
-Three commits + 1 cnc smoke this session — IQ3_S kernel closes the last quant
-gap, MLA head_dim cap 256→640 closes the kernel-side blocker for GLM, and
-a probe-only smoke on cnc GPU 0 proved `ModelConfig::from_gguf` parses GLM
-correctly and the new MLA guard accepts qk=576/v=512.)
+2026-05-24 late evening (**GLM-4.7-flash Q-LoRA branch WITNESSED entering on
+real GGUF — partial witness. 4 gaps surfaced + 3 fixes shipped + 1 new
+kernel during the smoke chase; full decode still gated on MoE expert
+matmul dispatch for non-Q4_K dtypes.**)
+
+## What Was Done This Turn (2026-05-24 late evening, GLM smoke chase)
+
+Built aether-serve on cnc GPU 1 (workhorse stopped via openclaw main (B)
+approval), ran the GLM-4.7-flash-UD-IQ3_XXS GGUF through full
+`QwenSession::new` + warmup decode.  Four real gaps surfaced; first three
+fixed in-line, fourth filed.
+
+**Witnessed:**
+
+```
+[QwenSession] arch=deepseek2 layers=47 d_model=2048 heads_q=20 heads_kv=1
+              head_dim=102 d_ff=10240 vocab=154880 rope=1000000 eps=1.00e-5
+[QwenSession] MLA mode: q_total=11520 d_k_row=11520 d_v_row=10240 attn_out_dim=10240
+[QwenSession] MLA Q branch (layer 0): Q-LoRA (q_lora_rank=768,
+              w_q_a=0x2, w_q_b=0x3)
+[aether-serve] model loaded in 36.91s
+[aether-serve] warming GPU + capturing graph (1 steps)...
+```
+
+The `q_lora_rank=768, w_q_a/b non-zero` line is the first proof that GLM's
+Q-LoRA tensors **load successfully and the branch will fire** — `serving.rs:978-988`
+was previously dead code (V2-Lite has `q_lora_rank=0`).
+
+**Fixes shipped this turn:**
+
+| # | What | Where |
+|---|---|---|
+| 1 | `load_block` no longer panics on missing `attn_q.weight` for `q_lora_rank>0` MLA archs (use opt loader when `is_mla && w_q_a/b loaded`) | `runtime/src/serving.rs:676` |
+| 2 | F32 (dtype 0) weight matmul: new `fused_f32_matmul_seq1` CUDA kernel + `aether_op_fused_f32_matmul_seq1_cuda` wrapper + `dt=0` case in `dispatch_matmul` + `upload_tensor_u8` accepts dtype 0 with `n_elems * 4` bytes | `runtime/src/cuda.rs:3105+`, `runtime/src/serving.rs:92,581,646` |
+| 3 | Non-fused SwiGLU FFN fallback for non-Q4_K gate/up (GLM layer 0 = IQ4_XS): `dispatch_matmul(gate) + dispatch_matmul(up) + silu + mul` with a tmp `d_ff` scratch | `runtime/src/serving.rs:813` |
+| 4 | Added one-shot `[QwenSession] MLA Q branch (layer 0): ...` diagnostic so the Q-LoRA branch is visible at load time | `runtime/src/serving.rs:1416` |
+
+**Open gap (filed): `FR-17-extra-moe-quant-dispatch`** — `moe_ffn_forward`
+expert dispatch (`serving.rs:1132`) supports Q4_K(12) / Q5_0(6) / Q8_0(8)
+only.  GLM-4.7-flash MoE blocks (layer 1+) use IQ3_S(21) for many expert
+tensors, with IQ3_XXS / IQ4_NL / IQ4_XS / Q5_K / Q6_K / F16 / F32 likely
+present too.  The minimum-path-to-GLM-witness is the IQ3_S expert variant
+(mirror of `fused_q4k_expert_matmul_seq1` with the IQ3_S unpacking + odd-int
+scale).  The full generalization is a dispatch-table refactor worth its own
+session.
+
+**Coordination note:** workhorse stopped + restarted cleanly via
+`systemctl stop openclaw-inference-workhorse.service` →
+`systemctl start ...`.  Memory baseline before smoke: GPU 1 = 10513 MiB
+used (workhorse 10254 MiB).  After stop: 259 MiB (rpc-server only).
+After restart: workhorse re-loaded, GPU 1 = 515 MiB and climbing.
+GPU 0 untouched throughout (6077 MiB; matt-voice stale ~4958 MiB +
+scout/embed).  No service stops on GPU 0.  No fabricated logit dump —
+decode panicked before producing logits, so no DUMP line in this handoff.
+
+## What's Next (priority order)
+
+1. **`FR-17-extra-moe-quant-dispatch` (IQ3_S expert matmul, minimum
+   sufficient)** — write `fused_iq3_s_expert_matmul_seq1` mirroring the
+   Q4_K expert pattern (`expert_offset_blocks = expert_idx * n_out *
+   blocks_per_row` added to weight pointer, 110-byte block IQ3_S decode
+   per existing standalone kernel).  Wire into `moe_ffn_forward` dispatch
+   at `serving.rs:1132`.  Cost estimate: ~80 LoC CUDA + ~30 LoC
+   Rust wrapper + parity test against the standalone IQ3_S kernel on
+   1-expert input.
+
+2. **Re-run GLM full-decode smoke** — same protocol (B approval +
+   workhorse stop), with the new expert dispatch.  Expected hit order
+   for next gaps: probably more expert dtypes (IQ3_XXS / IQ4_NL / IQ4_XS).
+   Eventually witness: finite logits, structured top-5, non-PAD tokens.
+
+3. **Generalize `dispatch_expert` to a uniform "slice-copy + dispatch_matmul"
+   path** — instead of per-dtype expert kernels, add `aether_dev_d2d_u8_offset`
+   and have `dispatch_expert` copy `expert_idx`'s slice of the concatenated
+   weight buffer to a tmp u8 buffer + call the regular `dispatch_matmul`.
+   Cost: tmp alloc per expert call (slower than fused), but covers ALL
+   11 quant formats with zero new kernels.  Worth it post-witness as a
+   simplification.
+
+4. **`q_lora_rank > 0` synthetic parity test** (still applies) — exercise
+   the `attn_q_a → attn_q_a_norm → attn_q_b` chain against a CPU
+   reference in `runtime/tests/`, independent of GGUF.
+
+5. Document MLA 640 ceiling in `ModelConfig` doc-comment (unchanged).
 
 ## Project Status
-🟢 GLM-4.7-flash unblocked through session construction; full-decode gated
-on one unwitnessed branch (`q_lora_rank > 0` Q-LoRA path).  V2-Lite Q4_K_M
+🟡 GLM-4.7-flash unblocked through Q-LoRA branch *entry*; full-decode gated
+on MoE expert matmul dispatch for non-Q4_K dtypes (IQ3_S minimum, full
+generalization deferred).  V2-Lite Q4_K_M
 end-to-end decode still witnessed.  Per-kernel parity green across all 11
 GGUF quant formats (F16/Q4_0/Q4_K/Q5_0/Q5_K/Q6_K/Q8_0/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS).
 

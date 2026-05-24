@@ -82,6 +82,7 @@ struct CudaCtx {
     append_kv: CudaFunction,
     attention_seq1: CudaFunction,
     fused_f16_matmul_seq1: CudaFunction,
+    fused_f32_matmul_seq1: CudaFunction,
     fused_q4k_expert_matmul_seq1: CudaFunction,
     fused_q8_0_expert_matmul_seq1: CudaFunction,
     fused_q5_0_expert_matmul_seq1: CudaFunction,
@@ -3104,6 +3105,41 @@ extern "C" __global__ void fused_f16_matmul_seq1(
     }
 }
 
+// FR-17-extra-mla-fwd companion — F32-weight matmul for seq=1 decode.
+// GLM-4.7-flash stores some tensors (the MoE shared-expert MLPs and a few
+// LM-head-adjacent tensors) as raw F32.  Layout is row-major [n_out, n_in].
+// Same CTA shape as the F16 variant; just no f16->f32 conversion needed.
+extern "C" __global__ void fused_f32_matmul_seq1(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float*       __restrict__ y,
+    int n_in, int n_out)
+{
+    int o = blockIdx.x;
+    if (o >= n_out) return;
+    int tid = threadIdx.x;
+    const float* w_row = w + (size_t)o * n_in;
+    float acc = 0.0f;
+    for (int i = tid; i < n_in; i += blockDim.x) {
+        acc += x[i] * w_row[i];
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+    }
+    __shared__ float warp_sums[8];
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float w_acc = (tid < 8) ? warp_sums[tid] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            w_acc += __shfl_down_sync(0xFFFFFFFFu, w_acc, off);
+        }
+        if (lane == 0) y[o] = w_acc;
+    }
+}
+
 extern "C" __global__ void dequant_q6_k(
     const unsigned char* __restrict__ blocks,
     float*               __restrict__ out,
@@ -3364,6 +3400,7 @@ fn ctx() -> &'static CudaCtx {
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
               "fused_f16_matmul_seq1",
+              "fused_f32_matmul_seq1",
               "fused_q4k_expert_matmul_seq1",
               "fused_q8_0_expert_matmul_seq1",
               "fused_q5_0_expert_matmul_seq1",
@@ -3414,6 +3451,7 @@ fn ctx() -> &'static CudaCtx {
         let append_kv = device.get_func("aether_kernels", "append_kv").unwrap();
         let attention_seq1 = device.get_func("aether_kernels", "attention_seq1").unwrap();
         let fused_f16_matmul_seq1 = device.get_func("aether_kernels", "fused_f16_matmul_seq1").unwrap();
+        let fused_f32_matmul_seq1 = device.get_func("aether_kernels", "fused_f32_matmul_seq1").unwrap();
         let fused_q4k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_expert_matmul_seq1").unwrap();
         let fused_q8_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q8_0_expert_matmul_seq1").unwrap();
         let fused_q5_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_expert_matmul_seq1").unwrap();
@@ -3440,6 +3478,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1, fused_f16_matmul_seq1,
+                  fused_f32_matmul_seq1,
                   fused_q4k_expert_matmul_seq1,
                   fused_q8_0_expert_matmul_seq1,
                   fused_q5_0_expert_matmul_seq1,
@@ -4645,6 +4684,35 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_f16_matmul_seq1.clone()
             .launch(cfg, (xv, wv, yv, n_in, n_out))
             .expect("launch fused_f16_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17-extra-mla-fwd companion — F32-weight matmul for seq=1 decode.
+/// Weight is stored as raw float32 in a u8-registered buffer (same upload
+/// path as F16/Q4_K/etc.).  Used by GLM-4.7-flash which keeps some shared-
+/// expert and head-adjacent tensors as F32.
+#[no_mangle] pub extern "C" fn aether_op_fused_f32_matmul_seq1_cuda(
+    x: i64, w_f32: i64, y: i64, n_in: c_int, n_out: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_f32) else { return -1; };
+    if n_in <= 0 || n_out <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (n_out as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_f32_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_in, n_out))
+            .expect("launch fused_f32_matmul_seq1");
     }
     0
 }
