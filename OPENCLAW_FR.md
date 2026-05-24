@@ -15,6 +15,27 @@ The closure-of-the-list gate is **OpenClaw cnc-local fleet running 100% on aethe
 
 ---
 
+## Consumer-side concerns from OpenClaw operator (2026-05-23)
+
+Audit from the OpenClaw side during the deepseek-adversary expansion. These don't add new FRs but document what's blocking actual cnc adoption and where this doc has drifted from code reality.
+
+- **This file is 3 days behind code reality.** `trainer/src/bin/serve.rs::handle_request` no longer contains the stub — verified 2026-05-23 by `grep "handle_request stub"` returning zero matches. Top-of-file doc-comment now reads "OpenAI-compatible HTTP server backed by a real Qwen forward pass on GPU." Per today's `HANDOFF.md`, SharedKvPool multi-tenancy, paged-KV inside QwenSession, TLS 1.3 + h2 ALPN, and the cert-chain verifier all landed since 2026-05-20. **FR-19-extra-serve-forward-wire is effectively DONE in code but still `[ ]` here.** Recommend a sweep to flip ✅ on whatever HANDOFF.md preamble reports as landed and cite the commit hashes.
+
+- **cnc-deployed binary is stale.** `/opt/openclaw-inference/bin/aether-serve` (last modified 2026-05-20 14:53) predates SharedKvPool, paged-KV, and TLS — none of those flags are recognized by the deployed binary. Anyone trying `--tls --pool-blocks N --gguf <path>` against the cnc binary will hit "unknown flag" errors. **Recommend:** add a "deploy to cnc" runbook step to the rollout — either build-on-cnc or scp the kokonoe-built release binary. Today there is no automation pushing aether builds to cnc.
+
+- **Safe migration order is not documented yet.** Suggest a section near the top of this file:
+    1. Sync `/opt/aether` + rebuild on cnc (or scp release binary from kokonoe)
+    2. **scout (Qwen2.5-7B) swap** — safe today: FR-19-extra-serve-forward-wire closed, 7B parity proven in HANDOFF
+    3. **embed (bge-large) swap** — blocked on FR-17-extra-bert-fwd + FR-19-extra-embed-endpoint
+    4. **workhorse (Qwen2.5-14B) swap** — blocked on FR-17-extra-14b-e2e (48 decoder blocks — NaN-at-block-N regression risk surfaced for 7B at block-3; 14B not yet enumerated)
+    5. **main-fallback (Qwen2.5-32B-Q3_K_M)** — blocked on FR-17-extra-32b-e2e + FR-18-extra-tp-infer-bench
+
+- **Crash dump volume in working tree.** As of 2026-05-23, the J:/aether root contains 71 `crash_*.dump` files. If these are expected debug artifacts from active development, recommend a `.gitignore` line and a `dumps/` subdirectory; if they represent stability concerns from runtime, that warrants its own FR. From the OpenClaw side these dumps are invisible (we only consume the binary), so this is informational.
+
+- **One additional integration FR may be needed when cnc adoption begins.** OpenClaw's existing systemd units use llama.cpp's CLI surface (`--model --host --port --ctx-size --n-gpu-layers --temp --top-p --alias --metrics`). The aether-serve CLI from `serve.rs` doc-comment uses `--port --gguf --pool-blocks --tls --warmup`. Names diverge. For the migration to be one-`ExecStart=`-edit-per-unit as the top-of-this-file design promises, either (a) aether-serve grows compat aliases for the llama.cpp flag names, (b) the rollout includes a flag-translation table in the runbook, or (c) we accept a per-unit ExecStart= rewrite. Filing as a potential **FR-19-extra-cli-flag-compat** if/when this becomes painful in practice — not opening it yet, just flagging the shape.
+
+---
+
 ## Critical path (gates phase 0 of OpenClaw rollout)
 
 ### ⛔ BLOCKER: aether-serve model-forward wiring
