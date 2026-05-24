@@ -932,7 +932,12 @@ unsafe fn dispatch_h2_stream(
                                     req.text_prompt.clone()
                                 };
                                 if let Some(text) = encode_input {
-                                    req.prompt_ids = sess.encode_text(&text);
+                                    let used_template = !req.messages.is_empty();
+                                    req.prompt_ids = if used_template {
+                                        sess.encode_text_with_specials(&text)
+                                    } else {
+                                        sess.encode_text(&text)
+                                    };
                                 }
                             }
                         }
@@ -1166,7 +1171,15 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
                         let _ = send_text_t(t, 400, "body has no usable prompt");
                         return;
                     };
-                    let ids = sess.encode_text(&text);
+                    // When the chat-template path produced the text,
+                    // it contains special markers like <|user|> that
+                    // need their special-token ids (not byte BPE).
+                    let used_template = !req.messages.is_empty();
+                    let ids = if used_template {
+                        sess.encode_text_with_specials(&text)
+                    } else {
+                        sess.encode_text(&text)
+                    };
                     if ids.is_empty() {
                         let _ = send_text_t(t, 500,
                             "text encode failed (no tokenizer loaded? or vocab gap) — pass prompt_ids");

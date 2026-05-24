@@ -2737,7 +2737,98 @@ fn apply_per_arch_template(arch: &str, messages: &[(String, String)]) -> Option<
     Some(out)
 }
 
+/// FR-x-extra-chat-template: per-arch list of special-token surface
+/// strings.  Each must be looked up in the GGUF vocab via
+/// `aether_bpe_lookup_bytes` to find its single-id encoding.  encode_
+/// text_with_specials uses this list to split the input around the
+/// special tokens and emit each as its proper id rather than letting
+/// BPE byte-encode the raw `<|...|>` markers (which the model has
+/// never seen at training time).
+fn arch_special_tokens(arch: &str) -> &'static [&'static str] {
+    match arch {
+        "deepseek2" | "glm" | "glm4" => &[
+            "[gMASK]", "<sop>",
+            "<|system|>", "<|user|>", "<|assistant|>", "<|observation|>",
+            "<|endoftext|>", "<|eot_id|>", "<|eom_id|>",
+        ],
+        "qwen2" | "qwen3" | "qwen3moe" | "qwen3vl" => &[
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "<|object_ref_start|>", "<|object_ref_end|>",
+            "<|box_start|>", "<|box_end|>",
+        ],
+        "llama" => &[
+            "<|begin_of_text|>", "<|end_of_text|>",
+            "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
+        ],
+        "gemma3" => &["<start_of_turn>", "<end_of_turn>", "<bos>", "<eos>"],
+        _ => &[],
+    }
+}
+
 impl QwenSession {
+    /// FR-x-extra-chat-template: encode text containing special-token
+    /// surface markers (e.g. `<|user|>`, `[gMASK]`) into a mixed id
+    /// stream where each known marker becomes its single vocab id and
+    /// the gaps are BPE-encoded normally.  Falls back to plain
+    /// `encode_text` when no specials match.
+    pub fn encode_text_with_specials(&self, text: &str) -> Vec<usize> {
+        if self.bpe_handle < 0 || text.is_empty() { return Vec::new(); }
+        let specials = arch_special_tokens(&self.cfg.arch);
+        if specials.is_empty() { return self.encode_text(text); }
+
+        // Lookup each special surface → vocab id once.  Skip any that
+        // don't actually appear in this GGUF's vocab.
+        let mut special_ids: Vec<(&str, i32)> = Vec::with_capacity(specials.len());
+        for s in specials {
+            let id = unsafe {
+                aether_bpe_lookup_bytes(
+                    self.bpe_handle,
+                    s.as_ptr() as *const c_void,
+                    s.len() as c_int,
+                )
+            };
+            if id >= 0 { special_ids.push((s, id)); }
+        }
+        if special_ids.is_empty() { return self.encode_text(text); }
+
+        // Walk the text left-to-right, emitting BPE-encoded chunks
+        // between special-marker matches.  Use longest-match-wins so
+        // e.g. `<|eot_id|>` beats `<|`.
+        let mut out: Vec<usize> = Vec::new();
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        let mut chunk_start = 0usize;
+        while i < bytes.len() {
+            let mut matched: Option<(usize, i32)> = None; // (len, id)
+            for (s, id) in &special_ids {
+                let sb = s.as_bytes();
+                if i + sb.len() <= bytes.len() && &bytes[i..i + sb.len()] == sb {
+                    if matched.map(|(l, _)| sb.len() > l).unwrap_or(true) {
+                        matched = Some((sb.len(), *id));
+                    }
+                }
+            }
+            if let Some((slen, id)) = matched {
+                if i > chunk_start {
+                    let chunk = &text[chunk_start..i];
+                    let mut ids = self.encode_text(chunk);
+                    out.append(&mut ids);
+                }
+                out.push(id as usize);
+                i += slen;
+                chunk_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        if chunk_start < bytes.len() {
+            let chunk = &text[chunk_start..];
+            let mut ids = self.encode_text(chunk);
+            out.append(&mut ids);
+        }
+        out
+    }
+
     /// FR-x-extra-chat-template: render `messages` through the GGUF-
     /// embedded jinja-lite chat template.  Returns `None` if no
     /// template is loaded;  the caller should fall back to plain-text
