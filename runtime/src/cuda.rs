@@ -64,6 +64,8 @@ struct CudaCtx {
     dequant_q6_k_gpu:  CudaFunction,
     fused_q4k_matmul_seq1: CudaFunction,
     fused_q4_0_matmul_seq1: CudaFunction,
+    fused_q5_0_matmul_seq1: CudaFunction,
+    fused_q8_0_matmul_seq1: CudaFunction,
     fused_q4k_matmul_seq1_v2: CudaFunction,
     fused_q6k_matmul_seq1_v2: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul: CudaFunction,
@@ -1526,6 +1528,110 @@ extern "C" __global__ void fused_q4k_matmul_seq1(
     if (ni < n) out[ni] = acc;
 }
 
+// FR-17-extra-q8_0-fwd — FUSED Q8_0 matmul.  Used by cnc's V2-Lite Q4_K_M
+// for its ffn_down tensors (the unaligned d_ff=10944 / expert_ff_dim=1408
+// dimensions; llama.cpp's quantiser falls back to Q8_0 there because Q4_K's
+// 256-element super-block doesn't align to those dims).
+//
+// Q8_0 block layout (34 bytes per 32-element block):
+//   bytes 0-1   : f16 scale `d`
+//   bytes 2-33  : 32 signed-int8 quants
+//   dequant: y_i = d * (int8)qs[i]
+extern "C" __global__ void fused_q8_0_matmul_seq1(
+    const float*         __restrict__ a,           // [k]
+    const unsigned char* __restrict__ w,           // [n * n_blocks * 34]
+    float*               __restrict__ out,         // [n]
+    int n, int n_blocks)                           // k = n_blocks * 32
+{
+    const int BLOCK_N = 32;
+    __shared__ float a_tile[32];
+
+    int ni = blockIdx.x * BLOCK_N + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        a_tile[threadIdx.x] = a[bi * 32 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base =
+                w + (size_t)ni * n_blocks * 34 + (size_t)bi * 34;
+            unsigned short d_bits =
+                ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            float d = aether_f16_to_f32_dev(d_bits);
+            const signed char* qs = (const signed char*)(base + 2);
+
+            #pragma unroll
+            for (int i = 0; i < 32; i++) {
+                float w_val = d * (float)(int)qs[i];
+                acc += a_tile[i] * w_val;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (ni < n) out[ni] = acc;
+}
+
+// FR-17-extra-q5_0-fwd — FUSED Q5_0 matmul.  Companion to Q8_0; cnc's
+// V2-Lite Q4_K_M uses Q5_0 for ~half of its ffn_down_exps tensors.
+//
+// Q5_0 block layout (22 bytes per 32-element block):
+//   bytes 0-1   : f16 scale `d`
+//   bytes 2-5   : 4-byte qh (32 high-bits, one per element, little-endian u32)
+//   bytes 6-21  : 16-byte ql (nibble-packed low 4 bits, byte i holds
+//                 low-nibble for elem i AND high-nibble for elem i+16)
+//   dequant: q_lo = (ql[i] & 0xF) | ((qh >> i)        & 1) << 4
+//            q_hi = (ql[i] >> 4)  | ((qh >> (i + 16)) & 1) << 4
+//            y_at_i      = d * (q_lo - 16)
+//            y_at_i_p_16 = d * (q_hi - 16)
+extern "C" __global__ void fused_q5_0_matmul_seq1(
+    const float*         __restrict__ a,           // [k]
+    const unsigned char* __restrict__ w,           // [n * n_blocks * 22]
+    float*               __restrict__ out,         // [n]
+    int n, int n_blocks)                           // k = n_blocks * 32
+{
+    const int BLOCK_N = 32;
+    __shared__ float a_tile[32];
+
+    int ni = blockIdx.x * BLOCK_N + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        a_tile[threadIdx.x] = a[bi * 32 + threadIdx.x];
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base =
+                w + (size_t)ni * n_blocks * 22 + (size_t)bi * 22;
+            unsigned short d_bits =
+                ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            float d = aether_f16_to_f32_dev(d_bits);
+            unsigned int qh =
+                  (unsigned int)base[2]
+                | ((unsigned int)base[3] << 8)
+                | ((unsigned int)base[4] << 16)
+                | ((unsigned int)base[5] << 24);
+            const unsigned char* ql = base + 6;
+
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                unsigned char byte = ql[i];
+                int q_lo = (int)((byte & 0xFu) | (((qh >> i) & 1u) << 4)) - 16;
+                int q_hi = (int)(((byte >> 4) & 0xFu)
+                                  | (((qh >> (i + 16)) & 1u) << 4)) - 16;
+                float w_lo = d * (float)q_lo;
+                float w_hi = d * (float)q_hi;
+                acc += a_tile[i]      * w_lo;
+                acc += a_tile[i + 16] * w_hi;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (ni < n) out[ni] = acc;
+}
+
 // FR-17-extra-q4_0-fwd — FUSED Q4_0 matmul for the local DeepSeek-V2-Lite
 // GGUF (which ships in Q4_0 not Q4_K) and other Q4_0-quantised models.
 //
@@ -2630,6 +2736,8 @@ fn ctx() -> &'static CudaCtx {
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
+              "fused_q5_0_matmul_seq1",
+              "fused_q8_0_matmul_seq1",
               "fused_q4k_matmul_seq1_v2", "fused_q6k_matmul_seq1_v2",
               "fused_q4k_ffn_gate_up_silu_mul",
               "fused_q4k_matmul_seq1_v3", "fused_q4k_ffn_gate_up_silu_mul_v2",
@@ -2666,6 +2774,8 @@ fn ctx() -> &'static CudaCtx {
         let dequant_q6_k_gpu      = device.get_func("aether_kernels", "dequant_q6_k").unwrap();
         let fused_q4k_matmul_seq1 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1").unwrap();
         let fused_q4_0_matmul_seq1 = device.get_func("aether_kernels", "fused_q4_0_matmul_seq1").unwrap();
+        let fused_q5_0_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_matmul_seq1").unwrap();
+        let fused_q8_0_matmul_seq1 = device.get_func("aether_kernels", "fused_q8_0_matmul_seq1").unwrap();
         let fused_q4k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v2").unwrap();
         let fused_q6k_matmul_seq1_v2 = device.get_func("aether_kernels", "fused_q6k_matmul_seq1_v2").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul").unwrap();
@@ -2689,7 +2799,9 @@ fn ctx() -> &'static CudaCtx {
                   rms_norm_fwd, rope_apply, gqa_repeat_kv,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu,
-                  fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1, fused_q4k_matmul_seq1_v2,
+                  fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
+                  fused_q5_0_matmul_seq1, fused_q8_0_matmul_seq1,
+                  fused_q4k_matmul_seq1_v2,
                   fused_q6k_matmul_seq1_v2, fused_q4k_ffn_gate_up_silu_mul,
                   fused_q4k_matmul_seq1_v3, fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
@@ -4535,6 +4647,67 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_q4_0_matmul_seq1.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks))
             .expect("launch fused_q4_0_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17-extra-q5_0-fwd — Fused Q5_0 matmul (22-byte 32-elem blocks).
+/// `n_blocks` counts 32-element blocks (k = n_blocks * 32).
+#[no_mangle] pub extern "C" fn aether_op_fused_q5_0_matmul_seq1_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let block_n = 32u32;
+    let grid_x = ((n as u32) + block_n - 1) / block_n;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (block_n, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q5_0_matmul_seq1.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q5_0_matmul_seq1");
+    }
+    0
+}
+
+/// FR-17-extra-q8_0-fwd — Fused Q8_0 matmul (34-byte 32-elem blocks).
+#[no_mangle] pub extern "C" fn aether_op_fused_q8_0_matmul_seq1_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let block_n = 32u32;
+    let grid_x = ((n as u32) + block_n - 1) / block_n;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (block_n, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q8_0_matmul_seq1.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q8_0_matmul_seq1");
     }
     0
 }
