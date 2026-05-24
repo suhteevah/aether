@@ -1,7 +1,73 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 morning (**8-item priority sweep done — text-prompt encode
+2026-05-24 afternoon (**Continuous-batching Phase 2: SSE streaming SHIPPED
++ live; batched-decode component primitives (hetero attn/append + weight-reuse
+seqB matmul, 1.9×) shipped + tested. Crash-recovery session.**)
+
+## What Was Done This Session (2026-05-24 afternoon — continuous-batching Phase 2)
+
+Session resumed after a crash. Pre-session HEAD was `6834cd0` (continuous-
+batching scheduler + TP scaffolding); working tree clean, nothing lost. Picked
+up the Phase-2 follow-ons that 6834cd0's own commit message filed. 6 commits:
+
+| Hash | What | State |
+|---|---|---|
+| `85518f6` | **SSE streaming over the scheduler** | ✅ SHIPPED + live-verified |
+| `0837e4e` | hetero-position batched attn + append_kv kernels | ✅ tested primitive |
+| `02fca19` | weight-reuse seqB Q4_K matmul (1.8–1.9× @ B=4) | ✅ tested + measured |
+| `c9d4501` | move seqB kernel → PAGED_KERNEL_SRC (lazy module) | ✅ fix |
+| `5a5ed0b` | bench-ledger: correct regression misattribution | ✅ |
+
+**#1 SSE streaming (DONE, the user-facing win).** `stream:true` with
+`--max-concurrent N` previously 503'd (`serve.rs:1602`). Now: a `StreamEvent`
+mpsc channel from the scheduler worker → per-token SSE deltas in
+`handle_completion_streaming_scheduler_t`. Chunk format byte-identical to the
+legacy single-session path. **Live-verified on Qwen2.5-7B (3070 Ti):** single
+stream + two concurrent streams, no deadlock, `[DONE]` terminator. Gated test
+`batched_streaming_pieces_match_full_decode` passes (streamed ids == final ids).
+
+**#2 batched-decode component primitives (tested, NOT yet wired e2e):**
+- Hetero kernels (`batched_paged_attention_hetero_devarg` /
+  `batched_paged_append_kv_hetero_devarg`) — each request reads its own
+  `cur_seq`/`pos` from a per-request array, so slots at DIFFERENT decode
+  positions can fuse into one launch. Parity bit-identical to staggered seq1
+  (`cuda_batched_paged_attention_hetero_parity.rs`).
+- `fused_q4k_matmul_seqB_v3` — weight-reuse batched matmul (dequant once, apply
+  to B rows). **1.9× at batch=4, n=3584**; bit-identical to B× seq1_v3
+  (`cuda_q4k_matmul_seqB_parity.rs`). Lives in `PAGED_KERNEL_SRC` (lazy module)
+  so it imposes ZERO cost on single-stream decode.
+
+**⚠️ Honest status: batched decode is NOT yet faster end-to-end.** The
+scheduler still multiplexes serial seq1 steps. These are the proven building
+blocks; the remaining integration (Phase 2b-2b, below) is what makes concurrent
+serving actually faster.
+
+**Bench note (important):** bench-runner flagged decode at 34.5 tok/s vs a
+37.2 baseline (add5216, 2026-05-20) and blamed the seqB kernel. **Disproved** —
+`KERNEL_SRC` is byte-identical to pre-session 6834cd0, so the −7% predates this
+session (drift across the 05-20→05-24 GLM/MoE/gemma3/qwen3 arc). See
+BENCH_LEDGER correction at `5a5ed0b`.
+
+### What's Next (this thread)
+
+1. **Phase 2b-2b — batched block-forward** (the e2e throughput win). Build
+   `step_logits_for_batch(slots)`: B-row matmuls via `fused_q4k_matmul_seqB_v3`,
+   a per-request batched RoPE kernel (RoPE position differs per slot — the
+   only genuinely new bit), hetero attn/append (done), B-row norms/silu/residual.
+   Prove token-identical to serial decode on a real GGUF, then wire the
+   scheduler worker to call it instead of per-slot serial steps. Also needs
+   seqB variants of q6k/f16 matmuls + the fused FFN, OR fall back to seq1 for
+   non-q4k weights initially.
+2. **Bisect the 37.2→34.6 single-stream decode drift** across 05-20→6834cd0.
+   Likely a KERNEL_SRC `__global__` added during the GLM/MoE work
+   (nvrtc_kernel_unit_pressure). Separate from Phase 2.
+3. TP Phase 2 (the other 6834cd0 follow-on; the cuda.rs multi-context refactor)
+   remains untouched this session.
+
+---
+
+## (prior) 2026-05-24 morning (**8-item priority sweep done — text-prompt encode
 WIRED + verified live on aether-serve:18913, --bind flag fixed, MLA
 absorbed-mode dtype dispatch + persistent workspace buffers landed,
 dispatch_expert generalized to table-driven, Q-LoRA CPU parity test
