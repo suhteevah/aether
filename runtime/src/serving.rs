@@ -31,11 +31,14 @@ use crate::{
     aether_gguf_find_tensor_by_name, aether_gguf_get_tensor_dtype,
     aether_gguf_get_tensor_data_ptr, aether_gguf_get_tensor_n_elems,
     aether_dequant_q4_k_m, aether_f16_to_f32,
-    aether_gguf_get_metadata_u32, aether_gguf_get_metadata_array_string_n,
+    aether_gguf_get_metadata_u32, aether_gguf_get_metadata_string,
+    aether_gguf_get_metadata_array_string_n,
     aether_gguf_get_metadata_array_string_get,
     aether_bpe_tokenizer_new, aether_bpe_tokenizer_free,
     aether_bpe_add_token_with_id, aether_bpe_add_merge_by_id,
     aether_bpe_decode, aether_bpe_encode_ids, aether_bpe_lookup_bytes,
+    aether_template_new, aether_template_free, aether_template_push_message,
+    aether_template_render, aether_template_set_var,
 };
 use crate::cuda::{
     aether_dev_init, aether_dev_alloc_f32, aether_dev_free_f32,
@@ -1779,6 +1782,12 @@ pub struct QwenSession {
     /// slot means "no vocab entry for that surface char" — which
     /// shouldn't happen for any well-formed GPT-2-style vocab.
     byte_to_id_cache: std::sync::OnceLock<Box<[i32; 256]>>,
+    /// FR-x-extra-chat-template — Jinja-style chat template loaded from
+    /// `tokenizer.chat_template` GGUF metadata.  `None` if the model
+    /// doesn't ship one (e.g. base / non-instruct models).  Used by
+    /// `apply_chat_template` to render `messages: [(role, content)]`
+    /// into the wire text the model was trained to expect.
+    chat_template: Option<String>,
 }
 
 struct PagedCfg {
@@ -2032,6 +2041,29 @@ impl QwenSession {
 
             let (bpe_handle, eos_token) = load_tokenizer_from_gguf(h);
             let gpt2_u2b = build_gpt2_unicode_to_byte();
+            // FR-x-extra-chat-template: best-effort read of the GGUF's
+            // `tokenizer.chat_template` string metadata.  Buffer is 64 KiB
+            // since some templates (DeepSeek / Yi family) approach 8 KiB,
+            // and concatenated function-calling templates can grow.
+            let chat_template = {
+                let key = b"tokenizer.chat_template";
+                let mut buf = vec![0u8; 65536];
+                let nb = aether_gguf_get_metadata_string(
+                    h, key.as_ptr() as i64, key.len() as c_int,
+                    buf.as_mut_ptr() as i64, buf.len() as c_int);
+                if nb > 0 {
+                    match std::str::from_utf8(&buf[..nb as usize]) {
+                        Ok(s) => {
+                            eprintln!("[QwenSession] chat_template loaded ({} bytes)", nb);
+                            Some(s.to_string())
+                        }
+                        Err(_) => None,
+                    }
+                } else {
+                    eprintln!("[QwenSession] no chat_template in GGUF metadata");
+                    None
+                }
+            };
             Ok(QwenSession {
                 gguf_handle: h, blocks, final_norm_g,
                 lm_head, lm_n_blocks, lm_dt,
@@ -2045,6 +2077,7 @@ impl QwenSession {
                 page_table_host: Vec::new(),
                 cfg,
                 byte_to_id_cache: std::sync::OnceLock::new(),
+                chat_template,
             })
         }
     }
@@ -2630,6 +2663,125 @@ fn argmax(logits: &[f32]) -> usize {
 // =====================================================================
 
 impl QwenSession {
+    /// FR-x-extra-chat-template: render `messages` through the GGUF-
+    /// embedded jinja-lite chat template.  Returns `None` if no
+    /// template is loaded;  the caller should fall back to plain-text
+    /// encode of joined contents in that case.
+    ///
+    /// Templates often reference `add_generation_prompt` and similar
+    /// flags that signal "the next thing the model emits is the
+    /// assistant turn".  We set this to `"true"` so the template
+    /// closes with whatever role marker invites the assistant to
+    /// respond.
+    pub fn apply_chat_template(&self, messages: &[(String, String)]) -> Option<String> {
+        let template = self.chat_template.as_ref()?;
+        if messages.is_empty() { return None; }
+        unsafe {
+            let th = aether_template_new();
+            if th < 0 { return None; }
+
+            // Common template variables.  Jinja-lite resolves missing
+            // ones to "" (empty), so over-setting is safe.
+            let _ = aether_template_set_var(th,
+                b"add_generation_prompt".as_ptr() as *const c_void, 20,
+                b"true".as_ptr() as *const c_void, 4);
+            let _ = aether_template_set_var(th,
+                b"bos_token".as_ptr() as *const c_void, 9,
+                b"".as_ptr() as *const c_void, 0);
+            let _ = aether_template_set_var(th,
+                b"eos_token".as_ptr() as *const c_void, 9,
+                b"".as_ptr() as *const c_void, 0);
+
+            for (role, content) in messages {
+                let rc = aether_template_push_message(th,
+                    role.as_ptr() as *const c_void, role.len() as c_int,
+                    content.as_ptr() as *const c_void, content.len() as c_int);
+                if rc != 0 {
+                    aether_template_free(th);
+                    return None;
+                }
+            }
+
+            // 256 KiB output buffer — chat templates seldom exceed
+            // even 16 KiB but Function-calling / RAG payloads can.
+            let mut out = vec![0u8; 256 * 1024];
+            let nb = aether_template_render(th,
+                template.as_ptr() as *const c_void, template.len() as c_int,
+                out.as_mut_ptr() as *mut c_void, out.len() as c_int);
+            aether_template_free(th);
+            if nb <= 0 { return None; }
+            String::from_utf8(out[..nb as usize].to_vec()).ok()
+        }
+    }
+
+    /// FR-x-extra-sampling: split out from `decode_step` so the caller
+    /// can do something other than argmax on the result.  Advances
+    /// `next_pos` and returns the raw logits vector (length =
+    /// cfg.vocab).  Same forward path as `decode_step`.
+    pub fn step_logits(&mut self, last_id: usize) -> Vec<f32> {
+        unsafe {
+            let pos = self.next_pos;
+            if let Err(e) = self.ensure_block_for_position(pos) {
+                panic!("[step_logits] pool allocation failed at pos {}: {}", pos, e);
+            }
+            let emb = self.dequant_embd_row(last_id);
+            aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, self.cfg.d_model as c_int);
+            let cur_seq = pos + 1;
+            let step_host = [pos, cur_seq, 0i32, 0i32];
+            aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
+
+            if self.cfg.n_experts > 0 {
+                self.run_forward_imperative();
+            } else {
+                if !self.graph_captured {
+                    aether_dev_sync();
+                    self.capture_graph_now();
+                }
+                let rc = aether_dev_graph_launch();
+                assert_eq!(rc, 0, "aether_dev_graph_launch failed: {}", rc);
+            }
+            aether_dev_sync();
+
+            let mut logits = vec![0.0f32; self.cfg.vocab];
+            aether_dev_d2h_f32(self.act.logits, logits.as_mut_ptr() as i64, self.cfg.vocab as c_int);
+            self.next_pos += 1;
+            logits
+        }
+    }
+
+    /// FR-x-extra-sampling: temperature + top-p sampler over the
+    /// generation loop.  `temperature <= 0.0` falls back to greedy
+    /// argmax (bit-identical to the existing `generate` / `decode_step`
+    /// path).  `top_p >= 1.0` disables nucleus cutoff.  RNG is seeded
+    /// from the OS at first call and stepped via xorshift64.
+    pub fn generate_sampled(
+        &mut self,
+        prompt_ids: &[usize],
+        max_tokens: usize,
+        stop_token: Option<usize>,
+        temperature: f32,
+        top_p: f32,
+    ) -> Vec<usize> {
+        self.reset();
+        self.prefill(prompt_ids);
+        let mut generated = Vec::with_capacity(max_tokens);
+        let mut last = *prompt_ids.last().expect("prompt cannot be empty");
+        let mut rng = seed_rng();
+        for _ in 0..max_tokens {
+            let mut logits = self.step_logits(last);
+            let id = if temperature <= 0.0 {
+                argmax(&logits)
+            } else {
+                sample_from_logits(&mut logits, temperature, top_p, &mut rng)
+            };
+            if Some(id) == stop_token { break; }
+            generated.push(id);
+            last = id;
+            if self.next_pos as usize >= MAX_SEQ - 1 { break; }
+        }
+        generated
+    }
+
     /// Encode arbitrary UTF-8 text into token ids using the BPE
     /// tokenizer loaded from the GGUF.  Returns empty vec if the
     /// tokenizer wasn't loaded.
@@ -2685,6 +2837,87 @@ impl QwenSession {
         if n < 0 { return Vec::new(); }
         out_ids[..n as usize].iter().map(|&i| i as usize).collect()
     }
+}
+
+/// External-callable version of the internal greedy argmax — used by
+/// the trainer-bin streaming path to mirror the non-streaming sampler
+/// behaviour exactly.
+pub fn argmax_external(logits: &[f32]) -> usize {
+    argmax(logits)
+}
+
+/// External-callable version of `seed_rng` for the trainer-bin
+/// streaming path.
+pub fn seed_rng_external() -> u64 {
+    seed_rng()
+}
+
+/// FR-x-extra-sampling: seed an xorshift64 RNG from the OS / time.
+/// Not crypto-grade — we just need uncorrelated draws across
+/// sessions.  std::time::SystemTime nanos provides enough entropy for
+/// next-token sampling.
+fn seed_rng() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64).unwrap_or(0xdead_beef_cafe_babe);
+    let pid = std::process::id() as u64;
+    let mut s = nanos ^ pid.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    if s == 0 { s = 0xdead_beef_cafe_babe; }
+    s
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Multinomial sample over `logits` with temperature + top-p (nucleus)
+/// cutoff.  Mutates `logits` in place (softmax + zeroing for cutoff).
+/// Returns the chosen index.  Caller guarantees temperature > 0.0.
+pub fn sample_from_logits(
+    logits: &mut [f32], temperature: f32, top_p: f32, rng: &mut u64,
+) -> usize {
+    // Apply temperature.
+    for x in logits.iter_mut() { *x /= temperature; }
+    // Numerically-stable softmax.
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for x in logits.iter_mut() { *x = (*x - max).exp(); sum += *x; }
+    if sum > 0.0 {
+        for x in logits.iter_mut() { *x /= sum; }
+    }
+    // Top-p nucleus filter.  Sort indices by descending prob, find the
+    // cumulative cutoff, zero everything past it, renormalise.
+    if top_p < 1.0 && top_p > 0.0 {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|a, b|
+            logits[*b].partial_cmp(&logits[*a])
+                .unwrap_or(std::cmp::Ordering::Equal));
+        let mut cum = 0.0f32;
+        let mut cutoff = idx.len();
+        for (rank, &i) in idx.iter().enumerate() {
+            cum += logits[i];
+            if cum >= top_p { cutoff = rank + 1; break; }
+        }
+        // Zero past-cutoff entries by walking idx[cutoff..].
+        for &i in &idx[cutoff..] { logits[i] = 0.0; }
+        let new_sum: f32 = logits.iter().sum();
+        if new_sum > 0.0 {
+            for x in logits.iter_mut() { *x /= new_sum; }
+        }
+    }
+    // Draw uniform [0,1) and walk cumulative.
+    let r = (xorshift64(rng) as f64 / u64::MAX as f64) as f32;
+    let mut cum = 0.0f32;
+    for (i, &p) in logits.iter().enumerate() {
+        cum += p;
+        if cum >= r { return i; }
+    }
+    logits.len() - 1
 }
 
 /// GPT-2 byte→unicode alphabet (the 256-entry version that maps every

@@ -85,6 +85,10 @@ struct Cli {
     /// substrate-swap finding #3).  Pass `--bind 127.0.0.1` to restore
     /// the loopback-only behavior.
     bind: String,
+    /// FR-x-extra-sampling: default sampler parameters when the request
+    /// body omits `temperature` / `top_p`.  0.0 → greedy argmax.
+    default_temperature: f32,
+    default_top_p: f32,
 }
 
 fn parse_cli() -> Cli {
@@ -103,6 +107,11 @@ fn parse_cli() -> Cli {
         bge_gguf: None,
         bge_model: "bge-large-en-v1.5".into(),
         bind: "0.0.0.0".into(),
+        // 0.8 / 0.9 — sane chat defaults that break greedy loops while
+        // still keeping outputs focused.  Override per-request via the
+        // OpenAI-standard `temperature` / `top_p` body fields.
+        default_temperature: 0.8,
+        default_top_p: 0.9,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -129,6 +138,10 @@ fn parse_cli() -> Cli {
             "--bge-gguf" => cli.bge_gguf = Some(it.next().expect("--bge-gguf PATH")),
             "--bge-model" => cli.bge_model = it.next().expect("--bge-model NAME"),
             "--bind" => cli.bind = it.next().expect("--bind ADDR"),
+            "--temperature" => cli.default_temperature =
+                it.next().expect("--temperature F").parse().expect("temperature float"),
+            "--top-p" => cli.default_top_p =
+                it.next().expect("--top-p F").parse().expect("top_p float"),
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--bind ADDR] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -272,6 +285,16 @@ struct JsonBody {
     /// Best-effort surface of `messages[*].content` joined with "\n".
     /// Used only when `prompt_ids` is absent (FR-x-extra: BPE encode).
     text_prompt: Option<String>,
+    /// FR-x-extra-sampling: temperature for the next-token sampler.
+    /// `None` or `0.0` → greedy argmax (the legacy behaviour).  `> 0.0`
+    /// scales logits before softmax → multinomial sample.
+    temperature: Option<f32>,
+    /// Top-p (nucleus) sampling cutoff.  `None` or `1.0` → no cutoff.
+    top_p: Option<f32>,
+    /// FR-x-extra-chat-template: ordered (role, content) pairs from the
+    /// request's `messages: [...]` array.  Empty when the client sent
+    /// `prompt_ids` directly.  Used by the chat-template apply path.
+    messages: Vec<(String, String)>,
 }
 
 fn parse_body(body: &[u8], default_max: usize) -> Result<JsonBody, &'static str> {
@@ -288,12 +311,15 @@ fn parse_body(body: &[u8], default_max: usize) -> Result<JsonBody, &'static str>
     let stream = find_key_bool(s, "stream").unwrap_or(false);
 
     let text_prompt = find_messages_content(s);
+    let messages = find_messages_pairs(s);
+    let temperature = find_key_float(s, "temperature");
+    let top_p = find_key_float(s, "top_p");
 
     if prompt_ids.is_empty() && text_prompt.is_none() {
         return Err("body has neither prompt_ids nor messages[].content");
     }
 
-    Ok(JsonBody { prompt_ids, max_tokens, stream, text_prompt })
+    Ok(JsonBody { prompt_ids, max_tokens, stream, text_prompt, temperature, top_p, messages })
 }
 
 // ============================================================================
@@ -468,6 +494,18 @@ fn find_key_bool(s: &str, key: &str) -> Option<bool> {
     else { None }
 }
 
+fn find_key_float(s: &str, key: &str) -> Option<f32> {
+    let pat = format!("\"{}\"", key);
+    let i = s.find(&pat)?;
+    let after_key = &s[i + pat.len()..];
+    let colon = after_key.find(':')?;
+    let after_colon = after_key[colon + 1..].trim_start();
+    let end = after_colon.find(|c: char|
+        !c.is_ascii_digit() && c != '-' && c != '.' && c != 'e' && c != 'E' && c != '+'
+    ).unwrap_or(after_colon.len());
+    after_colon[..end].parse().ok()
+}
+
 /// Hack: walk `messages` looking for `"content": "..."`, join with \n.
 fn find_messages_content(s: &str) -> Option<String> {
     let key = "\"messages\"";
@@ -500,6 +538,49 @@ fn find_messages_content(s: &str) -> Option<String> {
         cursor = abs;
     }
     if parts.is_empty() { None } else { Some(parts.join("\n")) }
+}
+
+/// Parse `messages: [{role:..., content:...}, ...]` into ordered (role,
+/// content) pairs.  Tolerant of whitespace / property ordering — assumes
+/// each role appears before its content in the message object.  Falls
+/// back gracefully (returns Vec::new()) on malformed input;  the chat-
+/// template path also has a fallback to plain-text encode.
+fn find_messages_pairs(s: &str) -> Vec<(String, String)> {
+    let key = "\"messages\"";
+    let Some(i) = s.find(key) else { return Vec::new(); };
+    let mut cursor = i + key.len();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let bytes = s.as_bytes();
+    loop {
+        let Some(rel) = s[cursor..].find("\"role\"") else { break; };
+        let role_at = cursor + rel + "\"role\"".len();
+        // Skip to value of role.
+        let after_role = &s[role_at..];
+        let Some(colon) = after_role.find(':') else { break; };
+        let after_colon = after_role[colon + 1..].trim_start();
+        if !after_colon.starts_with('"') { cursor = role_at; continue; }
+        let q1 = role_at + colon + 1 + (after_role[colon + 1..].len() - after_colon.len()) + 1;
+        let mut j = q1;
+        while j < bytes.len() && !(bytes[j] == b'"' && bytes[j - 1] != b'\\') { j += 1; }
+        if j >= bytes.len() { break; }
+        let role = unescape_json_string(&s[q1..j]);
+        cursor = j + 1;
+        // Find matching content.
+        let Some(rel) = s[cursor..].find("\"content\"") else { break; };
+        let cont_at = cursor + rel + "\"content\"".len();
+        let after_cont = &s[cont_at..];
+        let Some(colon) = after_cont.find(':') else { break; };
+        let after_colon = after_cont[colon + 1..].trim_start();
+        if !after_colon.starts_with('"') { cursor = cont_at; continue; }
+        let q1 = cont_at + colon + 1 + (after_cont[colon + 1..].len() - after_colon.len()) + 1;
+        let mut j = q1;
+        while j < bytes.len() && !(bytes[j] == b'"' && bytes[j - 1] != b'\\') { j += 1; }
+        if j >= bytes.len() { break; }
+        let content = unescape_json_string(&s[q1..j]);
+        cursor = j + 1;
+        out.push((role, content));
+    }
+    out
 }
 
 fn unescape_json_string(s: &str) -> String {
@@ -837,19 +918,23 @@ unsafe fn dispatch_h2_stream(
                     // handle_completion_t path.  Map text → token ids if
                     // the client didn't supply prompt_ids directly.
                     if req.prompt_ids.is_empty() {
-                        if let Some(text) = req.text_prompt.as_deref() {
-                            #[cfg(feature = "cuda")]
-                            {
-                                match &state.session {
-                                    Some(sess_mu) => {
-                                        let sess = sess_mu.lock().unwrap();
-                                        req.prompt_ids = sess.encode_text(text);
-                                    }
-                                    None => {}
+                        #[cfg(feature = "cuda")]
+                        {
+                            if let Some(sess_mu) = &state.session {
+                                let sess = sess_mu.lock().unwrap();
+                                // Prefer chat-template apply if we have
+                                // structured messages + a template; fall
+                                // back to plain text otherwise.
+                                let encode_input = if !req.messages.is_empty() {
+                                    sess.apply_chat_template(&req.messages)
+                                        .or_else(|| req.text_prompt.clone())
+                                } else {
+                                    req.text_prompt.clone()
+                                };
+                                if let Some(text) = encode_input {
+                                    req.prompt_ids = sess.encode_text(&text);
                                 }
                             }
-                            #[cfg(not(feature = "cuda"))]
-                            { let _ = text; }
                         }
                     }
                     if req.prompt_ids.is_empty() {
@@ -921,7 +1006,10 @@ unsafe fn render_completion_json(state: &ServerState, req: &JsonBody) -> String 
                 let stop = state.cli.stop_token.or_else(|| {
                     if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
                 });
-                let ids = sess.generate(&req.prompt_ids, req.max_tokens, stop);
+                let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
+                let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
+                let ids = sess.generate_sampled(
+                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p);
                 completion_tokens = ids.len() as c_int;
                 let text = sess.decode_ids(&ids);
                 generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
@@ -1053,40 +1141,51 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
         Err(e) => { let _ = send_text_t(t, 400, e); return; }
     };
 
-    // FR-x-extra-text-encode: when the client sends `messages: [...]` /
-    // raw text instead of `prompt_ids: [...]`, run the GPT-2 BPE encode
-    // path against the session's loaded tokenizer.  Used by every OpenAI-
-    // compatible client (LiteLLM, OpenAI Python lib, curl) — the prior
-    // 501 made aether-serve unusable from any chat consumer.
+    // FR-x-extra-text-encode + chat-template: when the client sends
+    // `messages: [...]`, prefer applying the GGUF chat template to the
+    // (role, content) pairs and encoding the rendered text — the model
+    // was trained on that wire format and produces coherent output
+    // when given it.  Fall back to plain-text encode of joined
+    // contents if no template is loaded.
     if req.prompt_ids.is_empty() {
-        if let Some(text) = req.text_prompt.as_deref() {
-            #[cfg(feature = "cuda")]
-            {
-                match &state.session {
-                    Some(sess_mu) => {
-                        let sess = sess_mu.lock().unwrap();
-                        let ids = sess.encode_text(text);
-                        if ids.is_empty() {
-                            let _ = send_text_t(t, 500,
-                                "text encode failed (no tokenizer loaded? or vocab gap) — pass prompt_ids");
-                            return;
+        #[cfg(feature = "cuda")]
+        {
+            match &state.session {
+                Some(sess_mu) => {
+                    let sess = sess_mu.lock().unwrap();
+                    // Prefer chat-template apply.
+                    let encode_input: Option<String> = if !req.messages.is_empty() {
+                        match sess.apply_chat_template(&req.messages) {
+                            Some(rendered) => Some(rendered),
+                            None => req.text_prompt.clone(),
                         }
-                        req.prompt_ids = ids;
-                    }
-                    None => {
-                        let _ = send_text_t(t, 503,
-                            "no model loaded (start with --gguf) — text encode unavailable");
+                    } else {
+                        req.text_prompt.clone()
+                    };
+                    let Some(text) = encode_input else {
+                        let _ = send_text_t(t, 400, "body has no usable prompt");
+                        return;
+                    };
+                    let ids = sess.encode_text(&text);
+                    if ids.is_empty() {
+                        let _ = send_text_t(t, 500,
+                            "text encode failed (no tokenizer loaded? or vocab gap) — pass prompt_ids");
                         return;
                     }
+                    req.prompt_ids = ids;
+                }
+                None => {
+                    let _ = send_text_t(t, 503,
+                        "no model loaded (start with --gguf) — text encode unavailable");
+                    return;
                 }
             }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = text;
-                let _ = send_text_t(t, 501,
-                    "text encode requires --features cuda build");
-                return;
-            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = send_text_t(t, 501,
+                "text encode requires --features cuda build");
+            return;
         }
     }
 
@@ -1128,10 +1227,15 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
                     if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
                 });
                 let t = std::time::Instant::now();
-                let ids = sess.generate(&req.prompt_ids, req.max_tokens, stop);
+                // FR-x-extra-sampling: temperature / top_p from request,
+                // fallback to CLI defaults.  temperature <= 0 → greedy.
+                let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
+                let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
+                let ids = sess.generate_sampled(
+                    &req.prompt_ids, req.max_tokens, stop, temperature, top_p);
                 let secs = t.elapsed().as_secs_f32();
-                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s",
-                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6));
+                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2})",
+                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6), temperature, top_p);
                 completion_tokens = ids.len() as c_int;
                 // Decode IDs back to real text via the loaded BPE tokenizer
                 // + GPT-2 byte fixup. Falls back to id list if tokenizer
@@ -1222,11 +1326,23 @@ unsafe fn handle_completion_streaming_t(state: &ServerState, t: &mut dyn Transpo
             let stop = state.cli.stop_token.or_else(|| {
                 if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
             });
+            let temperature = req.temperature.unwrap_or(state.cli.default_temperature);
+            let top_p = req.top_p.unwrap_or(state.cli.default_top_p);
+            // Stream the sampled generation token-by-token.  Use step_logits +
+            // sample_from_logits rather than generate_sampled so we can emit
+            // each token as it's produced.  Mirrors the non-streaming sampled
+            // path's semantics.
             sess.reset();
             sess.prefill(&req.prompt_ids);
             let mut last = *req.prompt_ids.last().unwrap();
+            let mut rng = aether_rt::serving::seed_rng_external();
             for _ in 0..req.max_tokens {
-                let id = sess.decode_step(last);
+                let mut logits = sess.step_logits(last);
+                let id = if temperature <= 0.0 {
+                    aether_rt::serving::argmax_external(&logits)
+                } else {
+                    aether_rt::serving::sample_from_logits(&mut logits, temperature, top_p, &mut rng)
+                };
                 if Some(id) == stop { break; }
                 let piece = sess.decode_ids(&[id]);
                 let escaped = json_escape(&piece);
