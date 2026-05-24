@@ -49,16 +49,42 @@ serving actually faster.
 session (drift across the 05-20→05-24 GLM/MoE/gemma3/qwen3 arc). See
 BENCH_LEDGER correction at `5a5ed0b`.
 
+### Batched-decode PRIMITIVE SET — COMPLETE + tested (5866abb adds the last)
+
+All four kernels a batched decode forward needs are now shipped and proven
+bit-identical to their seq1 references (parity tests, RTX 3070 Ti):
+- `fused_q4k_matmul_seqB_v3` — weight-reuse matmul, **1.9× @ B=4** (02fca19/c9d4501)
+- `batched_paged_attention_hetero_devarg` — per-req cur_seq (0837e4e)
+- `batched_paged_append_kv_hetero_devarg` — per-req pos (0837e4e)
+- `batched_rope_apply_devarg` — per-req position (5866abb)
+All live in `PAGED_KERNEL_SRC` (lazy module → zero single-stream cost).
+
 ### What's Next (this thread)
 
-1. **Phase 2b-2b — batched block-forward** (the e2e throughput win). Build
-   `step_logits_for_batch(slots)`: B-row matmuls via `fused_q4k_matmul_seqB_v3`,
-   a per-request batched RoPE kernel (RoPE position differs per slot — the
-   only genuinely new bit), hetero attn/append (done), B-row norms/silu/residual.
-   Prove token-identical to serial decode on a real GGUF, then wire the
-   scheduler worker to call it instead of per-slot serial steps. Also needs
-   seqB variants of q6k/f16 matmuls + the fused FFN, OR fall back to seq1 for
-   non-q4k weights initially.
+1. **Phase 2b-2b orchestration — the e2e throughput win (NOT yet built).**
+   Build `step_logits_for_batch(slots) -> Vec<Vec<f32>>` in serving.rs:
+   - A batched `ActivationGpu` (buffers sized `MAX_BATCH * dim`; reuse the
+     first B rows).  B varies per tick (active slot count ≤ max_concurrent).
+   - Per tick: assemble emb_batch host [B*d_model] (dequant_embd_row per slot)
+     → one h2d; upload page_table_batch + pos_batch + cur_seq_batch i32 arrays.
+   - Per layer: rms_norm(rows=B) → seqB matmul Q/K/V → batched_rope(Q,K) →
+     hetero append + hetero attention → seqB O-proj → residual(B*d) → rms_norm
+     → seqB gate/up + silu + mul (B*d_ff) → seqB down → residual.  Then final
+     rms_norm + seqB lm_head → logitsB → d2h B logit vectors.
+   - **Mixed-dtype blocker**: the handle API can't sub-slice, so non-q4k
+     weights (Qwen2.5-7B uses q6k for some v_proj/ffn_down) can't fall back to
+     per-row seq1 directly.  TWO options: (a) add an offset-copy op
+     `aether_dev_d2d_f32_offset(src,src_off,dst,dst_off,n)` (~20 lines) so the
+     batched dispatch can copy row b → scratch, run seq1, copy back — covers
+     ALL dtypes, weight-reuse only for q4k; or (b) write seqB-q6k/f16 matmul
+     variants (mirror the q4k seqB).  (a) is less code for a first cut.
+   - **Verify token-identical** to B× `step_logits_for_slot` on Qwen2.5-7B
+     (local blob at C:/Users/Matt/.ollama/.../sha256-2bada8a7...), then wire
+     the scheduler worker (`run_worker` step 4 in batched_serving.rs) to call
+     it instead of the per-slot serial `step_slot` loop.
+   - **Risk**: if the token-identical test surfaces a numerical mismatch it's
+     open-ended GPU debugging — budget for it.  Until this lands, concurrent
+     serving is correct (serial multiplexed) but not faster.
 2. **Bisect the 37.2→34.6 single-stream decode drift** across 05-20→6834cd0.
    Likely a KERNEL_SRC `__global__` added during the GLM/MoE work
    (nvrtc_kernel_unit_pressure). Separate from Phase 2.
