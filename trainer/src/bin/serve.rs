@@ -855,7 +855,22 @@ unsafe fn dispatch_h2_stream(
                     if req.prompt_ids.is_empty() {
                         format!("{{\"error\":\"text encode failed or no model loaded\"}}")
                     } else {
-                        render_completion_json(state, &req)
+                        // FR-x-extra: vocab guard — see handle_completion_t for rationale.
+                        #[cfg(feature = "cuda")]
+                        let oob = match &state.session {
+                            Some(sess_mu) => {
+                                let v = sess_mu.lock().unwrap().cfg.vocab;
+                                req.prompt_ids.iter().find(|&&i| i >= v).copied().map(|i| (i, v))
+                            }
+                            None => None,
+                        };
+                        #[cfg(not(feature = "cuda"))]
+                        let oob: Option<(usize, usize)> = None;
+                        if let Some((bad, vocab)) = oob {
+                            format!("{{\"error\":\"prompt_ids contains id {} out of vocab {}\"}}", bad, vocab)
+                        } else {
+                            render_completion_json(state, &req)
+                        }
                     }
                 }
                 Err(e) => format!("{{\"error\":\"{}\"}}", e),
@@ -1067,10 +1082,29 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = state;
                 let _ = text;
                 let _ = send_text_t(t, 501,
                     "text encode requires --features cuda build");
+                return;
+            }
+        }
+    }
+
+    // FR-x-extra: validate prompt_ids against the model's vocab BEFORE
+    // dispatching into generate().  Otherwise an out-of-vocab id from a
+    // stale or cross-model client (e.g. GLM BOS 154822 sent to a
+    // Qwen2.5 server with vocab=152064) panics deep in
+    // dequant_embd_row and takes the server down for ~10s while systemd
+    // restarts it.  Return 400 instead.
+    #[cfg(feature = "cuda")]
+    if !req.prompt_ids.is_empty() {
+        if let Some(sess_mu) = &state.session {
+            let vocab = sess_mu.lock().unwrap().cfg.vocab;
+            if let Some(&bad) = req.prompt_ids.iter().find(|&&i| i >= vocab) {
+                let msg = format!(
+                    "prompt_ids contains token id {} which is out of vocab (vocab_size={}); pass ids in [0, {})",
+                    bad, vocab, vocab);
+                let _ = send_text_t(t, 400, &msg);
                 return;
             }
         }
