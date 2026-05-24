@@ -826,6 +826,22 @@ unsafe fn block_forward_devarg(
             norm_eps, 1, d_model);
     }
     aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
+    // glm-debug: dump x AFTER attention residual, BEFORE second RMSnorm + FFN.
+    // Pinpoints whether NaN enters via attn vs FFN at layer 1 (first MoE).
+    // Gated on AETHER_DUMP_INTRA_BLOCK so it's free for prod paths.
+    if std::env::var("AETHER_DUMP_INTRA_BLOCK").is_ok() {
+        aether_dev_sync();
+        let mut h = vec![0.0f32; cfg.d_model];
+        aether_dev_d2h_f32(act.x, h.as_mut_ptr() as i64, d_model);
+        let n_nan = h.iter().filter(|x| x.is_nan()).count();
+        let n_inf = h.iter().filter(|x| x.is_infinite()).count();
+        let finite: Vec<f32> = h.iter().cloned().filter(|x| x.is_finite()).collect();
+        let mn = finite.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = finite.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mean = if !finite.is_empty() { finite.iter().sum::<f32>() / finite.len() as f32 } else { 0.0 };
+        eprintln!("[POST-ATTN x] nan={} inf={} min={:.4e} max={:.4e} mean={:.4e}",
+            n_nan, n_inf, mn, mx, mean);
+    }
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
     if bw.w_router != 0 {
         moe_ffn_forward(bw, act, cfg);
