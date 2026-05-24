@@ -1,7 +1,140 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-26 (**Gemma3 dispatch LANDED — 3 of the 4 originally-deferred
+2026-05-24 evening (**GLM-4.7-flash session-construction WITNESSED on real GGUF.**
+Three commits + 1 cnc smoke this session — IQ3_S kernel closes the last quant
+gap, MLA head_dim cap 256→640 closes the kernel-side blocker for GLM, and
+a probe-only smoke on cnc GPU 0 proved `ModelConfig::from_gguf` parses GLM
+correctly and the new MLA guard accepts qk=576/v=512.)
+
+## Project Status
+🟢 GLM-4.7-flash unblocked through session construction; full-decode gated
+on one unwitnessed branch (`q_lora_rank > 0` Q-LoRA path).  V2-Lite Q4_K_M
+end-to-end decode still witnessed.  Per-kernel parity green across all 11
+GGUF quant formats (F16/Q4_0/Q4_K/Q5_0/Q5_K/Q6_K/Q8_0/IQ3_XXS/IQ3_S/IQ4_NL/IQ4_XS).
+
+## What Was Done This Session (2026-05-24)
+
+### Commits
+
+| Hash | Title | What it does |
+|---|---|---|
+| `b858c68` | FR-17-extra-iq3_s-fwd: IQ3_S matmul | 110-byte 256-elem block kernel with embedded 512-entry codebook + direct 8-bit signs + odd-int per-sub-block scales.  Closes the IQ3_S gap (~44 tensors in GLM-4.7-flash-UD-IQ3_XXS).  dt=21 wired into `dispatch_matmul` + both upload helpers; parity test covers pack/unpack roundtrip + n=32,k=256 tight + n=k=2048 GLM-class shape. |
+| `b6bfacf` | FR-17-extra-mla-fwd: head_dim cap 256→640 | `paged_attention_mla_devarg` `q_local`/`out_local` bumped `[8]→[20]`.  GLM-4.7-flash (qk=576/v=512) and DeepSeek-V2 (qk=192/v=128) both fit.  QwenSession session-construction guard now branches on `kv_lora_rank > 0` to apply qk/v_head_dim ≤ 640 check on MLA archs.  Two new tests: `mla_handles_glm_47_flash_class_head_dim` (qk=576, v=512) + `mla_handles_per_lane_exact_boundary` (qk=v=640 — exact boundary). |
+| `6c091e8` | glm-probe binary + cnc smoke witness | New `trainer/src/bin/glm_probe.rs` opens GGUF, dumps full `ModelConfig`, replicates the QwenSession `head_dim` guard, exits before tensor upload.  Probe-only — peak VRAM <100 MB, never approaches the 13 GB full-load.  Ran on cnc GPU 0 (openclaw-approved slot) against `glm-4.7-flash-UD-IQ3_XXS.gguf`. |
+
+### cnc probe witness (commit message of 6c091e8 captures full output)
+
+Ran 2026-05-24 ~01:08 PDT on cnc-server GPU 0 (Tesla P100-PCIE-12GB),
+LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:/usr/local/lib.  Openclaw main
+coordinated the slot — workhorse on GPU 1 untouched, no service stops:
+
+```
+arch=deepseek2, 47 layers, d_model=2048
+n_q_heads=20, n_kv_heads=1
+qk_head_dim=576 (qk_nope=512 + qk_rope=64), v_head_dim=512
+kv_lora_rank=512, q_lora_rank=768
+64 experts top-4 + 1 shared expert, expert_ff_dim=1536
+leading_dense=1, yarn_factor=1 (no YaRN scaling)
+guard PASS: MLA branch accepted (qk≤640, v≤640)
+```
+
+### Code-audit follow-ups main flagged
+
+- **n_kv_heads=1 stride concern → cleared.** `serving.rs:1391-1397`
+  `KvCacheGpu` sizing already branches on `is_mla = cfg.kv_lora_rank > 0` and
+  uses `cfg.n_q_heads * cfg.qk_head_dim` / `cfg.n_q_heads * cfg.v_head_dim`
+  exclusively on the MLA branch.  V2-Lite's `n_kv_heads == n_q_heads == 16`
+  coincidence was masking nothing — the path is structurally correct on
+  GLM's `n_kv_heads=1 vs n_q_heads=20` shape too.
+
+- **q_lora_rank > 0 Q-LoRA branch → confirmed unwitnessed.**
+  `serving.rs:978-988` only runs when `cfg.q_lora_rank > 0 && bw.w_q_a != 0
+  && bw.w_q_b != 0`.  V2-Lite has `q_lora_rank=0` so this branch was never
+  exercised.  GLM is the first arch to need it.  Tensors loaded but kernel
+  chain end-to-end unverified.  Real follow-up for the next session.
+
+## Current State
+
+### Working
+- All 11 GGUF quant kernels (parity tests green): F16, Q4_0, Q4_K, Q5_0,
+  Q5_K, Q6_K, Q8_0, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS
+- MLA attention kernel supports head_dim up to 640 (q_local[20] /
+  out_local[20]) — covers GLM (qk=576/v=512), DeepSeek-V2 (qk=192/v=128),
+  DeepSeek-V2-Lite (qk=192/v=128)
+- V2-Lite Q4_K_M end-to-end decode witnessed on cnc (c8c1a22 from
+  earlier in this session) — real tokens, finite logits, structured top-5
+- GLM-4.7-flash GGUF parses correctly into `ModelConfig`; QwenSession
+  session-construction guard passes
+
+### Not yet exercised
+- **Q-LoRA attention branch** (`serving.rs:978-988`) — only runs with
+  `q_lora_rank > 0`; GLM is the first arch to need it
+- **Full GLM-4.7-flash forward pass** — needs GPU 1 / 16GB (13GB GGUF
+  doesn't fit on GPU 0's 12GB)
+- **SharedKvPool MLA-mode support** — multi-tenant only, single-tenant
+  aether-serve doesn't need it
+
+### Not changed this session
+- All existing arch dispatches (qwen2/3/3vl/3moe/gemma3) — see prior
+  HANDOFF section for those
+
+## Blocking Issues
+None for the commits this session.  For GLM-4.7-flash full-decode follow-up:
+- Need a GPU 1 slot (workhorse stop) to fit 13GB IQ3_XXS GGUF.  Not a code
+  blocker — a coordination one with openclaw main.
+
+## What's Next (priority order)
+
+1. **GLM-4.7-flash full-decode smoke** — Q-LoRA branch + full attention
+   chain.  Requires GPU 1 slot (stop workhorse → free 16GB).  Validation
+   is "finite, structured top-5 logits", same shape as the V2-Lite
+   c8c1a22 witness.  Expected smoke output: `glm-probe` style ModelConfig
+   dump + `aether-serve --gguf glm... --warmup 1` decode of "1+1=?" or
+   similar trivial prompt, check tokens decode to non-PAD.
+
+2. **`q_lora_rank > 0` parity test** — synthetic test in
+   `runtime/tests/` that exercises `attn_q_a` → `attn_q_a_norm` →
+   `attn_q_b` path against a CPU reference, independent of any GGUF.
+   Closes the Q-LoRA branch as unit-tested before full-decode runs.
+
+3. **Document the new MLA cap in `runtime/src/serving.rs::ModelConfig`
+   doc-comment** — currently the doc says "MLA: per-head Q/K dim
+   (e.g. 128 + 64 = 192 for V2-Lite)"; should mention the 640 ceiling
+   so a future reader doesn't push past it without bumping arrays.
+
+4. **SharedKvPool MLA-mode support** — only matters for multi-tenant
+   aether-serve.  Lowest priority among the GLM blockers.
+
+## Notes for Next Session
+
+- `glm-probe` is at `trainer/src/bin/glm-probe` (committed `6c091e8`),
+  built via `cargo build -p trainer --bin glm-probe --features cuda
+  --release`.  Re-run pattern (kept verbatim from this session — works):
+  ```
+  ssh cnc-server "cd /opt/aether && LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:/usr/local/lib CUDA_VISIBLE_DEVICES=0 timeout 90 ./target/release/glm-probe /opt/openclaw-inference/models/glm-4.7-flash-UD-IQ3_XXS.gguf"
+  ```
+
+- cnc git was at `9e53256` (stale) when this session started — sourced
+  the runtime via tar-over-ssh of `runtime/src/` + `trainer/src/bin/glm_probe.rs`
+  + `trainer/Cargo.toml`.  After extracting, `sudo touch -m` the .rs
+  files (memory tip: `tar -xzf` preserves mtimes → cargo skips rebuild).
+
+- The IQ3_S kernel grid table is embedded directly in `KERNEL_SRC` —
+  not loaded from any external table.  Same as IQ3_XXS.  If you ever
+  need to regenerate it, the source is llama.cpp's
+  `ggml/src/ggml-quants.c::iq3s_grid` (512 × u32).
+
+- For coordinating cnc smokes: ask openclaw `main` via
+  `sudo podman exec openclaw-gateway openclaw agent --agent main
+  --message '...'`.  Main is opus-4-7 OAuth, runs through Tailscale
+  dashboard at `https://cnc-server.tailb85819.ts.net:8443`.  Probe-only
+  smokes (no service stops) are green-light by default.  Full-decode
+  smokes that need workhorse stopped require explicit (B) approval.
+
+---
+
+## 2026-05-26 (**Gemma3 dispatch LANDED — 3 of the 4 originally-deferred
 per-arch FRs are now ship-quality code.**
 
 Three pieces shipped this turn for FR-17-extra-gemma-fwd:
