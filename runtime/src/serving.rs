@@ -30,7 +30,7 @@ use crate::{
     aether_gguf_open, aether_gguf_close,
     aether_gguf_find_tensor_by_name, aether_gguf_get_tensor_dtype,
     aether_gguf_get_tensor_data_ptr, aether_gguf_get_tensor_n_elems,
-    aether_dequant_q4_k_m,
+    aether_dequant_q4_k_m, aether_f16_to_f32,
     aether_gguf_get_metadata_u32, aether_gguf_get_metadata_array_string_n,
     aether_gguf_get_metadata_array_string_get,
     aether_bpe_tokenizer_new, aether_bpe_tokenizer_free,
@@ -625,13 +625,35 @@ unsafe fn upload_f32_tensor(h: i64, name: &str) -> i64 {
 
 /// Non-panicking variant for tensors that exist on some archs but not others.
 /// Returns 0 (treated as "absent" by callers) if the tensor isn't in the GGUF.
+///
+/// Dtype-aware as of the GLM-4.7-flash debug (router NaN-cascade bisect).  If
+/// the GGUF stores the tensor as F16 (dt=1), dequantises to F32 host-side
+/// before the H2D copy.  Without this, the prior body read 4 bytes/elem from
+/// 2-byte F16 storage → garbage F32 values → NaN router_logits in the very
+/// first MoE block.
 unsafe fn upload_f32_tensor_opt(h: i64, name: &str) -> i64 {
     let needle = name.as_bytes();
     let idx = aether_gguf_find_tensor_by_name(h, needle.as_ptr() as i64, needle.len() as c_int);
     if idx < 0 { return 0; }
+    let dt = aether_gguf_get_tensor_dtype(h, idx);
     let n_elems = aether_gguf_get_tensor_n_elems(h, idx) as usize;
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
-    let host: Vec<f32> = std::slice::from_raw_parts(dptr as *const f32, n_elems).to_vec();
+    let host: Vec<f32> = match dt {
+        0 => {
+            // F32 — direct copy.
+            std::slice::from_raw_parts(dptr as *const f32, n_elems).to_vec()
+        }
+        1 => {
+            // F16 — dequantise per element.
+            let raw = std::slice::from_raw_parts(dptr as *const u16, n_elems);
+            raw.iter().map(|&h16| aether_f16_to_f32(h16 as i32)).collect()
+        }
+        _ => panic!("upload_f32_tensor_opt: tensor '{}' has unsupported dtype {} \
+                    (only F32=0 and F16=1 dequant-on-load today)", name, dt),
+    };
+    if std::env::var("AETHER_DUMP_F32_LOADS").is_ok() {
+        eprintln!("[upload_f32_tensor_opt] {} dt={} n_elems={}", name, dt, n_elems);
+    }
     let d = aether_dev_alloc_f32(n_elems as c_int);
     aether_dev_h2d_f32(host.as_ptr() as i64, d, n_elems as c_int);
     d
