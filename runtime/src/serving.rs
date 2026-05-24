@@ -169,6 +169,11 @@ pub struct ModelConfig {
     /// experts).  DeepSeek-V2-Lite uses 2 shared experts.  0 = no shared
     /// experts (Qwen3-MoE).  Unused when n_experts == 0.
     pub n_shared_experts: i32,
+    /// MLA / MoE: per-expert FFN hidden dim.  Routed experts use this dim;
+    /// the n_shared experts are FUSED into a single MLP with hidden dim
+    /// `n_shared_experts * expert_ff_dim`.  DeepSeek-V2-Lite: 1408.
+    /// 0 = N/A.  Read from `<arch>.expert_feed_forward_length`.
+    pub expert_ff_dim: usize,
     /// FR-17-extra-mla-fwd YaRN — RoPE scaling factor (s).  0 or 1 = no
     /// scaling (standard RoPE).  > 1 = YaRN-by-parts scaling with this
     /// factor.  DeepSeek-V2-Lite uses 40.
@@ -203,6 +208,7 @@ impl ModelConfig {
             kv_lora_rank: 0, q_lora_rank: 0,
             qk_head_dim: 0, qk_rope_head_dim: 0, v_head_dim: 0,
             leading_dense_blocks: 0, n_shared_experts: 0,
+            expert_ff_dim: 0,
             yarn_factor: 1.0, yarn_log_multiplier: 0.0,
             yarn_orig_ctx: 4096.0,
             yarn_beta_fast: 32.0, yarn_beta_slow: 1.0,
@@ -279,6 +285,9 @@ impl ModelConfig {
         let n_shared_experts = read_meta_u32(gguf_handle,
             &format!("{}.expert_shared_count", prefix))
             .map(|v| v as i32).unwrap_or(0);
+        let expert_ff_dim = read_meta_u32(gguf_handle,
+            &format!("{}.expert_feed_forward_length", prefix))
+            .map(|v| v as usize).unwrap_or(0);
         // FR-17-extra-mla-fwd YaRN — long-context RoPE scaling.  Only active
         // when `<arch>.rope.scaling.type == "yarn"`; for "linear" / absent
         // we keep the standard RoPE path.  Defaults match the YaRN paper +
@@ -316,7 +325,7 @@ impl ModelConfig {
             sliding_window,
             kv_lora_rank, q_lora_rank,
             qk_head_dim, qk_rope_head_dim, v_head_dim,
-            leading_dense_blocks, n_shared_experts,
+            leading_dense_blocks, n_shared_experts, expert_ff_dim,
             yarn_factor, yarn_log_multiplier, yarn_orig_ctx,
             yarn_beta_fast, yarn_beta_slow,
         }
@@ -390,6 +399,14 @@ struct BlockGpu {
     attn_q_a_norm_g: i64,
     w_q_b: i64,
     dt_kv_a_mqa: i32, dt_kv_b: i32, dt_q_a: i32, dt_q_b: i32,
+    /// FR-17-extra-mla-fwd MoE shared experts — DeepSeek-V2 / GLM-4.7-flash
+    /// have `expert_shared_count > 0` always-on experts that are FUSED into
+    /// a single MLP with hidden dim = n_shared * expert_ff_dim
+    /// (V2-Lite: 2 * 1408 = 2816).  Stored under
+    /// `blk.N.ffn_{gate,up,down}_shexp.weight`.  All 0 when absent (no
+    /// shared experts).
+    w_gate_shexp: i64, w_up_shexp: i64, w_down_shexp: i64,
+    dt_gate_shexp: i32, dt_up_shexp: i32, dt_down_shexp: i32,
 }
 
 struct ActivationGpu {
@@ -599,6 +616,13 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     let (w_up_exps,   _, dt_up_exps)   = upload_tensor_u8_opt(h, &format!("{}ffn_up_exps.weight", p));
     let (w_down_exps, _, dt_down_exps) = upload_tensor_u8_opt(h, &format!("{}ffn_down_exps.weight", p));
     let w_router = upload_f32_tensor_opt(h, &format!("{}ffn_gate_inp.weight", p));
+    // Shared experts (FR-17-extra-mla-fwd MoE).  Present on deepseek2 /
+    // glm-4.7-flash MoE blocks; absent on Qwen3-MoE and on the leading
+    // dense block.  Stored as a single FUSED MLP with hidden dim
+    // n_shared * expert_ff_dim (already concatenated in the GGUF).
+    let (w_gate_shexp, _, dt_gate_shexp) = upload_tensor_u8_opt(h, &format!("{}ffn_gate_shexp.weight", p));
+    let (w_up_shexp,   _, dt_up_shexp)   = upload_tensor_u8_opt(h, &format!("{}ffn_up_shexp.weight", p));
+    let (w_down_shexp, _, dt_down_shexp) = upload_tensor_u8_opt(h, &format!("{}ffn_down_shexp.weight", p));
     if w_gate == 0 && w_gate_exps == 0 {
         panic!("blk.{} has neither dense ffn_gate nor MoE ffn_gate_exps", b);
     }
@@ -627,6 +651,8 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
         attn_q_a_norm_g: upload_f32_tensor_opt(h, &format!("{}attn_q_a_norm.weight", p)),
         w_q_b,
         dt_kv_a_mqa, dt_kv_b, dt_q_a, dt_q_b,
+        w_gate_shexp, w_up_shexp, w_down_shexp,
+        dt_gate_shexp, dt_up_shexp, dt_down_shexp,
     }
 }
 
@@ -1004,7 +1030,37 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
         aether_op_add_inplace_f32_cuda(out_acc, down_e, d_model as c_int);
     }
 
-    // 4. x += out_acc (residual).
+    // 4. Shared experts (FR-17-extra-mla-fwd MoE shared).  DeepSeek-V2 /
+    // GLM-4.7-flash have a small always-on FFN alongside the routed
+    // experts.  The GGUF pre-concatenates the n_shared experts into a
+    // single fused MLP with hidden dim d_ff_shared = n_shared *
+    // expert_ff_dim — so this is just a regular gate/up/silu_mul/down
+    // chain at that hidden dim.  Contribution is added at full weight 1.0.
+    if cfg.n_shared_experts > 0 && bw.w_gate_shexp != 0 {
+        let d_ff_shared = (cfg.n_shared_experts as usize) * cfg.expert_ff_dim;
+        if d_ff_shared > 0 {
+            let gate_sh = aether_dev_alloc_f32(d_ff_shared as c_int);
+            let up_sh   = aether_dev_alloc_f32(d_ff_shared as c_int);
+            let down_sh = aether_dev_alloc_f32(d_model as c_int);
+            // gate = x_norm @ w_gate_shexp^T  [d_ff_shared]
+            dispatch_matmul(act.x_norm, bw.w_gate_shexp, bw.dt_gate_shexp,
+                gate_sh, d_ff_shared as c_int, d_model as c_int);
+            dispatch_matmul(act.x_norm, bw.w_up_shexp, bw.dt_up_shexp,
+                up_sh, d_ff_shared as c_int, d_model as c_int);
+            aether_op_silu_f32_cuda(gate_sh, d_ff_shared as c_int);
+            aether_op_mul_inplace_f32_cuda(gate_sh, up_sh, d_ff_shared as c_int);
+            // down = gate @ w_down_shexp^T  [d_model]
+            dispatch_matmul(gate_sh, bw.w_down_shexp, bw.dt_down_shexp,
+                down_sh, d_model as c_int, d_ff_shared as c_int);
+            // out_acc += shared_output (weight 1.0)
+            aether_op_add_inplace_f32_cuda(out_acc, down_sh, d_model as c_int);
+            let _ = aether_dev_free_f32(gate_sh);
+            let _ = aether_dev_free_f32(up_sh);
+            let _ = aether_dev_free_f32(down_sh);
+        }
+    }
+
+    // 5. x += out_acc (residual).
     aether_op_add_inplace_f32_cuda(act.x, out_acc, d_model as c_int);
 
     // Free workspaces.

@@ -85,7 +85,8 @@ fn probe_deepseek2_mla_surface() {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if !name.starts_with("blk.0.") && !name.starts_with("token_embd")
+            if !name.starts_with("blk.0.") && !name.starts_with("blk.1.")
+                && !name.starts_with("token_embd")
                 && !name.starts_with("output") {
                 continue;
             }
