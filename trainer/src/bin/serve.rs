@@ -95,6 +95,22 @@ struct Cli {
     /// outputs jittery.
     default_presence_penalty: f32,
     default_frequency_penalty: f32,
+    /// FR-x-extra-tp — tensor-parallel world size.  Default 1 (single
+    /// GPU, behaviour unchanged).  `--tp 2` requests 2-way tensor
+    /// parallelism; runtime-detects NCCL + multi-GPU availability and
+    /// falls back to TP=1 with a warning if unavailable.
+    tp: usize,
+    /// FR-19.5-extra-deep — continuous-batching slot count.  Default 1
+    /// preserves the legacy single-session path bit-for-bit.  When > 1,
+    /// the server constructs an `aether_rt::batched_serving::BatchScheduler`
+    /// over a pool-backed `QwenSession` and routes non-streaming chat
+    /// requests through it.  Streaming + legacy single-session callers
+    /// stay on the original path.
+    max_concurrent: usize,
+    /// FR-19.5-extra-deep — paged-KV blocks per scheduler slot.  Multiplied
+    /// by `max_concurrent` to size the SharedKvPool when `max_concurrent
+    /// > 1`.  Default 8 (32 tokens of KV per slot, matches MAX_SEQ).
+    blocks_per_slot: i32,
 }
 
 fn parse_cli() -> Cli {
@@ -120,6 +136,9 @@ fn parse_cli() -> Cli {
         default_top_p: 0.9,
         default_presence_penalty: 0.3,
         default_frequency_penalty: 0.3,
+        tp: 1,
+        max_concurrent: 1,
+        blocks_per_slot: 8,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -154,6 +173,12 @@ fn parse_cli() -> Cli {
                 it.next().expect("--presence-penalty F").parse().expect("presence_penalty float"),
             "--frequency-penalty" => cli.default_frequency_penalty =
                 it.next().expect("--frequency-penalty F").parse().expect("frequency_penalty float"),
+            "--tp" => cli.tp =
+                it.next().expect("--tp N").parse().expect("tp int"),
+            "--max-concurrent" => cli.max_concurrent =
+                it.next().expect("--max-concurrent N").parse().expect("max-concurrent int"),
+            "--blocks-per-slot" => cli.blocks_per_slot =
+                it.next().expect("--blocks-per-slot N").parse().expect("blocks-per-slot int"),
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--bind ADDR] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -167,6 +192,16 @@ fn parse_cli() -> Cli {
                 eprintln!("  --paged routes K/V through paged_append_kv_devarg +");
                 eprintln!("        paged_attention_seq1_devarg (FR-19.4-extra) — identity");
                 eprintln!("        page table, bit-identical token output to contiguous mode.");
+                eprintln!("  --tp N requests N-way tensor parallelism.  N=1 is the default");
+                eprintln!("        single-GPU path.  N>1 runtime-detects NCCL + multi-GPU");
+                eprintln!("        and falls back to N=1 with a warning if unavailable.");
+                eprintln!("  --max-concurrent N enables FR-19.5-extra-deep continuous batching:");
+                eprintln!("        up to N chat requests share one paged-KV session via");
+                eprintln!("        BatchScheduler; non-streaming requests route through the");
+                eprintln!("        scheduler, streaming + N=1 keep the legacy single-session");
+                eprintln!("        path bit-for-bit.  Default 1.  Implies --paged + --pool-blocks.");
+                eprintln!("  --blocks-per-slot K sizes the SharedKvPool: total blocks = N*K.");
+                eprintln!("        Default 8 (32 tokens of KV per slot).");
                 eprintln!("  Without --gguf, returns a stub response (HTTP/JSON plumbing only).");
                 std::process::exit(0);
             }
@@ -754,6 +789,13 @@ struct ServerState {
     #[cfg(feature = "cuda")]
     #[allow(dead_code)]
     pool: Option<std::sync::Arc<SharedKvPool>>,
+    /// FR-19.5-extra-deep — continuous-batching scheduler.  When
+    /// `cli.max_concurrent > 1`, non-streaming /v1/chat/completions
+    /// requests are dispatched through this instead of the per-request
+    /// `session` Mutex.  `session` stays None in that mode (the
+    /// scheduler owns the QwenSession internally).
+    #[cfg(feature = "cuda")]
+    scheduler: Option<std::sync::Arc<aether_rt::batched_serving::BatchScheduler>>,
     /// FR-17-extra-bert-fwd: BERT/BGE encoder for /v1/embeddings, loaded
     /// when --bge-gguf is supplied.  Held under a Mutex so concurrent
     /// /v1/embeddings calls serialise.  (BertSession holds no state between
@@ -768,9 +810,19 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn new(cli: Cli) -> Result<Self, String> {
+    fn new(mut cli: Cli) -> Result<Self, String> {
         #[cfg(feature = "cuda")]
         {
+            // FR-19.5-extra-deep: --max-concurrent > 1 IMPLIES paged-KV
+            // + a SharedKvPool sized for max_concurrent * blocks_per_slot.
+            // Default 1 keeps every legacy single-session caller bit-
+            // identical (no scheduler, no pool unless --pool-blocks).
+            if cli.max_concurrent > 1 {
+                if cli.pool_blocks == 0 {
+                    cli.pool_blocks = cli.max_concurrent as i32 * cli.blocks_per_slot;
+                }
+                cli.paged = true;
+            }
             let pool = if cli.pool_blocks > 0 {
                 eprintln!("[aether-serve] allocating SharedKvPool: {} blocks × 4 tokens = {} token capacity",
                     cli.pool_blocks, cli.pool_blocks * 4);
@@ -782,7 +834,28 @@ impl ServerState {
                     eprintln!("[aether-serve] loading GGUF: {}{}", path,
                         if cli.paged { " (paged KV mode)" } else { "" });
                     let t = std::time::Instant::now();
-                    let mut s = if let Some(p) = &pool {
+                    let mut s = if cli.tp > 1 {
+                        // FR-x-extra-tp — tensor-parallel session.  Constructs a
+                        // TpSession which runtime-detects NCCL + multi-GPU
+                        // availability.  Falls back to TP=1 (single-GPU) with a
+                        // warning if unavailable.  The inner QwenSession is the
+                        // underlying compute engine in both cases; multi-GPU
+                        // execution wires up once the cuda.rs multi-context
+                        // refactor lands (see tensor_parallel::TP_GAPS).
+                        if pool.is_some() {
+                            return Err(
+                                "--tp > 1 with --pool-blocks is not yet supported; \
+                                 SharedKvPool multi-context refactor is filed alongside \
+                                 TP_GAPS::CUDA_MULTI_CONTEXT".into());
+                        }
+                        let tp = if cli.paged {
+                            aether_rt::tensor_parallel::TpSession::new_paged(path, cli.tp)
+                        } else {
+                            aether_rt::tensor_parallel::TpSession::new(path, cli.tp)
+                        }.map_err(|e| format!("TpSession construction failed: {}", e))?;
+                        eprintln!("[aether-serve] {}", tp.diag());
+                        tp.into_inner()
+                    } else if let Some(p) = &pool {
                         QwenSession::new_paged_with_pool(path, p.clone())?
                     } else if cli.paged {
                         QwenSession::new_paged(path)?
@@ -802,6 +875,35 @@ impl ServerState {
                     eprintln!("[aether-serve] no --gguf supplied; requests will return STUB responses");
                     None
                 }
+            };
+
+            // FR-19.5-extra-deep: when max_concurrent > 1 and the session
+            // is pool-backed, lift the QwenSession out of the legacy
+            // Mutex wrap and hand it to a BatchScheduler.  Streaming
+            // requests still need a Mutex<QwenSession> to call directly
+            // — Phase-1 fallback is to keep streaming on the legacy
+            // single-session path; when the scheduler is active and a
+            // streaming request arrives, we return 503 with a clear
+            // message.  Non-streaming chat completions route through
+            // the scheduler.
+            let (session, scheduler) = if cli.max_concurrent > 1 {
+                let Some(mu) = session else {
+                    return Err(
+                        "--max-concurrent N > 1 requires --gguf (no model loaded)".into());
+                };
+                let inner = mu.into_inner().map_err(|e| format!("session poisoned: {}", e))?;
+                if !inner.is_pool_backed() {
+                    return Err(format!(
+                        "--max-concurrent {} requires a pool-backed session — \
+                         did --pool-blocks default get suppressed?  is_pool_backed=false",
+                        cli.max_concurrent));
+                }
+                let sched = aether_rt::batched_serving::BatchScheduler::new(
+                    inner, cli.max_concurrent)?;
+                eprintln!("[aether-serve] BatchScheduler online: max_concurrent={}", cli.max_concurrent);
+                (None, Some(std::sync::Arc::new(sched)))
+            } else {
+                (session, None)
             };
             let (bert, bert_tokenizer) = match &cli.bge_gguf {
                 Some(path) => {
@@ -828,7 +930,7 @@ impl ServerState {
                 }
                 None => (None, None),
             };
-            return Ok(ServerState { cli, session, pool, bert, bert_tokenizer });
+            return Ok(ServerState { cli, session, pool, scheduler, bert, bert_tokenizer });
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1066,11 +1168,27 @@ unsafe fn dispatch_h2_stream(
                     if req.prompt_ids.is_empty() {
                         #[cfg(feature = "cuda")]
                         {
-                            if let Some(sess_mu) = &state.session {
+                            if let Some(sched) = &state.scheduler {
+                                let (encode_input, used_template): (Option<String>, bool) =
+                                    if is_chat_path && !req.messages.is_empty() {
+                                        match sched.apply_chat_template(&req.messages) {
+                                            Some(s) => (Some(s), true),
+                                            None => (req.text_prompt.clone(), false),
+                                        }
+                                    } else if is_chat_path {
+                                        (req.text_prompt.clone(), false)
+                                    } else {
+                                        (req.raw_prompt.clone().or_else(|| req.text_prompt.clone()), false)
+                                    };
+                                if let Some(text) = encode_input {
+                                    req.prompt_ids = if used_template {
+                                        sched.encode_text_with_specials(&text)
+                                    } else {
+                                        sched.encode_text(&text)
+                                    };
+                                }
+                            } else if let Some(sess_mu) = &state.session {
                                 let sess = sess_mu.lock().unwrap();
-                                // Chat path applies the per-arch template;
-                                // legacy /v1/completions uses raw `prompt`
-                                // verbatim (no template).
                                 let (encode_input, used_template): (Option<String>, bool) = if is_chat_path && !req.messages.is_empty() {
                                     match sess.apply_chat_template(&req.messages) {
                                         Some(s) => (Some(s), true),
@@ -1096,12 +1214,14 @@ unsafe fn dispatch_h2_stream(
                     } else {
                         // FR-x-extra: vocab guard — see handle_completion_t for rationale.
                         #[cfg(feature = "cuda")]
-                        let oob = match &state.session {
-                            Some(sess_mu) => {
-                                let v = sess_mu.lock().unwrap().cfg.vocab;
-                                req.prompt_ids.iter().find(|&&i| i >= v).copied().map(|i| (i, v))
-                            }
-                            None => None,
+                        let oob = if let Some(sched) = &state.scheduler {
+                            let v = sched.vocab();
+                            req.prompt_ids.iter().find(|&&i| i >= v).copied().map(|i| (i, v))
+                        } else if let Some(sess_mu) = &state.session {
+                            let v = sess_mu.lock().unwrap().cfg.vocab;
+                            req.prompt_ids.iter().find(|&&i| i >= v).copied().map(|i| (i, v))
+                        } else {
+                            None
                         };
                         #[cfg(not(feature = "cuda"))]
                         let oob: Option<(usize, usize)> = None;
@@ -1154,30 +1274,59 @@ unsafe fn render_completion_json(state: &ServerState, req: &JsonBody) -> String 
     let completion_tokens: c_int;
     #[cfg(feature = "cuda")]
     {
-        match &state.session {
-            Some(sess_mu) => {
-                let mut sess = sess_mu.lock().unwrap();
-                let stop = state.cli.stop_token.or_else(|| {
-                    if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
-                });
-                let params = aether_rt::serving::SamplingParams {
-                    temperature: req.temperature.unwrap_or(state.cli.default_temperature),
-                    top_p: req.top_p.unwrap_or(state.cli.default_top_p),
-                    top_k: req.top_k.unwrap_or(0),
-                    presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
-                    frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
-                    seed: req.seed,
-                    logit_bias: req.logit_bias.clone(),
-                };
-                let ids = sess.generate_sampled_v2(
-                    &req.prompt_ids, req.max_tokens, stop, &params, &req.stop_strings);
-                completion_tokens = ids.len() as c_int;
-                let text = sess.decode_ids(&ids);
-                generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
-            }
-            None => {
-                generated_text = "[aether-serve stub: --gguf not supplied]".into();
-                completion_tokens = 0;
+        if let Some(sched) = &state.scheduler {
+            // FR-19.5-extra-deep — scheduler-routed path for H2 clients.
+            let stop = state.cli.stop_token.or_else(|| {
+                let eos = sched.eos_token();
+                if eos >= 0 { Some(eos as usize) } else { None }
+            });
+            let params = aether_rt::serving::SamplingParams {
+                temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                top_k: req.top_k.unwrap_or(0),
+                presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                seed: req.seed,
+                logit_bias: req.logit_bias.clone(),
+            };
+            let ids = match sched.generate_blocking(
+                req.prompt_ids.clone(), req.max_tokens, stop,
+                params, req.stop_strings.clone(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return format!("{{\"error\":\"scheduler error: {}\"}}", e);
+                }
+            };
+            completion_tokens = ids.len() as c_int;
+            let text = sched.decode_ids(&ids);
+            generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
+        } else {
+            match &state.session {
+                Some(sess_mu) => {
+                    let mut sess = sess_mu.lock().unwrap();
+                    let stop = state.cli.stop_token.or_else(|| {
+                        if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
+                    });
+                    let params = aether_rt::serving::SamplingParams {
+                        temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                        top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                        top_k: req.top_k.unwrap_or(0),
+                        presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                        frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                        seed: req.seed,
+                        logit_bias: req.logit_bias.clone(),
+                    };
+                    let ids = sess.generate_sampled_v2(
+                        &req.prompt_ids, req.max_tokens, stop, &params, &req.stop_strings);
+                    completion_tokens = ids.len() as c_int;
+                    let text = sess.decode_ids(&ids);
+                    generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
+                }
+                None => {
+                    generated_text = "[aether-serve stub: --gguf not supplied]".into();
+                    completion_tokens = 0;
+                }
             }
         }
     }
@@ -1345,10 +1494,24 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
     if req.prompt_ids.is_empty() {
         #[cfg(feature = "cuda")]
         {
-            match &state.session {
-                Some(sess_mu) => {
+            // FR-19.5-extra-deep: scheduler mode delegates encoding to the
+            // scheduler's shared session; legacy mode keeps the
+            // Mutex<QwenSession> path.
+            let (encode_input, used_template, have_session): (Option<String>, bool, bool) =
+                if let Some(sched) = &state.scheduler {
+                    if is_chat && !req.messages.is_empty() {
+                        match sched.apply_chat_template(&req.messages) {
+                            Some(rendered) => (Some(rendered), true, true),
+                            None => (req.text_prompt.clone(), false, true),
+                        }
+                    } else if is_chat {
+                        (req.text_prompt.clone(), false, true)
+                    } else {
+                        (req.raw_prompt.clone().or_else(|| req.text_prompt.clone()), false, true)
+                    }
+                } else if let Some(sess_mu) = &state.session {
                     let sess = sess_mu.lock().unwrap();
-                    let (encode_input, used_template): (Option<String>, bool) = if is_chat && !req.messages.is_empty() {
+                    let pair = if is_chat && !req.messages.is_empty() {
                         match sess.apply_chat_template(&req.messages) {
                             Some(rendered) => (Some(rendered), true),
                             None => (req.text_prompt.clone(), false),
@@ -1356,33 +1519,43 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
                     } else if is_chat {
                         (req.text_prompt.clone(), false)
                     } else {
-                        // /v1/completions:  raw prompt path.  Fall back
-                        // to text_prompt or joined-messages text as a
-                        // courtesy when neither is supplied.
                         (req.raw_prompt.clone().or_else(|| req.text_prompt.clone()), false)
                     };
-                    let Some(text) = encode_input else {
-                        let _ = send_text_t(t, 400, "body has no usable prompt");
-                        return;
-                    };
-                    let ids = if used_template {
-                        sess.encode_text_with_specials(&text)
-                    } else {
-                        sess.encode_text(&text)
-                    };
-                    if ids.is_empty() {
-                        let _ = send_text_t(t, 500,
-                            "text encode failed (no tokenizer loaded? or vocab gap) — pass prompt_ids");
-                        return;
-                    }
-                    req.prompt_ids = ids;
-                }
-                None => {
-                    let _ = send_text_t(t, 503,
-                        "no model loaded (start with --gguf) — text encode unavailable");
-                    return;
-                }
+                    (pair.0, pair.1, true)
+                } else {
+                    (None, false, false)
+                };
+            if !have_session {
+                let _ = send_text_t(t, 503,
+                    "no model loaded (start with --gguf) — text encode unavailable");
+                return;
             }
+            let Some(text) = encode_input else {
+                let _ = send_text_t(t, 400, "body has no usable prompt");
+                return;
+            };
+            let ids = if let Some(sched) = &state.scheduler {
+                if used_template {
+                    sched.encode_text_with_specials(&text)
+                } else {
+                    sched.encode_text(&text)
+                }
+            } else if let Some(sess_mu) = &state.session {
+                let sess = sess_mu.lock().unwrap();
+                if used_template {
+                    sess.encode_text_with_specials(&text)
+                } else {
+                    sess.encode_text(&text)
+                }
+            } else {
+                Vec::new()
+            };
+            if ids.is_empty() {
+                let _ = send_text_t(t, 500,
+                    "text encode failed (no tokenizer loaded? or vocab gap) — pass prompt_ids");
+                return;
+            }
+            req.prompt_ids = ids;
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -1401,8 +1574,14 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
     // restarts it.  Return 400 instead.
     #[cfg(feature = "cuda")]
     if !req.prompt_ids.is_empty() {
-        if let Some(sess_mu) = &state.session {
-            let vocab = sess_mu.lock().unwrap().cfg.vocab;
+        let vocab_opt: Option<usize> = if let Some(sched) = &state.scheduler {
+            Some(sched.vocab())
+        } else if let Some(sess_mu) = &state.session {
+            Some(sess_mu.lock().unwrap().cfg.vocab)
+        } else {
+            None
+        };
+        if let Some(vocab) = vocab_opt {
             if let Some(&bad) = req.prompt_ids.iter().find(|&&i| i >= vocab) {
                 let msg = format!(
                     "prompt_ids contains token id {} which is out of vocab (vocab_size={}); pass ids in [0, {})",
@@ -1414,6 +1593,18 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
     }
 
     if req.stream {
+        // FR-19.5-extra-deep: streaming over the BatchScheduler is not
+        // shipped in Phase 1.  Without a scheduler, the legacy path
+        // handles streaming through generate_sampled_v2 + the SSE
+        // chunker in handle_completion_streaming_t.  Reject streaming
+        // when the scheduler owns the session.
+        #[cfg(feature = "cuda")]
+        if state.scheduler.is_some() {
+            let _ = send_text_t(t, 503,
+                "streaming not yet supported with --max-concurrent > 1; \
+                 retry without 'stream: true', or restart without --max-concurrent");
+            return;
+        }
         handle_completion_streaming_t(state, t, &req);
         return;
     }
@@ -1424,42 +1615,74 @@ unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: 
 
     #[cfg(feature = "cuda")]
     {
-        match &state.session {
-            Some(sess_mu) => {
-                let mut sess = sess_mu.lock().unwrap();
-                let stop = state.cli.stop_token.or_else(|| {
-                    if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
-                });
-                let t = std::time::Instant::now();
-                let params = aether_rt::serving::SamplingParams {
-                    temperature: req.temperature.unwrap_or(state.cli.default_temperature),
-                    top_p: req.top_p.unwrap_or(state.cli.default_top_p),
-                    top_k: req.top_k.unwrap_or(0),
-                    presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
-                    frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
-                    seed: req.seed,
-                    logit_bias: req.logit_bias.clone(),
-                };
-                let ids = sess.generate_sampled_v2(
-                    &req.prompt_ids, req.max_tokens, stop, &params, &req.stop_strings);
-                let secs = t.elapsed().as_secs_f32();
-                eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2} top_k={} pp={:.2} fp={:.2})",
-                    ids.len(), secs, ids.len() as f32 / secs.max(1e-6),
-                    params.temperature, params.top_p, params.top_k, params.presence_penalty, params.frequency_penalty);
-                completion_tokens = ids.len() as c_int;
-                // Decode IDs back to real text via the loaded BPE tokenizer
-                // + GPT-2 byte fixup. Falls back to id list if tokenizer
-                // wasn't loaded (non-Qwen GGUF without ggml.tokens).
-                let text = sess.decode_ids(&ids);
-                generated_text = if text.is_empty() {
-                    format_id_list(&ids)
-                } else {
-                    text
-                };
-            }
-            None => {
-                generated_text = "[aether-serve stub: --gguf not supplied]".into();
-                completion_tokens = 0;
+        // FR-19.5-extra-deep: scheduler mode routes generation through
+        // BatchScheduler::generate_blocking; legacy mode keeps the
+        // direct Mutex<QwenSession>::generate_sampled_v2 path.
+        if let Some(sched) = &state.scheduler {
+            let stop = state.cli.stop_token.or_else(|| {
+                let eos = sched.eos_token();
+                if eos >= 0 { Some(eos as usize) } else { None }
+            });
+            let params = aether_rt::serving::SamplingParams {
+                temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                top_k: req.top_k.unwrap_or(0),
+                presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                seed: req.seed,
+                logit_bias: req.logit_bias.clone(),
+            };
+            let t0 = std::time::Instant::now();
+            let ids = match sched.generate_blocking(
+                req.prompt_ids.clone(), req.max_tokens, stop, params, req.stop_strings.clone(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = send_text_t(t, 500, &format!("scheduler error: {}", e));
+                    return;
+                }
+            };
+            let secs = t0.elapsed().as_secs_f32();
+            eprintln!("[serve/sched] {} tokens in {:.3}s = {:.2} tok/s",
+                ids.len(), secs, ids.len() as f32 / secs.max(1e-6));
+            completion_tokens = ids.len() as c_int;
+            let text = sched.decode_ids(&ids);
+            generated_text = if text.is_empty() { format_id_list(&ids) } else { text };
+        } else {
+            match &state.session {
+                Some(sess_mu) => {
+                    let mut sess = sess_mu.lock().unwrap();
+                    let stop = state.cli.stop_token.or_else(|| {
+                        if sess.eos_token >= 0 { Some(sess.eos_token as usize) } else { None }
+                    });
+                    let t = std::time::Instant::now();
+                    let params = aether_rt::serving::SamplingParams {
+                        temperature: req.temperature.unwrap_or(state.cli.default_temperature),
+                        top_p: req.top_p.unwrap_or(state.cli.default_top_p),
+                        top_k: req.top_k.unwrap_or(0),
+                        presence_penalty: req.presence_penalty.unwrap_or(state.cli.default_presence_penalty),
+                        frequency_penalty: req.frequency_penalty.unwrap_or(state.cli.default_frequency_penalty),
+                        seed: req.seed,
+                        logit_bias: req.logit_bias.clone(),
+                    };
+                    let ids = sess.generate_sampled_v2(
+                        &req.prompt_ids, req.max_tokens, stop, &params, &req.stop_strings);
+                    let secs = t.elapsed().as_secs_f32();
+                    eprintln!("[serve] generated {} tokens in {:.3}s = {:.2} tok/s (T={:.2} top_p={:.2} top_k={} pp={:.2} fp={:.2})",
+                        ids.len(), secs, ids.len() as f32 / secs.max(1e-6),
+                        params.temperature, params.top_p, params.top_k, params.presence_penalty, params.frequency_penalty);
+                    completion_tokens = ids.len() as c_int;
+                    let text = sess.decode_ids(&ids);
+                    generated_text = if text.is_empty() {
+                        format_id_list(&ids)
+                    } else {
+                        text
+                    };
+                }
+                None => {
+                    generated_text = "[aether-serve stub: --gguf not supplied]".into();
+                    completion_tokens = 0;
+                }
             }
         }
     }

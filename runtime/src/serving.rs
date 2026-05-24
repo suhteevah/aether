@@ -3096,6 +3096,191 @@ impl QwenSession {
         if n < 0 { return Vec::new(); }
         out_ids[..n as usize].iter().map(|&i| i as usize).collect()
     }
+
+    // ================================================================
+    // FR-19.5-extra-deep — batched-serving slot helpers.
+    //
+    // These accessors let `crate::batched_serving::BatchScheduler` drive
+    // N independent in-flight requests through ONE `QwenSession`.  Each
+    // request has its own page_table_host + owned_blocks + next_pos that
+    // live in a `SessionSlot` outside this struct.  Per decode tick the
+    // scheduler:
+    //   1. H2Ds the slot's page_table_host into `paged_cfg.page_table_dev`
+    //      (single shared device buffer — the captured graph reads it at
+    //      kernel-launch time so the same graph executes correctly with
+    //      different slot KV mappings).
+    //   2. Sets `self.next_pos` from the slot.
+    //   3. Calls `step_logits` (existing single-session path).
+    //   4. Reads the new `self.next_pos` back into the slot.
+    //
+    // No QwenSession internals leak out of the crate — the scheduler
+    // works against these methods alone.  Legacy single-session callers
+    // (`generate`, `generate_sampled_v2`, etc.) ignore everything below.
+    // ================================================================
+
+    /// Block size (tokens per logical block) for the session's paged-KV
+    /// layout, or `None` if not in paged mode.  Slots use this to size
+    /// their `page_table_host`.
+    pub fn paged_block_size(&self) -> Option<i32> {
+        self.paged_cfg.as_ref().map(|p| p.block_size)
+    }
+
+    /// Number of logical block slots the per-slot `page_table_host`
+    /// vector should reserve (sized for `MAX_SEQ` tokens).  Returns 0
+    /// when paged mode is off.
+    pub fn paged_n_logical(&self) -> usize {
+        match &self.paged_cfg {
+            Some(p) => ((MAX_SEQ as i32 + p.block_size - 1) / p.block_size) as usize,
+            None => 0,
+        }
+    }
+
+    /// Reference to the model's shared KV pool (for slot block alloc),
+    /// or `None` when this session isn't pool-backed.
+    pub fn pool_arc(&self) -> Option<std::sync::Arc<SharedKvPool>> {
+        self.pool.clone()
+    }
+
+    /// Allocate (if not already mapped) a physical block from the shared
+    /// pool for logical position `pos`.  Updates the supplied
+    /// `page_table_host` + `owned_blocks` in place; no session state
+    /// touched.  Returns Err on pool exhaustion.
+    pub fn slot_ensure_block(
+        &self,
+        pos: i32,
+        page_table_host: &mut Vec<i32>,
+        owned_blocks: &mut Vec<i32>,
+    ) -> Result<(), &'static str> {
+        let Some(p) = &self.paged_cfg else { return Ok(()); };
+        let Some(pool) = &self.pool else { return Ok(()); };
+        if pos < 0 { return Err("negative position"); }
+        let logical = (pos / p.block_size) as usize;
+        if logical < page_table_host.len() && page_table_host[logical] >= 0 {
+            return Ok(());
+        }
+        if logical >= page_table_host.len() {
+            page_table_host.resize(logical + 1, -1);
+        }
+        let b = pool.allocate_block();
+        if b < 0 { return Err("pool exhausted"); }
+        page_table_host[logical] = b;
+        owned_blocks.push(b);
+        Ok(())
+    }
+
+    /// Return all of `owned_blocks` to the shared pool's free list.
+    /// Idempotent; safe to call multiple times.
+    pub fn slot_release_blocks(&self, owned_blocks: &mut Vec<i32>) {
+        if let Some(pool) = &self.pool {
+            for b in owned_blocks.drain(..) {
+                pool.free_block(b);
+            }
+        } else {
+            owned_blocks.clear();
+        }
+    }
+
+    /// Vocab size — exposed so the scheduler can validate prompt_ids and
+    /// out-of-range logit_bias entries without locking the session.
+    pub fn vocab(&self) -> usize { self.cfg.vocab }
+
+    /// True if the session is configured for paged-KV with a shared
+    /// `SharedKvPool` (required for the batched scheduler).
+    pub fn is_pool_backed(&self) -> bool {
+        self.pool.is_some() && self.paged_cfg.is_some()
+    }
+
+    /// MoE archs can't be CUDA-graph-captured (host-side router top-k each
+    /// layer).  Scheduler uses this to size single-request critical
+    /// sections — MoE batched workers still produce correct output but
+    /// can't piggyback on the captured graph.
+    pub fn is_moe(&self) -> bool { self.cfg.n_experts > 0 }
+
+    /// Maximum decode position before the slot must stop (matches the
+    /// MAX_SEQ - 1 guard inside `generate*`).
+    pub fn max_pos(&self) -> i32 { (MAX_SEQ as i32) - 1 }
+
+    /// Decode-step entry point used by the batched scheduler.  Binds the
+    /// supplied per-slot state (page_table + position), runs ONE forward
+    /// pass, reads `act.logits` back to host, advances `*next_pos` in
+    /// the caller-owned variable, and returns the raw logits vector.
+    ///
+    /// PRECONDITION: `page_table_host[pos / block_size]` is already
+    /// mapped (call `slot_ensure_block` first).  Caller holds the
+    /// session lock; no other thread may run forward concurrently.
+    pub fn step_logits_for_slot(
+        &mut self,
+        page_table_host: &[i32],
+        next_pos: &mut i32,
+        last_id: usize,
+    ) -> Vec<f32> {
+        unsafe {
+            // 1. H2D the slot's page-table mapping into the session-wide
+            //    device buffer.  The captured graph reads page_table_dev
+            //    in-kernel (NOT baked in at capture), so the same graph
+            //    correctly fetches this slot's K/V pool blocks.
+            if let Some(p) = &self.paged_cfg {
+                if !page_table_host.is_empty() {
+                    aether_dev_h2d_i32(
+                        page_table_host.as_ptr() as i64,
+                        p.page_table_dev,
+                        page_table_host.len() as c_int,
+                    );
+                }
+            }
+            // 2. Bind position state.
+            self.next_pos = *next_pos;
+            // 3. Run the standard forward (graph or imperative).
+            let logits = self.step_logits(last_id);
+            // 4. Read advanced position back to the caller's slot.
+            *next_pos = self.next_pos;
+            logits
+        }
+    }
+
+    /// Prefill helper for the batched scheduler.  Mirrors `prefill` but
+    /// against an external slot state.  Allocates pool blocks as needed
+    /// and walks every prompt token through the forward pass.  After
+    /// return, `*next_pos = prompt_ids.len() - 1` (matching the legacy
+    /// single-session `prefill`).
+    pub fn prefill_for_slot(
+        &mut self,
+        page_table_host: &mut Vec<i32>,
+        owned_blocks: &mut Vec<i32>,
+        next_pos: &mut i32,
+        prompt_ids: &[usize],
+    ) -> Result<(), &'static str> {
+        if prompt_ids.is_empty() { return Err("prompt cannot be empty"); }
+        unsafe {
+            for (i, &t_id) in prompt_ids.iter().enumerate() {
+                let pos = i as i32;
+                self.slot_ensure_block(pos, page_table_host, owned_blocks)?;
+                // H2D the (possibly-updated) page table.
+                if let Some(p) = &self.paged_cfg {
+                    if !page_table_host.is_empty() {
+                        aether_dev_h2d_i32(
+                            page_table_host.as_ptr() as i64,
+                            p.page_table_dev,
+                            page_table_host.len() as c_int,
+                        );
+                    }
+                }
+                let emb = self.dequant_embd_row(t_id);
+                aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, self.cfg.d_model as c_int);
+                let cur_seq = pos + 1;
+                let step_host = [pos, cur_seq, 0i32, 0i32];
+                aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
+                for b in 0..self.cfg.n_layers {
+                    block_forward_devarg(
+                        &self.blocks[b], &self.act, &self.kvs[b],
+                        self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+                }
+            }
+            aether_dev_sync();
+            *next_pos = (prompt_ids.len() as i32) - 1;
+        }
+        Ok(())
+    }
 }
 
 /// External-callable version of the internal greedy argmax — used by

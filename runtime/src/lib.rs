@@ -18,10 +18,21 @@ pub mod cuda;
 pub mod serving;
 
 #[cfg(feature = "cuda")]
+pub mod batched_serving;
+
+#[cfg(feature = "cuda")]
 pub mod bert;
 
 #[cfg(feature = "nccl")]
 pub mod nccl_real;
+
+/// FR-x-extra-tp — tensor-parallel inference orchestration.  Phase 1 ships
+/// the sharding-plan math + API surface + NCCL-availability detection;
+/// TP=1 path is bit-identical to single-GPU.  TP=N≥2 falls back to TP=1
+/// with a warning until the multi-context cuda.rs refactor lands.  See
+/// `tensor_parallel::TP_GAPS` for the structural follow-ons.
+#[cfg(feature = "cuda")]
+pub mod tensor_parallel;
 
 pub mod tls13;
 
