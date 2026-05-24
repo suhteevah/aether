@@ -22,6 +22,7 @@ use aether_rt::{
     aether_gguf_get_metadata_array_string_get,
     aether_bpe_tokenizer_new, aether_bpe_add_token_with_id,
     aether_bpe_add_merge_by_id, aether_bpe_encode, aether_bpe_decode,
+    aether_bpe_encode_ids, aether_bpe_lookup_bytes,
 };
 
 const QWEN_BLOB: &str = "C:\\Users\\Matt\\.ollama\\models\\blobs\\sha256-2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730";
@@ -221,6 +222,84 @@ fn qwen25_tokenizer_decode_roundtrip() {
         // decode half here.
 
         eprintln!("[OK] Qwen2.5-7B tokenizer decode + GPT-2 byte fixup verified");
+        aether_gguf_close(h);
+    }
+}
+
+/// FR-x-extra-text-encode: encode "hello world" with the wired BPE
+/// encode path (byte→surface_id via aether_bpe_lookup_bytes, then merge
+/// loop via aether_bpe_encode_ids), then decode the resulting ids and
+/// confirm the surface text round-trips back to "hello world".
+#[test]
+fn qwen25_tokenizer_encode_roundtrip() {
+    if !std::path::Path::new(QWEN_BLOB).exists() {
+        eprintln!("[skip] Qwen2.5-7B GGUF not present");
+        return;
+    }
+    unsafe {
+        let h = aether_gguf_open(QWEN_BLOB.as_ptr() as i64, QWEN_BLOB.len() as c_int);
+        assert!(h >= 0);
+
+        let (bpe, vocab_bytes) = load_qwen25_vocab(h);
+        let _ = load_qwen25_merges(h, bpe, &vocab_bytes);
+
+        // Build the 256-entry byte→token_id cache via the new
+        // aether_bpe_lookup_bytes primitive.  Mirrors what QwenSession::
+        // encode_text does internally.
+        let b2u = build_gpt2_byte_to_unicode();
+        let mut byte_to_id = [-1i32; 256];
+        let mut tmp = [0u8; 4];
+        for b in 0..256u32 {
+            let ch = b2u[b as usize];
+            let s = ch.encode_utf8(&mut tmp);
+            let id = aether_bpe_lookup_bytes(
+                bpe,
+                s.as_ptr() as *const c_void,
+                s.len() as c_int,
+            );
+            byte_to_id[b as usize] = id;
+        }
+        let missing = byte_to_id.iter().filter(|&&i| i < 0).count();
+        eprintln!("[encode] byte→id cache built; missing={}", missing);
+        assert_eq!(missing, 0, "Qwen2.5 vocab should cover all 256 surface bytes");
+
+        // Encode "hello world".
+        let text = b"hello world";
+        let initial: Vec<i32> = text.iter().map(|&b| byte_to_id[b as usize]).collect();
+        let mut out_ids = vec![0i32; 64];
+        let n = aether_bpe_encode_ids(
+            bpe,
+            initial.as_ptr() as *const c_void, initial.len() as c_int,
+            out_ids.as_mut_ptr() as *mut c_void, out_ids.len() as c_int,
+        );
+        assert!(n > 0, "encode_ids failed (n={})", n);
+        out_ids.truncate(n as usize);
+        eprintln!("[encode] {} ids: {:?}", n, out_ids);
+
+        // Should be fewer ids than initial bytes — the BPE merges
+        // collapsed " world" / "hello" / etc.
+        assert!((n as usize) < text.len(),
+            "expected merges to collapse 11 bytes to <11 ids, got {}", n);
+        assert!((n as usize) <= 4,
+            "expected ≤ 4 ids for 'hello world' on Qwen2.5, got {}", n);
+
+        // Decode back to surface + GPT-2 inverse → real text.
+        let mut surface_buf = vec![0u8; 256];
+        let nb = aether_bpe_decode(
+            bpe,
+            out_ids.as_ptr() as *const c_void, out_ids.len() as c_int,
+            surface_buf.as_mut_ptr() as *mut c_void, surface_buf.len() as c_int,
+        );
+        assert!(nb > 0, "decode failed (nb={})", nb);
+        let surface = std::str::from_utf8(&surface_buf[..nb as usize]).unwrap();
+        let u2b = build_gpt2_unicode_to_byte(&b2u);
+        let real = surface_to_bytes(surface, &u2b);
+        eprintln!("[encode] roundtrip: {:?}", std::str::from_utf8(&real).unwrap());
+
+        // Round-trip must yield "hello world" byte-for-byte.
+        assert_eq!(&real[..], text);
+        eprintln!("[OK] Qwen2.5-7B encode_ids + decode round-trip verified");
+
         aether_gguf_close(h);
     }
 }

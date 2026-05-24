@@ -35,7 +35,7 @@ use crate::{
     aether_gguf_get_metadata_array_string_get,
     aether_bpe_tokenizer_new, aether_bpe_tokenizer_free,
     aether_bpe_add_token_with_id, aether_bpe_add_merge_by_id,
-    aether_bpe_decode,
+    aether_bpe_decode, aether_bpe_encode_ids, aether_bpe_lookup_bytes,
 };
 use crate::cuda::{
     aether_dev_init, aether_dev_alloc_f32, aether_dev_free_f32,
@@ -60,6 +60,16 @@ use crate::cuda::{
     aether_op_mla_rope_k_shared_yarn_f32_cuda,
     aether_op_mla_absorb_q_q8_0_cuda,
     aether_op_mla_absorb_v_q8_0_cuda,
+    aether_op_mla_absorb_q_f16_cuda,
+    aether_op_mla_absorb_v_f16_cuda,
+    aether_op_mla_absorb_q_q4_k_cuda,
+    aether_op_mla_absorb_v_q4_k_cuda,
+    aether_op_mla_absorb_q_q5_k_cuda,
+    aether_op_mla_absorb_v_q5_k_cuda,
+    aether_op_mla_absorb_q_q6_k_cuda,
+    aether_op_mla_absorb_v_q6_k_cuda,
+    aether_op_mla_absorb_q_iq4_nl_cuda,
+    aether_op_mla_absorb_v_iq4_nl_cuda,
     aether_op_mla_broadcast_kv_for_mqa_f32_cuda,
     aether_op_matmul_nt_f32_cuda,
     aether_op_bias_add_f32_cuda, aether_op_add_inplace_f32_cuda,
@@ -528,6 +538,22 @@ struct ActivationGpu {
     attn_out: i64, proj: i64,
     gate: i64, down: i64,
     logits: i64,
+    // FR-17-extra-mla-absorbed-persist — persistent workspace buffers for
+    // `mla_attention_forward_absorbed`.  Allocated once at session
+    // construction (only if `cfg.is_mla_absorbed()`); reused across every
+    // layer × token instead of cuda_alloc/free per call.
+    // Each is 0 for non-MLA-absorbed archs.
+    mla_abs_kv_a: i64,         // [kv_lora_rank + qk_rope]
+    mla_abs_c_kv: i64,         // [kv_lora_rank]
+    mla_abs_c_kv_n: i64,       // [kv_lora_rank]
+    mla_abs_k_pe: i64,         // [qk_rope]
+    mla_abs_q_a: i64,          // [q_lora_rank]   (0 when q_lora_rank == 0)
+    mla_abs_q_a_n: i64,        // [q_lora_rank]   (0 when q_lora_rank == 0)
+    mla_abs_q_proj: i64,       // [n_heads * key_mla]
+    mla_abs_q_full: i64,       // [n_heads * (kv_lora_rank + qk_rope)]
+    mla_abs_k_row: i64,        // [n_heads * (kv_lora_rank + qk_rope)]
+    mla_abs_v_row: i64,        // [n_heads * kv_lora_rank]
+    mla_abs_attn_v_out: i64,   // [n_heads * kv_lora_rank]
 }
 
 struct KvCacheGpu { k_cache: i64, v_cache: i64 }
@@ -1221,38 +1247,39 @@ unsafe fn mla_attention_forward_absorbed(
         "absorbed MLA requires Q-LoRA (q_lora_rank > 0)");
     assert!(bw.w_k_b != 0 && bw.w_v_b != 0,
         "absorbed MLA requires attn_k_b + attn_v_b tensors");
-    assert!(bw.dt_k_b == 8 && bw.dt_v_b == 8,
-        "absorbed MLA currently supports Q8_0 (dt=8) for w_k_b/w_v_b only; \
-         got dt_k_b={} dt_v_b={}", bw.dt_k_b, bw.dt_v_b);
-    assert!(q_nope_per_head % 32 == 0,
-        "q_nope_per_head ({}) must be a multiple of 32 for Q8_0 wk_b kernel",
-        q_nope_per_head);
-    assert!(kv_lora_rank % 32 == 0,
-        "kv_lora_rank ({}) must be a multiple of 32 for Q8_0 wv_b kernel",
-        kv_lora_rank);
 
-    // Per-call workspace (drops at end of fn).  Sizes:
-    //   kv_a            = kv_lora_rank + qk_rope
-    //   c_kv, c_kv_n    = kv_lora_rank
-    //   k_pe            = qk_rope
-    //   q_a, q_a_n      = q_lora_rank
-    //   q_proj          = n_heads * key_mla (output of w_q_b)
-    //   q_full          = n_heads * (kv_lora_rank + qk_rope) (post-absorption + q_pe concat)
-    //   k_row           = n_heads * (kv_lora_rank + qk_rope) (broadcast K for cache)
-    //   v_row           = n_heads * kv_lora_rank             (broadcast V for cache)
-    //   attn_v_out      = n_heads * kv_lora_rank (paged_attention output)
-    let kv_a   = aether_dev_alloc_f32(kv_lora_rank + qk_rope);
-    let c_kv   = aether_dev_alloc_f32(kv_lora_rank);
-    let c_kv_n = aether_dev_alloc_f32(kv_lora_rank);
-    let k_pe   = aether_dev_alloc_f32(qk_rope);
+    // FR-17-extra-mla-absorbed-dtypes — per-dtype helper closures for the
+    // per-head Q absorption + V reduction kernels.  Dispatch on bw.dt_k_b /
+    // bw.dt_v_b independently (in theory an arch could quantize each side
+    // differently, though in practice both sides match).
+    //
+    // Block-quant types (Q4_K/Q5_K/Q6_K) require their natural alignment:
+    //     Q4_K/Q5_K/Q6_K: n_in % 256 == 0
+    //     Q8_0 / IQ4_NL : n_in % 32  == 0
+    //     F16: no alignment constraint (per-element)
+    //
+    // We check alignment per-side and only dispatch into the kernel matching
+    // the actual dtype.  Anything not in the table panics with a clear
+    // dtype + side identifier so a future arch surfaces the gap explicitly.
+
+    // FR-17-extra-mla-absorbed-persist — reuse the ActivationGpu persistent
+    // buffers instead of cuda_alloc_f32 / cuda_free_f32 per call.  This drops
+    // the per-token alloc count from ~517 (47 layers × 11 buffers) to 0.
+    assert!(act.mla_abs_kv_a != 0,
+        "ActivationGpu MLA-absorbed workspace was not allocated; \
+         was the session built with is_mla_absorbed() == true?");
+    let kv_a = act.mla_abs_kv_a;
+    let c_kv = act.mla_abs_c_kv;
+    let c_kv_n = act.mla_abs_c_kv_n;
+    let k_pe = act.mla_abs_k_pe;
     let q_a_dim = cfg.q_lora_rank as c_int;
-    let q_a    = aether_dev_alloc_f32(q_a_dim);
-    let q_a_n  = aether_dev_alloc_f32(q_a_dim);
-    let q_proj = aether_dev_alloc_f32(n_heads * key_mla);
-    let q_full = aether_dev_alloc_f32(n_heads * (kv_lora_rank + qk_rope));
-    let k_row  = aether_dev_alloc_f32(n_heads * (kv_lora_rank + qk_rope));
-    let v_row  = aether_dev_alloc_f32(n_heads * kv_lora_rank);
-    let attn_v_out = aether_dev_alloc_f32(n_heads * kv_lora_rank);
+    let q_a = act.mla_abs_q_a;
+    let q_a_n = act.mla_abs_q_a_n;
+    let q_proj = act.mla_abs_q_proj;
+    let q_full = act.mla_abs_q_full;
+    let k_row = act.mla_abs_k_row;
+    let v_row = act.mla_abs_v_row;
+    let attn_v_out = act.mla_abs_attn_v_out;
 
     let dump_mla = std::env::var("AETHER_DUMP_MLA").is_ok();
     let probe = |label: &str, h: i64, n: usize| {
@@ -1308,13 +1335,13 @@ unsafe fn mla_attention_forward_absorbed(
             n_heads, key_mla, q_nope_per_head, rope_base, step_args);
     }
 
-    // Step 4: Per-head Q absorption + q_pe concat via Q8_0 wk_b.  Output
-    // q_full has per-head dim (kv_lora_rank + qk_rope) — matches Kcur per
-    // head in the broadcast cache.
-    let wk_blocks_per_row = q_nope_per_head / 32;
-    aether_op_mla_absorb_q_q8_0_cuda(
-        q_proj, bw.w_k_b, q_full,
-        n_heads, key_mla, qk_rope, kv_lora_rank, wk_blocks_per_row);
+    // Step 4: Per-head Q absorption + q_pe concat via wk_b.  Output q_full
+    // has per-head dim (kv_lora_rank + qk_rope) — matches Kcur per head in
+    // the broadcast cache.  Dispatch on bw.dt_k_b for the dequant body;
+    // alignment of q_nope_per_head determines which block-size is valid.
+    mla_absorb_q_dispatch(
+        bw.dt_k_b, q_proj, bw.w_k_b, q_full,
+        n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head);
     probe("q_full_absorbed", q_full, (n_heads * (kv_lora_rank + qk_rope)) as usize);
 
     // Step 5: Broadcast c_kv (+ k_pe for K) to per-head MQA slots.
@@ -1347,17 +1374,148 @@ unsafe fn mla_attention_forward_absorbed(
         scale, max_seq as c_int, step_args);
     probe("attn_v_out", attn_v_out, (n_heads * kv_lora_rank) as usize);
 
-    // Step 7: Per-head V absorption via Q8_0 wv_b — reduces kv_lora_rank to
-    // value_mla per head.  Writes into act.attn_out (first n_heads*val_mla floats).
-    let wv_blocks_per_row = kv_lora_rank / 32;
-    aether_op_mla_absorb_v_q8_0_cuda(
-        attn_v_out, bw.w_v_b, act.attn_out,
-        n_heads, kv_lora_rank, val_mla, wv_blocks_per_row);
+    // Step 7: Per-head V absorption via wv_b — reduces kv_lora_rank to
+    // value_mla per head.  Writes into act.attn_out (first n_heads*val_mla
+    // floats).  Dispatch on bw.dt_v_b.
+    mla_absorb_v_dispatch(
+        bw.dt_v_b, attn_v_out, bw.w_v_b, act.attn_out,
+        n_heads, kv_lora_rank, val_mla);
     probe("attn_out", act.attn_out, (n_heads * val_mla) as usize);
 
-    // Free per-call workspace.
-    for h in [kv_a, c_kv, c_kv_n, k_pe, q_a, q_a_n, q_proj, q_full, k_row, v_row, attn_v_out] {
-        let _ = aether_dev_free_f32(h);
+    // Per-call workspace is persistent on ActivationGpu — nothing to free.
+    let _ = q_a_dim; // suppress unused-binding warning when q_lora_rank == 0
+}
+
+/// FR-17-extra-mla-absorbed-dtypes — Q absorption dispatch.  Maps the GGUF
+/// dtype code of `attn_k_b` to the matching CUDA kernel.  Each kernel reads
+/// `q_nope_per_head` input elements (the non-rope sub-region of q_proj per
+/// head) and outputs to `q_full[h, oi]` for oi in [0, kv_lora_rank + qk_rope).
+/// Asserts the alignment requirement of the chosen quant block size, and
+/// panics with a clear dtype string for unsupported dtypes so future archs
+/// surface the gap explicitly rather than producing silent wrong output.
+unsafe fn mla_absorb_q_dispatch(
+    dt: i32, q_proj: i64, w_k_b: i64, q_full: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, q_nope_per_head: c_int,
+) {
+    match dt {
+        1 => {
+            // F16 — no block alignment; n_in_per_row = q_nope_per_head.
+            aether_op_mla_absorb_q_f16_cuda(
+                q_proj, w_k_b, q_full,
+                n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head);
+        }
+        8 => {
+            // Q8_0 — 32-elem blocks.
+            assert!(q_nope_per_head % 32 == 0,
+                "q_nope_per_head ({}) must be a multiple of 32 for Q8_0 wk_b",
+                q_nope_per_head);
+            aether_op_mla_absorb_q_q8_0_cuda(
+                q_proj, w_k_b, q_full,
+                n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head / 32);
+        }
+        20 => {
+            // IQ4_NL — 32-elem blocks (same shape as Q4_0, codebook lookup).
+            assert!(q_nope_per_head % 32 == 0,
+                "q_nope_per_head ({}) must be a multiple of 32 for IQ4_NL wk_b",
+                q_nope_per_head);
+            aether_op_mla_absorb_q_iq4_nl_cuda(
+                q_proj, w_k_b, q_full,
+                n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head / 32);
+        }
+        12 => {
+            // Q4_K — 256-elem super-blocks.
+            assert!(q_nope_per_head % 256 == 0,
+                "q_nope_per_head ({}) must be a multiple of 256 for Q4_K wk_b",
+                q_nope_per_head);
+            aether_op_mla_absorb_q_q4_k_cuda(
+                q_proj, w_k_b, q_full,
+                n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head / 256);
+        }
+        13 => {
+            // Q5_K — 256-elem super-blocks.
+            assert!(q_nope_per_head % 256 == 0,
+                "q_nope_per_head ({}) must be a multiple of 256 for Q5_K wk_b",
+                q_nope_per_head);
+            aether_op_mla_absorb_q_q5_k_cuda(
+                q_proj, w_k_b, q_full,
+                n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head / 256);
+        }
+        14 => {
+            // Q6_K — 256-elem super-blocks.
+            assert!(q_nope_per_head % 256 == 0,
+                "q_nope_per_head ({}) must be a multiple of 256 for Q6_K wk_b",
+                q_nope_per_head);
+            aether_op_mla_absorb_q_q6_k_cuda(
+                q_proj, w_k_b, q_full,
+                n_heads, key_mla, qk_rope, kv_lora_rank, q_nope_per_head / 256);
+        }
+        _ => panic!(
+            "mla_absorb_q_dispatch: unsupported attn_k_b dtype dt={} \
+             (supported: 1=F16, 8=Q8_0, 12=Q4_K, 13=Q5_K, 14=Q6_K, 20=IQ4_NL; \
+             TODO: 6=Q5_0, 18=IQ3_XXS, 21=IQ3_S, 23=IQ4_XS)", dt),
+    }
+}
+
+/// FR-17-extra-mla-absorbed-dtypes — V reduction dispatch.  Mirror of the
+/// Q-absorption dispatch but for `attn_v_b`.  Input per head is
+/// `kv_lora_rank` floats (the paged_attention output); output per head is
+/// `value_mla` floats written into `attn_out`.
+unsafe fn mla_absorb_v_dispatch(
+    dt: i32, attn_v_out: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, val_mla: c_int,
+) {
+    match dt {
+        1 => {
+            // F16 — no block alignment; n_in_per_row = kv_lora_rank.
+            aether_op_mla_absorb_v_f16_cuda(
+                attn_v_out, w_v_b, attn_out,
+                n_heads, kv_lora_rank, val_mla, kv_lora_rank);
+        }
+        8 => {
+            assert!(kv_lora_rank % 32 == 0,
+                "kv_lora_rank ({}) must be a multiple of 32 for Q8_0 wv_b",
+                kv_lora_rank);
+            aether_op_mla_absorb_v_q8_0_cuda(
+                attn_v_out, w_v_b, attn_out,
+                n_heads, kv_lora_rank, val_mla, kv_lora_rank / 32);
+        }
+        20 => {
+            assert!(kv_lora_rank % 32 == 0,
+                "kv_lora_rank ({}) must be a multiple of 32 for IQ4_NL wv_b",
+                kv_lora_rank);
+            aether_op_mla_absorb_v_iq4_nl_cuda(
+                attn_v_out, w_v_b, attn_out,
+                n_heads, kv_lora_rank, val_mla, kv_lora_rank / 32);
+        }
+        12 => {
+            assert!(kv_lora_rank % 256 == 0,
+                "kv_lora_rank ({}) must be a multiple of 256 for Q4_K wv_b",
+                kv_lora_rank);
+            aether_op_mla_absorb_v_q4_k_cuda(
+                attn_v_out, w_v_b, attn_out,
+                n_heads, kv_lora_rank, val_mla, kv_lora_rank / 256);
+        }
+        13 => {
+            assert!(kv_lora_rank % 256 == 0,
+                "kv_lora_rank ({}) must be a multiple of 256 for Q5_K wv_b",
+                kv_lora_rank);
+            aether_op_mla_absorb_v_q5_k_cuda(
+                attn_v_out, w_v_b, attn_out,
+                n_heads, kv_lora_rank, val_mla, kv_lora_rank / 256);
+        }
+        14 => {
+            assert!(kv_lora_rank % 256 == 0,
+                "kv_lora_rank ({}) must be a multiple of 256 for Q6_K wv_b",
+                kv_lora_rank);
+            aether_op_mla_absorb_v_q6_k_cuda(
+                attn_v_out, w_v_b, attn_out,
+                n_heads, kv_lora_rank, val_mla, kv_lora_rank / 256);
+        }
+        _ => panic!(
+            "mla_absorb_v_dispatch: unsupported attn_v_b dtype dt={} \
+             (supported: 1=F16, 8=Q8_0, 12=Q4_K, 13=Q5_K, 14=Q6_K, 20=IQ4_NL; \
+             TODO: 6=Q5_0, 18=IQ3_XXS, 21=IQ3_S, 23=IQ4_XS)", dt),
     }
 }
 
@@ -1368,6 +1526,71 @@ unsafe fn mla_attention_forward_absorbed(
 #[inline(always)]
 fn matmul_nt_f32_cuda_unused() -> i32 {
     let _ = aether_op_matmul_nt_f32_cuda; 0
+}
+
+// ---------------------------------------------------------------------------
+// FR-17-extra-moe-quant: MoE expert-matmul dispatch table.
+//
+// Adding a new dtype to the MoE expert dispatch is now a one-line table row:
+//   ExpertDtype { dt: <ggml_type_int>, block_n_elems: <32 or 256>, kernel: <fn> },
+//
+// The kernel signature is the per-expert fused-matmul ABI:
+//     fn(x: i64, w_base: i64, y: i64, n_out: c_int,
+//        blocks_per_row: c_int, expert_idx: c_int) -> c_int
+//
+// `block_n_elems` is the number of input elements consumed per quant block
+// (32 for Q8_0/Q5_0/Q4_0/IQ4_NL/Q5_1/Q8_1; 256 for Q4_K/Q5_K/Q6_K/IQ3_S/
+// IQ3_XXS/IQ4_XS).  It determines `blocks_per_row = n_in / block_n_elems`.
+//
+// Coverage today (GLM-4.7-flash + DeepSeek-V2-Lite + Qwen3-MoE):
+//   Q4_K(12), Q5_0(6), Q8_0(8), IQ3_XXS(18), IQ3_S(21), IQ4_XS(23)
+//
+// Cold-path dtypes that have a STANDALONE `dispatch_matmul` kernel but no
+// expert-variant kernel yet (would require a new fused_<dt>_expert_matmul_seq1
+// in cuda.rs to add — same pattern as the existing 6):
+//   F32(0), F16(1), Q4_0(2), Q5_K(13), Q6_K(14), IQ4_NL(20)
+// These will panic with a clear "add a table row + expert kernel" message.
+//
+// roadmap: P17.5
+
+type ExpertKernel = extern "C" fn(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int;
+
+struct ExpertDtype {
+    dt: i32,
+    block_n_elems: usize,
+    kernel: ExpertKernel,
+}
+
+const MOE_EXPERT_DISPATCH: &[ExpertDtype] = &[
+    ExpertDtype { dt: 12, block_n_elems: 256, kernel: aether_op_fused_q4k_expert_matmul_seq1_cuda },
+    ExpertDtype { dt:  8, block_n_elems:  32, kernel: aether_op_fused_q8_0_expert_matmul_seq1_cuda },
+    ExpertDtype { dt:  6, block_n_elems:  32, kernel: aether_op_fused_q5_0_expert_matmul_seq1_cuda },
+    ExpertDtype { dt: 21, block_n_elems: 256, kernel: aether_op_fused_iq3_s_expert_matmul_seq1_cuda },
+    ExpertDtype { dt: 23, block_n_elems: 256, kernel: aether_op_fused_iq4_xs_expert_matmul_seq1_cuda },
+    ExpertDtype { dt: 18, block_n_elems: 256, kernel: aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda },
+    // <- add new dtypes here, one line each, plus the matching kernel
+    //    `fused_<dt>_expert_matmul_seq1` in cuda.rs.
+];
+
+/// Look up the MoE expert-matmul kernel for weight dtype `dt`.  Panics with
+/// a directive pointing at MOE_EXPERT_DISPATCH if the dtype isn't tabled.
+#[inline]
+fn lookup_expert_kernel(dt: i32) -> &'static ExpertDtype {
+    for entry in MOE_EXPERT_DISPATCH {
+        if entry.dt == dt { return entry; }
+    }
+    let supported: Vec<String> = MOE_EXPERT_DISPATCH.iter()
+        .map(|e| e.dt.to_string()).collect();
+    panic!(
+        "moe expert matmul: unsupported dtype {} (supported: [{}]).  \
+         To add: append `ExpertDtype {{ dt: {}, block_n_elems: <32|256>, \
+         kernel: aether_op_fused_<DT>_expert_matmul_seq1_cuda }}` to \
+         MOE_EXPERT_DISPATCH in serving.rs and ship the matching kernel \
+         in cuda.rs.",
+        dt, supported.join(","), dt);
 }
 
 unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig) {
@@ -1412,65 +1635,28 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
     let sum: f32 = weights.iter().sum();
     for w in &mut weights { *w /= sum; }
 
-    // 3. Per-expert forward.  Q4_K kernels need n_in % 256; the Q8_0/Q5_0
-    // expert variants work in 32-elem blocks so they cover the cases where
-    // expert_ff isn't a multiple of 256 (V2-Lite: expert_ff=1408 / 32 = 44,
-    // not a multiple of 256).  Dispatch on dt per tensor.
+    // 3. Per-expert forward.  Dispatch on dtype-per-tensor via the
+    // MOE_EXPERT_DISPATCH table above.  `blocks_per_row` is derived from the
+    // per-dtype `block_n_elems`, so 32-elem block dtypes (Q8_0/Q5_0) and
+    // 256-elem block dtypes (Q4_K/Q5_K/IQ3_S/IQ4_XS/IQ3_XXS) coexist.
     //
-    // Q4_K block_per_row = n_in / 256.   Q8_0/Q5_0 block_per_row = n_in / 32.
-    let bpr_q4k_in = (d_model / 256) as c_int;       // gate/up: n_in = d_model
-    let bpr_q4k_ff = (expert_ff / 256) as c_int;     // down: n_in = expert_ff (only if Q4_K + aligned)
-    let bpr_q8_in  = (d_model / 32)  as c_int;
-    let bpr_q8_ff  = (expert_ff / 32)  as c_int;
+    // Common case: expert_ff isn't a multiple of 256 (e.g. V2-Lite
+    // expert_ff=1408 / 32 = 44) so the `down` tensor MUST land on a
+    // 32-elem-block dtype if any expert is non-Q4_K.  The dtype-per-tensor
+    // routing handles this transparently.
     let exp_ff_c = expert_ff as c_int;
     let d_model_c = d_model as c_int;
 
     let dispatch_expert = |x_in: i64, w_base: i64, dt: i32, y: i64,
                             n_out: c_int, n_in_d_model: bool, expert_idx: c_int| {
         // n_in_d_model=true → n_in = d_model.  Else n_in = expert_ff.
-        match dt {
-            12 => {
-                // Q4_K — n_in must be a multiple of 256.
-                let bpr = if n_in_d_model { bpr_q4k_in } else { bpr_q4k_ff };
-                aether_op_fused_q4k_expert_matmul_seq1_cuda(
-                    x_in, w_base, y, n_out, bpr, expert_idx);
-            }
-            8 => {
-                let bpr = if n_in_d_model { bpr_q8_in } else { bpr_q8_ff };
-                aether_op_fused_q8_0_expert_matmul_seq1_cuda(
-                    x_in, w_base, y, n_out, bpr, expert_idx);
-            }
-            6 => {
-                let bpr = if n_in_d_model { bpr_q8_in } else { bpr_q8_ff };
-                aether_op_fused_q5_0_expert_matmul_seq1_cuda(
-                    x_in, w_base, y, n_out, bpr, expert_idx);
-            }
-            21 => {
-                // IQ3_S — 256-elem blocks; same blocks_per_row math as Q4_K.
-                // GLM-4.7-flash MoE blocks (layer 1+) use IQ3_S for many
-                // expert tensors (gate/up/down).  FR-17-extra-moe-quant-dispatch.
-                let bpr = if n_in_d_model { bpr_q4k_in } else { bpr_q4k_ff };
-                aether_op_fused_iq3_s_expert_matmul_seq1_cuda(
-                    x_in, w_base, y, n_out, bpr, expert_idx);
-            }
-            23 => {
-                // IQ4_XS — 256-elem blocks; same blocks_per_row math as Q4_K.
-                // GLM-4.7-flash MoE blocks surface this dtype before any
-                // IQ3_S ones.  FR-17-extra-moe-quant-dispatch-iq4xs.
-                let bpr = if n_in_d_model { bpr_q4k_in } else { bpr_q4k_ff };
-                aether_op_fused_iq4_xs_expert_matmul_seq1_cuda(
-                    x_in, w_base, y, n_out, bpr, expert_idx);
-            }
-            18 => {
-                // IQ3_XXS — 256-elem blocks; same blocks_per_row math as Q4_K.
-                // GLM-4.7-flash MoE blocks surface this dtype third after
-                // IQ4_XS and IQ3_S.  FR-17-extra-moe-quant-dispatch-iq3xxs.
-                let bpr = if n_in_d_model { bpr_q4k_in } else { bpr_q4k_ff };
-                aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda(
-                    x_in, w_base, y, n_out, bpr, expert_idx);
-            }
-            _ => panic!("moe expert matmul: unsupported dtype {} (only Q4_K=12, Q5_0=6, Q8_0=8, IQ3_XXS=18, IQ3_S=21, IQ4_XS=23 today)", dt),
-        }
+        let entry = lookup_expert_kernel(dt);
+        let n_in = if n_in_d_model { d_model } else { expert_ff };
+        debug_assert!(n_in % entry.block_n_elems == 0,
+            "moe expert dt={}: n_in={} not divisible by block_n_elems={}",
+            dt, n_in, entry.block_n_elems);
+        let bpr = (n_in / entry.block_n_elems) as c_int;
+        (entry.kernel)(x_in, w_base, y, n_out, bpr, expert_idx);
     };
 
     for (k, &expert_idx) in selected.iter().enumerate() {
@@ -1585,6 +1771,14 @@ pub struct QwenSession {
     /// FR-17-extra-runtime-shape — runtime shape from GGUF metadata.
     /// Falls back to Qwen2.5-7B if metadata absent.
     pub cfg: ModelConfig,
+    /// FR-x-extra-text-encode — lazy cache of byte → token-id for the
+    /// 256 GPT-2 surface-char single-byte vocab entries.  Built on
+    /// first `encode_text` call by mapping each byte 0..=255 through
+    /// the GPT-2 byte→unicode alphabet and looking up the resulting
+    /// surface char (UTF-8 encoded) in the BPE decode_table.  -1 in a
+    /// slot means "no vocab entry for that surface char" — which
+    /// shouldn't happen for any well-formed GPT-2-style vocab.
+    byte_to_id_cache: std::sync::OnceLock<Box<[i32; 256]>>,
 }
 
 struct PagedCfg {
@@ -1767,6 +1961,39 @@ impl QwenSession {
                 };
                 eprintln!("[QwenSession] MLA Q branch (layer 0): {}", q_branch);
             }
+            // FR-17-extra-mla-absorbed-persist — persistent workspace buffers
+            // for the absorbed-MLA forward path.  Allocated once here (per
+            // session) and reused across every layer × token, replacing the
+            // 11-buffer per-call alloc/free pattern in
+            // `mla_attention_forward_absorbed`.  On a 47-layer GLM-4.7-flash
+            // decode this drops ~517 device allocations per token to ~0.
+            let mla_absorbed = cfg.is_mla_absorbed();
+            let mla_abs_kv_a = if mla_absorbed {
+                aether_dev_alloc_f32((cfg.kv_lora_rank + cfg.qk_rope_head_dim) as c_int) } else { 0 };
+            let mla_abs_c_kv = if mla_absorbed {
+                aether_dev_alloc_f32(cfg.kv_lora_rank as c_int) } else { 0 };
+            let mla_abs_c_kv_n = if mla_absorbed {
+                aether_dev_alloc_f32(cfg.kv_lora_rank as c_int) } else { 0 };
+            let mla_abs_k_pe = if mla_absorbed {
+                aether_dev_alloc_f32(cfg.qk_rope_head_dim as c_int) } else { 0 };
+            let mla_abs_q_a = if mla_absorbed && cfg.q_lora_rank > 0 {
+                aether_dev_alloc_f32(cfg.q_lora_rank as c_int) } else { 0 };
+            let mla_abs_q_a_n = if mla_absorbed && cfg.q_lora_rank > 0 {
+                aether_dev_alloc_f32(cfg.q_lora_rank as c_int) } else { 0 };
+            let mla_abs_q_proj = if mla_absorbed {
+                aether_dev_alloc_f32((cfg.n_q_heads as i32 * cfg.key_length_mla) as c_int) } else { 0 };
+            let mla_abs_q_full = if mla_absorbed {
+                aether_dev_alloc_f32(
+                    (cfg.n_q_heads as i32 * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)) as c_int)
+            } else { 0 };
+            let mla_abs_k_row = if mla_absorbed {
+                aether_dev_alloc_f32(
+                    (cfg.n_q_heads as i32 * (cfg.kv_lora_rank + cfg.qk_rope_head_dim)) as c_int)
+            } else { 0 };
+            let mla_abs_v_row = if mla_absorbed {
+                aether_dev_alloc_f32((cfg.n_q_heads as i32 * cfg.kv_lora_rank) as c_int) } else { 0 };
+            let mla_abs_attn_v_out = if mla_absorbed {
+                aether_dev_alloc_f32((cfg.n_q_heads as i32 * cfg.kv_lora_rank) as c_int) } else { 0 };
             let act = ActivationGpu {
                 x: aether_dev_alloc_f32(cfg.d_model as c_int),
                 x_norm: aether_dev_alloc_f32(cfg.d_model as c_int),
@@ -1778,6 +2005,9 @@ impl QwenSession {
                 gate: aether_dev_alloc_f32(cfg.d_ff as c_int),
                 down: aether_dev_alloc_f32(cfg.d_model as c_int),
                 logits: aether_dev_alloc_f32(cfg.vocab as c_int),
+                mla_abs_kv_a, mla_abs_c_kv, mla_abs_c_kv_n, mla_abs_k_pe,
+                mla_abs_q_a, mla_abs_q_a_n, mla_abs_q_proj, mla_abs_q_full,
+                mla_abs_k_row, mla_abs_v_row, mla_abs_attn_v_out,
             };
             let kvs: Vec<KvCacheGpu> = (0..cfg.n_layers).map(|_| KvCacheGpu {
                 k_cache: aether_dev_alloc_f32((MAX_SEQ * d_k_row) as c_int),
@@ -1814,6 +2044,7 @@ impl QwenSession {
                 owned_blocks: Vec::new(),
                 page_table_host: Vec::new(),
                 cfg,
+                byte_to_id_cache: std::sync::OnceLock::new(),
             })
         }
     }
@@ -2175,6 +2406,15 @@ impl Drop for QwenSession {
             let _ = aether_dev_free_f32(self.act.gate);
             let _ = aether_dev_free_f32(self.act.down);
             let _ = aether_dev_free_f32(self.act.logits);
+            // Persistent MLA-absorbed workspace buffers (0 if not allocated).
+            for h in [self.act.mla_abs_kv_a, self.act.mla_abs_c_kv,
+                      self.act.mla_abs_c_kv_n, self.act.mla_abs_k_pe,
+                      self.act.mla_abs_q_a, self.act.mla_abs_q_a_n,
+                      self.act.mla_abs_q_proj, self.act.mla_abs_q_full,
+                      self.act.mla_abs_k_row, self.act.mla_abs_v_row,
+                      self.act.mla_abs_attn_v_out] {
+                if h != 0 { let _ = aether_dev_free_f32(h); }
+            }
             let shared = self.pool.is_some();
             for kv in self.kvs.drain(..) {
                 if !shared {
@@ -2348,4 +2588,109 @@ fn argmax(logits: &[f32]) -> usize {
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0)
+}
+
+// =====================================================================
+// FR-x-extra-text-encode — wire text → token ids for GPT-2-style BPE.
+//
+// aether-serve's chat-completion handler historically required
+// `prompt_ids: [int]` because text encoding wasn't wired.  Every chat
+// client (LiteLLM, OpenAI Python lib, raw curl) sends
+// `messages: [{role, content: "..."}]` instead — and 501'd.
+//
+// This impl block bridges the gap: take raw text → GPT-2 byte→unicode
+// surface chars → vocab-id lookup → BPE merge loop → token ids.
+//
+// Limitation vs reference tokenizers:
+//   - No GPT-2 regex pre-tokenization (`'s|'t| ?\p{L}+|...`).  The merge
+//     loop runs over the full input ids as one stream.  For typical
+//     English prompts this still yields valid tokenization that the
+//     model can consume — just may not be byte-exact with HF's
+//     `AutoTokenizer.encode(text)`.  Pre-tokenization is filed as
+//     FR-x-extra-text-encode-regex.
+//   - First call rebuilds the byte→id cache via 256 linear scans of the
+//     vocab (152K entries each).  Subsequent calls hit the cache.
+// =====================================================================
+
+impl QwenSession {
+    /// Encode arbitrary UTF-8 text into token ids using the BPE
+    /// tokenizer loaded from the GGUF.  Returns empty vec if the
+    /// tokenizer wasn't loaded.
+    pub fn encode_text(&self, text: &str) -> Vec<usize> {
+        if self.bpe_handle < 0 || text.is_empty() { return Vec::new(); }
+
+        // Build (or get cached) byte→token_id table.  This is the
+        // GPT-2 byte alphabet: byte 0 → 'Ā' (U+0100), byte 32 → 'Ġ'
+        // (U+0120), etc., looked up in the vocab.
+        let cache = self.byte_to_id_cache.get_or_init(|| {
+            let b2u = build_gpt2_byte_to_unicode_array();
+            let mut table = Box::new([-1i32; 256]);
+            let mut buf = [0u8; 4];
+            for b in 0..256u32 {
+                let ch = b2u[b as usize];
+                let s = ch.encode_utf8(&mut buf);
+                let id = unsafe {
+                    aether_bpe_lookup_bytes(
+                        self.bpe_handle,
+                        s.as_ptr() as *const c_void,
+                        s.len() as c_int,
+                    )
+                };
+                table[b as usize] = id;
+            }
+            table
+        });
+
+        // Map each input byte → its surface-char vocab id.
+        let bytes = text.as_bytes();
+        let mut initial: Vec<i32> = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            let id = cache[b as usize];
+            if id < 0 {
+                // Vocab is missing the surface char for this byte; bail.
+                // The caller can fall back to raw byte ids or refuse.
+                eprintln!("[encode_text] vocab missing byte {} (surface char {})",
+                    b, b);
+                return Vec::new();
+            }
+            initial.push(id);
+        }
+
+        // Run the BPE merge loop on the initial surface-id stream.
+        let mut out_ids = vec![0i32; initial.len()];
+        let n = unsafe {
+            aether_bpe_encode_ids(
+                self.bpe_handle,
+                initial.as_ptr() as *const c_void, initial.len() as c_int,
+                out_ids.as_mut_ptr() as *mut c_void, out_ids.len() as c_int,
+            )
+        };
+        if n < 0 { return Vec::new(); }
+        out_ids[..n as usize].iter().map(|&i| i as usize).collect()
+    }
+}
+
+/// GPT-2 byte→unicode alphabet (the 256-entry version that maps every
+/// byte 0..=255 to a single printable unicode codepoint).  Returns a
+/// 256-array indexed by byte value.  Identical to the one in
+/// `runtime/tests/qwen25_tokenizer_roundtrip.rs`.
+fn build_gpt2_byte_to_unicode_array() -> [char; 256] {
+    let mut bs: Vec<u32> = Vec::new();
+    for b in 33..=126_u32 { bs.push(b); }
+    for b in 161..=172_u32 { bs.push(b); }
+    for b in 174..=255_u32 { bs.push(b); }
+    let mut cs: Vec<u32> = bs.clone();
+    let mut n = 0u32;
+    for b in 0..256_u32 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push(256 + n);
+            n += 1;
+        }
+    }
+    let mut tbl = ['\0'; 256];
+    for (b, c) in bs.iter().zip(cs.iter()) {
+        tbl[*b as usize] = char::from_u32(*c).unwrap_or('\0');
+    }
+    tbl
 }

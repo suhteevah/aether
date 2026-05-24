@@ -29,7 +29,8 @@ use std::os::raw::c_int;
 use std::ffi::c_void;
 
 use aether_rt::{
-    aether_tcp_listen, aether_tcp_listener_port, aether_tcp_accept_one,
+    aether_tcp_listen, aether_tcp_listen_addr,
+    aether_tcp_listener_port, aether_tcp_accept_one,
     aether_tcp_send, aether_tcp_recv, aether_tcp_close, aether_tcp_stream_close,
     aether_http_parse_request, aether_http_write_response_200,
     aether_openai_render_completion,
@@ -77,6 +78,13 @@ struct Cli {
     /// Embedding-model name reported back in /v1/embeddings responses
     /// (separate from --model which names the chat-completions model).
     bge_model: String,
+    /// FR-x-extra: bind address — default "0.0.0.0" so the server is
+    /// reachable from podman bridges / other hosts / etc.  The prior
+    /// behavior (via `aether_tcp_listen`) hardcoded `127.0.0.1`, which
+    /// blocked LiteLLM-in-podman from reaching the server (per kokonoe
+    /// substrate-swap finding #3).  Pass `--bind 127.0.0.1` to restore
+    /// the loopback-only behavior.
+    bind: String,
 }
 
 fn parse_cli() -> Cli {
@@ -94,6 +102,7 @@ fn parse_cli() -> Cli {
         probe: false,
         bge_gguf: None,
         bge_model: "bge-large-en-v1.5".into(),
+        bind: "0.0.0.0".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -119,10 +128,12 @@ fn parse_cli() -> Cli {
             "--probe" => cli.probe = true,
             "--bge-gguf" => cli.bge_gguf = Some(it.next().expect("--bge-gguf PATH")),
             "--bge-model" => cli.bge_model = it.next().expect("--bge-model NAME"),
+            "--bind" => cli.bind = it.next().expect("--bind ADDR"),
             "-h" | "--help" => {
-                eprintln!("aether-serve [--port N] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
+                eprintln!("aether-serve [--port N] [--bind ADDR] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
-                eprintln!("  Listens on 0.0.0.0:port for OpenAI-compat /v1/chat/completions.");
+                eprintln!("  Listens on <bind>:port (default bind=0.0.0.0) for OpenAI-compat /v1/chat/completions.");
+                eprintln!("  Pass --bind 127.0.0.1 to restrict to loopback only.");
                 eprintln!("  --gguf points at any Qwen2.5-7B-Instruct Q4_K_M model file.");
                 eprintln!("  --warmup N runs N synthetic decode steps on startup to drive");
                 eprintln!("    the GPU into P0/P2 power state and pre-capture the graph.");
@@ -821,7 +832,32 @@ unsafe fn dispatch_h2_stream(
         }
         ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
             let resp = match parse_body(&body, state.cli.max_tokens_default) {
-                Ok(req) => render_completion_json(state, &req),
+                Ok(mut req) => {
+                    // FR-x-extra-text-encode: same wiring as the HTTP/1.1
+                    // handle_completion_t path.  Map text → token ids if
+                    // the client didn't supply prompt_ids directly.
+                    if req.prompt_ids.is_empty() {
+                        if let Some(text) = req.text_prompt.as_deref() {
+                            #[cfg(feature = "cuda")]
+                            {
+                                match &state.session {
+                                    Some(sess_mu) => {
+                                        let sess = sess_mu.lock().unwrap();
+                                        req.prompt_ids = sess.encode_text(text);
+                                    }
+                                    None => {}
+                                }
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            { let _ = text; }
+                        }
+                    }
+                    if req.prompt_ids.is_empty() {
+                        format!("{{\"error\":\"text encode failed or no model loaded\"}}")
+                    } else {
+                        render_completion_json(state, &req)
+                    }
+                }
                 Err(e) => format!("{{\"error\":\"{}\"}}", e),
             };
             write_h2_json(t, stream_id, 200, resp.as_bytes());
@@ -997,15 +1033,47 @@ unsafe fn handle_list_models_t(state: &ServerState, t: &mut dyn Transport) {
 }
 
 unsafe fn handle_completion_t(state: &ServerState, t: &mut dyn Transport, body: &[u8]) {
-    let req = match parse_body(body, state.cli.max_tokens_default) {
+    let mut req = match parse_body(body, state.cli.max_tokens_default) {
         Ok(r) => r,
         Err(e) => { let _ = send_text_t(t, 400, e); return; }
     };
 
-    if req.text_prompt.is_some() && req.prompt_ids.is_empty() {
-        let _ = send_text_t(t, 501,
-            "text-prompt encode not wired yet; pass prompt_ids (token ids) for now");
-        return;
+    // FR-x-extra-text-encode: when the client sends `messages: [...]` /
+    // raw text instead of `prompt_ids: [...]`, run the GPT-2 BPE encode
+    // path against the session's loaded tokenizer.  Used by every OpenAI-
+    // compatible client (LiteLLM, OpenAI Python lib, curl) — the prior
+    // 501 made aether-serve unusable from any chat consumer.
+    if req.prompt_ids.is_empty() {
+        if let Some(text) = req.text_prompt.as_deref() {
+            #[cfg(feature = "cuda")]
+            {
+                match &state.session {
+                    Some(sess_mu) => {
+                        let sess = sess_mu.lock().unwrap();
+                        let ids = sess.encode_text(text);
+                        if ids.is_empty() {
+                            let _ = send_text_t(t, 500,
+                                "text encode failed (no tokenizer loaded? or vocab gap) — pass prompt_ids");
+                            return;
+                        }
+                        req.prompt_ids = ids;
+                    }
+                    None => {
+                        let _ = send_text_t(t, 503,
+                            "no model loaded (start with --gguf) — text encode unavailable");
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = state;
+                let _ = text;
+                let _ = send_text_t(t, 501,
+                    "text encode requires --features cuda build");
+                return;
+            }
+        }
     }
 
     if req.stream {
@@ -1417,15 +1485,27 @@ fn main() {
     };
     let state = std::sync::Arc::new(state);
     unsafe {
-        let listener = aether_tcp_listen(state.cli.port);
+        // FR-x-extra: bind via aether_tcp_listen_addr so --bind can switch
+        // between 0.0.0.0 (default, reachable from podman / other hosts)
+        // and 127.0.0.1 (loopback only).  The legacy `aether_tcp_listen`
+        // hardcodes 127.0.0.1 — the log line used to lie about 0.0.0.0
+        // (kokonoe substrate-swap finding #3).
+        let bind_bytes = state.cli.bind.as_bytes();
+        let listener = aether_tcp_listen_addr(
+            bind_bytes.as_ptr() as i64, bind_bytes.len() as std::os::raw::c_int,
+            state.cli.port,
+        );
+        // Bare-port fallback path retained so older deployments that only
+        // know the loopback semantics still build green.
+        let _ = aether_tcp_listen;
         if listener < 0 {
-            eprintln!("[aether-serve] failed to bind port {}", state.cli.port);
+            eprintln!("[aether-serve] failed to bind {}:{}", state.cli.bind, state.cli.port);
             std::process::exit(1);
         }
         let bound_port = aether_tcp_listener_port(listener);
         let scheme = if tls_on { "https" } else { "http" };
-        eprintln!("[aether-serve] listening on 0.0.0.0:{} ({}, model={}, concurrent=on)",
-            bound_port, scheme, state.cli.model);
+        eprintln!("[aether-serve] listening on {}:{} ({}, model={}, concurrent=on)",
+            state.cli.bind, bound_port, scheme, state.cli.model);
         if tls_on {
             eprintln!("[aether-serve] TLS 1.3 enabled; fresh self-signed Ed25519 cert per session (CN={})", tls_cn);
             eprintln!("[aether-serve] try:");

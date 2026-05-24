@@ -118,6 +118,17 @@ struct PagedCtx {
     mla_absorb_q_q8_0: CudaFunction,
     mla_absorb_v_q8_0: CudaFunction,
     mla_broadcast_kv_for_mqa: CudaFunction,
+    // FR-17-extra-mla-absorbed-dtypes — extra dtype dispatch for w_k_b / w_v_b.
+    mla_absorb_q_f16: CudaFunction,
+    mla_absorb_v_f16: CudaFunction,
+    mla_absorb_q_q4_k: CudaFunction,
+    mla_absorb_v_q4_k: CudaFunction,
+    mla_absorb_q_q5_k: CudaFunction,
+    mla_absorb_v_q5_k: CudaFunction,
+    mla_absorb_q_q6_k: CudaFunction,
+    mla_absorb_v_q6_k: CudaFunction,
+    mla_absorb_q_iq4_nl: CudaFunction,
+    mla_absorb_v_iq4_nl: CudaFunction,
 }
 
 static PAGED_CTX: OnceLock<PagedCtx> = OnceLock::new();
@@ -142,7 +153,17 @@ fn paged_ctx() -> &'static PagedCtx {
               "mla_rope_k_shared_yarn",
               "mla_absorb_q_q8_0",
               "mla_absorb_v_q8_0",
-              "mla_broadcast_kv_for_mqa"])
+              "mla_broadcast_kv_for_mqa",
+              "mla_absorb_q_f16",
+              "mla_absorb_v_f16",
+              "mla_absorb_q_q4_k",
+              "mla_absorb_v_q4_k",
+              "mla_absorb_q_q5_k",
+              "mla_absorb_v_q5_k",
+              "mla_absorb_q_q6_k",
+              "mla_absorb_v_q6_k",
+              "mla_absorb_q_iq4_nl",
+              "mla_absorb_v_iq4_nl"])
             .expect("load_ptx paged");
         PagedCtx {
             paged_append_kv_devarg:
@@ -179,6 +200,26 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "mla_absorb_v_q8_0").unwrap(),
             mla_broadcast_kv_for_mqa:
                 device.get_func("aether_paged_kernels", "mla_broadcast_kv_for_mqa").unwrap(),
+            mla_absorb_q_f16:
+                device.get_func("aether_paged_kernels", "mla_absorb_q_f16").unwrap(),
+            mla_absorb_v_f16:
+                device.get_func("aether_paged_kernels", "mla_absorb_v_f16").unwrap(),
+            mla_absorb_q_q4_k:
+                device.get_func("aether_paged_kernels", "mla_absorb_q_q4_k").unwrap(),
+            mla_absorb_v_q4_k:
+                device.get_func("aether_paged_kernels", "mla_absorb_v_q4_k").unwrap(),
+            mla_absorb_q_q5_k:
+                device.get_func("aether_paged_kernels", "mla_absorb_q_q5_k").unwrap(),
+            mla_absorb_v_q5_k:
+                device.get_func("aether_paged_kernels", "mla_absorb_v_q5_k").unwrap(),
+            mla_absorb_q_q6_k:
+                device.get_func("aether_paged_kernels", "mla_absorb_q_q6_k").unwrap(),
+            mla_absorb_v_q6_k:
+                device.get_func("aether_paged_kernels", "mla_absorb_v_q6_k").unwrap(),
+            mla_absorb_q_iq4_nl:
+                device.get_func("aether_paged_kernels", "mla_absorb_q_iq4_nl").unwrap(),
+            mla_absorb_v_iq4_nl:
+                device.get_func("aether_paged_kernels", "mla_absorb_v_iq4_nl").unwrap(),
         }
     })
 }
@@ -1063,6 +1104,497 @@ extern "C" __global__ void mla_broadcast_kv_for_mqa(
         int j = idx % kv_lora_rank;
         v_row[idx] = c_kv[j];
     }
+}
+
+// FR-17-extra-mla-absorbed-dtypes — multi-dtype Q absorption kernels.
+//
+// All mirror the Q8_0 variant's CTA / grid shape (one CTA per
+// (out_col, head), one thread per CTA), so q_nope_per_head fits in a
+// single thread loop.  Only the per-block dequant body differs.
+//
+// =====================
+// F16 (dt = 1) — 2 bytes per element, no blocks.
+// =====================
+extern "C" __global__ void mla_absorb_q_f16(
+    const float*          __restrict__ q_proj,
+    const unsigned short* __restrict__ w_k_b,
+    float*                __restrict__ q_out,
+    int n_heads, int key_mla, int qk_rope, int kv_lora_rank, int n_in_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    int q_nope = key_mla - qk_rope;
+    int out_per_head = kv_lora_rank + qk_rope;
+    if (oi >= out_per_head || h >= n_heads) return;
+
+    if (oi < kv_lora_rank) {
+        size_t row_off = (size_t)h * kv_lora_rank * n_in_per_row
+                       + (size_t)oi * n_in_per_row;
+        const unsigned short* w_row = w_k_b + row_off;
+        const float* qin = q_proj + (size_t)h * key_mla;
+        float acc = 0.0f;
+        for (int k = 0; k < n_in_per_row; k++) {
+            acc += qin[k] * aether_f16_to_f32_dev(w_row[k]);
+        }
+        q_out[(size_t)h * out_per_head + oi] = acc;
+    } else {
+        int j = oi - kv_lora_rank;
+        q_out[(size_t)h * out_per_head + oi] =
+            q_proj[(size_t)h * key_mla + q_nope + j];
+    }
+}
+
+extern "C" __global__ void mla_absorb_v_f16(
+    const float*          __restrict__ attn_v,
+    const unsigned short* __restrict__ w_v_b,
+    float*                __restrict__ attn_out,
+    int n_heads, int kv_lora_rank, int value_mla, int n_in_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    if (oi >= value_mla || h >= n_heads) return;
+
+    size_t row_off = (size_t)h * value_mla * n_in_per_row
+                   + (size_t)oi * n_in_per_row;
+    const unsigned short* w_row = w_v_b + row_off;
+    const float* ain = attn_v + (size_t)h * kv_lora_rank;
+    float acc = 0.0f;
+    for (int k = 0; k < n_in_per_row; k++) {
+        acc += ain[k] * aether_f16_to_f32_dev(w_row[k]);
+    }
+    attn_out[(size_t)h * value_mla + oi] = acc;
+}
+
+// =====================
+// Q4_K (dt = 12) — 144 bytes per 256-elem super-block, requires
+// n_in_per_row % 256 == 0.  Scale/min decode mirrors Q4_K standalone
+// matmul (q4k_get_scale / q4k_get_min inlined to avoid cross-unit deps).
+// =====================
+extern "C" __global__ void mla_absorb_q_q4_k(
+    const float*         __restrict__ q_proj,
+    const unsigned char* __restrict__ w_k_b,
+    float*               __restrict__ q_out,
+    int n_heads, int key_mla, int qk_rope, int kv_lora_rank, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    int q_nope = key_mla - qk_rope;
+    int out_per_head = kv_lora_rank + qk_rope;
+    if (oi >= out_per_head || h >= n_heads) return;
+
+    if (oi < kv_lora_rank) {
+        size_t base_bytes = (size_t)h * kv_lora_rank * blocks_per_row * 144
+                          + (size_t)oi * blocks_per_row * 144;
+        const unsigned char* base = w_k_b + base_bytes;
+        const float* qin = q_proj + (size_t)h * key_mla;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const unsigned char* blk = base + (size_t)b * 144;
+            unsigned short d_bits    = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+            unsigned short dmin_bits = ((unsigned short)blk[3] << 8) | (unsigned short)blk[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* sc = blk + 4;
+            const unsigned char* qs = blk + 16;
+            for (int sub = 0; sub < 8; sub++) {
+                unsigned int sc6, mn6;
+                if (sub < 4) {
+                    sc6 = (unsigned int)sc[sub] & 63u;
+                    mn6 = (unsigned int)sc[sub + 4] & 63u;
+                } else {
+                    sc6 = ((unsigned int)sc[sub + 4] & 0xFu)
+                        | (((unsigned int)sc[sub - 4] >> 6) << 4);
+                    mn6 = ((unsigned int)sc[sub + 4] >> 4)
+                        | (((unsigned int)sc[sub] >> 6) << 4);
+                }
+                float d_eff = d * (float)sc6;
+                float m_eff = dmin * (float)mn6;
+                int j = sub >> 1;
+                int is_hi = sub & 1;
+                int qs_off = j * 32;
+                for (int l = 0; l < 32; l++) {
+                    unsigned char byte = qs[qs_off + l];
+                    unsigned int nibble = is_hi
+                        ? (((unsigned int)byte >> 4) & 0xFu)
+                        : ((unsigned int)byte & 0xFu);
+                    float w_val = d_eff * (float)nibble - m_eff;
+                    acc += qin[b * 256 + sub * 32 + l] * w_val;
+                }
+            }
+        }
+        q_out[(size_t)h * out_per_head + oi] = acc;
+    } else {
+        int j = oi - kv_lora_rank;
+        q_out[(size_t)h * out_per_head + oi] =
+            q_proj[(size_t)h * key_mla + q_nope + j];
+    }
+}
+
+extern "C" __global__ void mla_absorb_v_q4_k(
+    const float*         __restrict__ attn_v,
+    const unsigned char* __restrict__ w_v_b,
+    float*               __restrict__ attn_out,
+    int n_heads, int kv_lora_rank, int value_mla, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    if (oi >= value_mla || h >= n_heads) return;
+
+    size_t base_bytes = (size_t)h * value_mla * blocks_per_row * 144
+                      + (size_t)oi * blocks_per_row * 144;
+    const unsigned char* base = w_v_b + base_bytes;
+    const float* ain = attn_v + (size_t)h * kv_lora_rank;
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const unsigned char* blk = base + (size_t)b * 144;
+        unsigned short d_bits    = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        unsigned short dmin_bits = ((unsigned short)blk[3] << 8) | (unsigned short)blk[2];
+        float d    = aether_f16_to_f32_dev(d_bits);
+        float dmin = aether_f16_to_f32_dev(dmin_bits);
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qs = blk + 16;
+        for (int sub = 0; sub < 8; sub++) {
+            unsigned int sc6, mn6;
+            if (sub < 4) {
+                sc6 = (unsigned int)sc[sub] & 63u;
+                mn6 = (unsigned int)sc[sub + 4] & 63u;
+            } else {
+                sc6 = ((unsigned int)sc[sub + 4] & 0xFu)
+                    | (((unsigned int)sc[sub - 4] >> 6) << 4);
+                mn6 = ((unsigned int)sc[sub + 4] >> 4)
+                    | (((unsigned int)sc[sub] >> 6) << 4);
+            }
+            float d_eff = d * (float)sc6;
+            float m_eff = dmin * (float)mn6;
+            int j = sub >> 1;
+            int is_hi = sub & 1;
+            int qs_off = j * 32;
+            for (int l = 0; l < 32; l++) {
+                unsigned char byte = qs[qs_off + l];
+                unsigned int nibble = is_hi
+                    ? (((unsigned int)byte >> 4) & 0xFu)
+                    : ((unsigned int)byte & 0xFu);
+                float w_val = d_eff * (float)nibble - m_eff;
+                acc += ain[b * 256 + sub * 32 + l] * w_val;
+            }
+        }
+    }
+    attn_out[(size_t)h * value_mla + oi] = acc;
+}
+
+// =====================
+// Q5_K (dt = 13) — 176 bytes per 256-elem super-block.  Same Q4_K-style
+// scales + 32-byte qh high-bits + 128-byte qs nibbles.
+// =====================
+extern "C" __global__ void mla_absorb_q_q5_k(
+    const float*         __restrict__ q_proj,
+    const unsigned char* __restrict__ w_k_b,
+    float*               __restrict__ q_out,
+    int n_heads, int key_mla, int qk_rope, int kv_lora_rank, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    int q_nope = key_mla - qk_rope;
+    int out_per_head = kv_lora_rank + qk_rope;
+    if (oi >= out_per_head || h >= n_heads) return;
+
+    if (oi < kv_lora_rank) {
+        size_t base_bytes = (size_t)h * kv_lora_rank * blocks_per_row * 176
+                          + (size_t)oi * blocks_per_row * 176;
+        const unsigned char* base = w_k_b + base_bytes;
+        const float* qin = q_proj + (size_t)h * key_mla;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const unsigned char* blk = base + (size_t)b * 176;
+            unsigned short d_bits    = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+            unsigned short dmin_bits = ((unsigned short)blk[3] << 8) | (unsigned short)blk[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* sc = blk + 4;
+            const unsigned char* qh = blk + 16;
+            const unsigned char* qs = blk + 48;
+            for (int sub = 0; sub < 8; sub++) {
+                unsigned int sc6, mn6;
+                if (sub < 4) {
+                    sc6 = (unsigned int)sc[sub] & 63u;
+                    mn6 = (unsigned int)sc[sub + 4] & 63u;
+                } else {
+                    sc6 = ((unsigned int)sc[sub + 4] & 0xFu)
+                        | (((unsigned int)sc[sub - 4] >> 6) << 4);
+                    mn6 = ((unsigned int)sc[sub + 4] >> 4)
+                        | (((unsigned int)sc[sub] >> 6) << 4);
+                }
+                float d_eff = d * (float)sc6;
+                float m_eff = dmin * (float)mn6;
+                int j = sub >> 1;
+                int is_hi = sub & 1;
+                int qs_off = j * 32;
+                for (int l = 0; l < 32; l++) {
+                    unsigned char byte = qs[qs_off + l];
+                    unsigned int nibble = is_hi
+                        ? (((unsigned int)byte >> 4) & 0xFu)
+                        : ((unsigned int)byte & 0xFu);
+                    unsigned int hi_bit = ((unsigned int)qh[l] >> sub) & 1u;
+                    unsigned int quant  = nibble | (hi_bit << 4);
+                    float w_val = d_eff * (float)quant - m_eff;
+                    acc += qin[b * 256 + sub * 32 + l] * w_val;
+                }
+            }
+        }
+        q_out[(size_t)h * out_per_head + oi] = acc;
+    } else {
+        int j = oi - kv_lora_rank;
+        q_out[(size_t)h * out_per_head + oi] =
+            q_proj[(size_t)h * key_mla + q_nope + j];
+    }
+}
+
+extern "C" __global__ void mla_absorb_v_q5_k(
+    const float*         __restrict__ attn_v,
+    const unsigned char* __restrict__ w_v_b,
+    float*               __restrict__ attn_out,
+    int n_heads, int kv_lora_rank, int value_mla, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    if (oi >= value_mla || h >= n_heads) return;
+
+    size_t base_bytes = (size_t)h * value_mla * blocks_per_row * 176
+                      + (size_t)oi * blocks_per_row * 176;
+    const unsigned char* base = w_v_b + base_bytes;
+    const float* ain = attn_v + (size_t)h * kv_lora_rank;
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const unsigned char* blk = base + (size_t)b * 176;
+        unsigned short d_bits    = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        unsigned short dmin_bits = ((unsigned short)blk[3] << 8) | (unsigned short)blk[2];
+        float d    = aether_f16_to_f32_dev(d_bits);
+        float dmin = aether_f16_to_f32_dev(dmin_bits);
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qh = blk + 16;
+        const unsigned char* qs = blk + 48;
+        for (int sub = 0; sub < 8; sub++) {
+            unsigned int sc6, mn6;
+            if (sub < 4) {
+                sc6 = (unsigned int)sc[sub] & 63u;
+                mn6 = (unsigned int)sc[sub + 4] & 63u;
+            } else {
+                sc6 = ((unsigned int)sc[sub + 4] & 0xFu)
+                    | (((unsigned int)sc[sub - 4] >> 6) << 4);
+                mn6 = ((unsigned int)sc[sub + 4] >> 4)
+                    | (((unsigned int)sc[sub] >> 6) << 4);
+            }
+            float d_eff = d * (float)sc6;
+            float m_eff = dmin * (float)mn6;
+            int j = sub >> 1;
+            int is_hi = sub & 1;
+            int qs_off = j * 32;
+            for (int l = 0; l < 32; l++) {
+                unsigned char byte = qs[qs_off + l];
+                unsigned int nibble = is_hi
+                    ? (((unsigned int)byte >> 4) & 0xFu)
+                    : ((unsigned int)byte & 0xFu);
+                unsigned int hi_bit = ((unsigned int)qh[l] >> sub) & 1u;
+                unsigned int quant  = nibble | (hi_bit << 4);
+                float w_val = d_eff * (float)quant - m_eff;
+                acc += ain[b * 256 + sub * 32 + l] * w_val;
+            }
+        }
+    }
+    attn_out[(size_t)h * value_mla + oi] = acc;
+}
+
+// =====================
+// Q6_K (dt = 14) — 210 bytes per 256-elem super-block.  Layout:
+//   ql[0..128]   = low 4 bits
+//   qh[128..192] = high 2 bits
+//   sc[192..208] = i8 sub-block scales (16 sub-blocks of 16 elems each)
+//   d  [208..210] = f16 super-block scale
+// =====================
+extern "C" __global__ void mla_absorb_q_q6_k(
+    const float*         __restrict__ q_proj,
+    const unsigned char* __restrict__ w_k_b,
+    float*               __restrict__ q_out,
+    int n_heads, int key_mla, int qk_rope, int kv_lora_rank, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    int q_nope = key_mla - qk_rope;
+    int out_per_head = kv_lora_rank + qk_rope;
+    if (oi >= out_per_head || h >= n_heads) return;
+
+    if (oi < kv_lora_rank) {
+        size_t base_bytes = (size_t)h * kv_lora_rank * blocks_per_row * 210
+                          + (size_t)oi * blocks_per_row * 210;
+        const unsigned char* base = w_k_b + base_bytes;
+        const float* qin = q_proj + (size_t)h * key_mla;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const unsigned char* blk = base + (size_t)b * 210;
+            const unsigned char* ql = blk;
+            const unsigned char* qh = blk + 128;
+            const signed char*   sc = (const signed char*)(blk + 192);
+            unsigned short d_bits = ((unsigned short)blk[209] << 8) | (unsigned short)blk[208];
+            float d = aether_f16_to_f32_dev(d_bits);
+            for (int n_outer = 0; n_outer < 2; n_outer++) {
+                int ql_off = n_outer * 64;
+                int qh_off = n_outer * 32;
+                int sc_off = n_outer * 8;
+                for (int l = 0; l < 32; l++) {
+                    int is = l >> 4;
+                    unsigned char qhv = qh[qh_off + l];
+                    int q1 = (int)((ql[ql_off + l] & 0xFu) | (((unsigned int)(qhv >> 0) & 3u) << 4)) - 32;
+                    int q2 = (int)((ql[ql_off + l + 32] & 0xFu) | (((unsigned int)(qhv >> 2) & 3u) << 4)) - 32;
+                    int q3 = (int)((((unsigned int)ql[ql_off + l] >> 4) & 0xFu) | (((unsigned int)(qhv >> 4) & 3u) << 4)) - 32;
+                    int q4 = (int)((((unsigned int)ql[ql_off + l + 32] >> 4) & 0xFu) | (((unsigned int)(qhv >> 6) & 3u) << 4)) - 32;
+                    float s1 = d * (float)sc[sc_off + is + 0];
+                    float s2 = d * (float)sc[sc_off + is + 2];
+                    float s3 = d * (float)sc[sc_off + is + 4];
+                    float s4 = d * (float)sc[sc_off + is + 6];
+                    int a_base = b * 256 + n_outer * 128;
+                    acc += qin[a_base + l +  0] * (s1 * (float)q1);
+                    acc += qin[a_base + l + 32] * (s2 * (float)q2);
+                    acc += qin[a_base + l + 64] * (s3 * (float)q3);
+                    acc += qin[a_base + l + 96] * (s4 * (float)q4);
+                }
+            }
+        }
+        q_out[(size_t)h * out_per_head + oi] = acc;
+    } else {
+        int j = oi - kv_lora_rank;
+        q_out[(size_t)h * out_per_head + oi] =
+            q_proj[(size_t)h * key_mla + q_nope + j];
+    }
+}
+
+extern "C" __global__ void mla_absorb_v_q6_k(
+    const float*         __restrict__ attn_v,
+    const unsigned char* __restrict__ w_v_b,
+    float*               __restrict__ attn_out,
+    int n_heads, int kv_lora_rank, int value_mla, int blocks_per_row)
+{
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    if (oi >= value_mla || h >= n_heads) return;
+
+    size_t base_bytes = (size_t)h * value_mla * blocks_per_row * 210
+                      + (size_t)oi * blocks_per_row * 210;
+    const unsigned char* base = w_v_b + base_bytes;
+    const float* ain = attn_v + (size_t)h * kv_lora_rank;
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const unsigned char* blk = base + (size_t)b * 210;
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+        const signed char*   sc = (const signed char*)(blk + 192);
+        unsigned short d_bits = ((unsigned short)blk[209] << 8) | (unsigned short)blk[208];
+        float d = aether_f16_to_f32_dev(d_bits);
+        for (int n_outer = 0; n_outer < 2; n_outer++) {
+            int ql_off = n_outer * 64;
+            int qh_off = n_outer * 32;
+            int sc_off = n_outer * 8;
+            for (int l = 0; l < 32; l++) {
+                int is = l >> 4;
+                unsigned char qhv = qh[qh_off + l];
+                int q1 = (int)((ql[ql_off + l] & 0xFu) | (((unsigned int)(qhv >> 0) & 3u) << 4)) - 32;
+                int q2 = (int)((ql[ql_off + l + 32] & 0xFu) | (((unsigned int)(qhv >> 2) & 3u) << 4)) - 32;
+                int q3 = (int)((((unsigned int)ql[ql_off + l] >> 4) & 0xFu) | (((unsigned int)(qhv >> 4) & 3u) << 4)) - 32;
+                int q4 = (int)((((unsigned int)ql[ql_off + l + 32] >> 4) & 0xFu) | (((unsigned int)(qhv >> 6) & 3u) << 4)) - 32;
+                float s1 = d * (float)sc[sc_off + is + 0];
+                float s2 = d * (float)sc[sc_off + is + 2];
+                float s3 = d * (float)sc[sc_off + is + 4];
+                float s4 = d * (float)sc[sc_off + is + 6];
+                int a_base = b * 256 + n_outer * 128;
+                acc += ain[a_base + l +  0] * (s1 * (float)q1);
+                acc += ain[a_base + l + 32] * (s2 * (float)q2);
+                acc += ain[a_base + l + 64] * (s3 * (float)q3);
+                acc += ain[a_base + l + 96] * (s4 * (float)q4);
+            }
+        }
+    }
+    attn_out[(size_t)h * value_mla + oi] = acc;
+}
+
+// =====================
+// IQ4_NL (dt = 20) — 18 bytes per 32-elem block.  f16 d + 16 nibble bytes
+// indexing the kvalues_iq4nl signed-int8 codebook.
+// =====================
+extern "C" __global__ void mla_absorb_q_iq4_nl(
+    const float*         __restrict__ q_proj,
+    const unsigned char* __restrict__ w_k_b,
+    float*               __restrict__ q_out,
+    int n_heads, int key_mla, int qk_rope, int kv_lora_rank, int blocks_per_row)
+{
+    static const int kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113
+    };
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    int q_nope = key_mla - qk_rope;
+    int out_per_head = kv_lora_rank + qk_rope;
+    if (oi >= out_per_head || h >= n_heads) return;
+
+    if (oi < kv_lora_rank) {
+        size_t base_bytes = (size_t)h * kv_lora_rank * blocks_per_row * 18
+                          + (size_t)oi * blocks_per_row * 18;
+        const unsigned char* base = w_k_b + base_bytes;
+        const float* qin = q_proj + (size_t)h * key_mla;
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) {
+            const unsigned char* blk = base + (size_t)b * 18;
+            unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+            float d = aether_f16_to_f32_dev(d_bits);
+            const unsigned char* qs = blk + 2;
+            for (int i = 0; i < 16; i++) {
+                unsigned char byte = qs[i];
+                int q_lo = kvalues[byte & 0xF];
+                int q_hi = kvalues[(byte >> 4) & 0xF];
+                acc += qin[b * 32 + i]      * (d * (float)q_lo);
+                acc += qin[b * 32 + i + 16] * (d * (float)q_hi);
+            }
+        }
+        q_out[(size_t)h * out_per_head + oi] = acc;
+    } else {
+        int j = oi - kv_lora_rank;
+        q_out[(size_t)h * out_per_head + oi] =
+            q_proj[(size_t)h * key_mla + q_nope + j];
+    }
+}
+
+extern "C" __global__ void mla_absorb_v_iq4_nl(
+    const float*         __restrict__ attn_v,
+    const unsigned char* __restrict__ w_v_b,
+    float*               __restrict__ attn_out,
+    int n_heads, int kv_lora_rank, int value_mla, int blocks_per_row)
+{
+    static const int kvalues[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113
+    };
+    int oi = blockIdx.x;
+    int h  = blockIdx.y;
+    if (oi >= value_mla || h >= n_heads) return;
+
+    size_t base_bytes = (size_t)h * value_mla * blocks_per_row * 18
+                      + (size_t)oi * blocks_per_row * 18;
+    const unsigned char* base = w_v_b + base_bytes;
+    const float* ain = attn_v + (size_t)h * kv_lora_rank;
+    float acc = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const unsigned char* blk = base + (size_t)b * 18;
+        unsigned short d_bits = ((unsigned short)blk[1] << 8) | (unsigned short)blk[0];
+        float d = aether_f16_to_f32_dev(d_bits);
+        const unsigned char* qs = blk + 2;
+        for (int i = 0; i < 16; i++) {
+            unsigned char byte = qs[i];
+            int q_lo = kvalues[byte & 0xF];
+            int q_hi = kvalues[(byte >> 4) & 0xF];
+            acc += ain[b * 32 + i]      * (d * (float)q_lo);
+            acc += ain[b * 32 + i + 16] * (d * (float)q_hi);
+        }
+    }
+    attn_out[(size_t)h * value_mla + oi] = acc;
 }
 "#;
 
@@ -5430,7 +5962,10 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let Some(is)  = handle_to_i32_idx(step_args_i32) else { return -1; };
     if n_heads <= 0 || qk_head_dim <= 0 || v_head_dim <= 0
         || max_seq <= 0 || block_size <= 0 { return -1; }
-    if qk_head_dim > 256 || v_head_dim > 256 { return -3; }
+    // q_local[20] / out_local[20] in paged_attention_mla_devarg → 20 × 32 = 640
+    // max per-head dim.  Bumped from the original 256 cap in commit b6bfacf
+    // (the kernel arrays were bumped; this host-side guard was missed).
+    if qk_head_dim > 640 || v_head_dim > 640 { return -3; }
     let bs = unsafe { bufs() };
     let ibs = unsafe { i32_bufs() };
     let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
@@ -5777,6 +6312,299 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().mla_broadcast_kv_for_mqa.clone()
             .launch(cfg, (cv, pv, kv, vv, n_heads, kv_lora_rank, qk_rope))
             .expect("launch mla_broadcast_kv_for_mqa");
+    }
+    0
+}
+
+// =====================================================================
+// FR-17-extra-mla-absorbed-dtypes — Q / V absorb wrappers for additional
+// w_k_b / w_v_b dtypes (F16, Q4_K, Q5_K, Q6_K, IQ4_NL).  All mirror the
+// Q8_0 versions' calling convention; only the device kernel chosen
+// differs.  `n_in_per_row` for F16 = element count per output row;
+// `blocks_per_row` for block-quants = number of super-blocks per row.
+// =====================================================================
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_q_f16_cuda(
+    q_proj: i64, w_k_b: i64, q_out: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, n_in_per_row: c_int,
+) -> c_int {
+    let (Some(i_q), Some(i_o)) = (handle_to_idx(q_proj), handle_to_idx(q_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_k_b) else { return -1; };
+    if n_heads <= 0 || key_mla <= 0 || qk_rope <= 0 || kv_lora_rank <= 0
+        || n_in_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: ((kv_lora_rank + qk_rope) as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv = &*q_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_q_f16.clone()
+            .launch(cfg, (qv, wv, ov, n_heads, key_mla, qk_rope,
+                          kv_lora_rank, n_in_per_row))
+            .expect("launch mla_absorb_q_f16");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_v_f16_cuda(
+    attn_v: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, value_mla: c_int, n_in_per_row: c_int,
+) -> c_int {
+    let (Some(i_a), Some(i_o)) = (handle_to_idx(attn_v), handle_to_idx(attn_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_v_b) else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || value_mla <= 0 || n_in_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (value_mla as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_v_f16.clone()
+            .launch(cfg, (av, wv, ov, n_heads, kv_lora_rank, value_mla, n_in_per_row))
+            .expect("launch mla_absorb_v_f16");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_q_q4_k_cuda(
+    q_proj: i64, w_k_b: i64, q_out: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_q), Some(i_o)) = (handle_to_idx(q_proj), handle_to_idx(q_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_k_b) else { return -1; };
+    if n_heads <= 0 || key_mla <= 0 || qk_rope <= 0 || kv_lora_rank <= 0
+        || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: ((kv_lora_rank + qk_rope) as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv = &*q_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_q_q4_k.clone()
+            .launch(cfg, (qv, wv, ov, n_heads, key_mla, qk_rope,
+                          kv_lora_rank, blocks_per_row))
+            .expect("launch mla_absorb_q_q4_k");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_v_q4_k_cuda(
+    attn_v: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, value_mla: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_a), Some(i_o)) = (handle_to_idx(attn_v), handle_to_idx(attn_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_v_b) else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || value_mla <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (value_mla as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_v_q4_k.clone()
+            .launch(cfg, (av, wv, ov, n_heads, kv_lora_rank, value_mla, blocks_per_row))
+            .expect("launch mla_absorb_v_q4_k");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_q_q5_k_cuda(
+    q_proj: i64, w_k_b: i64, q_out: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_q), Some(i_o)) = (handle_to_idx(q_proj), handle_to_idx(q_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_k_b) else { return -1; };
+    if n_heads <= 0 || key_mla <= 0 || qk_rope <= 0 || kv_lora_rank <= 0
+        || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: ((kv_lora_rank + qk_rope) as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv = &*q_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_q_q5_k.clone()
+            .launch(cfg, (qv, wv, ov, n_heads, key_mla, qk_rope,
+                          kv_lora_rank, blocks_per_row))
+            .expect("launch mla_absorb_q_q5_k");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_v_q5_k_cuda(
+    attn_v: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, value_mla: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_a), Some(i_o)) = (handle_to_idx(attn_v), handle_to_idx(attn_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_v_b) else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || value_mla <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (value_mla as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_v_q5_k.clone()
+            .launch(cfg, (av, wv, ov, n_heads, kv_lora_rank, value_mla, blocks_per_row))
+            .expect("launch mla_absorb_v_q5_k");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_q_q6_k_cuda(
+    q_proj: i64, w_k_b: i64, q_out: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_q), Some(i_o)) = (handle_to_idx(q_proj), handle_to_idx(q_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_k_b) else { return -1; };
+    if n_heads <= 0 || key_mla <= 0 || qk_rope <= 0 || kv_lora_rank <= 0
+        || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: ((kv_lora_rank + qk_rope) as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv = &*q_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_q_q6_k.clone()
+            .launch(cfg, (qv, wv, ov, n_heads, key_mla, qk_rope,
+                          kv_lora_rank, blocks_per_row))
+            .expect("launch mla_absorb_q_q6_k");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_v_q6_k_cuda(
+    attn_v: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, value_mla: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_a), Some(i_o)) = (handle_to_idx(attn_v), handle_to_idx(attn_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_v_b) else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || value_mla <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (value_mla as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_v_q6_k.clone()
+            .launch(cfg, (av, wv, ov, n_heads, kv_lora_rank, value_mla, blocks_per_row))
+            .expect("launch mla_absorb_v_q6_k");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_q_iq4_nl_cuda(
+    q_proj: i64, w_k_b: i64, q_out: i64,
+    n_heads: c_int, key_mla: c_int, qk_rope: c_int,
+    kv_lora_rank: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_q), Some(i_o)) = (handle_to_idx(q_proj), handle_to_idx(q_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_k_b) else { return -1; };
+    if n_heads <= 0 || key_mla <= 0 || qk_rope <= 0 || kv_lora_rank <= 0
+        || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: ((kv_lora_rank + qk_rope) as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv = &*q_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_q_iq4_nl.clone()
+            .launch(cfg, (qv, wv, ov, n_heads, key_mla, qk_rope,
+                          kv_lora_rank, blocks_per_row))
+            .expect("launch mla_absorb_q_iq4_nl");
+    }
+    0
+}
+
+#[no_mangle] pub extern "C" fn aether_op_mla_absorb_v_iq4_nl_cuda(
+    attn_v: i64, w_v_b: i64, attn_out: i64,
+    n_heads: c_int, kv_lora_rank: c_int, value_mla: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let (Some(i_a), Some(i_o)) = (handle_to_idx(attn_v), handle_to_idx(attn_out))
+        else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_v_b) else { return -1; };
+    if n_heads <= 0 || kv_lora_rank <= 0 || value_mla <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let cfg = LaunchConfig {
+        grid_dim: (value_mla as u32, n_heads as u32, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let ov = &mut *o_p; let wv = &*w_p;
+        paged_ctx().mla_absorb_v_iq4_nl.clone()
+            .launch(cfg, (av, wv, ov, n_heads, kv_lora_rank, value_mla, blocks_per_row))
+            .expect("launch mla_absorb_v_iq4_nl");
     }
     0
 }

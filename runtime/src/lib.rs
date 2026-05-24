@@ -4844,6 +4844,73 @@ unsafe fn bpe_table() -> &'static mut Vec<Option<Box<BpeTokenizer>>> {
     tokens.len() as c_int
 }
 
+/// FR-x-extra: BPE merge-loop over pre-resolved initial token ids.
+///
+/// `aether_bpe_encode` starts from raw bytes (0..255) which only works
+/// if the merges table was built against byte-level inputs. GPT-2/Qwen
+/// style BPE uses a byte→unicode surface alphabet, so the initial
+/// tokens are surface-char vocab ids (single-byte tokens in the GPT-2
+/// vocab — there are 256 of them, scattered through the vocab). The
+/// caller is responsible for the byte→surface_id lookup (since that
+/// requires reading the GGUF vocab strings); we just run the same
+/// merge loop over the resolved initial ids.
+///
+/// Writes up to `max_ids` resulting ids into `out_ids`. Returns the
+/// number written, -1 on overflow / bad handle / invalid initial id.
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_encode_ids(
+    handle: i64,
+    initial_ids: *const c_void, n_initial: c_int,
+    out_ids: *mut c_void, max_ids: c_int,
+) -> c_int {
+    if handle < 0 || initial_ids.is_null() || out_ids.is_null() { return -1; }
+    if n_initial < 0 || max_ids <= 0 { return -1; }
+    if n_initial == 0 { return 0; }
+    let tbl = bpe_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(t) = tbl[h].as_ref() else { return -1; };
+    let in_buf = std::slice::from_raw_parts(initial_ids as *const i32, n_initial as usize);
+    let mut tokens: Vec<u32> = Vec::with_capacity(in_buf.len());
+    for &id in in_buf {
+        if id < 0 { return -1; }
+        let id_u = id as usize;
+        if id_u >= t.decode_table.len() { return -1; }
+        tokens.push(id as u32);
+    }
+    loop {
+        if tokens.len() < 2 { break; }
+        let mut best_pair: Option<(u32, u32)> = None;
+        let mut best_rank: u32 = u32::MAX;
+        let mut best_merged: u32 = 0;
+        for i in 0..tokens.len() - 1 {
+            if let Some(&(merged, rank)) = t.merges.get(&(tokens[i], tokens[i + 1])) {
+                if rank < best_rank {
+                    best_rank = rank;
+                    best_pair = Some((tokens[i], tokens[i + 1]));
+                    best_merged = merged;
+                }
+            }
+        }
+        let Some((bl, br)) = best_pair else { break; };
+        let mut new_tokens: Vec<u32> = Vec::with_capacity(tokens.len());
+        let mut i = 0;
+        while i < tokens.len() {
+            if i + 1 < tokens.len() && tokens[i] == bl && tokens[i + 1] == br {
+                new_tokens.push(best_merged);
+                i += 2;
+            } else {
+                new_tokens.push(tokens[i]);
+                i += 1;
+            }
+        }
+        tokens = new_tokens;
+    }
+    if tokens.len() > max_ids as usize { return -1; }
+    let out = std::slice::from_raw_parts_mut(out_ids as *mut i32, max_ids as usize);
+    for (i, tok) in tokens.iter().enumerate() { out[i] = *tok as i32; }
+    tokens.len() as c_int
+}
+
 /// Decode `n_ids` ids back into UTF-8 bytes. Writes up to `max_bytes`
 /// into `out_bytes`. Returns bytes written, or -1 on bad handle / id
 /// out of range / overflow.
@@ -4871,6 +4938,31 @@ unsafe fn bpe_table() -> &'static mut Vec<Option<Box<BpeTokenizer>>> {
         written += bytes.len();
     }
     written as c_int
+}
+
+/// FR-x-extra: look up the token id for an exact byte sequence in a
+/// loaded BPE tokenizer. Returns the id (>= 0) on match, -1 on bad
+/// handle / no-match. Used by the chat-completion encode path to map
+/// each GPT-2 surface byte sequence (e.g. UTF-8 of 'Ġ') to its single-
+/// surface-char vocab id before running the merge loop.
+///
+/// O(N_VOCAB) linear scan — fine at startup (called 256 times to
+/// build the byte→id cache), bad in a hot loop. The encode side
+/// caches results, so the linear scan only happens once per session.
+#[no_mangle] pub unsafe extern "C" fn aether_bpe_lookup_bytes(
+    handle: i64,
+    bytes: *const c_void, n_bytes: c_int,
+) -> i32 {
+    if handle < 0 || bytes.is_null() || n_bytes <= 0 { return -1; }
+    let tbl = bpe_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(t) = tbl[h].as_ref() else { return -1; };
+    let needle = std::slice::from_raw_parts(bytes as *const u8, n_bytes as usize);
+    for (id, slot) in t.decode_table.iter().enumerate() {
+        if slot.as_slice() == needle { return id as i32; }
+    }
+    -1
 }
 
 // =====================================================================
