@@ -2662,6 +2662,81 @@ fn argmax(logits: &[f32]) -> usize {
 //     vocab (152K entries each).  Subsequent calls hit the cache.
 // =====================================================================
 
+/// FR-x-extra-chat-template: hand-rolled per-arch simplified templates.
+///
+/// The GGUF-embedded `tokenizer.chat_template` strings on modern
+/// instruct models use heavy Jinja features (namespaces, macros,
+/// filters, whitespace-strip markers, elif/loop.first, etc.) that the
+/// jinja-lite renderer in lib.rs doesn't support.  Rather than expand
+/// jinja-lite to full Jinja (a substantial chunk of work), we ship
+/// known-good simplified templates per architecture that produce the
+/// wire format the model was trained to expect.  apply_chat_template
+/// uses these when the GGUF template fails to render.
+///
+/// Templates are formatted via direct string concat in
+/// `apply_per_arch_template` below.  Each is a TINY shape — just the
+/// role markers + content — sufficient to put the model in
+/// "respond as assistant" mode.
+fn apply_per_arch_template(arch: &str, messages: &[(String, String)]) -> Option<String> {
+    if messages.is_empty() { return None; }
+    let mut out = String::new();
+    match arch {
+        // GLM / DeepSeek-v2 / DeepSeek-v3 family (architecture = "deepseek2"
+        // in the GGUF for GLM-4.7-flash + V2-Lite + V3).  Wire format:
+        //   [gMASK]<sop><|user|>{content}<|assistant|>{content}...<|assistant|>
+        "deepseek2" | "glm" | "glm4" => {
+            out.push_str("[gMASK]<sop>");
+            for (role, content) in messages {
+                match role.as_str() {
+                    "system"    => { out.push_str("<|system|>"); out.push_str(content); }
+                    "user"      => { out.push_str("<|user|>");   out.push_str(content); }
+                    "assistant" => { out.push_str("<|assistant|>"); out.push_str(content); }
+                    _ => {}
+                }
+            }
+            out.push_str("<|assistant|>");
+        }
+        // Qwen2 / Qwen2.5 / Qwen3:  <|im_start|>{role}\n{content}<|im_end|>\n
+        "qwen2" | "qwen3" | "qwen3moe" | "qwen3vl" => {
+            for (role, content) in messages {
+                out.push_str("<|im_start|>");
+                out.push_str(role);
+                out.push('\n');
+                out.push_str(content);
+                out.push_str("<|im_end|>\n");
+            }
+            out.push_str("<|im_start|>assistant\n");
+        }
+        // Llama-3:  <|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
+        "llama" => {
+            out.push_str("<|begin_of_text|>");
+            for (role, content) in messages {
+                out.push_str("<|start_header_id|>");
+                out.push_str(role);
+                out.push_str("<|end_header_id|>\n\n");
+                out.push_str(content);
+                out.push_str("<|eot_id|>");
+            }
+            out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        }
+        // Gemma3:  <start_of_turn>{role}\n{content}<end_of_turn>\n
+        "gemma3" => {
+            for (role, content) in messages {
+                let r = if role == "assistant" { "model" } else { role.as_str() };
+                out.push_str("<start_of_turn>");
+                out.push_str(r);
+                out.push('\n');
+                out.push_str(content);
+                out.push_str("<end_of_turn>\n");
+            }
+            out.push_str("<start_of_turn>model\n");
+        }
+        // Unknown arch — caller falls back to plain-text encode.
+        _ => return None,
+    }
+    Some(out)
+}
+
 impl QwenSession {
     /// FR-x-extra-chat-template: render `messages` through the GGUF-
     /// embedded jinja-lite chat template.  Returns `None` if no
@@ -2674,8 +2749,15 @@ impl QwenSession {
     /// closes with whatever role marker invites the assistant to
     /// respond.
     pub fn apply_chat_template(&self, messages: &[(String, String)]) -> Option<String> {
-        let template = self.chat_template.as_ref()?;
         if messages.is_empty() { return None; }
+        // Always prefer the per-arch hand-rolled template.  It produces
+        // exactly the wire format the model was trained on, without
+        // depending on jinja-lite handling every feature the GGUF
+        // template might use (macros, filters, namespaces, etc.).
+        if let Some(s) = apply_per_arch_template(&self.cfg.arch, messages) {
+            return Some(s);
+        }
+        let template = self.chat_template.as_ref()?;
         unsafe {
             let th = aether_template_new();
             if th < 0 { return None; }
