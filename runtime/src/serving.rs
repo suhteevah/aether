@@ -66,6 +66,7 @@ use crate::cuda::{
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
+    aether_op_fused_q4_0_matmul_seq1_cuda,
     aether_op_fused_q4k_expert_matmul_seq1_cuda,
     aether_op_matmul_f32_cuda,
     aether_dev_graph_begin, aether_dev_graph_end,
@@ -91,6 +92,12 @@ unsafe fn dispatch_matmul(
             // F16 (FR-17-extra-f16-fwd).  Weights stored row-major
             // [n_out * n_in] as raw F16.
             aether_op_fused_f16_matmul_seq1_cuda(x_norm, w, y, n_in, n_out);
+        }
+        2 => {
+            // Q4_0 (FR-17-extra-q4_0-fwd).  32-elem blocks of 18 bytes each:
+            // f16 scale + 16 nibble-packed bytes.  Used by older / local
+            // DeepSeek-V2-Lite and a few other small models.
+            aether_op_fused_q4_0_matmul_seq1_cuda(x_norm, w, y, n_out, n_in / 32);
         }
         _ => panic!("dispatch_matmul: unsupported weight dtype {}", dt),
     }
@@ -519,6 +526,7 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
         12 => { let nb = n_elems / 256; (nb, nb * 144) }     // Q4_K
         14 => { let nb = n_elems / 256; (nb, nb * 210) }     // Q6_K
         1  => { (n_elems, n_elems * 2) }                     // F16 (2 bytes/elem)
+        2  => { let nb = n_elems / 32; (nb, nb * 18) }       // Q4_0 (FR-17-extra-q4_0-fwd)
         _  => panic!("unsupported dtype {} for tensor {}", dt, name),
     };
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
@@ -566,6 +574,7 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
         12 => { let nb = n_elems / 256; (nb, nb * 144) }
         14 => { let nb = n_elems / 256; (nb, nb * 210) }
         1  => { (n_elems, n_elems * 2) }
+        2  => { let nb = n_elems / 32; (nb, nb * 18) }
         _  => return (0, 0, 0),
     };
     let dptr = aether_gguf_get_tensor_data_ptr(h, idx);
