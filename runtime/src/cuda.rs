@@ -106,6 +106,8 @@ struct PagedCtx {
     paged_attention_seq1_devarg: CudaFunction,
     batched_paged_attention_seqB_devarg: CudaFunction,
     batched_paged_append_kv_seqB_devarg: CudaFunction,
+    batched_paged_attention_hetero_devarg: CudaFunction,
+    batched_paged_append_kv_hetero_devarg: CudaFunction,
     paged_attention_flex_devarg: CudaFunction,
     paged_attention_mla_devarg: CudaFunction,
     paged_append_kv_mla_devarg: CudaFunction,
@@ -142,6 +144,8 @@ fn paged_ctx() -> &'static PagedCtx {
             &["paged_append_kv_devarg", "paged_attention_seq1_devarg",
               "batched_paged_attention_seqB_devarg",
               "batched_paged_append_kv_seqB_devarg",
+              "batched_paged_attention_hetero_devarg",
+              "batched_paged_append_kv_hetero_devarg",
               "paged_attention_flex_devarg",
               "paged_attention_mla_devarg",
               "paged_append_kv_mla_devarg",
@@ -175,6 +179,10 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "batched_paged_attention_seqB_devarg").unwrap(),
             batched_paged_append_kv_seqB_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_append_kv_seqB_devarg").unwrap(),
+            batched_paged_attention_hetero_devarg:
+                device.get_func("aether_paged_kernels", "batched_paged_attention_hetero_devarg").unwrap(),
+            batched_paged_append_kv_hetero_devarg:
+                device.get_func("aether_paged_kernels", "batched_paged_append_kv_hetero_devarg").unwrap(),
             paged_attention_flex_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_flex_devarg").unwrap(),
             paged_attention_mla_devarg:
@@ -488,6 +496,140 @@ extern "C" __global__ void batched_paged_attention_seqB_devarg(
     __syncwarp();
 
     // Pass 3: aggregate V by softmax weights
+    float out_local[8] = {0.0f};
+    for (int t = 0; t < cur_seq; t++) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = pt[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        float w = scores[t];
+        const float* v_ptr = v_pool + row * d_kv + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) out_local[i] += w * v_ptr[lane * per_lane + i];
+        }
+    }
+    float* out_ptr = attn_out_batch + (req * n_q_heads + head) * head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) out_ptr[lane * per_lane + i] = out_local[i];
+    }
+}
+
+// FR-19.5-extra-deep Phase 2 — HETEROGENEOUS-position batched append_kv.
+// Identical to batched_paged_append_kv_seqB_devarg except each request
+// writes its new K/V at its OWN position `pos_batch[req]` (instead of a
+// single shared step_args[0]).  This is what lets the continuous-
+// batching scheduler fuse N slots that are at different decode positions
+// into ONE launch.  Grid (ceil(d_kv/threads), B).
+extern "C" __global__ void batched_paged_append_kv_hetero_devarg(
+    const float* __restrict__ k_new_batch,    // [B * d_kv]
+    const float* __restrict__ v_new_batch,    // [B * d_kv]
+    float*       __restrict__ k_pool,
+    float*       __restrict__ v_pool,
+    const int*   __restrict__ page_table_batch,
+    int d_kv, int block_size, int page_table_stride,
+    const int* __restrict__ pos_batch)        // [B] — per-request position
+{
+    int req = blockIdx.y;
+    int pos = pos_batch[req];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= d_kv) return;
+    int logical_blk = pos / block_size;
+    int in_blk_pos  = pos - logical_blk * block_size;
+    int phys_blk    = page_table_batch[req * page_table_stride + logical_blk];
+    size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+    k_pool[row * d_kv + tid] = k_new_batch[req * d_kv + tid];
+    v_pool[row * d_kv + tid] = v_new_batch[req * d_kv + tid];
+}
+
+// FR-19.5-extra-deep Phase 2 — HETEROGENEOUS-position batched attention.
+// Identical to batched_paged_attention_seqB_devarg except each request
+// attends over its OWN window [0, cur_seq_batch[req]) rather than a
+// single shared step_args[1].  Block (head, req); one warp per (head,
+// req).  Shared `scores[]` is launch-sized for the MAX cur_seq across
+// the batch; each block uses only its own request's prefix.
+extern "C" __global__ void batched_paged_attention_hetero_devarg(
+    const float* __restrict__ q_batch,            // [B * n_q_heads * head_dim]
+    const float* __restrict__ k_pool,             // shared pool
+    const float* __restrict__ v_pool,             // shared pool
+    const int*   __restrict__ page_table_batch,   // [B * page_table_stride]
+    float*       __restrict__ attn_out_batch,     // [B * n_q_heads * head_dim]
+    int n_q_heads, int n_kv_heads, int head_dim, int block_size,
+    int page_table_stride,
+    float scale, const int* __restrict__ cur_seq_batch)  // [B]
+{
+    int req     = blockIdx.y;
+    int cur_seq = cur_seq_batch[req];
+    extern __shared__ float scores[];
+
+    int head    = blockIdx.x;
+    int lane    = threadIdx.x;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head = head / kv_per_q;
+    int d_kv    = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;
+
+    const float* q_ptr = q_batch + (req * n_q_heads + head) * head_dim;
+    const int*   pt    = page_table_batch + req * page_table_stride;
+
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane * per_lane + i];
+    }
+
+    // Pass 1: scores[t] = Q · K[t, kv_head] * scale
+    for (int t = 0; t < cur_seq; t++) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = pt[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        const float* k_ptr = k_pool + row * d_kv + kv_head * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane * per_lane + i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncwarp();
+
+    // Pass 2: softmax over [0, cur_seq).
+    float local_max = __int_as_float(0xFF800000u);
+    for (int t = lane; t < cur_seq; t += 32) {
+        float s = scores[t];
+        if (s > local_max) local_max = s;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xFFFFFFFFu, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    float max_val = __shfl_sync(0xFFFFFFFFu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int t = lane; t < cur_seq; t += 32) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xFFFFFFFFu, local_sum, off);
+    }
+    float sum_val = __shfl_sync(0xFFFFFFFFu, local_sum, 0);
+    float inv_sum = 1.0f / sum_val;
+    for (int t = lane; t < cur_seq; t += 32) {
+        scores[t] *= inv_sum;
+    }
+    __syncwarp();
+
+    // Pass 3: aggregate V by softmax weights.
     float out_local[8] = {0.0f};
     for (int t = 0; t < cur_seq; t++) {
         int logical_blk = t / block_size;
@@ -6871,6 +7013,101 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
                           n_q_heads, n_kv_heads, head_dim, block_size,
                           page_table_stride, scale, sv))
             .expect("launch batched_paged_attention_seqB_devarg");
+    }
+    0
+}
+
+/// FR-19.5-extra-deep Phase 2 — HETEROGENEOUS-position batched append_kv.
+/// Like the seqB variant but each request writes at its OWN position read
+/// from `pos_batch_dev` (an i32 device buffer of length `batch`) instead
+/// of a single shared step_args[0].  Lets the scheduler fuse N slots at
+/// different decode positions into one launch.
+#[no_mangle] pub extern "C" fn aether_op_batched_paged_append_kv_hetero_devarg_f32_cuda(
+    k_new_batch: i64, v_new_batch: i64,
+    k_pool: i64, v_pool: i64,
+    page_table_batch_dev: i64,
+    batch: c_int, d_kv: c_int, block_size: c_int, page_table_stride: c_int,
+    pos_batch_dev: i64,
+) -> c_int {
+    let Some(i_kn) = handle_to_idx(k_new_batch) else { return -1; };
+    let Some(i_vn) = handle_to_idx(v_new_batch) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_batch_dev) else { return -1; };
+    let Some(i_pos) = handle_to_i32_idx(pos_batch_dev) else { return -1; };
+    if batch <= 0 || d_kv <= 0 || block_size <= 0 || page_table_stride <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let kn = bs[i_kn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vn = bs[i_vn].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp = bs[i_kp].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let vp = bs[i_vp].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let pt = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let pos = ibs[i_pos].as_ref().unwrap() as *const CudaSlice<i32>;
+    let threads_per_block: u32 = 256;
+    let blocks_per_req: u32 = ((d_kv as u32) + threads_per_block - 1) / threads_per_block;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks_per_req, batch as u32, 1),
+        block_dim: (threads_per_block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let knr = &*kn; let vnr = &*vn;
+        let kpm = &mut *kp; let vpm = &mut *vp;
+        let ptv = &*pt; let posv = &*pos;
+        paged_ctx().batched_paged_append_kv_hetero_devarg.clone()
+            .launch(cfg, (knr, vnr, kpm, vpm, ptv,
+                          d_kv, block_size, page_table_stride, posv))
+            .expect("launch batched_paged_append_kv_hetero_devarg");
+    }
+    0
+}
+
+/// FR-19.5-extra-deep Phase 2 — HETEROGENEOUS-position batched attention.
+/// Like the seqB variant but each request attends over its OWN window
+/// [0, cur_seq_batch[req]) read from `cur_seq_batch_dev` (an i32 device
+/// buffer of length `batch`) instead of a single shared step_args[1].
+/// Shared scores[] is launch-sized for `max_seq` (the upper bound on any
+/// request's cur_seq); each block uses only its own prefix.
+#[no_mangle] pub extern "C" fn aether_op_batched_paged_attention_hetero_devarg_f32_cuda(
+    q_batch: i64, k_pool: i64, v_pool: i64,
+    page_table_batch_dev: i64, attn_out_batch: i64,
+    batch: c_int,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int, block_size: c_int,
+    page_table_stride: c_int,
+    scale: f32, max_seq: c_int, cur_seq_batch_dev: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_batch) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_batch_dev) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out_batch) else { return -1; };
+    let Some(i_cs) = handle_to_i32_idx(cur_seq_batch_dev) else { return -1; };
+    if batch <= 0 || n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0
+        || max_seq <= 0 || block_size <= 0 || page_table_stride <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp_p = bs[i_kp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vp_p = bs[i_vp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pt_p = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cs  = ibs[i_cs].as_ref().unwrap() as *const CudaSlice<i32>;
+    let shmem = (max_seq as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, batch as u32, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
+        let ov = &mut *o_p; let csv = &*cs;
+        paged_ctx().batched_paged_attention_hetero_devarg.clone()
+            .launch(cfg, (qv, kpv, vpv, ptv, ov,
+                          n_q_heads, n_kv_heads, head_dim, block_size,
+                          page_table_stride, scale, csv))
+            .expect("launch batched_paged_attention_hetero_devarg");
     }
     0
 }
