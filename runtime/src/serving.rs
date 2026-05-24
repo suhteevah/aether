@@ -2465,14 +2465,27 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> (i64, i32) {
         return (-1, -1);
     }
 
+    // GLM-4.7-flash has at least one vocab entry > 512 bytes (entry
+    // 112972).  Bump the buffer + handle the "too small" return (-2)
+    // by skipping the entry rather than bailing out of the whole
+    // tokenizer load.  Each skipped entry inserts an empty Vec at its
+    // index so merge-table lookups stay index-aligned (empty bytes
+    // never matches a real GPT-2 surface char in encode-side lookup).
     let mut vocab_bytes: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
-    let mut buf = vec![0u8; 512];
+    let mut buf = vec![0u8; 16384];
+    let mut skipped_oversized = 0i64;
     for i in 0..n {
         let nb = aether_gguf_get_metadata_array_string_get(
             h, tok_key.as_ptr() as i64, tok_key.len() as c_int, i,
             buf.as_mut_ptr() as i64, buf.len() as c_int);
+        if nb == -2 {
+            // Entry larger than 16 KiB — skip but keep index alignment.
+            skipped_oversized += 1;
+            vocab_bytes.push(Vec::new());
+            continue;
+        }
         if nb < 0 {
-            eprintln!("[QwenSession] vocab entry {} truncated (nb={})", i, nb);
+            eprintln!("[QwenSession] vocab entry {} failed (nb={})", i, nb);
             aether_bpe_tokenizer_free(bpe);
             return (-1, -1);
         }
@@ -2485,6 +2498,10 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> (i64, i32) {
             return (-1, -1);
         }
         vocab_bytes.push(bytes);
+    }
+    if skipped_oversized > 0 {
+        eprintln!("[QwenSession] {} vocab entries skipped as oversized (> 16 KiB)",
+            skipped_oversized);
     }
 
     let merges_key = b"tokenizer.ggml.merges";
