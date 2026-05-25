@@ -64,6 +64,7 @@ struct CudaCtx {
     gqa_repeat_kv:     CudaFunction,
     silu_inplace:      CudaFunction,
     silu_bwd:          CudaFunction,
+    transpose_021:     CudaFunction,
     mul_inplace:       CudaFunction,
     add_inplace:       CudaFunction,
     bias_add:          CudaFunction,
@@ -2576,6 +2577,25 @@ extern "C" __global__ void silu_bwd(
     float sig = 1.0f / (1.0f + expf(-xi));
     float gp = sig * (1.0f + xi * (1.0f - sig));
     dx[i] = dy[i] * gp;
+}
+
+// matt-voice FR-18.6-real leg 2 — transpose the first two dims of a 3-D
+// [d0, d1, d2] tensor → [d1, d0, d2] (021 permutation, last dim kept). The
+// training attention forward produces Q/K/V token-major [s, h, hd] from the
+// matmul + RoPE, but the SDPA kernels want head-major [h, s, hd]; this swaps
+// between them (and back, by swapping d0/d1). One thread per element.
+//
+// roadmap: P18
+extern "C" __global__ void transpose_021(
+    const float* __restrict__ in, float* __restrict__ out,
+    int d0, int d1, int d2)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= d0 * d1 * d2) return;
+    int c = idx % d2;
+    int b = (idx / d2) % d1;
+    int a = idx / (d2 * d1);
+    out[(b * d0 + a) * d2 + c] = in[idx];
 }
 
 // matt-voice — element-wise multiply in place: x[i] *= y[i]. Used by
@@ -5208,7 +5228,7 @@ fn ctx() -> &'static CudaCtx {
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv",
-              "silu_inplace", "silu_bwd", "mul_inplace", "add_inplace", "bias_add",
+              "silu_inplace", "silu_bwd", "transpose_021", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
               "fused_q5_0_matmul_seq1",
@@ -5261,6 +5281,7 @@ fn ctx() -> &'static CudaCtx {
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
         let silu_bwd              = device.get_func("aether_kernels", "silu_bwd").unwrap();
+        let transpose_021         = device.get_func("aether_kernels", "transpose_021").unwrap();
         let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
         let add_inplace           = device.get_func("aether_kernels", "add_inplace").unwrap();
         let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
@@ -5307,7 +5328,7 @@ fn ctx() -> &'static CudaCtx {
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
                   rope_apply, rope_apply_backward, gqa_repeat_kv,
-                  silu_inplace, silu_bwd, mul_inplace, add_inplace, bias_add,
+                  silu_inplace, silu_bwd, transpose_021, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
                   fused_q5_0_matmul_seq1, fused_q8_0_matmul_seq1,
@@ -7966,6 +7987,26 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     unsafe {
         let xv = &*x_p; let dyv = &*dy_p; let dxv = &mut *dx_p;
         ctx().silu_bwd.clone().launch(cfg, (xv, dyv, dxv, n)).expect("launch silu_bwd");
+    }
+    0
+}
+
+/// matt-voice FR-18.6-real leg 2 — transpose first two dims of [d0,d1,d2] →
+/// [d1,d0,d2]. Swaps between token-major [s,h,hd] and head-major [h,s,hd] for
+/// training attention. Call with (s,h,hd) one way, (h,s,hd) to invert.
+///
+/// roadmap: P18
+#[no_mangle] pub extern "C" fn aether_op_transpose_021_f32_cuda(
+    inp: i64, out: i64, d0: c_int, d1: c_int, d2: c_int,
+) -> c_int {
+    let (Some(ii), Some(io)) = (handle_to_idx(inp), handle_to_idx(out)) else { return -1; };
+    let bs = unsafe { bufs() };
+    let i_p = bs[ii].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[io].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems((d0 * d1 * d2) as u32);
+    unsafe {
+        let iv = &*i_p; let ov = &mut *o_p;
+        ctx().transpose_021.clone().launch(cfg, (iv, ov, d0, d1, d2)).expect("launch transpose_021");
     }
     0
 }
