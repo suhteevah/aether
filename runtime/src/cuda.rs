@@ -83,6 +83,7 @@ struct CudaCtx {
     fused_q5_0_expert_matmul_seq1: CudaFunction,
     fused_iq3_s_expert_matmul_seq1: CudaFunction,
     fused_q3_k_expert_matmul_seq1: CudaFunction,
+    fused_q5_k_expert_matmul_seq1: CudaFunction,
     fused_iq4_xs_expert_matmul_seq1: CudaFunction,
     fused_iq3_xxs_expert_matmul_seq1: CudaFunction,
     bert_self_attention_fwd: CudaFunction,
@@ -3180,6 +3181,65 @@ extern "C" __global__ void fused_q5_k_matmul_seq1(
     if (ni < n) out[ni] = acc;
 }
 
+// matt-voice — Q5_K MoE expert matmul (Qwen3-MoE Q3_K_M expert mix uses Q3_K+Q5_K).
+extern "C" __global__ void fused_q5_k_expert_matmul_seq1(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks, int expert_offset_blocks)
+{
+    const int BLOCK_N = 32;
+    __shared__ float a_tile[256];
+
+    int ni = blockIdx.x * BLOCK_N + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            int kk = p * BLOCK_N + threadIdx.x;
+            a_tile[kk] = a[bi * 256 + kk];
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)expert_offset_blocks * 176 + (size_t)ni * n_blocks * 176 + (size_t)bi * 176;
+            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+            float d    = aether_f16_to_f32_dev(d_bits);
+            float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* scales = base + 4;     // 12 bytes
+            const unsigned char* qh     = base + 16;    // 32 bytes
+            const unsigned char* qs     = base + 48;    // 128 bytes
+
+            #pragma unroll
+            for (int sub = 0; sub < 8; sub++) {
+                int j = sub >> 1;
+                int is_hi = sub & 1;
+                unsigned int sc = q4k_get_scale(sub, scales);
+                unsigned int mn = q4k_get_min(sub, scales);
+                float d_eff = d * (float)sc;
+                float m_eff = dmin * (float)mn;
+                int qs_off = j * 32;
+                #pragma unroll 8
+                for (int l = 0; l < 32; l++) {
+                    unsigned char byte = qs[qs_off + l];
+                    unsigned int nibble = is_hi
+                        ? (((unsigned int)byte >> 4) & 0xFu)
+                        : ((unsigned int)byte & 0xFu);
+                    unsigned int hi_bit = ((unsigned int)qh[l] >> sub) & 1u;
+                    unsigned int quant  = nibble | (hi_bit << 4);   // 5-bit in [0, 31]
+                    float w_val = d_eff * (float)quant - m_eff;
+                    acc += a_tile[sub * 32 + l] * w_val;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (ni < n) out[ni] = acc;
+}
+
 // FR-17-extra-q3_k-fwd — FUSED Q3_K matmul (3-bit quants).  Unblocks
 // Qwen3-MoE Q3_K_M which has 198 Q3_K tensors out of 579.  Block layout
 // matches ggml's `block_q3_K` (110 bytes per 256-elem super-block):
@@ -5488,6 +5548,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q5_0_expert_matmul_seq1",
               "fused_iq3_s_expert_matmul_seq1",
               "fused_q3_k_expert_matmul_seq1",
+              "fused_q5_k_expert_matmul_seq1",
               "fused_iq4_xs_expert_matmul_seq1",
               "fused_iq3_xxs_expert_matmul_seq1",
               "bert_self_attention_fwd",
@@ -5538,6 +5599,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q5_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_expert_matmul_seq1").unwrap();
         let fused_iq3_s_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_s_expert_matmul_seq1").unwrap();
         let fused_q3_k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q3_k_expert_matmul_seq1").unwrap();
+        let fused_q5_k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_k_expert_matmul_seq1").unwrap();
         let fused_iq4_xs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq4_xs_expert_matmul_seq1").unwrap();
         let fused_iq3_xxs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_xxs_expert_matmul_seq1").unwrap();
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
@@ -5573,6 +5635,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q5_0_expert_matmul_seq1,
                   fused_iq3_s_expert_matmul_seq1,
                   fused_q3_k_expert_matmul_seq1,
+                  fused_q5_k_expert_matmul_seq1,
                   fused_iq4_xs_expert_matmul_seq1,
                   fused_iq3_xxs_expert_matmul_seq1,
                   bert_self_attention_fwd, bert_embed_sum }
@@ -7083,6 +7146,32 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_q3_k_expert_matmul_seq1.clone()
             .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
             .expect("launch fused_q3_k_expert_matmul_seq1");
+    }
+    0
+}
+
+/// matt-voice — Q5_K MoE expert matmul (Qwen3-MoE Q3_K_M expert mix = Q3_K + Q5_K).
+#[no_mangle] pub extern "C" fn aether_op_fused_q5_k_expert_matmul_seq1_cuda(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_base) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 || expert_idx < 0 { return -1; }
+    let expert_offset_blocks = expert_idx * n_out * blocks_per_row;
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let block_n = 32u32;
+    let grid_x = ((n_out as u32) + block_n - 1) / block_n;
+    let cfg = LaunchConfig { grid_dim: (grid_x, 1, 1), block_dim: (block_n, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_q5_k_expert_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
+            .expect("launch fused_q5_k_expert_matmul_seq1");
     }
     0
 }

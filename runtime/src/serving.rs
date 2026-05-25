@@ -98,6 +98,7 @@ use crate::cuda::{
     aether_op_fused_q5_0_expert_matmul_seq1_cuda,
     aether_op_fused_iq3_s_expert_matmul_seq1_cuda,
     aether_op_fused_q3_k_expert_matmul_seq1_cuda,
+    aether_op_fused_q5_k_expert_matmul_seq1_cuda,
     aether_op_fused_iq4_xs_expert_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda,
     aether_op_matmul_f32_cuda,
@@ -1786,6 +1787,7 @@ const MOE_EXPERT_DISPATCH: &[ExpertDtype] = &[
     ExpertDtype { dt:  6, block_n_elems:  32, kernel: aether_op_fused_q5_0_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 21, block_n_elems: 256, kernel: aether_op_fused_iq3_s_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 11, block_n_elems: 256, kernel: aether_op_fused_q3_k_expert_matmul_seq1_cuda },
+    ExpertDtype { dt: 13, block_n_elems: 256, kernel: aether_op_fused_q5_k_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 23, block_n_elems: 256, kernel: aether_op_fused_iq4_xs_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 18, block_n_elems: 256, kernel: aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda },
     // <- add new dtypes here, one line each, plus the matching kernel
