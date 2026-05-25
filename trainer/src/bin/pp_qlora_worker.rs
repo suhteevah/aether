@@ -108,9 +108,20 @@ fn main() {
     // with a provisional range then re-split: instead, open once for cfg.
     let (_, cfg_peek) = unsafe { aether_rt::serving::open_gguf_config(&gguf).expect("open gguf") };
     let total = cfg_peek.n_layers;
-    assert!(total % world == 0, "n_layers {} not divisible by world {}", total, world);
-    let per = total / world;
-    let range = (rank * per)..((rank + 1) * per);
+    // --splits "28,36" gives per-rank layer counts (must sum to total + len==world);
+    // de-risks an uneven-VRAM split (fewer layers on the smaller card). Absent =
+    // even split.
+    let range = if let Some(splits_s) = argval(&a, "--splits") {
+        let counts: Vec<usize> = splits_s.split(',').map(|s| s.trim().parse().expect("--splits int")).collect();
+        assert_eq!(counts.len(), world, "--splits len {} != world {}", counts.len(), world);
+        assert_eq!(counts.iter().sum::<usize>(), total, "--splits sum {} != n_layers {}", counts.iter().sum::<usize>(), total);
+        let lo: usize = counts[..rank].iter().sum();
+        lo..(lo + counts[rank])
+    } else {
+        assert!(total % world == 0, "n_layers {} not divisible by world {}", total, world);
+        let per = total / world;
+        (rank * per)..((rank + 1) * per)
+    };
     let is_last = rank + 1 == world;
     eprintln!("[pp-qlora rank {}/{}] layers {:?} of {} (gguf={})", rank, world, range, total, gguf);
 
