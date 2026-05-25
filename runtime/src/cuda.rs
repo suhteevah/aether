@@ -49,6 +49,8 @@ struct CudaCtx {
     softmax_f32:       CudaFunction,
     softmax_bwd:       CudaFunction,
     softmax_bwd_scaled:CudaFunction,
+    sdpa_causal_bwd_dq: CudaFunction,
+    sdpa_causal_bwd_dkv:CudaFunction,
     scale_f32:         CudaFunction,
     gelu_inplace:      CudaFunction,
     add_layer_norm_fwd:CudaFunction,
@@ -2003,6 +2005,87 @@ extern "C" __global__ void softmax_bwd(
     float dot = 0.0f;
     for (int j = 0; j < D; j++) dot += yr[j] * dyr[j];
     for (int j = 0; j < D; j++) dxr[j] = yr[j] * (dyr[j] - dot);
+}
+
+// matt-voice FR-18.6-real leg 2 — causal SDPA backward (qwen3 training).
+//
+// roadmap: P18
+//
+// Mirrors the CPU reference ops::sdpa_causal_backward_f32 exactly. Layout
+// [bh, s, d] for q/k/v/dout/dq/dk/dv; `attn` is the saved forward softmax
+// probs [bh, s, s] (0 above the diagonal). scale = 1/sqrt(d).
+//
+// Split by output element to avoid atomics:
+//   sdpa_causal_bwd_dq  — one thread per (h, i): builds d_scores row i into a
+//     [bh, s, s] scratch and writes dq row i.
+//   sdpa_causal_bwd_dkv — one thread per (h, j): reads the d_scores scratch +
+//     attn + dout + q to write dk and dv column j.
+// The dq kernel must run first (the dkv kernel reads its d_scores output).
+extern "C" __global__ void sdpa_causal_bwd_dq(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ attn,
+    const float* __restrict__ dout,
+    float* __restrict__ dq, float* __restrict__ d_scores,
+    float scale, int bh, int s_len, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh * s_len) return;
+    int h = idx / s_len;
+    int i = idx - h * s_len;
+    const float* qh  = q    + h * s_len * d;
+    const float* kh  = k    + h * s_len * d;
+    const float* vh  = v    + h * s_len * d;
+    const float* ah  = attn + h * s_len * s_len;
+    const float* doh = dout + h * s_len * d;
+    float* dqh = dq       + h * s_len * d;
+    float* dsh = d_scores + h * s_len * s_len;
+    // d_attn[i,j] = sum_dd dout[i,dd]*v[j,dd] (j<=i); stash in dsh, accumulate dot.
+    float dot = 0.0f;
+    for (int j = 0; j <= i; j++) {
+        float da = 0.0f;
+        for (int dd = 0; dd < d; dd++) da += doh[i * d + dd] * vh[j * d + dd];
+        dsh[i * s_len + j] = da;
+        dot += ah[i * s_len + j] * da;
+    }
+    // d_scores[i,j] = attn[i,j]*(d_attn[i,j] - dot).
+    for (int j = 0; j <= i; j++) {
+        float da = dsh[i * s_len + j];
+        dsh[i * s_len + j] = ah[i * s_len + j] * (da - dot);
+    }
+    for (int j = i + 1; j < s_len; j++) dsh[i * s_len + j] = 0.0f;
+    // dq[i,dd] = scale * sum_{j<=i} d_scores[i,j]*k[j,dd].
+    for (int dd = 0; dd < d; dd++) {
+        float acc = 0.0f;
+        for (int j = 0; j <= i; j++) acc += dsh[i * s_len + j] * kh[j * d + dd];
+        dqh[i * d + dd] = scale * acc;
+    }
+}
+
+extern "C" __global__ void sdpa_causal_bwd_dkv(
+    const float* __restrict__ q, const float* __restrict__ attn,
+    const float* __restrict__ dout, const float* __restrict__ d_scores,
+    float* __restrict__ dk, float* __restrict__ dv,
+    float scale, int bh, int s_len, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh * s_len) return;
+    int h = idx / s_len;
+    int j = idx - h * s_len;
+    const float* qh  = q        + h * s_len * d;
+    const float* ah  = attn     + h * s_len * s_len;
+    const float* doh = dout     + h * s_len * d;
+    const float* dsh = d_scores + h * s_len * s_len;
+    float* dkh = dk + h * s_len * d;
+    float* dvh = dv + h * s_len * d;
+    for (int dd = 0; dd < d; dd++) {
+        float accv = 0.0f, acck = 0.0f;
+        for (int i = j; i < s_len; i++) {
+            accv += ah[i * s_len + j] * doh[i * d + dd];
+            acck += dsh[i * s_len + j] * qh[i * d + dd];
+        }
+        dvh[j * d + dd] = accv;
+        dkh[j * d + dd] = scale * acck;
+    }
 }
 
 // Row-wise softmax across last dim D. y[i,j] = exp(x[i,j] - max_i) / sum_i.
@@ -5056,7 +5139,8 @@ fn ctx() -> &'static CudaCtx {
             &["cross_entropy_fwd", "cross_entropy_bwd", "adamw_step",
               "add_f32", "gelu_fwd", "gelu_bwd",
               "layer_norm_fwd", "layer_norm_bwd_dx", "layer_norm_bwd_params",
-              "softmax_f32", "softmax_bwd", "softmax_bwd_scaled", "scale_f32",
+              "softmax_f32", "softmax_bwd", "softmax_bwd_scaled",
+              "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv",
@@ -5099,6 +5183,8 @@ fn ctx() -> &'static CudaCtx {
         let softmax_f32           = device.get_func("aether_kernels", "softmax_f32").unwrap();
         let softmax_bwd           = device.get_func("aether_kernels", "softmax_bwd").unwrap();
         let softmax_bwd_scaled    = device.get_func("aether_kernels", "softmax_bwd_scaled").unwrap();
+        let sdpa_causal_bwd_dq    = device.get_func("aether_kernels", "sdpa_causal_bwd_dq").unwrap();
+        let sdpa_causal_bwd_dkv   = device.get_func("aether_kernels", "sdpa_causal_bwd_dkv").unwrap();
         let scale_f32             = device.get_func("aether_kernels", "scale_f32").unwrap();
         let gelu_inplace          = device.get_func("aether_kernels", "gelu_inplace").unwrap();
         let add_layer_norm_fwd    = device.get_func("aether_kernels", "add_layer_norm_fwd").unwrap();
@@ -5149,7 +5235,8 @@ fn ctx() -> &'static CudaCtx {
         CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
-                  softmax_f32, softmax_bwd, softmax_bwd_scaled, scale_f32, gelu_inplace,
+                  softmax_f32, softmax_bwd, softmax_bwd_scaled,
+                  sdpa_causal_bwd_dq, sdpa_causal_bwd_dkv, scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
                   rope_apply, rope_apply_backward, gqa_repeat_kv,
@@ -6066,6 +6153,55 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         ctx().softmax_bwd_scaled.clone()
             .launch(cfg, (yv, dyv, dxv, s, b, d))
             .expect("launch softmax_bwd_scaled");
+    }
+    0
+}
+
+/// Causal SDPA backward (matt-voice FR-18.6-real leg 2, qwen3 training).
+///
+/// roadmap: P18
+///
+/// Mirrors ops::sdpa_causal_backward_f32. All tensors are device f32 handles:
+/// `q`/`k`/`v`/`dout`/`dq`/`dk`/`dv` are [bh, s, d]; `attn` is the saved
+/// forward softmax probs [bh, s, s]; `d_scores` is a caller-provided [bh, s, s]
+/// scratch. Runs the dq kernel (which fills d_scores) then the dkv kernel.
+/// `scale` is 1/sqrt(d) (passed in so the caller controls it).
+#[no_mangle] pub extern "C" fn aether_op_sdpa_causal_backward_f32_cuda(
+    q: i64, k: i64, v: i64, attn: i64, dout: i64,
+    dq: i64, dk: i64, dv: i64, d_scores: i64,
+    bh: c_int, s_len: c_int, d: c_int,
+) -> c_int {
+    let (Some(iq), Some(ik), Some(iv), Some(ia), Some(ido),
+         Some(idq), Some(idk), Some(idv), Some(ids)) = (
+        handle_to_idx(q), handle_to_idx(k), handle_to_idx(v), handle_to_idx(attn),
+        handle_to_idx(dout), handle_to_idx(dq), handle_to_idx(dk), handle_to_idx(dv),
+        handle_to_idx(d_scores))
+        else { return -1; };
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let bs = unsafe { bufs() };
+    let q_p   = bs[iq].as_ref().unwrap() as *const CudaSlice<f32>;
+    let k_p   = bs[ik].as_ref().unwrap() as *const CudaSlice<f32>;
+    let v_p   = bs[iv].as_ref().unwrap() as *const CudaSlice<f32>;
+    let a_p   = bs[ia].as_ref().unwrap() as *const CudaSlice<f32>;
+    let do_p  = bs[ido].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dq_p  = bs[idq].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let dk_p  = bs[idk].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let dv_p  = bs[idv].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let ds_p  = bs[ids].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems((bh * s_len) as u32);
+    unsafe {
+        // Pass 1: dq + d_scores.
+        let qv = &*q_p; let kv = &*k_p; let vv = &*v_p; let av = &*a_p; let dov = &*do_p;
+        let dqv = &mut *dq_p; let dsv = &mut *ds_p;
+        ctx().sdpa_causal_bwd_dq.clone()
+            .launch(cfg.clone(), (qv, kv, vv, av, dov, dqv, dsv, scale, bh, s_len, d))
+            .expect("launch sdpa_causal_bwd_dq");
+        // Pass 2: dk + dv (reads d_scores from pass 1; same stream → ordered).
+        let dsv2 = &*ds_p;
+        let dkv = &mut *dk_p; let dvv = &mut *dv_p;
+        ctx().sdpa_causal_bwd_dkv.clone()
+            .launch(cfg, (qv, av, dov, dsv2, dkv, dvv, scale, bh, s_len, d))
+            .expect("launch sdpa_causal_bwd_dkv");
     }
     0
 }
