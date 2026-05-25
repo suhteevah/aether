@@ -57,6 +57,7 @@ struct CudaCtx {
     rms_norm_bwd_dx:   CudaFunction,
     rms_norm_bwd_gamma:CudaFunction,
     rope_apply:        CudaFunction,
+    rope_apply_backward:CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     silu_inplace:      CudaFunction,
     mul_inplace:       CudaFunction,
@@ -2331,6 +2332,40 @@ extern "C" __global__ void rope_apply(
     float x0 = x[i0], x1 = x[i1];
     x[i0] = x0 * c - x1 * s;
     x[i1] = x0 * s + x1 * c;
+}
+
+// matt-voice FR-18.6-real leg 2 — RoPE backward (qwen3 training).
+//
+// roadmap: P18
+//
+// Forward rotates each pair by R(theta) = [[c,-s],[s,c]] (see rope_apply).
+// RoPE is orthogonal and parameter-free, so the gradient transform is the
+// transpose R^T = [[c,s],[-s,c]]. In-place on the gradient buffer: on entry
+// `g` holds dy (grad w.r.t. the roped output); on exit it holds dx. Same
+// index math as rope_apply so the per-pair theta matches exactly.
+extern "C" __global__ void rope_apply_backward(
+    float*       __restrict__ g,
+    int seq, int n_heads, int head_dim,
+    float base, int pos_start)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hd_half = head_dim / 2;
+    int total = seq * n_heads * hd_half;
+    if (idx >= total) return;
+    int t = idx / (n_heads * hd_half);
+    int rem = idx - t * (n_heads * hd_half);
+    int h = rem / hd_half;
+    int i = rem - h * hd_half;
+    int base_off = (t * n_heads + h) * head_dim;
+    float pos = (float)(t + pos_start);
+    float exp = -2.0f * (float)i / (float)head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float y0 = g[i0], y1 = g[i1];
+    g[i0] =  y0 * c + y1 * s;
+    g[i1] = -y0 * s + y1 * c;
 }
 
 // FR-17.14-extra-deepest-graph -- rope_apply variant that reads pos
@@ -5024,7 +5059,7 @@ fn ctx() -> &'static CudaCtx {
               "softmax_f32", "softmax_bwd", "softmax_bwd_scaled", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
-              "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "gqa_repeat_kv",
+              "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
@@ -5071,6 +5106,7 @@ fn ctx() -> &'static CudaCtx {
         let rms_norm_bwd_dx       = device.get_func("aether_kernels", "rms_norm_bwd_dx").unwrap();
         let rms_norm_bwd_gamma    = device.get_func("aether_kernels", "rms_norm_bwd_gamma").unwrap();
         let rope_apply            = device.get_func("aether_kernels", "rope_apply").unwrap();
+        let rope_apply_backward   = device.get_func("aether_kernels", "rope_apply_backward").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
         let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
@@ -5115,7 +5151,8 @@ fn ctx() -> &'static CudaCtx {
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
                   softmax_f32, softmax_bwd, softmax_bwd_scaled, scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
-                  rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma, rope_apply, gqa_repeat_kv,
+                  rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
+                  rope_apply, rope_apply_backward, gqa_repeat_kv,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
@@ -6222,6 +6259,29 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().rope_apply.clone()
             .launch(cfg, (xv, seq, n_heads, head_dim, base, pos_start))
             .expect("launch rope_apply");
+    }
+    0
+}
+
+/// RoPE backward (matt-voice FR-18.6-real leg 2, qwen3 training). In-place on
+/// the gradient buffer `g`: applies the transpose rotation R^T so on exit `g`
+/// holds dx given dy on entry. Same args as the forward `rope_apply`.
+///
+/// roadmap: P18
+#[no_mangle] pub extern "C" fn aether_op_rope_apply_backward_f32_cuda(
+    g: i64, seq: c_int, n_heads: c_int, head_dim: c_int,
+    base: f32, pos_start: c_int,
+) -> c_int {
+    let Some(ig) = handle_to_idx(g) else { return -1; };
+    let bs = unsafe { bufs() };
+    let g_p = bs[ig].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (seq * n_heads * (head_dim / 2)) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let gv = &mut *g_p;
+        ctx().rope_apply_backward.clone()
+            .launch(cfg, (gv, seq, n_heads, head_dim, base, pos_start))
+            .expect("launch rope_apply_backward");
     }
     0
 }
