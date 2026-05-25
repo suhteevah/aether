@@ -1,5 +1,41 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-25 (session end)
+🟢 Two big threads landed; both have clean carry-forward. (Older dated sections
+below are chronological; this block is the canonical current state.)
+
+**1. matt-voice REAL 32B QLoRA pipeline — VALIDATED, 8h run deferred.**
+Full path built: embed real tokens → 64 Qwen3-32B layers split across 2×P100 →
+real Q6_K lm_head → next-token CE → adapter backprop. 20-step real-data run
+(matt-voice ChatML corpus, 2.38M tokens) loss **4.485 → 1.732**, no OOM, clean
+exit. Launch-ready; operator deferred the 8h run (slot lapsed). Recipe: `pp-qlora-worker
+--data <ids.bin> --t 32 --splits 26,38 --microbatch 1 --lora-rank 16 --alpha 32
+--lr 2e-4 --save <p> --ckpt-every 200`; stop all 3 cnc services first (re-grant
+(B) via openclaw main per-day). Full detail: memory `matt_voice_real_training_validated`.
+
+**2. Per-arch round — shared vocab-1 root cause FOUND + fixed.**
+A free GGUF dtype probe (no bisect) found `dequant_embd_row` hardcoded Q4_K while
+`token_embd` is Q6_K(gemma3)/Q3_K(qwen3moe)/IQ3_S(IQ3_M) → garbage embeddings →
+the vocab-1 NaN-pin across all three. Fix (`b5397fa`): dtype-aware embedding dequant
++ host `aether_dequant_q3_k`/`aether_dequant_iq3_s`. Payoff: **IQ3_M fully coherent**,
+**qwen3moe forward fixed** (real tokens), **gemma3 narrowed** (no longer pad-pinned).
+Also shipped: Q3_K upload arm, Q3_K+Q5_K MoE expert kernels, gemma3 tied-embed
+lm_head + embed scale, aether-serve port-collision fix (:8081→:18913).
+
+**Per-arch ledger:**
+- witness-ready: qwen2.5, GLM (MLA-absorbed), BGE, **IQ3_M-class** (R1-Distill coherent)
+- forward-fixed, needs chat-template wiring in serving: qwen3moe, V2-Lite
+- parked (narrowed to ~3 gemma-specifics): gemma3 forward — kokonoe code, no eviction to find
+
+**What's next (prioritized):** (a) gemma3 gemma-specifics bisect (logit softcap /
+query_pre_attn_scalar / sliding-window) — kokonoe code; (b) per-model chat-template
+wiring in serving.rs to flip qwen3moe+V2-Lite to witness-ready; (c) the 8h matt-voice
+run when scheduled; (d) qwen3moe expert mix may need more dtypes (Q6_K dt=14) — chase
+if a re-smoke surfaces it. Build: `cargo build --workspace --release` clean;
+`--features cuda` clean. Fleet fully restored, all evictions reversible.
+
+---
+
 ## 2026-05-25 — PER-ARCH VERIFICATION (live cnc smokes, NOT "fully ready")
 Ran real decode/embedding smokes against the deployed `aether-serve` binary on
 cnc P100s (workhorse evicted from GPU1 for the window, restored after; no
