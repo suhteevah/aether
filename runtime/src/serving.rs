@@ -43,6 +43,7 @@ use crate::{
 use crate::cuda::{
     aether_dev_init, aether_dev_alloc_f32, aether_dev_free_f32,
     aether_dev_h2d_f32, aether_dev_d2h_f32, aether_dev_sync,
+    aether_dev_h2d_f32_n, aether_dev_d2h_f32_n, aether_dev_h2d_i32_n,
     aether_dev_alloc_u8, aether_dev_free_u8, aether_dev_h2d_u8,
     aether_dev_alloc_i32, aether_dev_free_i32, aether_dev_h2d_i32,
     aether_op_rms_norm_f32_cuda,
@@ -99,6 +100,11 @@ use crate::cuda::{
     aether_op_fused_iq4_xs_expert_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda,
     aether_op_matmul_f32_cuda,
+    aether_op_fused_q4k_matmul_seqB_v3_cuda,
+    aether_op_batched_rope_apply_devarg_f32_cuda,
+    aether_op_batched_paged_append_kv_hetero_devarg_f32_cuda,
+    aether_op_batched_paged_attention_hetero_devarg_f32_cuda,
+    aether_dev_d2d_f32_offset,
     aether_dev_graph_begin, aether_dev_graph_end,
     aether_dev_graph_launch, aether_dev_graph_destroy,
 };
@@ -210,6 +216,12 @@ pub const VOCAB: usize = 152064;
 pub const ROPE_BASE: f32 = 1_000_000.0;
 pub const NORM_EPS: f32 = 1e-6;
 pub const MAX_SEQ: usize = 32;  // FIXME: bump after profiling per-MAX_SEQ cost
+
+/// FR-19.5-extra-deep Phase 2b-2b — max requests fused into one batched
+/// decode tick.  Capped at 8 because `fused_q4k_matmul_seqB_v3` rejects
+/// `batch > 8` (its weight-reuse register budget).  Matches the scheduler's
+/// default `--max-concurrent`.
+pub const MAX_BATCH: usize = 8;
 
 /// FR-17-extra-runtime-shape — Runtime model configuration read from GGUF
 /// metadata.  Replaces the historical `const`s for everything that's
@@ -565,6 +577,33 @@ struct ActivationGpu {
     mla_abs_k_row: i64,        // [n_heads * (kv_lora_rank + qk_rope)]
     mla_abs_v_row: i64,        // [n_heads * kv_lora_rank]
     mla_abs_attn_v_out: i64,   // [n_heads * kv_lora_rank]
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — batched-decode activation workspace.
+/// Sized `MAX_BATCH` rows; the batched forward reuses the first `b` rows
+/// each tick (b = active slot count ≤ MAX_BATCH).  Allocated lazily on the
+/// first `step_logits_for_batch` call so single-stream decode pays nothing.
+/// Every field is row-major `[MAX_BATCH * dim]`.
+struct BatchActivationGpu {
+    x: i64,            // [cap * d_model]
+    x_norm: i64,       // [cap * d_model]
+    q: i64,            // [cap * (n_q_heads * head_dim)]
+    k_step: i64,       // [cap * d_kv]
+    v_step: i64,       // [cap * d_kv]
+    attn_out: i64,     // [cap * d_model]
+    proj: i64,         // [cap * d_model]
+    gate: i64,         // [cap * d_ff]
+    up: i64,           // [cap * d_ff]   (separate buffer for the SwiGLU up branch)
+    down: i64,         // [cap * d_model]
+    logits: i64,       // [cap * vocab]
+    // Per-request metadata, device-side i32 (length cap, or cap*n_logical).
+    pos_batch: i64,        // i32 [cap]            decode position per request
+    cur_seq_batch: i64,    // i32 [cap]            attention window length per request
+    page_table_batch: i64, // i32 [cap * n_logical] each request's logical→physical map
+    n_logical: i32,        // page_table stride
+    // Scratch row buffers for the non-Q4_K offset-copy matmul fallback.
+    scratch_in: i64,   // [max(d_model, d_ff)]
+    scratch_out: i64,  // [vocab]
 }
 
 struct KvCacheGpu { k_cache: i64, v_cache: i64 }
@@ -1038,6 +1077,100 @@ unsafe fn standard_attention_forward(
             n_q_heads, n_kv_heads, head_dim, scale,
             max_seq as c_int, step_args);
     }
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — batched matmul over `b` rows.
+///
+/// `x` is `[b * n_in]`, `y` is `[b * n_out]`.  For Q4_K weights (dt==12) the
+/// weight-reuse seqB kernel dequants each super-block once and applies it to
+/// all `b` rows (the 1.9× win).  For every other dtype the handle API can't
+/// sub-slice the weight, so we stage each row through `scratch_in`/`scratch_out`
+/// (offset 0) and run the existing seq1 dispatch — correct for ALL dtypes,
+/// no weight-reuse for those specific tensors (e.g. Qwen2.5-7B Q6_K v/down).
+unsafe fn matmul_batched(
+    x: i64, w: i64, dt: i32, y: i64,
+    n_out: c_int, n_in: c_int, b: c_int,
+    scratch_in: i64, scratch_out: i64,
+) {
+    if dt == 12 {
+        let rc = aether_op_fused_q4k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b);
+        assert_eq!(rc, 0, "fused_q4k_matmul_seqB_v3 failed (rc={}, b={})", rc, b);
+    } else {
+        for row in 0..b {
+            aether_dev_d2d_f32_offset(x, row * n_in, scratch_in, 0, n_in);
+            dispatch_matmul(scratch_in, w, dt, scratch_out, n_out, n_in);
+            aether_dev_d2d_f32_offset(scratch_out, 0, y, row * n_out, n_out);
+        }
+    }
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — one transformer layer over `b` fused
+/// requests at heterogeneous decode positions.  Mirrors
+/// `standard_attention_forward` + the dense-FFN tail of `block_forward_devarg`,
+/// but every op runs over `b` rows: norms/biases take `rows=b`, elementwise
+/// ops take `n=b*dim`, matmuls go through `matmul_batched`, and RoPE / append /
+/// attention use the per-request hetero kernels driven by `pos_batch` /
+/// `cur_seq_batch` / `page_table_batch`.
+///
+/// Caller contract: this path covers the STANDARD (non-MLA) attention + DENSE
+/// (non-MoE) FFN shape with `head_dim % 32 == 0` and `sliding_window == 0`
+/// (`QwenSession::is_batchable`).  MLA / MoE / flex arches stay on the serial
+/// per-slot path.
+unsafe fn block_forward_batched(
+    bw: &BlockGpu, ba: &BatchActivationGpu, kv: &KvCacheGpu,
+    b: c_int, cfg: &ModelConfig, max_seq: usize, block_size: c_int,
+) {
+    let d_model = cfg.d_model as c_int;
+    let d_kv = cfg.d_kv as c_int;
+    let d_ff = cfg.d_ff as c_int;
+    let n_q_heads = cfg.n_q_heads as c_int;
+    let n_kv_heads = cfg.n_kv_heads as c_int;
+    let head_dim = cfg.head_dim as c_int;
+    let rope_base = cfg.rope_base;
+    let eps = cfg.norm_eps;
+    let stride = ba.n_logical;
+    let (si, so) = (ba.scratch_in, ba.scratch_out);
+
+    aether_op_rms_norm_f32_cuda(ba.x, bw.attn_norm_g, ba.x_norm, eps, b, d_model);
+
+    matmul_batched(ba.x_norm, bw.w_q, bw.dt_q, ba.q, d_model, d_model, b, si, so);
+    if bw.b_q != 0 { aether_op_bias_add_f32_cuda(ba.q, bw.b_q, b, d_model); }
+    matmul_batched(ba.x_norm, bw.w_k, bw.dt_k, ba.k_step, d_kv, d_model, b, si, so);
+    if bw.b_k != 0 { aether_op_bias_add_f32_cuda(ba.k_step, bw.b_k, b, d_kv); }
+    matmul_batched(ba.x_norm, bw.w_v, bw.dt_v, ba.v_step, d_kv, d_model, b, si, so);
+    if bw.b_v != 0 { aether_op_bias_add_f32_cuda(ba.v_step, bw.b_v, b, d_kv); }
+
+    // Qwen3 per-head Q/K RMSNorm — each (request, head) row of head_dim is
+    // normalized independently, so rows = b * n_{q,kv}_heads.
+    if bw.attn_q_norm_g != 0 {
+        aether_op_rms_norm_f32_cuda(ba.q, bw.attn_q_norm_g, ba.q, eps, b * n_q_heads, head_dim);
+    }
+    if bw.attn_k_norm_g != 0 {
+        aether_op_rms_norm_f32_cuda(ba.k_step, bw.attn_k_norm_g, ba.k_step, eps, b * n_kv_heads, head_dim);
+    }
+
+    aether_op_batched_rope_apply_devarg_f32_cuda(ba.q, b, n_q_heads, head_dim, rope_base, ba.pos_batch);
+    aether_op_batched_rope_apply_devarg_f32_cuda(ba.k_step, b, n_kv_heads, head_dim, rope_base, ba.pos_batch);
+
+    let scale: f32 = 1.0 / (cfg.head_dim as f32).sqrt();
+    aether_op_batched_paged_append_kv_hetero_devarg_f32_cuda(
+        ba.k_step, ba.v_step, kv.k_cache, kv.v_cache, ba.page_table_batch,
+        b, d_kv, block_size, stride, ba.pos_batch);
+    aether_op_batched_paged_attention_hetero_devarg_f32_cuda(
+        ba.q, kv.k_cache, kv.v_cache, ba.page_table_batch, ba.attn_out,
+        b, n_q_heads, n_kv_heads, head_dim, block_size, stride,
+        scale, max_seq as c_int, ba.cur_seq_batch);
+
+    matmul_batched(ba.attn_out, bw.w_o, bw.dt_o, ba.proj, d_model, d_model, b, si, so);
+    aether_op_add_inplace_f32_cuda(ba.x, ba.proj, b * d_model);
+
+    aether_op_rms_norm_f32_cuda(ba.x, bw.ffn_norm_g, ba.x_norm, eps, b, d_model);
+    matmul_batched(ba.x_norm, bw.w_gate, bw.dt_gate, ba.gate, d_ff, d_model, b, si, so);
+    matmul_batched(ba.x_norm, bw.w_up,   bw.dt_up,   ba.up,   d_ff, d_model, b, si, so);
+    aether_op_silu_f32_cuda(ba.gate, b * d_ff);
+    aether_op_mul_inplace_f32_cuda(ba.gate, ba.up, b * d_ff);
+    matmul_batched(ba.gate, bw.w_down, bw.dt_down, ba.down, d_model, d_ff, b, si, so);
+    aether_op_add_inplace_f32_cuda(ba.x, ba.down, b * d_model);
 }
 
 /// FR-17-extra-moe-fwd — Mixture-of-Experts FFN forward pass.
@@ -1796,6 +1929,10 @@ pub struct QwenSession {
     /// `apply_chat_template` to render `messages: [(role, content)]`
     /// into the wire text the model was trained to expect.
     chat_template: Option<String>,
+    /// FR-19.5-extra-deep Phase 2b-2b — lazily-allocated batched-decode
+    /// workspace.  `None` until the first `step_logits_for_batch` call.
+    /// Single-stream decode never touches it (zero cost).
+    batch_state: Option<BatchActivationGpu>,
 }
 
 struct PagedCfg {
@@ -2086,6 +2223,7 @@ impl QwenSession {
                 cfg,
                 byte_to_id_cache: std::sync::OnceLock::new(),
                 chat_template,
+                batch_state: None,
             })
         }
     }
@@ -2455,6 +2593,17 @@ impl Drop for QwenSession {
                       self.act.mla_abs_k_row, self.act.mla_abs_v_row,
                       self.act.mla_abs_attn_v_out] {
                 if h != 0 { let _ = aether_dev_free_f32(h); }
+            }
+            // FR-19.5-extra-deep Phase 2b-2b — batched-decode workspace.
+            if let Some(ba) = self.batch_state.take() {
+                for h in [ba.x, ba.x_norm, ba.q, ba.k_step, ba.v_step,
+                          ba.attn_out, ba.proj, ba.gate, ba.up, ba.down,
+                          ba.logits, ba.scratch_in, ba.scratch_out] {
+                    if h != 0 { let _ = aether_dev_free_f32(h); }
+                }
+                for h in [ba.pos_batch, ba.cur_seq_batch, ba.page_table_batch] {
+                    if h != 0 { let _ = aether_dev_free_i32(h); }
+                }
             }
             let shared = self.pool.is_some();
             for kv in self.kvs.drain(..) {
@@ -3235,6 +3384,145 @@ impl QwenSession {
             // 4. Read advanced position back to the caller's slot.
             *next_pos = self.next_pos;
             logits
+        }
+    }
+
+    /// FR-19.5-extra-deep Phase 2b-2b — can this model use the batched
+    /// decode path?  Covers the STANDARD attention + DENSE FFN shape only:
+    /// non-MLA (kv_lora_rank == 0), non-MoE (n_experts == 0), non-flex
+    /// (head_dim % 32 == 0 && sliding_window == 0), paged KV.  Everything
+    /// else (deepseek2 / glm MLA, qwen3moe, gemma3 flex) stays on the
+    /// serial per-slot path.
+    pub fn is_batchable(&self) -> bool {
+        self.paged_cfg.is_some()
+            && self.cfg.kv_lora_rank == 0
+            && self.cfg.n_experts == 0
+            && (self.cfg.head_dim % 32) == 0
+            && self.cfg.sliding_window == 0
+    }
+
+    /// Lazily allocate the batched-decode workspace (sized `MAX_BATCH` rows).
+    /// Idempotent; only the first call allocates.
+    unsafe fn ensure_batch_state(&mut self) {
+        if self.batch_state.is_some() { return; }
+        let cap = MAX_BATCH as c_int;
+        let d_model = self.cfg.d_model as c_int;
+        let d_kv = self.cfg.d_kv as c_int;
+        let d_ff = self.cfg.d_ff as c_int;
+        let q_total = (self.cfg.n_q_heads * self.cfg.head_dim) as c_int;
+        let vocab = self.cfg.vocab as c_int;
+        let n_logical = self.paged_n_logical() as i32;
+        let scratch_in_n = d_model.max(d_ff);
+        self.batch_state = Some(BatchActivationGpu {
+            x:        aether_dev_alloc_f32(cap * d_model),
+            x_norm:   aether_dev_alloc_f32(cap * d_model),
+            q:        aether_dev_alloc_f32(cap * q_total),
+            k_step:   aether_dev_alloc_f32(cap * d_kv),
+            v_step:   aether_dev_alloc_f32(cap * d_kv),
+            attn_out: aether_dev_alloc_f32(cap * d_model),
+            proj:     aether_dev_alloc_f32(cap * d_model),
+            gate:     aether_dev_alloc_f32(cap * d_ff),
+            up:       aether_dev_alloc_f32(cap * d_ff),
+            down:     aether_dev_alloc_f32(cap * d_model),
+            logits:   aether_dev_alloc_f32(cap * vocab),
+            pos_batch:        aether_dev_alloc_i32(cap),
+            cur_seq_batch:    aether_dev_alloc_i32(cap),
+            page_table_batch: aether_dev_alloc_i32(cap * n_logical),
+            n_logical,
+            scratch_in:  aether_dev_alloc_f32(scratch_in_n),
+            scratch_out: aether_dev_alloc_f32(vocab),
+        });
+    }
+
+    /// FR-19.5-extra-deep Phase 2b-2b — fused batched decode.  Runs ONE
+    /// forward pass over `b = page_tables.len()` requests at heterogeneous
+    /// decode positions and returns `b` raw logit vectors (each length
+    /// `cfg.vocab`).  Advances every `next_positions[i]` by 1.
+    ///
+    /// This is the e2e throughput win: Q4_K weights are dequantized once per
+    /// super-block and applied to all `b` rows (1.9× at b=4), and attention /
+    /// RoPE / append run as single per-request hetero launches instead of `b`
+    /// serial seq1 steps.
+    ///
+    /// PRECONDITION (mirrors `step_logits_for_slot`): the caller has already
+    /// mapped each slot's block for its current position (`slot_ensure_block`)
+    /// so every `page_tables[i]` is valid for `next_positions[i]`.  Caller
+    /// holds the session lock.  `is_batchable()` must be true.
+    pub fn step_logits_for_batch(
+        &mut self,
+        page_tables: &[Vec<i32>],
+        last_ids: &[usize],
+        next_positions: &mut [i32],
+    ) -> Vec<Vec<f32>> {
+        let b = page_tables.len();
+        assert!(b >= 1 && b <= MAX_BATCH,
+            "step_logits_for_batch: batch {} out of range 1..={}", b, MAX_BATCH);
+        assert_eq!(b, last_ids.len(), "last_ids length mismatch");
+        assert_eq!(b, next_positions.len(), "next_positions length mismatch");
+        unsafe {
+            self.ensure_batch_state();
+            let d_model = self.cfg.d_model;
+            let vocab = self.cfg.vocab;
+            // Snapshot the (Copy) device handles so the dequant loop can take
+            // an immutable borrow of self without conflicting.
+            let (bx, bpos, bcur, bpt, blogits, b_si, b_so, n_logical) = {
+                let ba = self.batch_state.as_ref().unwrap();
+                (ba.x, ba.pos_batch, ba.cur_seq_batch, ba.page_table_batch,
+                 ba.logits, ba.scratch_in, ba.scratch_out, ba.n_logical as usize)
+            };
+
+            // Assemble host-side batched inputs.
+            let mut emb_host = vec![0.0f32; b * d_model];
+            let mut pos_host = vec![0i32; b];
+            let mut cur_seq_host = vec![0i32; b];
+            let mut pt_host = vec![-1i32; b * n_logical];
+            for i in 0..b {
+                let row = self.dequant_embd_row(last_ids[i]);
+                emb_host[i * d_model..(i + 1) * d_model].copy_from_slice(&row);
+                let pos = next_positions[i];
+                pos_host[i] = pos;
+                cur_seq_host[i] = pos + 1;
+                let pt = &page_tables[i];
+                let n = pt.len().min(n_logical);
+                pt_host[i * n_logical..i * n_logical + n].copy_from_slice(&pt[..n]);
+            }
+            aether_dev_h2d_f32_n(emb_host.as_ptr() as i64, bx, (b * d_model) as c_int);
+            aether_dev_h2d_i32_n(pos_host.as_ptr() as i64, bpos, b as c_int);
+            aether_dev_h2d_i32_n(cur_seq_host.as_ptr() as i64, bcur, b as c_int);
+            aether_dev_h2d_i32_n(pt_host.as_ptr() as i64, bpt, (b * n_logical) as c_int);
+
+            // Per-layer batched forward.
+            let bc = b as c_int;
+            let block_size = self.paged_cfg.as_ref().map(|p| p.block_size).unwrap_or(1);
+            for layer in 0..self.cfg.n_layers {
+                block_forward_batched(
+                    &self.blocks[layer],
+                    self.batch_state.as_ref().unwrap(),
+                    &self.kvs[layer],
+                    bc, &self.cfg, MAX_SEQ, block_size);
+            }
+
+            // Final RMSNorm + LM head over all b rows.
+            {
+                let ba = self.batch_state.as_ref().unwrap();
+                aether_op_rms_norm_f32_cuda(
+                    ba.x, self.final_norm_g, ba.x_norm,
+                    self.cfg.norm_eps, bc, d_model as c_int);
+                matmul_batched(
+                    ba.x_norm, self.lm_head, self.lm_dt, ba.logits,
+                    vocab as c_int, d_model as c_int, bc, b_si, b_so);
+            }
+            aether_dev_sync();
+
+            // Read back b logit vectors.
+            let mut logits_host = vec![0.0f32; b * vocab];
+            aether_dev_d2h_f32_n(blogits, logits_host.as_mut_ptr() as i64, (b * vocab) as c_int);
+            let mut out = Vec::with_capacity(b);
+            for i in 0..b {
+                out.push(logits_host[i * vocab..(i + 1) * vocab].to_vec());
+            }
+            for p in next_positions.iter_mut() { *p += 1; }
+            out
         }
     }
 

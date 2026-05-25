@@ -110,6 +110,7 @@ struct PagedCtx {
     batched_paged_append_kv_hetero_devarg: CudaFunction,
     fused_q4k_matmul_seqB_v3: CudaFunction,
     batched_rope_apply_devarg: CudaFunction,
+    d2d_copy_f32_offset: CudaFunction,
     paged_attention_flex_devarg: CudaFunction,
     paged_attention_mla_devarg: CudaFunction,
     paged_append_kv_mla_devarg: CudaFunction,
@@ -150,6 +151,7 @@ fn paged_ctx() -> &'static PagedCtx {
               "batched_paged_append_kv_hetero_devarg",
               "fused_q4k_matmul_seqB_v3",
               "batched_rope_apply_devarg",
+              "d2d_copy_f32_offset",
               "paged_attention_flex_devarg",
               "paged_attention_mla_devarg",
               "paged_append_kv_mla_devarg",
@@ -191,6 +193,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "fused_q4k_matmul_seqB_v3").unwrap(),
             batched_rope_apply_devarg:
                 device.get_func("aether_paged_kernels", "batched_rope_apply_devarg").unwrap(),
+            d2d_copy_f32_offset:
+                device.get_func("aether_paged_kernels", "d2d_copy_f32_offset").unwrap(),
             paged_attention_flex_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_flex_devarg").unwrap(),
             paged_attention_mla_devarg:
@@ -279,6 +283,22 @@ extern "C" __device__ float aether_f16_to_f32_dev(unsigned short h) {
     unsigned int f32_mant = mant << 13;
     bits = (sign << 31) | f32_exp | f32_mant;
     return __int_as_float(bits);
+}
+
+// FR-19.5-extra-deep Phase 2b-2b — device-to-device offset copy.  Copies
+// `n` f32s from src[src_off..] to dst[dst_off..].  Used by the batched
+// decode path to stage a single request's row of a batched activation
+// buffer into a contiguous scratch buffer (offset 0) so a seq1 matmul
+// kernel — which always reads/writes from offset 0 — can run against a
+// non-Q4_K weight (e.g. Qwen2.5-7B's Q6_K v_proj / ffn_down), then copy
+// the result row back.  Covers ALL dtypes; Q4_K rows take the weight-reuse
+// seqB kernel instead.  Lives here (lazy module) so single-stream pays nothing.
+extern "C" __global__ void d2d_copy_f32_offset(
+    const float* __restrict__ src, int src_off,
+    float*       __restrict__ dst, int dst_off, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[dst_off + i] = src[src_off + i];
 }
 
 // FR-19.5-extra-deep — batched paged append_kv. B (k_new, v_new) pairs at
@@ -5092,6 +5112,47 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     0
 }
 
+/// FR-19.5-extra-deep Phase 2b-2b — host→device copy of `n` f32s into the
+/// FIRST `n` elements of a (possibly larger) buffer.  The batched-decode
+/// workspace reuses the first `b` rows of MAX_BATCH-sized buffers, so the
+/// copy length differs from the allocation; this slices an exact-length view.
+#[no_mangle] pub unsafe extern "C" fn aether_dev_h2d_f32_n(host: i64, dev: i64, n: c_int) -> c_int {
+    let Some(i) = handle_to_idx(dev) else { return -1; };
+    if host == 0 || n <= 0 { return -1; }
+    let host_slice = std::slice::from_raw_parts(host as *const f32, n as usize);
+    let bs = bufs();
+    let buf = bs[i].as_mut().expect("freed buffer");
+    let mut view = buf.slice_mut(0..n as usize);
+    ctx().device.htod_sync_copy_into(host_slice, &mut view).expect("h2d_n");
+    0
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — device→host copy of the FIRST `n` f32s
+/// of a (possibly larger) buffer.
+#[no_mangle] pub unsafe extern "C" fn aether_dev_d2h_f32_n(dev: i64, host: i64, n: c_int) -> c_int {
+    let Some(i) = handle_to_idx(dev) else { return -1; };
+    if host == 0 || n <= 0 { return -1; }
+    let host_slice = std::slice::from_raw_parts_mut(host as *mut f32, n as usize);
+    let bs = bufs();
+    let buf = bs[i].as_ref().expect("freed buffer");
+    let view = buf.slice(0..n as usize);
+    ctx().device.dtoh_sync_copy_into(&view, host_slice).expect("d2h_n");
+    0
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — host→device copy of `n` i32s into the
+/// FIRST `n` elements of a (possibly larger) buffer.
+#[no_mangle] pub unsafe extern "C" fn aether_dev_h2d_i32_n(host: i64, dev: i64, n: c_int) -> c_int {
+    let Some(i) = handle_to_i32_idx(dev) else { return -1; };
+    if host == 0 || n <= 0 { return -1; }
+    let host_slice = std::slice::from_raw_parts(host as *const i32, n as usize);
+    let bs = i32_bufs();
+    let buf = bs[i].as_mut().expect("freed i32 buf");
+    let mut view = buf.slice_mut(0..n as usize);
+    ctx().device.htod_sync_copy_into(host_slice, &mut view).expect("h2d_i32_n");
+    0
+}
+
 /// `out[m,n] = a[m,k] · b[k,n]` on the device via cuBLAS sgemm.
 ///
 /// cuBLAS is column-major; our buffers are row-major. We compute
@@ -5338,6 +5399,70 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     bs[idy] = Some(dy_buf);
     bs[ib] = Some(b_buf);
     bs[ida] = Some(da_buf);
+    0
+}
+
+/// matt-voice / FR-17.14-extra-qlora-bwd — backward through a FROZEN
+/// QUANTIZED linear `y = W x` for LoRA fine-tuning.
+///
+/// Computes `dx = Wᵀ · dy` (gradient of `y = W x` w.r.t. the input `x`),
+/// so the loss can flow *through* a frozen quantized base linear back to
+/// the LoRA adapters on the previous layer. LoRA only trains A/B, but the
+/// `dx` path needs the frozen W transposed against the upstream gradient.
+///
+/// Args:
+///   w     : u8 device handle — the quantized weight, GGUF natural order,
+///           logical shape `[n_out, n_in]` row-major. For Q4_K each row of
+///           `n_in` elements is `n_in/256` super-blocks of 144 bytes; for
+///           Q6_K, 210 bytes per super-block. `n_in` MUST be a multiple of
+///           256 (the super-block element count).
+///   dt    : GGML dtype enum — 12 = Q4_K, 14 = Q6_K (others → -2).
+///   dy    : f32 device handle, length `n_out` (upstream grad of `y`).
+///   dx    : f32 device handle, length `n_in` (output: `Wᵀ·dy`).
+///   n_out : output rows of W (= len(dy)).
+///   n_in  : input cols of W (= len(dx)), multiple of 256.
+///
+/// Strategy (LORA_PLAN option 1, simplest-correct): dequantize the whole
+/// W to a transient f32 device buffer `[n_out * n_in]` (row-major, exactly
+/// the layout the existing GPU dequant kernels emit), then run a single
+/// cuBLAS sgemm via `aether_op_matmul_f32_cuda` with `a = dy [1, n_out]`,
+/// `b = W_f32 [n_out, n_in]`, `out = dx [1, n_in]`. That gemm computes
+/// `dx[i] = Σ_o dy[o]·W[o,i] = (Wᵀ·dy)[i]`. The transient buffer is freed
+/// before return. No new kernel — pure reuse of dequant + sgemm.
+///
+/// Returns 0 on success, -1 on a bad handle / bad dims, -2 on unsupported
+/// dtype.
+#[no_mangle] pub extern "C" fn aether_op_quant_matmul_backward_lhs_f32_cuda(
+    w: i64, dt: c_int, dy: i64, dx: i64, n_out: c_int, n_in: c_int,
+) -> c_int {
+    // Validate the f32 handles up front; the u8 handle is validated by the
+    // dequant op below.
+    if handle_to_idx(dy).is_none() || handle_to_idx(dx).is_none() { return -1; }
+    if handle_to_u8_idx(w).is_none() { return -1; }
+    if n_out <= 0 || n_in <= 0 { return -1; }
+    if (n_in % 256) != 0 { return -1; }   // dequant kernels work in 256-elem super-blocks
+
+    let n_total = (n_out as i64) * (n_in as i64);
+    if n_total > c_int::MAX as i64 { return -1; }
+    let n_total = n_total as c_int;
+    let n_blocks = n_total / 256;          // 256 elems per super-block, exact (n_in%256==0)
+
+    // Transient f32 device buffer for the dequantised W [n_out, n_in].
+    let w_f32 = aether_dev_alloc_f32(n_total);
+    if w_f32 == 0 { return -1; }
+
+    // Dequant W → w_f32 (row-major [n_out, n_in]). dt selects the kernel.
+    let drc = match dt {
+        12 => aether_op_dequant_q4_k_m_f32_cuda(w, w_f32, n_blocks),
+        14 => aether_op_dequant_q6_k_f32_cuda(w, w_f32, n_blocks),
+        _  => { aether_dev_free_f32(w_f32); return -2; }
+    };
+    if drc != 0 { aether_dev_free_f32(w_f32); return -1; }
+
+    // dx[1, n_in] = dy[1, n_out] · w_f32[n_out, n_in]  (== Wᵀ·dy).
+    let mrc = aether_op_matmul_f32_cuda(dy, w_f32, dx, /*m=*/1, /*k=*/n_out, /*n=*/n_in);
+    aether_dev_free_f32(w_f32);
+    if mrc != 0 { return -1; }
     0
 }
 
@@ -7883,6 +8008,30 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().batched_rope_apply_devarg.clone()
             .launch(cfg, (xv, batch, n_heads, head_dim, base, pv))
             .expect("launch batched_rope_apply_devarg");
+    }
+    0
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — device-to-device offset copy of `n`
+/// f32s: `dst[dst_off .. dst_off+n] = src[src_off .. src_off+n]`.  `src`
+/// and `dst` MUST be distinct device handles (the batched decode fallback
+/// always stages between separate buffers).  Returns 0 on success, -1 on a
+/// bad handle / args.
+#[no_mangle] pub extern "C" fn aether_dev_d2d_f32_offset(
+    src: i64, src_off: c_int, dst: i64, dst_off: c_int, n: c_int,
+) -> c_int {
+    let Some(i_s) = handle_to_idx(src) else { return -1; };
+    let Some(i_d) = handle_to_idx(dst) else { return -1; };
+    if i_s == i_d || src_off < 0 || dst_off < 0 || n <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let s_p = bs[i_s].as_ref().expect("freed src") as *const CudaSlice<f32>;
+    let d_p = bs[i_d].as_mut().expect("freed dst") as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        let sv = &*s_p; let dv = &mut *d_p;
+        paged_ctx().d2d_copy_f32_offset.clone()
+            .launch(cfg, (sv, src_off, dv, dst_off, n))
+            .expect("launch d2d_copy_f32_offset");
     }
     0
 }

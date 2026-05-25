@@ -381,11 +381,72 @@ fn run_worker(
         // `done` one-shot and the optional `stream_tx`) happens once, in
         // step 5 — never double-send.
         let mut retired: Vec<(usize, Result<(), String>)> = Vec::new();
-        for (i, entry) in active.iter_mut().enumerate() {
-            match step_slot(&session, &mut entry.slot) {
-                Ok(true)  => retired.push((i, Ok(()))),
-                Ok(false) => { /* slot continues */ }
-                Err(e)    => retired.push((i, Err(e))),
+        // FR-19.5-extra-deep Phase 2b-2b — fuse all active slots into ONE
+        // batched GPU tick when the model supports it (standard attn + dense
+        // FFN) and ≥2 slots are in flight.  Q4_K weights dequant once and
+        // apply to all rows (1.9× @ b=4); attention/RoPE/append run as single
+        // per-request hetero launches.  Sampling stays per-slot, lock-free,
+        // via the shared `consume_slot_logits`.  Falls back to the serial
+        // per-slot loop for batch=1 or non-batchable arches (MLA / MoE / flex).
+        let use_batched = active.len() >= 2 && session.lock().unwrap().is_batchable();
+        if use_batched {
+            // One lock acquisition: ensure each slot's block, gather inputs,
+            // run the fused forward, write advanced positions back.
+            let batch_result: Result<Vec<Vec<f32>>, (usize, String)> = {
+                let mut sess = session.lock().unwrap();
+                let mut ensure_err = None;
+                for (i, entry) in active.iter_mut().enumerate() {
+                    if let Err(e) = sess.slot_ensure_block(
+                        entry.slot.next_pos,
+                        &mut entry.slot.page_table_host,
+                        &mut entry.slot.owned_blocks,
+                    ) {
+                        ensure_err = Some((i, format!(
+                            "pool exhausted at pos {}: {}", entry.slot.next_pos, e)));
+                        break;
+                    }
+                }
+                match ensure_err {
+                    Some(e) => Err(e),
+                    None => {
+                        let page_tables: Vec<Vec<i32>> =
+                            active.iter().map(|e| e.slot.page_table_host.clone()).collect();
+                        let last_ids: Vec<usize> =
+                            active.iter().map(|e| e.slot.last_token).collect();
+                        let mut positions: Vec<i32> =
+                            active.iter().map(|e| e.slot.next_pos).collect();
+                        let out = sess.step_logits_for_batch(
+                            &page_tables, &last_ids, &mut positions);
+                        for (entry, p) in active.iter_mut().zip(positions.iter()) {
+                            entry.slot.next_pos = *p;
+                        }
+                        Ok(out)
+                    }
+                }
+            };
+            match batch_result {
+                Ok(all) => {
+                    for (i, (entry, logits)) in
+                        active.iter_mut().zip(all.into_iter()).enumerate()
+                    {
+                        match consume_slot_logits(&session, &mut entry.slot, logits) {
+                            Ok(true)  => retired.push((i, Ok(()))),
+                            Ok(false) => { /* slot continues */ }
+                            Err(e)    => retired.push((i, Err(e))),
+                        }
+                    }
+                }
+                // A block-allocation failure aborts THIS slot only; the others
+                // simply tick on the next scheduler iteration (no token lost).
+                Err((i, msg)) => retired.push((i, Err(msg))),
+            }
+        } else {
+            for (i, entry) in active.iter_mut().enumerate() {
+                match step_slot(&session, &mut entry.slot) {
+                    Ok(true)  => retired.push((i, Ok(()))),
+                    Ok(false) => { /* slot continues */ }
+                    Err(e)    => retired.push((i, Err(e))),
+                }
             }
         }
 
@@ -497,7 +558,7 @@ fn step_slot(
     // Pool-block alloc + GPU forward live under one lock acquisition —
     // they're cheap to keep grouped and the alloc reads pool state
     // anyway (small Mutex inside SharedKvPool).
-    let mut logits = {
+    let logits = {
         let mut sess = session.lock().unwrap();
         if let Err(e) = sess.slot_ensure_block(
             slot.next_pos, &mut slot.page_table_host, &mut slot.owned_blocks,
@@ -510,6 +571,21 @@ fn step_slot(
             slot.last_token,
         )
     };
+    consume_slot_logits(session, slot, logits)
+}
+
+/// FR-19.5-extra-deep Phase 2b-2b — the per-slot post-logits half of a
+/// decode tick: logit_bias + repetition penalty, sample, stop-token +
+/// stop-string + max-tokens + max-seq checks, and stream/callback emit.
+/// Shared verbatim by the serial (`step_slot`) and batched
+/// (`step_logits_for_batch`) paths so sampling semantics are identical
+/// regardless of how the logits were produced.  Caller must NOT hold the
+/// session lock (this re-acquires it for `max_pos` / `decode_ids`).
+fn consume_slot_logits(
+    session: &Arc<Mutex<QwenSession>>,
+    slot: &mut SessionSlot,
+    mut logits: Vec<f32>,
+) -> Result<bool, String> {
     let max_pos = session.lock().unwrap().max_pos();
 
     // Per-slot logit biases + repetition penalties + sample.
