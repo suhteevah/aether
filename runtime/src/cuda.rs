@@ -62,6 +62,7 @@ struct CudaCtx {
     rope_apply:        CudaFunction,
     rope_apply_backward:CudaFunction,
     gqa_repeat_kv:     CudaFunction,
+    gqa_reduce_kv_grad:CudaFunction,
     silu_inplace:      CudaFunction,
     silu_bwd:          CudaFunction,
     transpose_021:     CudaFunction,
@@ -2548,6 +2549,35 @@ extern "C" __global__ void gqa_repeat_kv(
     int kh = qh / g;
     int src_off = (t * n_kv_heads + kh) * head_dim + d;
     kv_out[idx] = kv_in[src_off];
+}
+
+// matt-voice FR-18.6-real leg 2 — GQA backward: sum-reduce the grad of the
+// repeated [seq, n_q_heads, head_dim] tensor back down to the native
+// [seq, n_kv_heads, head_dim] layout. The forward gqa_repeat_kv broadcasts each
+// kv-head to g = n_q/n_kv query-heads (a copy), so the gradient of a copy is the
+// sum over the group. One thread per (t, kh, d) of the reduced tensor.
+//
+// roadmap: P18
+extern "C" __global__ void gqa_reduce_kv_grad(
+    const float* __restrict__ dkv_out,   // [seq, n_q_heads,  head_dim]
+    float*       __restrict__ dkv_in,     // [seq, n_kv_heads, head_dim]
+    int seq, int n_kv_heads, int head_dim, int n_q_heads)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq * n_kv_heads * head_dim;
+    if (idx >= total) return;
+    int t = idx / (n_kv_heads * head_dim);
+    int rem = idx - t * (n_kv_heads * head_dim);
+    int kh = rem / head_dim;
+    int d  = rem - kh * head_dim;
+    int g  = n_q_heads / n_kv_heads;
+    float acc = 0.0f;
+    for (int j = 0; j < g; j++) {
+        int qh = kh * g + j;
+        int src = (t * n_q_heads + qh) * head_dim + d;
+        acc += dkv_out[src];
+    }
+    dkv_in[idx] = acc;
 }
 
 // matt-voice / FR-17.6-extra — SiLU in place: x[i] = x[i] * sigmoid(x[i])
@@ -5227,7 +5257,7 @@ fn ctx() -> &'static CudaCtx {
               "sdpa_causal_fwd", "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
-              "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv",
+              "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv", "gqa_reduce_kv_grad",
               "silu_inplace", "silu_bwd", "transpose_021", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
@@ -5279,6 +5309,7 @@ fn ctx() -> &'static CudaCtx {
         let rope_apply            = device.get_func("aether_kernels", "rope_apply").unwrap();
         let rope_apply_backward   = device.get_func("aether_kernels", "rope_apply_backward").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
+        let gqa_reduce_kv_grad    = device.get_func("aether_kernels", "gqa_reduce_kv_grad").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
         let silu_bwd              = device.get_func("aether_kernels", "silu_bwd").unwrap();
         let transpose_021         = device.get_func("aether_kernels", "transpose_021").unwrap();
@@ -5327,7 +5358,7 @@ fn ctx() -> &'static CudaCtx {
                   scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
-                  rope_apply, rope_apply_backward, gqa_repeat_kv,
+                  rope_apply, rope_apply_backward, gqa_repeat_kv, gqa_reduce_kv_grad,
                   silu_inplace, silu_bwd, transpose_021, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
@@ -7953,6 +7984,30 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().gqa_repeat_kv.clone()
             .launch(cfg, (iv, ov, seq, n_kv_heads, head_dim, n_q_heads))
             .expect("launch gqa_repeat_kv");
+    }
+    0
+}
+
+/// matt-voice FR-18.6-real leg 2 — GQA backward (grad of the kv repeat).
+/// dkv_in[seq, n_kv_heads, head_dim] = sum over the g = n_q/n_kv query-heads in
+/// each group of dkv_out[seq, n_q_heads, head_dim]. Overwrites dkv_in.
+#[no_mangle] pub extern "C" fn aether_op_gqa_reduce_kv_grad_f32_cuda(
+    dkv_out: i64, dkv_in: i64,
+    seq: c_int, n_kv_heads: c_int, head_dim: c_int, n_q_heads: c_int,
+) -> c_int {
+    let (Some(io), Some(ii)) = (handle_to_idx(dkv_out), handle_to_idx(dkv_in))
+        else { return -1; };
+    if (n_q_heads % n_kv_heads) != 0 { return 1; }
+    let bs = unsafe { bufs() };
+    let o_p = bs[io].as_ref().unwrap() as *const CudaSlice<f32>;
+    let i_p = bs[ii].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let total = (seq * n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let ov = &*o_p; let iv = &mut *i_p;
+        ctx().gqa_reduce_kv_grad.clone()
+            .launch(cfg, (ov, iv, seq, n_kv_heads, head_dim, n_q_heads))
+            .expect("launch gqa_reduce_kv_grad");
     }
     0
 }
