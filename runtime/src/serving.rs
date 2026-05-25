@@ -1507,7 +1507,19 @@ unsafe fn mla_attention_forward(
     let d_v_row = n_heads * v_head_dim;
     let base_scale = 1.0f32 / (qk_head_dim as f32).sqrt();
     let scale = if yarn_active {
-        let mscale = 1.0 + cfg.yarn_log_multiplier * cfg.yarn_factor.ln();
+        // Match llama.cpp deepseek2 (src/models/deepseek2.cpp) EXACTLY — note
+        // this is NOT the same as `1 + log_mul*ln(s)`:
+        //   attn_factor = 1.0 (rope.scaling.attn_factor default)
+        //   inv_fs_log  = ln(1/freq_scale) = ln(yarn_factor)
+        //   attn_factor_org = attn_factor * (1 + 0.1*inv_fs_log)
+        //   mscale = attn_factor_org * (1 + 0.1*yarn_log_multiplier*inv_fs_log)
+        //   kq_scale = mscale^2 / sqrt(qk_head_dim)
+        // The matching rope cos/sin mscale (= attn_factor_org) is applied in the
+        // mla_rope_*_yarn kernels, so the pe-term carries attn_factor_org^2 and
+        // the whole score carries kq_scale — together = llama.cpp's scaling.
+        let inv_fs_log = cfg.yarn_factor.ln();
+        let attn_factor_org = 1.0f32 * (1.0 + 0.1 * inv_fs_log);
+        let mscale = attn_factor_org * (1.0 + 0.1 * cfg.yarn_log_multiplier * inv_fs_log);
         base_scale * mscale * mscale
     } else { base_scale };
     let (page_table_dev, block_size) = paged_cfg.expect(
@@ -2410,10 +2422,14 @@ impl QwenSession {
             // prints 0.0 here, the key wasn't read and the attention
             // temperature is silently missing — a real bug.
             if cfg.yarn_factor > 1.0 {
-                let mscale = 1.0 + cfg.yarn_log_multiplier * cfg.yarn_factor.ln();
-                eprintln!("[QwenSession] YaRN: factor={} log_mul={} orig_ctx={} beta=({},{}) -> mscale={:.4} mscale^2={:.4}",
+                // Same formula as the attention kq_scale (llama.cpp deepseek2).
+                let inv_fs_log = cfg.yarn_factor.ln();
+                let attn_factor_org = 1.0f32 * (1.0 + 0.1 * inv_fs_log);
+                let mscale = attn_factor_org * (1.0 + 0.1 * cfg.yarn_log_multiplier * inv_fs_log);
+                eprintln!("[QwenSession] YaRN: factor={} log_mul={} orig_ctx={} beta=({},{}) -> rope_mscale={:.4} attn_mscale={:.4} kq_scale_mscale^2={:.4}",
                     cfg.yarn_factor, cfg.yarn_log_multiplier, cfg.yarn_orig_ctx,
-                    cfg.yarn_beta_fast, cfg.yarn_beta_slow, mscale, mscale * mscale);
+                    cfg.yarn_beta_fast, cfg.yarn_beta_slow,
+                    attn_factor_org, mscale, mscale * mscale);
             }
             if cfg.n_experts > 0 {
                 eprintln!("[QwenSession] MoE: experts={} used={} shared={} gating={} (1=softmax 2=sigmoid) weights_norm={} weights_scale={}",

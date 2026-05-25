@@ -57,13 +57,16 @@ fn rope_k_shared_yarn_cpu(
 ) {
     let d = k_rope.len() as i32;
     let hd_half = d / 2;
+    // llama.cpp rope_yarn cos/sin mscale (ext_factor != 0): attn_factor=1.0,
+    // 1/freq_scale = yarn_s → mscale = 1 + 0.1*ln(yarn_s).
+    let rope_mscale = 1.0 + 0.1 * yarn_s.ln();
     for i in 0..hd_half {
         let scale = yarn_scale_factor(i, d, base, yarn_s, orig_ctx,
             beta_fast, beta_slow);
         let exp = -2.0 * (i as f32) / (d as f32);
         let theta = pos * scale * base.powf(exp);
-        let c = theta.cos();
-        let s = theta.sin();
+        let c = theta.cos() * rope_mscale;
+        let s = theta.sin() * rope_mscale;
         let x0 = k_rope[i as usize];
         let x1 = k_rope[(i + hd_half) as usize];
         k_rope[i as usize] = x0 * c - x1 * s;
@@ -78,6 +81,7 @@ fn rope_q_partial_yarn_cpu(
 ) {
     let rope_dim = qk_head_dim - nope_dim;
     let hd_half = rope_dim / 2;
+    let rope_mscale = 1.0 + 0.1 * yarn_s.ln();
     for h in 0..n_heads {
         let base_off = (h * qk_head_dim + nope_dim) as usize;
         for i in 0..hd_half {
@@ -85,8 +89,8 @@ fn rope_q_partial_yarn_cpu(
                 orig_ctx, beta_fast, beta_slow);
             let exp = -2.0 * (i as f32) / (rope_dim as f32);
             let theta = pos * scale * base.powf(exp);
-            let c = theta.cos();
-            let s = theta.sin();
+            let c = theta.cos() * rope_mscale;
+            let s = theta.sin() * rope_mscale;
             let x0 = q[base_off + i as usize];
             let x1 = q[base_off + (i + hd_half) as usize];
             q[base_off + i as usize] = x0 * c - x1 * s;
