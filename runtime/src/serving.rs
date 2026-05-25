@@ -2134,7 +2134,14 @@ impl SpmModel {
     }
 
     /// Encode a raw text fragment (already split away from special tokens).
-    /// Returns vocab ids.  Normalizes spaces to `▁` then Viterbi-segments.
+    ///
+    /// Matches llama.cpp's `llm_tokenizer_spm`: NOT Unigram-Viterbi (which
+    /// over-segments here — gemma's scores reward frequent short pieces, e.g.
+    /// `us`(-111)+`er`(-3) beats `user`(-1870)).  Instead it's iterative
+    /// bigram-merge: start from single UTF-8 chars, repeatedly merge the
+    /// adjacent pair whose CONCATENATION is the highest-scoring vocab piece
+    /// (ties → leftmost), until no adjacent pair forms a known piece.  Spaces
+    /// normalize to `▁` (U+2581); leftover non-vocab symbols byte-fall-back.
     fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() { return Vec::new(); }
         // Normalize: ASCII space -> U+2581 (▁, bytes E2 96 81).
@@ -2144,54 +2151,95 @@ impl SpmModel {
             else { norm.push(b); }
         }
         let n = norm.len();
-        // Viterbi: best[i] = best total score to cover norm[..i].
-        // back[i] = start index of the piece ending at i.
-        let neg = f32::NEG_INFINITY;
-        let mut best = vec![neg; n + 1];
-        let mut back = vec![0usize; n + 1];
-        let mut back_id = vec![u32::MAX; n + 1];
-        best[0] = 0.0;
-        for i in 1..=n {
-            // Try pieces ending at i, starting from max(0, i-max_piece_len).
-            let lo = i.saturating_sub(self.max_piece_len);
-            for j in lo..i {
-                if best[j] == neg { continue; }
-                if let Some(&(id, score)) = self.pieces.get(&norm[j..i]) {
-                    let cand = best[j] + score;
-                    if cand > best[i] {
-                        best[i] = cand;
-                        back[i] = j;
-                        back_id[i] = id;
+
+        // Symbols: a doubly-linked list over byte spans of `norm`, one per
+        // UTF-8 char initially.  `len == 0` marks a symbol merged away.
+        struct Sym { start: usize, len: usize, prev: i32, next: i32 }
+        let mut syms: Vec<Sym> = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            let c = norm[i];
+            let clen = if c < 0x80 { 1 }
+                else if c >> 5 == 0b110 { 2 }
+                else if c >> 4 == 0b1110 { 3 }
+                else if c >> 3 == 0b11110 { 4 }
+                else { 1 };
+            let clen = clen.min(n - i);
+            let idx = syms.len() as i32;
+            syms.push(Sym { start: i, len: clen, prev: idx - 1, next: idx + 1 });
+            i += clen;
+        }
+        if syms.is_empty() { return Vec::new(); }
+        let last = syms.len() - 1;
+        syms[last].next = -1;
+
+        // Candidate merge: (score, left, right, merged byte length).  Max-heap
+        // by score, ties broken by SMALLEST left index (matches llama.cpp).
+        struct Bi { score: f32, left: i32, right: i32, len: usize }
+        impl PartialEq for Bi { fn eq(&self, o: &Self) -> bool { self.cmp(o) == std::cmp::Ordering::Equal } }
+        impl Eq for Bi {}
+        impl PartialOrd for Bi { fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) } }
+        impl Ord for Bi {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                match self.score.partial_cmp(&o.score).unwrap_or(std::cmp::Ordering::Equal) {
+                    std::cmp::Ordering::Equal => o.left.cmp(&self.left), // smaller left = greater
+                    ord => ord,
+                }
+            }
+        }
+        let mut heap: std::collections::BinaryHeap<Bi> = std::collections::BinaryHeap::new();
+        // try_add: if syms[l]+syms[r] concatenated is a vocab piece, queue it.
+        macro_rules! try_add {
+            ($l:expr, $r:expr) => {{
+                let l = $l; let r = $r;
+                if l >= 0 && r >= 0 {
+                    let ls = &syms[l as usize]; let rs = &syms[r as usize];
+                    if ls.len > 0 && rs.len > 0 {
+                        let bytes = &norm[ls.start..rs.start + rs.len];
+                        if let Some(&(_, score)) = self.pieces.get(bytes) {
+                            heap.push(Bi { score, left: l, right: r, len: bytes.len() });
+                        }
+                    }
+                }
+            }};
+        }
+        for k in 0..syms.len() as i32 - 1 { try_add!(k, k + 1); }
+
+        while let Some(b) = heap.pop() {
+            let (l, r) = (b.left as usize, b.right as usize);
+            // Stale-bigram guard: both symbols still live + lengths still sum
+            // to the queued merge length (else one was already merged).
+            if syms[l].len == 0 || syms[r].len == 0 { continue; }
+            if syms[l].len + syms[r].len != b.len { continue; }
+            // Merge r into l.
+            syms[l].len += syms[r].len;
+            syms[r].len = 0;
+            let rn = syms[r].next;
+            syms[l].next = rn;
+            if rn >= 0 { syms[rn as usize].prev = b.left; }
+            // New bigrams with l's neighbours.
+            try_add!(syms[l].prev, b.left);
+            try_add!(b.left, syms[l].next);
+        }
+
+        // Emit surviving symbols left→right.  syms[0] is always the head.
+        let mut out: Vec<u32> = Vec::new();
+        let mut idx = 0i32;
+        while idx >= 0 {
+            let s = &syms[idx as usize];
+            if s.len > 0 {
+                let bytes = &norm[s.start..s.start + s.len];
+                if let Some(&(id, _)) = self.pieces.get(bytes) {
+                    out.push(id);
+                } else {
+                    for &bb in bytes {
+                        let fb = self.byte_fallback[bb as usize];
+                        if fb >= 0 { out.push(fb as u32); }
                     }
                 }
             }
-            // Byte-fallback: cover the single byte ending at i if no piece
-            // reached i (or it improves nothing). Use a large penalty so
-            // real pieces always win; only fires when Viterbi is stuck.
-            if best[i] == neg && best[i - 1] != neg {
-                best[i] = best[i - 1] - 1.0e4;
-                back[i] = i - 1;
-                back_id[i] = u32::MAX; // marker: emit byte fallback for norm[i-1]
-            }
+            idx = s.next;
         }
-        // Backtrace.
-        let mut out: Vec<u32> = Vec::new();
-        let mut i = n;
-        while i > 0 {
-            let j = back[i];
-            let id = back_id[i];
-            if id == u32::MAX {
-                // byte fallback for the single byte norm[j] (== norm[i-1])
-                let b = norm[j];
-                let fb = self.byte_fallback[b as usize];
-                if fb >= 0 { out.push(fb as u32); }
-                // else: unrepresentable byte, drop it.
-            } else {
-                out.push(id);
-            }
-            i = j;
-        }
-        out.reverse();
         out
     }
 }
@@ -4389,22 +4437,34 @@ mod spm_tests {
     use super::SpmModel;
 
     #[test]
-    fn viterbi_picks_max_score_not_longest_match() {
-        // Pieces: "abc" exists but with a worse total than "a"+"b"+"c".
+    fn bigram_merge_follows_score_priority() {
+        // chars a,b,c.  Bigrams "ab"(-1) and "bc"(-5) both vocab pieces;
+        // "abc" is NOT.  Highest-score bigram "ab" merges first, leaving
+        // ["ab","c"].  (Wrong order would merge "bc" → ["a","bc"].)
+        let toks: Vec<Vec<u8>> = ["a", "b", "c", "ab", "bc"]
+            .iter().map(|s| s.as_bytes().to_vec()).collect();
+        //          a     b     c     ab    bc
+        let scores = vec![-9.0, -9.0, -9.0, -1.0, -5.0];
+        let m = SpmModel::build(&toks, &scores);
+        assert_eq!(m.encode("abc"), vec![3, 2], "should merge ab(score-1) first");
+    }
+
+    #[test]
+    fn bigram_merge_builds_longest_when_chain_in_vocab() {
+        // Gemma case: frequent short pieces score higher, but the full chain
+        // is in vocab → merges build all the way up (like "user").
         let toks: Vec<Vec<u8>> = ["a", "b", "c", "ab", "abc"]
             .iter().map(|s| s.as_bytes().to_vec()).collect();
-        //          a     b     c     ab     abc
-        let scores = vec![-1.0, -1.0, -1.0, -5.0, -10.0];
+        //          a     b     c     ab    abc
+        let scores = vec![-1.0, -1.0, -1.0, -2.0, -10.0];
         let m = SpmModel::build(&toks, &scores);
-        // "abc": a+b+c = -3 (best) beats ab+c = -6 and abc = -10.
-        assert_eq!(m.encode("abc"), vec![0, 1, 2]);
-        // "ab": a+b = -2 beats ab = -5.
-        assert_eq!(m.encode("ab"), vec![0, 1]);
+        // (a,b)->ab(-2) merges (only candidate), then (ab,c)->abc(-10) → ["abc"].
+        assert_eq!(m.encode("abc"), vec![4]);
     }
 
     #[test]
     fn space_normalizes_to_u2581() {
-        // "▁x" is U+2581 + 'x'.  Input " x" (ascii space) must hit it.
+        // "▁x" is U+2581 + 'x'.  Input " x" (ascii space) must merge to it.
         let toks: Vec<Vec<u8>> = vec![
             "x".as_bytes().to_vec(),
             "\u{2581}x".as_bytes().to_vec(),   // id 1
@@ -4412,7 +4472,7 @@ mod spm_tests {
         ];
         let scores = vec![-3.0, -1.0, -3.0];
         let m = SpmModel::build(&toks, &scores);
-        // " x" → "▁x": single piece id 1 (score -1) beats ▁(-3)+x(-3)=-6.
+        // " x" → ▁,x chars → merge to "▁x" (id 1).
         assert_eq!(m.encode(" x"), vec![1]);
     }
 
