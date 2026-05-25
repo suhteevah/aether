@@ -39,8 +39,17 @@ use aether_rt::cuda::{
     aether_op_adamw_step_f32_cuda,
     aether_op_dequant_q4_k_m_f32_cuda, aether_op_dequant_q6_k_f32_cuda,
     aether_op_dequant_iq3_xxs_f32_cuda,
+    aether_dev_alloc_u8, aether_dev_h2d_u8,
+    aether_op_cross_entropy_f32_cuda, aether_op_cross_entropy_backward_f32_cuda,
+    aether_dev_alloc_i32, aether_dev_h2d_i32,
+};
+use aether_rt::{
+    aether_gguf_find_tensor_by_name, aether_gguf_get_tensor_dtype,
+    aether_gguf_get_tensor_n_elems, aether_gguf_get_tensor_data_ptr,
+    aether_dequant_q4_k_m,
 };
 use aether_rt::serving::{ModelConfig, QwenLayerWeights, open_gguf_config, load_qwen_layer};
+use std::ffi::c_void;
 
 use crate::pipeline::Stage;
 use crate::rng::Rng;
@@ -223,11 +232,17 @@ impl ActQ {
 /// Pipeline stage: a layer range of a Qwen3 GGUF, frozen-quant base + LoRA.
 pub struct QwenQLoraStage {
     pub cfg: ModelConfig,
+    pub gguf_handle: i64,
     layers: Vec<LayerQ>,
     fifo: VecDeque<Vec<ActQ>>,
     rank_lo: usize,
     // cached dims
     t: usize,
+    // last-rank real LM head (loaded on demand): output_norm (f32) + output.weight (Q6_K)
+    lm_norm: i64,
+    lm_w: i64,
+    lm_dt: i32,
+    lm_nb: usize, // n super-blocks per vocab row
 }
 
 impl QwenQLoraStage {
@@ -261,7 +276,8 @@ impl QwenQLoraStage {
             layers.len(),
             layers.first().map(|l| l.ad_q.n_params() + l.ad_k.n_params() + l.ad_v.n_params()
                 + l.ad_o.n_params() + l.ad_gate.n_params() + l.ad_up.n_params() + l.ad_down.n_params()).unwrap_or(0));
-        Ok(QwenQLoraStage { cfg, layers, fifo: VecDeque::new(), rank_lo, t })
+        Ok(QwenQLoraStage { cfg, gguf_handle: h, layers, fifo: VecDeque::new(), rank_lo, t,
+                            lm_norm: 0, lm_w: 0, lm_dt: 0, lm_nb: 0 })
     }
 
     pub fn n_layers(&self) -> usize { self.layers.len() }
@@ -477,6 +493,128 @@ impl QwenQLoraStage {
         aether_op_add_inplace_f32_cuda(d_x, d_x_attn, ci(t * d));
         aether_dev_free_f32(d_x1); aether_dev_free_f32(d_x_attn);
         d_x
+    }
+}
+
+// matt-voice REAL training: embed-in (rank 0) + LM-head loss (last rank) + adapter save.
+impl QwenQLoraStage {
+    /// Embed `ids` (len T) into [T, D] host floats via the GGUF token_embd.weight
+    /// (Q4_K rows, host dequant). Used by rank 0 to build the real model input.
+    pub fn embed_tokens(&self, ids: &[usize]) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        unsafe {
+            let needle = b"token_embd.weight";
+            let idx = aether_gguf_find_tensor_by_name(self.gguf_handle, needle.as_ptr() as i64, needle.len() as c_int);
+            assert!(idx >= 0, "[qlora] token_embd.weight not found");
+            let dt = aether_gguf_get_tensor_dtype(self.gguf_handle, idx);
+            assert_eq!(dt, 12, "[qlora] token_embd dtype {} != Q4_K(12); add dispatch", dt);
+            let n_elems = aether_gguf_get_tensor_n_elems(self.gguf_handle, idx) as usize;
+            let total_rows = n_elems / d;
+            let dptr = aether_gguf_get_tensor_data_ptr(self.gguf_handle, idx) as *const u8;
+            let bpr = (d / 256) * 144; // Q4_K bytes per row
+            let mut out = vec![0.0f32; ids.len() * d];
+            for (oi, &id) in ids.iter().enumerate() {
+                assert!(id < total_rows, "[qlora] token id {} >= vocab {}", id, total_rows);
+                let row = std::slice::from_raw_parts(dptr.add(id * bpr), bpr);
+                let mut rf = vec![0.0f32; d];
+                aether_dequant_q4_k_m(row.as_ptr() as *const c_void, rf.as_mut_ptr() as *mut c_void, (d / 256) as c_int);
+                out[oi * d..(oi + 1) * d].copy_from_slice(&rf);
+            }
+            out
+        }
+    }
+
+    /// Load output_norm.weight (F32) + output.weight (lm head, Q6_K) to device.
+    /// Last rank only; call once.
+    pub fn load_lm_head(&mut self) {
+        let d = self.cfg.d_model; let vocab = self.cfg.vocab;
+        unsafe {
+            // output_norm (f32)
+            let nn = b"output_norm.weight";
+            let ni = aether_gguf_find_tensor_by_name(self.gguf_handle, nn.as_ptr() as i64, nn.len() as c_int);
+            assert!(ni >= 0, "[qlora] output_norm.weight missing");
+            let ne = aether_gguf_get_tensor_n_elems(self.gguf_handle, ni) as usize;
+            let np = aether_gguf_get_tensor_data_ptr(self.gguf_handle, ni) as *const f32;
+            let nh = std::slice::from_raw_parts(np, ne).to_vec();
+            self.lm_norm = alloc(ne);
+            aether_dev_h2d_f32(nh.as_ptr() as i64, self.lm_norm, ci(ne));
+            // output.weight (Q6_K)
+            let wn = b"output.weight";
+            let wi = aether_gguf_find_tensor_by_name(self.gguf_handle, wn.as_ptr() as i64, wn.len() as c_int);
+            assert!(wi >= 0, "[qlora] output.weight missing");
+            let dt = aether_gguf_get_tensor_dtype(self.gguf_handle, wi);
+            assert_eq!(dt, 14, "[qlora] lm_head dtype {} != Q6_K(14); add dispatch", dt);
+            let wne = aether_gguf_get_tensor_n_elems(self.gguf_handle, wi) as usize;
+            let nblocks = wne / 256;
+            let bytes = nblocks * 210; // Q6_K block = 210 bytes / 256 elems
+            let wp = aether_gguf_get_tensor_data_ptr(self.gguf_handle, wi);
+            self.lm_w = aether_dev_alloc_u8(bytes as c_int);
+            aether_dev_h2d_u8(wp, self.lm_w, bytes as c_int);
+            self.lm_dt = dt;
+            self.lm_nb = nblocks / vocab; // super-blocks per row (d/256)
+            eprintln!("[qlora] lm_head loaded: output.weight Q6_K {}x{} ({} blocks), output_norm f32[{}]",
+                vocab, d, nblocks, ne);
+        }
+    }
+
+    /// (lm_norm, lm_w, lm_nb) handles for the free-fn loss (run_1f1b's loss closure
+    /// can't borrow the stage, which is already &mut-borrowed by the driver).
+    pub fn lm_handles(&self) -> (i64, i64, usize) { (self.lm_norm, self.lm_w, self.lm_nb) }
+}
+
+/// Real next-token LM loss for hidden [T, D] (last rank). `targets[t]` is the
+/// gold token at position t (already shifted by the caller). Returns
+/// (mean CE, d_hidden[T*D]). Base lm_head is FROZEN (no weight grad). Free fn so
+/// run_1f1b's loss closure can call it without borrowing the &mut stage.
+pub fn lm_head_loss(lm_norm: i64, lm_w: i64, lm_nb: usize, vocab: usize, d: usize,
+                    t: usize, eps: f32, hidden: &[f32], targets: &[i32]) -> (f32, Vec<f32>) {
+    assert_eq!(hidden.len(), t * d);
+    let xb = upload(hidden);
+    let xf = alloc(t * d);
+    aether_op_rms_norm_f32_cuda(xb, lm_norm, xf, eps, ci(t), ci(d));
+    // Dequant the Q6_K lm head once to f32 [vocab, d] (transient ~vocab*d*4 B),
+    // then forward + backward via plain multi-row matmul. One dequant per step.
+    let wf = alloc(vocab * d);
+    aether_op_dequant_q6_k_f32_cuda(lm_w, wf, ci(lm_nb * vocab));
+    // logits[T,vocab] = xf[T,d] @ wf[vocab,d]^T  == matmul_backward_lhs(xf, wf, logits)
+    let logits = alloc(t * vocab);
+    aether_op_matmul_backward_lhs_f32_cuda(xf, wf, logits, ci(t), ci(vocab), ci(d));
+    let tgt = aether_dev_alloc_i32(ci(t));
+    unsafe { aether_dev_h2d_i32(targets.as_ptr() as i64, tgt, ci(t)); }
+    let probs = alloc(t * vocab);
+    let loss = aether_op_cross_entropy_f32_cuda(logits, tgt, probs, ci(t), ci(vocab));
+    let d_logits = alloc(t * vocab);
+    aether_op_cross_entropy_backward_f32_cuda(probs, tgt, d_logits, ci(t), ci(vocab));
+    // d_xf = d_logits[T,vocab] @ wf[vocab,d]  (frozen lm head, no dW)
+    let d_xf = alloc(t * d);
+    aether_op_matmul_f32_cuda(d_logits, wf, d_xf, ci(t), ci(vocab), ci(d));
+    aether_dev_free_f32(wf);
+    let d_xb = alloc(t * d); let inv = alloc(t);
+    aether_op_rms_norm_backward_dx_f32_cuda(xb, lm_norm, d_xf, d_xb, inv, eps, ci(t), ci(d));
+    let dh = download(d_xb, t * d);
+    unsafe { aether_dev_sync(); }
+    for h in [xb, xf, logits, probs, d_logits, d_xf, d_xb, inv] { aether_dev_free_f32(h); }
+    aether_rt::cuda::aether_dev_free_i32(tgt);
+    (loss, dh)
+}
+
+impl QwenQLoraStage {
+    /// Write all adapter A/B (per layer) to `path` as a flat f32 dump with a tiny
+    /// header. Order: per layer, for ad in [q,k,v,o,gate,up,down]: A then B.
+    pub fn save_adapters(&self, path: &str) {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.rank_lo as u32).to_le_bytes());
+        for l in &self.layers {
+            for ad in [&l.ad_q, &l.ad_k, &l.ad_v, &l.ad_o, &l.ad_gate, &l.ad_up, &l.ad_down] {
+                let a = download(ad.a, ad.n_in * ad.rank);
+                let b = download(ad.b, ad.rank * ad.n_out);
+                for v in a.iter().chain(b.iter()) { buf.extend_from_slice(&v.to_le_bytes()); }
+            }
+        }
+        unsafe { aether_dev_sync(); }
+        std::fs::write(path, &buf).expect("[qlora] save_adapters write failed");
+        eprintln!("[qlora] saved adapters -> {} ({} bytes)", path, buf.len());
     }
 }
 

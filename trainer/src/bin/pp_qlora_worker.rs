@@ -29,7 +29,7 @@ use aether_rt::cuda::{
     aether_op_cross_entropy_f32_cuda, aether_op_cross_entropy_backward_f32_cuda,
 };
 use trainer::pipeline::{connect_pipeline, run_1f1b};
-use trainer::qwen_qlora_stage::QwenQLoraStage;
+use trainer::qwen_qlora_stage::{QwenQLoraStage, lm_head_loss};
 
 const VS: usize = 256; // synthetic loss-head vocab
 const EPS: f32 = 1e-5;
@@ -132,21 +132,84 @@ fn main() {
         rank, d, stage.total_adapter_params(), t, lora_rank, alpha);
 
     let links = connect_pipeline(rank, world, base_port, &host);
-    let inputs: Vec<Vec<f32>> = (0..microbatch).map(|mb| fill(0x2000 + mb as u64, t * d, 1.0)).collect();
-    let head = if is_last { Some(LossHead::new(t, d, microbatch)) } else { None };
+    let data_path = argval(&a, "--data");
+    let save_path = argval(&a, "--save");
+    let ckpt_every = au(&a, "--ckpt-every", 200);
+    let vocab = stage.cfg.vocab; let eps = stage.cfg.norm_eps;
+
+    // Deterministic training window per (step, mb): both ranks derive the same
+    // start so rank-0's embedded input matches the last rank's targets.
+    let pick = |s: usize, mb: usize, n_tok: usize| -> usize {
+        let mut x = (s as u64).wrapping_mul(0x9E37_79B9).wrapping_add(mb as u64 + seed);
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        (x as usize) % (n_tok - t - 1)
+    };
 
     let b0 = stage.adapter_b_abs_sum();
     let mut first = 0.0f32; let mut last = 0.0f32;
-    for s in 0..steps {
-        let inp = inputs.clone();
-        let losses = run_1f1b(&mut stage, rank, world, &links, microbatch, lr, (s + 1) as i64,
-            |mb| inp[mb].clone(),
-            |mb, out| head.as_ref().unwrap().loss_and_grad(mb, out));
-        if is_last {
-            let mean = losses.iter().sum::<f32>() / losses.len() as f32;
-            if s == 0 { first = mean; }
-            last = mean;
-            println!("STEP {} {:.6}", s, mean);
+
+    if let Some(dp) = data_path {
+        // ---- REAL run: tokenized corpus + real embed-in + real lm_head loss ----
+        let raw = std::fs::read(&dp).expect("read ids file");
+        let ntok = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+        let ids: Vec<u32> = (0..ntok).map(|i| {
+            let o = 8 + i * 4; u32::from_le_bytes(raw[o..o+4].try_into().unwrap())
+        }).collect();
+        eprintln!("[pp-qlora rank {}] REAL data: {} tokens, t={} microbatch={} steps={}", rank, ntok, t, microbatch, steps);
+        if is_last { stage.load_lm_head(); }
+        let (lm_norm, lm_w, lm_nb) = stage.lm_handles();
+
+        for s in 0..steps {
+            // rank 0: precompute embeddings for each microbatch window.
+            let emb: Vec<Vec<f32>> = if rank == 0 {
+                (0..microbatch).map(|mb| {
+                    let st = pick(s, mb, ntok);
+                    let win: Vec<usize> = (0..t).map(|i| ids[st + i] as usize).collect();
+                    stage.embed_tokens(&win)
+                }).collect()
+            } else { Vec::new() };
+            // last rank: next-token targets for each microbatch window.
+            let tgts: Vec<Vec<i32>> = if is_last {
+                (0..microbatch).map(|mb| {
+                    let st = pick(s, mb, ntok);
+                    (0..t).map(|i| ids[st + 1 + i] as i32).collect()
+                }).collect()
+            } else { Vec::new() };
+
+            let losses = run_1f1b(&mut stage, rank, world, &links, microbatch, lr, (s + 1) as i64,
+                |mb| emb[mb].clone(),
+                |mb, out| lm_head_loss(lm_norm, lm_w, lm_nb, vocab, d, t, eps, out, &tgts[mb]));
+            if is_last {
+                let mean = losses.iter().sum::<f32>() / losses.len() as f32;
+                if s == 0 { first = mean; }
+                last = mean;
+                println!("STEP {} {:.6}", s, mean);
+            }
+            // checkpoint adapters (this rank's slice).
+            if let Some(sp) = &save_path {
+                if (s + 1) % ckpt_every == 0 {
+                    stage.save_adapters(&format!("{}.rank{}.step{}", sp, rank, s + 1));
+                }
+            }
+        }
+        if let Some(sp) = &save_path {
+            stage.save_adapters(&format!("{}.rank{}.final", sp, rank));
+        }
+    } else {
+        // ---- SYNTHETIC smoke (no --data): random head + inputs ----
+        let inputs: Vec<Vec<f32>> = (0..microbatch).map(|mb| fill(0x2000 + mb as u64, t * d, 1.0)).collect();
+        let head = if is_last { Some(LossHead::new(t, d, microbatch)) } else { None };
+        for s in 0..steps {
+            let inp = inputs.clone();
+            let losses = run_1f1b(&mut stage, rank, world, &links, microbatch, lr, (s + 1) as i64,
+                |mb| inp[mb].clone(),
+                |mb, out| head.as_ref().unwrap().loss_and_grad(mb, out));
+            if is_last {
+                let mean = losses.iter().sum::<f32>() / losses.len() as f32;
+                if s == 0 { first = mean; }
+                last = mean;
+                println!("STEP {} {:.6}", s, mean);
+            }
         }
     }
     let b1 = stage.adapter_b_abs_sum();
