@@ -1,7 +1,35 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 LATE (**PERF: decode tok/s recovery via nvrtc-unit split. Measured
+2026-05-25 (**matt-voice REAL 32B QLoRA training pipeline VALIDATED end-to-end on
+2×P100. Built the real path (embed real tokens -> 64 qwen3 layers split 26/38 ->
+real Q6_K lm_head -> next-token CE -> adapter backprop), tokenized the matt-voice
+corpus (28513 ChatML examples, 2.38M tokens, Qwen3 tokenizer), and confirmed a
+20-step real-data run: loss 4.485→1.732, adapter |B| 0→37440, no OOM, clean exit.
+The actual 8h fine-tune DEFERRED (slot lapsed to next day) — pipeline + working
+config launch-ready. All 3 cnc services restarted + health-verified.**
+
+### matt-voice real-training: how to launch the deferred 8h run
+- Binary: `trainer/src/bin/pp_qlora_worker.rs` `--data <ids.bin>` mode. Stage:
+  `trainer/src/qwen_qlora_stage.rs` (embed_tokens / load_lm_head / lm_head_loss /
+  save_adapters). Corpus already tokenized at
+  `cnc:/opt/matt-voice/training-data/matt-voice-longform.ids.bin`.
+- **Working memory config (DO NOT exceed):** `--t 32 --splits 26,38 --microbatch 1
+  --lora-rank 16 --alpha 32 --lr 2e-4`. GPU0 (12GB) holds 26 layers; GPU1 (16GB)
+  holds 38 + the **chunked** Q6_K lm_head (16 vocab-chunks, ~190MB transient — the
+  whole-weight 3.1GB dequant OOM'd). T=64 OOM'd GPU0 on step 1 (fragmentation at
+  the edge); T=32 has headroom.
+- **cnc coordination:** stop ALL THREE services first (openclaw main re-grants (B)
+  per-day): `openclaw-inference-scout` + `aether-serve` (GPU0) + `openclaw-inference-
+  workhorse` (GPU1). Relaunch: `systemctl start` all three. The workhorse on GPU1
+  is easy to miss — it came up after main's "GPU1 free" read and OOM'd rank1.
+- **Tuning for quality before the long run:** the 20-step loss was noisy
+  (4.5→7.4→…→1.7) from microbatch=1 single-sample gradients. Add grad accumulation
+  (microbatch≥4) or lower lr (~1e-4) for a smoother real run. Adapter checkpoints
+  via `--save <path> --ckpt-every 200` (writes `<path>.rank{0,1}.step{N}`); a
+  .lora.gguf merge/export tool is still TODO.
+
+## (2026-05-24 LATE) PERF: decode tok/s recovery via nvrtc-unit split. Measured
 Aether was already ~108%% of llama.cpp on the 3070 Ti (never behind — the "1:1"
 premise was off); the lost ground was Aether's own 37.2 peak regression
 ([[nvrtc_kernel_unit_pressure]]). Split KERNEL_SRC → lazy TRAIN_KERNEL_SRC in 2
