@@ -5,6 +5,15 @@
 + live; batched-decode component primitives (hetero attn/append + weight-reuse
 seqB matmul, 1.9×) shipped + tested. Crash-recovery session.**)
 
+## Project Status
+🟡 Continuous-batching Phase 2 in progress. SSE streaming over the scheduler
+is **🟢 shipped + live-verified** (Qwen2.5-7B, 3070 Ti). The four batched-decode
+kernels are **🟢 built + parity-tested** (all bit-identical to seq1). The
+`step_logits_for_batch` orchestration that wires them — the actual e2e
+throughput win — is **NOT yet built**; concurrent serving today is correct
+(serial-multiplexed) but not faster. Single-stream decode + all prior arch
+support unchanged.
+
 ## What Was Done This Session (2026-05-24 afternoon — continuous-batching Phase 2)
 
 Session resumed after a crash. Pre-session HEAD was `6834cd0` (continuous-
