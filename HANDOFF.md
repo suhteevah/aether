@@ -1,6 +1,19 @@
 # Aether — Session Handoff
 
 ## Last Updated
+2026-05-24 LATE (**PERF: decode tok/s recovery via nvrtc-unit split. Measured
+Aether was already ~108%% of llama.cpp on the 3070 Ti (never behind — the "1:1"
+premise was off); the lost ground was Aether's own 37.2 peak regression
+([[nvrtc_kernel_unit_pressure]]). Split KERNEL_SRC → lazy TRAIN_KERNEL_SRC in 2
+batches (18 training/backward kernels moved out of the decode unit): decode
+32.6 → ~35.0 tok/s (+7.4%%, ~117%% of llama.cpp). Inference bit-intact, all
+grad-checks green. Commits 72f41e3 + 3af8d9f, BENCH_LEDGER rows appended.
+REMAINING to 37.2: inference-AMBIGUOUS kernels (gelu_fwd, layer_norm_fwd,
+add_layer_norm_fwd, bert_*, gqa_repeat/reduce) — need a BERT-embedding smoke to
+confirm decode-unused before moving. Decode bench now warm+configurable
+(16-step warmup, MAX_SEQ 128).**)
+
+## (prior) Last Updated
 2026-05-24 (**FR-18.6-real LEG 3 FINISHED — the matt-voice Qwen3-32B unlock is
 DONE. Full 64-layer Qwen3-32B-Q4_K_M QLoRA-trained across 2×P100 on cnc via
 Aether pipeline parallelism: both ranks loaded (28/36 split, no OOM), both GPUs
