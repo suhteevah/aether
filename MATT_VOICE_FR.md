@@ -121,6 +121,35 @@ These are concrete, single-command witnesses. Each one corresponds to an Aether 
 
 The first two witnesses are the immediate goal post-Phase 17. The third is the Phase 18 milestone. The fourth and fifth are the qualitative justification for the whole exercise.
 
+### Bigger-model target: Qwen3-32B dense (verified on cnc 2026-05-24 eve)
+
+Confirmed by Matt; verified by inspecting cnc, NOT taken on faith:
+- **Base GGUF staged + complete**: `cnc:/opt/matt-voice/models/Qwen3-32B-Q4_K_M.gguf` = **19 GB** (download finished 17:55; `dl.log` shows the curl run completing). Tokenizer/config at `cnc:/opt/matt-voice/models/qwen/Qwen-Qwen3-32B/`.
+- **Arch (from that dir's config.json)**: 64 hidden layers, hidden 5120, 64 q / 8 kv heads (GQA), head_dim 128, intermediate 25600, vocab 151936, rope_theta 1e6, **no sliding window**, `tie_word_embeddings=false`. 64 layers → clean **32/32 pipeline split**.
+- **Why this is the aether driver (not just a candle job)**: the 7B LoRA flow is already DONE via candle single-GPU (`matt-voice-7b-{v1,v2-r64,longform}.lora.gguf` exist on cnc). **Qwen3-32B Q4_K_M (19 GB) does NOT fit either P100** (cnc GPUs are 12 GB + 16 GB), so it CANNOT be trained single-GPU and DP-replication doesn't help. It requires **model-splitting training** — that is the capability only aether is being built to provide.
+- **cnc GPU state at check time**: GPU0 = 12 GB (10.5 used by the workhorse, 1.6 free), GPU1 = 16 GB free. A real 32B PP run needs the workhorse stopped to free GPU0 (coordinate via openclaw `main`, B-approval).
+
+**Gate (aether-side, to be built):** (1) **FR-18.6-real pipeline parallelism (1F1B)** to span the 64 layers across the two P100s; (2) **qwen3 GPU forward+backward in the trainer** (`trainer/model.rs` is a CPU reference net today) — reuse the verified `QwenSession` inference forward as the base; (3) **QLoRA against the quantized base**: forward delta-add of LoRA adapters + backprop through the frozen quantized linears. Pieces (3) partially landed 2026-05-24 eve: LoRA adapter math + DP adapter all-reduce (`trainer/src/lora.rs`, `lora_dp.rs`, CPU finite-diff verified) and the QMatMul-backward kernel `aether_op_quant_matmul_backward_lhs_f32_cuda` (`dx = Wᵀ·dy` through frozen Q4_K/Q6_K, GPU parity 3e-8 vs CPU). The big remaining build is PP/1F1B.
+
+### STRETCH target: Llama-3.3-70B (fit analysis, 2026-05-24 eve)
+
+Matt wants 70B "if we can fit it." For QLoRA the frozen quantized base dominates VRAM (adapters/grads/AdamW are tiny; activations bounded by checkpointing) → it's base-size vs pool-VRAM. Pool: cnc 2×P100 = 12+16 = **28 GB**; + kokonoe 3070 Ti 8 GB + satibook 3050 (~6–8 GB) ≈ **~42 GB total**, ~36 GB usable after CUDA context + activation working set. 70B GGUF sizes:
+
+| Quant | ~Size | cnc-only 28 GB | full pool ~42 GB | aether kernel |
+|---|---|---|---|---|
+| Q4_K_M | 42.5 GB | ❌ | ❌ | ✅ |
+| Q3_K_M | 34.6 GB | ❌ | ⚠️ tight | ✅ |
+| **IQ3_XXS** | **27.5 GB** | ❌ | ✅ ~14 GB headroom | ✅ fwd shipped |
+| Q2_K | 26.4 GB | ⚠️ ~2 GB | ✅ | ❌ |
+| IQ2_XS | 21 GB | ✅ ~7 GB | ✅ | ❌ |
+| IQ1_M | 16.8 GB | ✅ | ✅ | ❌ |
+
+**Verdict: 70B fits only at low-bit, not Q4_K.** Two targets (Matt: "both"):
+1. **IQ3_XXS (~27.5 GB), full-pool PP** — reuses the shipped IQ3_XXS forward; needs the QMatMul-backward extended to the IQ3_XXS dtype (one arm; its GPU dequant exists). **Recommended first** (least new code).
+2. **IQ2_XS (~21 GB), cnc-only PP** — simpler topology (no cross-host bubble) but needs BRAND-NEW IQ2 quant kernels (forward + dequant + backward). Larger build.
+
+The PP/1F1B machinery is identical for 32B/70B — build PP once, prove on 32B (fits cnc easily), scale to 70B by swapping model + quant. Caveat: P100s are Pascal (~9 TFLOPS fp32, no fast fp16) + cross-host PP bubble → 70B QLoRA will *fit* but be *slow*. No 70B GGUF staged yet (cnc /opt has 482 GB free; Llama-3.3-70B chat template already present).
+
 ---
 
 ## Aether-equivalent already in place (existing capability)

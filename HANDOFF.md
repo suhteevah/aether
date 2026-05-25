@@ -1,18 +1,80 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 afternoon (**Continuous-batching Phase 2: SSE streaming SHIPPED
-+ live; batched-decode component primitives (hetero attn/append + weight-reuse
-seqB matmul, 1.9×) shipped + tested. Crash-recovery session.**)
+2026-05-24 evening (**Continuous-batching Phase 2b-2b ORCHESTRATION DONE +
+witnessed — `step_logits_for_batch` fuses N requests into one decode tick,
+token-identical to single-stream. + matt-voice LoRA-DP foundation (CPU-tested)
++ frozen-base QLoRA-backward GPU kernel (parity-verified on real Qwen weights).
+NOTHING COMMITTED — working tree dirty, awaiting commit decision.**)
 
 ## Project Status
-🟡 Continuous-batching Phase 2 in progress. SSE streaming over the scheduler
-is **🟢 shipped + live-verified** (Qwen2.5-7B, 3070 Ti). The four batched-decode
-kernels are **🟢 built + parity-tested** (all bit-identical to seq1). The
-`step_logits_for_batch` orchestration that wires them — the actual e2e
-throughput win — is **NOT yet built**; concurrent serving today is correct
-(serial-multiplexed) but not faster. Single-stream decode + all prior arch
-support unchanged.
+🟢 Continuous-batching Phase 2b-2b COMPLETE. `QwenSession::step_logits_for_batch`
+runs ONE fused forward over b≤8 requests at heterogeneous positions
+(Q4_K weight-reuse seqB matmul 1.9× + per-request hetero RoPE/append/attention +
+Q6_K offset-copy fallback); `run_worker` fuses all active slots into one tick
+when batchable + ≥2 in flight. **Witnessed token-identical to single-stream
+`generate()`** (`cuda_batched_decode_parity.rs`); `qwen25_paged_parity` +
+`batched_serving_smoke` green (no single-stream regression).
+
+🟡 matt-voice multi-GPU training. **Target confirmed: Qwen3-32B dense**
+(base GGUF 19 GB staged+complete on cnc, 64 layers, verified 2026-05-24 eve).
+7B LoRA is ALREADY done via candle single-GPU (`matt-voice-7b-*.lora.gguf` on
+cnc). 32B is the aether driver because **it doesn't fit either P100 (12/16 GB)
+→ requires model-splitting (pipeline-parallel), which only aether is being
+built to provide**. DP-replication is useless for 32B. FOUNDATION landed this
+session (feeds the QLoRA piece): LoRA adapter math + AdamW + DP adapter
+all-reduce (`trainer/src/lora.rs`, `lora_dp.rs`, CPU finite-diff 5/5) +
+frozen-base QLoRA-backward GPU kernel (`aether_op_quant_matmul_backward_lhs_f32_cuda`,
+parity 3e-8). **Headline blocker: FR-18.6-real pipeline parallelism (1F1B)** to
+span 64 layers across 2×P100 + qwen3 GPU fwd/bwd in the trainer (reuse the
+verified QwenSession forward) + adapter forward-injection. Real run needs the
+cnc workhorse stopped to free GPU0. Full verified facts + gate in MATT_VOICE_FR.md.
+
+## What Was Done This Session (2026-05-24 evening — batched orchestration + LoRA foundation)
+
+**Uncommitted working-tree changes** (all built + tested on RTX 3070 Ti):
+
+### A. Phase 2b-2b batched decode (the e2e throughput win) — DONE + witnessed
+- `runtime/src/cuda.rs`: `aether_dev_d2d_f32_offset` (d2d offset copy kernel in
+  PAGED_KERNEL_SRC, lazy module → zero single-stream cost) + exact-length copy
+  variants `aether_dev_{h2d,d2h}_f32_n` / `aether_dev_h2d_i32_n` (cudarc
+  sub-slice views — the plain copies assert host len == FULL buffer len).
+- `runtime/src/serving.rs`: `BatchActivationGpu` (lazy, MAX_BATCH=8 × dim,
+  freed in Drop), `matmul_batched` (dt=12 → `fused_q4k_matmul_seqB_v3`; else
+  per-row offset-copy fallback through scratch_in/out), `block_forward_batched`
+  (standard attn + dense FFN over b rows), `step_logits_for_batch`,
+  `is_batchable()` (non-MLA, non-MoE, head_dim%32==0, no sliding window).
+- `runtime/src/batched_serving.rs`: `run_worker` fuses active slots into one
+  batched tick when batchable + ≥2; `step_slot` split → shared
+  `consume_slot_logits` (identical sampling serial vs batched).
+- WITNESS `runtime/tests/cuda_batched_decode_parity.rs`: 2 prompts at different
+  positions, batched tokens bit-identical to single-stream `generate()`.
+
+### B. matt-voice LoRA-DP — foundation + frozen-base backward
+- `trainer/src/lora.rs` + `lora_dp.rs` + `LORA_PLAN.md` (CPU foundation, 5/5
+  tests, finite-diff 1.8e-5). See [[matt_voice_qwen_blob_location]].
+- `runtime/src/cuda.rs`: `aether_op_quant_matmul_backward_lhs_f32_cuda(w, dt,
+  dy, dx, n_out, n_in)` — dx = Wᵀ·dy through a frozen Q4_K/Q6_K weight
+  (dequant + cuBLAS sgemm, no new nvrtc kernel). WITNESS
+  `runtime/tests/cuda_quant_matmul_backward_parity.rs` (max-diff 3e-8/6e-8 vs
+  CPU on real Qwen2.5-7B blk.0 q/v weights).
+
+### Notes / honesty
+- A subagent appended an unverified "TARGET LOCKED: Qwen3-32B / staged on cnc"
+  section to MATT_VOICE_FR.md — **reverted** (it had no cnc access; pure
+  hallucination). Confirm the real bigger-model target with Matt before acting
+  on 32B/pipeline-parallel; the current blob is Qwen2.5-7B.
+- Single-stream 37.2→34.6 tok/s drift (predates this session) still un-bisected.
+
+## What's Next (priority order)
+1. **Commit the above** (A is feature-complete + witnessed; B foundation is
+   tested) — held pending Matt's OK.
+2. **Bench the batched win**: measure aggregate tok/s at b=2/4/8 vs serial-
+   multiplexed (bench-runner subagent) — A is correct but the speedup is not
+   yet quantified e2e.
+3. **matt-voice B integration**: adapter device buffers on BlockGpu + forward
+   delta-add after each q/k/v/o/gate/up/down proj in QwenSession; activation
+   capture; training-loop wiring; then the real 2×P100 DP run on cnc.
 
 ## What Was Done This Session (2026-05-24 afternoon — continuous-batching Phase 2)
 
