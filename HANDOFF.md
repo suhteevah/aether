@@ -3162,3 +3162,28 @@ Acted on the queue. aether-serve rebuilt on cnc with 2 fixes; batch re-smoked on
 - **gemma3 forward** (open-ended bisect, cnc): loads but pad/vocab-1 → gemma3-specific path (pre/post norms, attn logit softcap, embedding scale) not fully right. Bisect like the GLM NaN chase (AETHER_DUMP_BLOCKS).
 - **IQ3_M quant** (the high-value one): one fix clears ALL IQ3_M models. IQ3_M is NOT in the dispatch dtype set (12/8/6/21/23/18 + matmul dtypes) — it's a distinct GGUF quant (≈ mixed IQ3_S/IQ3_XXS). Either it's silently mis-dispatched → NaN, or needs its own dequant+matmul kernel. Investigate which dt code IQ3_M maps to + whether a kernel exists.
 - **V2-Lite**: just needs the chat template applied in the serving path (or known-good prompt_ids) — not a forward fix.
+
+## 2026-05-25 — PER-ARCH ROUND: SESSION-END STATE (after shipping the fixes)
+
+Worked the queue to its natural stopping point. **5 partial-blackout workhorse-only
+evictions** (scout+aether-serve stayed up each time), all restored+health-checked.
+
+| Arch | State | Detail |
+|---|---|---|
+| qwen2.5, GLM(MLA-absorbed), BGE | ✅ **witness-ready** | coherent decode/embeddings (earlier smokes) |
+| V2-Lite | ✅ **not-a-bug** | real varied tokens; incoherent only w/o chat template — close |
+| qwen3-dense 32B | ⛔ **HW-blocked** | no small GGUF; covered by 2×P100 PP path |
+| **qwen3moe** | 🟡 **dispatch DONE, forward parked** | Q3_K(dt=11)+Q5_K(dt=13) expert kernels shipped → full MoE forward now RUNS (17 tok, no panic). Output vocab-1/pad → forward bug. |
+| **gemma3** | 🟡 **load DONE, forward parked** | tied-embed lm_head fallback + embedding ×√d_model shipped → loads. Output vocab-1/pad → forward bug (next: token_embd dtype — dequant_embd_row hardcodes Q4_K host dequant; + logit softcap). |
+| **IQ3_M (codestral/R1-distill)** | 🔍 **root-caused, parked** | IQ3_M *quant* bug, NOT arch (R1-Distill is qwen2-arch, fine on Q4_K, NaN on IQ3_M). codestral also has a tokenizer vocab-byte-10 gap. |
+
+### THE pattern (high-value next-session lead)
+**qwen3moe + gemma3 + IQ3_M all show the SAME vocab-1/pad NaN-pin** at the logits.
+The dispatch/load fixes are all shipped; what remains is a **forward-correctness
+bisect**, and the shared symptom suggests **one root cause, not three** — worth a
+single `AETHER_DUMP_BLOCKS`/`AETHER_DUMP_LOGITS` bisect (GLM-gate-close pattern) to
+find where NaN/degeneracy enters, likely a code path the working archs (qwen2.5/GLM)
+don't hit. Code work on kokonoe; eviction smokes only to verify.
+
+### Commits this round
+c8f882c Q3_K upload arm · (gemma3 lm_head) · (gemma3 embed scale) · Q3_K expert kernel · Q5_K expert kernel
