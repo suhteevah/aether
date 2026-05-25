@@ -1,6 +1,42 @@
 # Aether — Session Handoff
 
 ## Last Updated
+2026-05-24 (**FR-18.6-real leg 2 ALL FOUR FINISHERS DONE this session — GQA,
+LM-loss, QLoRA, GPU pipeline Stage. 5 commits, all witnessed on RTX 3070 Ti, all
+committed. Leg 2 is fully closed; only leg 3 (real 2×P100 run on cnc) remains,
+and that's coordination (workhorse stop via openclaw main), not code.**)
+
+## Project Status — leg 2 CLOSED
+🟢 The 4 leg-2 finishers the prior handoff listed as NEXT are all shipped +
+finite-diff/loss-curve witnessed:
+
+| # | Finisher | Commit | Witness |
+|---|---|---|---|
+| 1 | **GQA** repeat(fwd)/reduce(bwd) | `ae334c3` | new `gqa_reduce_kv_grad` kernel; GQA block (n_q=4,n_kv=2) grad-check max rel 2.35e-2 |
+| 2 | **LM-loss** wrapper (embed+lm_head+CE) | `663ae30` | new `embed_lookup`/`embed_scatter_add`; full LM loss=3.045, all 12 tensors max rel 2.04e-3 |
+| 4 | **GPU pipeline Stage** | `33b4ae0` | `QwenBlockStage` trains through `run_1f1b`, loss 2.91→1.72, grad-accum across microbatches |
+| 3 | **QLoRA** proj (frozen base + adapter) | `b239f5d` | adapter dA/dB finite-diff max rel 7.7e-4 |
+
+Build: `cargo build --workspace --release` clean (non-cuda); all 5 new tests
+green under `--features cuda` on the 3070 Ti. MHA capstone + qwen25_paged_parity
+unregressed.
+
+**What's NEXT — leg 3 (the last leg):**
+- Assemble for the real model: `QwenBlockStage` already implements the PP Stage;
+  for matt-voice 32B swap its f32 base matmuls for the quant kernels (proven) +
+  inject the QLoRA adapter (math proven in #3) after each q/k/v/o/gate/up/down
+  proj. The GQA repeat/reduce (#1) handles n_kv<n_q.
+- **2-rank/2-GPU run on cnc** (Qwen3-32B, 64 layers split 32/32): two PROCESSES
+  via `connect_pipeline` TCP rendezvous (NOT two threads — the runtime CudaCtx is
+  a process-global singleton; kokonoe's single GPU forced the world_size=1
+  witness via `PipeLinks::local_single()`). Needs the cnc workhorse stopped
+  (B-approval via openclaw main).
+- Multi-layer-per-stage already supported (`QwenBlockStage::build` takes a layer
+  range); the witness used 2 layers in 1 stage.
+
+---
+
+## (prior) Last Updated
 2026-05-24 (**FR-18.6-real PP push — leg 1 (1F1B machinery) DONE+witnessed;
 leg 2 DONE: all qwen3-block kernels (rms/rope/sdpa fwd+bwd, silu bwd,
 transpose) + CAPSTONE composition grad-check (qwen3 block fwd+bwd, finite-diff
