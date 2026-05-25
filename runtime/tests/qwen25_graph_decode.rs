@@ -43,7 +43,7 @@ const D_FF: usize = 18944;
 const VOCAB: usize = 152064;
 const ROPE_BASE: f32 = 1_000_000.0;
 const NORM_EPS: f32 = 1e-6;
-const MAX_SEQ: usize = 32;
+const MAX_SEQ: usize = 128;
 
 struct BlockGpu {
     attn_norm_g: i64, ffn_norm_g: i64,
@@ -240,7 +240,7 @@ fn qwen25_graph_decode_tok_per_sec() {
         // We use the LAST prompt token's state as the input; the first
         // captured step will use whatever step_args is currently set to.
         // After capture, we update step_args per actual decode step.
-        let n_gen = 5usize;
+        let n_gen = 16usize;
         let last_id_for_capture = token_ids.last().copied().unwrap();
         let emb_cap = dequant_embd_rows(h, &[last_id_for_capture]);
         aether_dev_h2d_f32(emb_cap.as_ptr() as i64, act.x, D_MODEL as c_int);
@@ -275,6 +275,19 @@ fn qwen25_graph_decode_tok_per_sec() {
         //  (b) re-launch the graph to do it again.
         // For a clean tok/s measurement, do (b): time only the graph
         // launches, not the capture.
+
+        // Warmup: ramp GPU boost clock (210→~1950 MHz) before timing so the
+        // measured tok/s is the warm steady-state, not the cold-clock first run.
+        for _ in 0..16 {
+            let pos = token_ids.len() as i32 - 1;
+            let step_host = [pos, pos + 1, 0i32, 0i32];
+            aether_dev_h2d_i32(step_host.as_ptr() as i64, step_args, 4);
+            let last_id = token_ids.last().copied().unwrap();
+            let emb = dequant_embd_rows(h, &[last_id]);
+            aether_dev_h2d_f32(emb.as_ptr() as i64, act.x, D_MODEL as c_int);
+            assert_eq!(0, aether_dev_graph_launch(), "warmup launch failed");
+            aether_dev_sync();
+        }
 
         let t_gen = std::time::Instant::now();
         for step in 0..n_gen {

@@ -338,3 +338,24 @@ Pending — fires once DataLoader lands. Today the closest proxy is `examples/ae
 ## Append rule
 
 Any commit that touches `runtime/src/cuda.rs`, `runtime/src/lib.rs`, `compiler/src/codegen/asm/`, or `compiler/src/mir/fuse.rs` MUST run `bench/<applicable>/run_all.ps1` and append a row here. Regressions get an explicit verdict + a remediation issue ID. Audit's `--bench` flag (planned) will check the commit-touched-files-vs-bench-row policy automatically.
+
+## bench/graph_decode — single-stream decode tok/s (2026-05-24, kernel-unit split)
+
+Qwen2.5-7B Q4_K_M, RTX 3070 Ti, `qwen25_graph_decode` warm (16-step warmup to
+ramp boost clock, then 16 timed tokens; cold first-process run discarded).
+
+| state | warm tok/s | vs llama.cpp (~30 same card) |
+|---|---|---|
+| pre-split (HEAD before this commit) | 32.4–32.8 | ~108% |
+| **post-split** | **33.5–33.8** | **~112%** |
+
+Change: moved 9 contiguous TRAINING-only kernels (cross_entropy ×2, embed_lookup
+/scatter_add, softmax_bwd ×2, sdpa_causal fwd+bwd_dq+bwd_dkv) out of `KERNEL_SRC`
+into a new lazy `TRAIN_KERNEL_SRC` nvrtc unit (compiled only on first training
+use; inference never touches it). Confirms [[nvrtc_kernel_unit_pressure]]: fewer
+`__global__`s in the decode compilation unit → less ptxas register/codegen
+pressure on the active decode kernels → +3.4% single-stream decode, inference
+bit-intact + all training grad-checks still green. ~14 more training kernels
+(gelu/layer_norm_bwd/adamw/rms_bwd/rope_bwd/gqa/silu_bwd/transpose) remain in
+KERNEL_SRC interspersed with decode keepers — a follow-up batch toward the 37.2
+peak (add5216).

@@ -37,8 +37,6 @@ struct CudaCtx {
     device: Arc<CudaDevice>,
     blas: CudaBlas,
     /// Per-kernel function handles, JIT-compiled once at first init.
-    cross_entropy_fwd: CudaFunction,
-    cross_entropy_bwd: CudaFunction,
     adamw_step:        CudaFunction,
     add_f32:           CudaFunction,
     gelu_fwd:          CudaFunction,
@@ -47,11 +45,6 @@ struct CudaCtx {
     layer_norm_bwd_dx: CudaFunction,
     layer_norm_bwd_params: CudaFunction,
     softmax_f32:       CudaFunction,
-    softmax_bwd:       CudaFunction,
-    softmax_bwd_scaled:CudaFunction,
-    sdpa_causal_fwd:    CudaFunction,
-    sdpa_causal_bwd_dq: CudaFunction,
-    sdpa_causal_bwd_dkv:CudaFunction,
     scale_f32:         CudaFunction,
     gelu_inplace:      CudaFunction,
     add_layer_norm_fwd:CudaFunction,
@@ -63,8 +56,6 @@ struct CudaCtx {
     rope_apply_backward:CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     gqa_reduce_kv_grad:CudaFunction,
-    embed_lookup:      CudaFunction,
-    embed_scatter_add: CudaFunction,
     silu_inplace:      CudaFunction,
     silu_bwd:          CudaFunction,
     transpose_021:     CudaFunction,
@@ -253,6 +244,48 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "mla_absorb_q_iq4_nl").unwrap(),
             mla_absorb_v_iq4_nl:
                 device.get_func("aether_paged_kernels", "mla_absorb_v_iq4_nl").unwrap(),
+        }
+    })
+}
+
+// matt-voice perf — TRAINING/aux kernels in their own nvrtc unit (lazy), so they
+// impose ZERO ptxas register/codegen pressure on the decode kernels in
+// KERNEL_SRC. Only compiled on first training use (grad-checks, QLoRA stage);
+// inference (aether-serve) never touches train_ctx(). roadmap: P18.
+struct TrainCtx {
+    cross_entropy_fwd: CudaFunction,
+    cross_entropy_bwd: CudaFunction,
+    embed_lookup:      CudaFunction,
+    embed_scatter_add: CudaFunction,
+    softmax_bwd:       CudaFunction,
+    softmax_bwd_scaled:CudaFunction,
+    sdpa_causal_fwd:    CudaFunction,
+    sdpa_causal_bwd_dq: CudaFunction,
+    sdpa_causal_bwd_dkv:CudaFunction,
+}
+
+static TRAIN_CTX: OnceLock<TrainCtx> = OnceLock::new();
+
+fn train_ctx() -> &'static TrainCtx {
+    TRAIN_CTX.get_or_init(|| {
+        let device = &ctx().device;
+        let ptx = compile_ptx(TRAIN_KERNEL_SRC).expect("compile_ptx train");
+        device.load_ptx(ptx, "aether_train_kernels",
+            &["cross_entropy_fwd", "cross_entropy_bwd",
+              "embed_lookup", "embed_scatter_add",
+              "softmax_bwd_scaled", "softmax_bwd",
+              "sdpa_causal_fwd", "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv"])
+            .expect("load_ptx train");
+        TrainCtx {
+            cross_entropy_fwd: device.get_func("aether_train_kernels", "cross_entropy_fwd").unwrap(),
+            cross_entropy_bwd: device.get_func("aether_train_kernels", "cross_entropy_bwd").unwrap(),
+            embed_lookup:      device.get_func("aether_train_kernels", "embed_lookup").unwrap(),
+            embed_scatter_add: device.get_func("aether_train_kernels", "embed_scatter_add").unwrap(),
+            softmax_bwd:       device.get_func("aether_train_kernels", "softmax_bwd").unwrap(),
+            softmax_bwd_scaled:device.get_func("aether_train_kernels", "softmax_bwd_scaled").unwrap(),
+            sdpa_causal_fwd:    device.get_func("aether_train_kernels", "sdpa_causal_fwd").unwrap(),
+            sdpa_causal_bwd_dq: device.get_func("aether_train_kernels", "sdpa_causal_bwd_dq").unwrap(),
+            sdpa_causal_bwd_dkv:device.get_func("aether_train_kernels", "sdpa_causal_bwd_dkv").unwrap(),
         }
     })
 }
@@ -1935,245 +1968,6 @@ extern "C" __global__ void mla_absorb_v_iq4_nl(
 /// cover. JIT-compiled to PTX once at first `aether_dev_init` and loaded
 /// into the context. Kept tiny — the heavy lifting is in cuBLAS sgemm.
 const KERNEL_SRC: &str = r#"
-extern "C" __global__ void cross_entropy_fwd(
-    const float* __restrict__ logits,
-    const int*   __restrict__ labels,
-    float*       __restrict__ probs,
-    float*       __restrict__ losses,
-    int B, int V)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B) return;
-    const float* row = logits + i * V;
-    float* prow = probs + i * V;
-    float mx = row[0];
-    for (int j = 1; j < V; j++) if (row[j] > mx) mx = row[j];
-    float sum = 0.0f;
-    for (int j = 0; j < V; j++) { float e = expf(row[j] - mx); prow[j] = e; sum += e; }
-    float inv = 1.0f / sum;
-    for (int j = 0; j < V; j++) prow[j] *= inv;
-    int lab = labels[i];
-    float p = prow[lab];
-    if (p < 1e-12f) p = 1e-12f;
-    losses[i] = -logf(p);
-}
-
-extern "C" __global__ void cross_entropy_bwd(
-    const float* __restrict__ probs,
-    const int*   __restrict__ labels,
-    float*       __restrict__ dlogits,
-    int B, int V)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= B * V) return;
-    int row = i / V;
-    int col = i % V;
-    float inv_b = 1.0f / (float)B;
-    float v = probs[i] * inv_b;
-    if (col == labels[row]) v -= inv_b;
-    dlogits[i] = v;
-}
-
-// matt-voice FR-18.6-real leg 2 — embedding lookup (token-id gather).
-// out[t, d] = table[ids[t] * D + d]. table is [V, D] row-major, ids is [T].
-// One thread per (t, d) of the [T, D] output.
-//
-// roadmap: P18
-extern "C" __global__ void embed_lookup(
-    const float* __restrict__ table, const int* __restrict__ ids,
-    float* __restrict__ out, int T, int D)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= T * D) return;
-    int t = idx / D;
-    int d = idx - t * D;
-    int id = ids[t];
-    out[idx] = table[id * D + d];
-}
-
-// matt-voice FR-18.6-real leg 2 — embedding backward (scatter-add).
-// Gradient of the gather: d_table[ids[t]*D + d] += d_out[t, d]. Distinct t can
-// share an id, so accumulate with atomicAdd. d_table must be zeroed first.
-// One thread per (t, d) of the [T, D] upstream grad.
-//
-// roadmap: P18
-extern "C" __global__ void embed_scatter_add(
-    const float* __restrict__ d_out, const int* __restrict__ ids,
-    float* __restrict__ d_table, int T, int D)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= T * D) return;
-    int t = idx / D;
-    int d = idx - t * D;
-    int id = ids[t];
-    atomicAdd(&d_table[id * D + d], d_out[idx]);
-}
-
-// Fused softmax-backward + in-place scale. Used by the attention-backward
-// fusion pattern (`d_scores = softmax_bwd(attn, d_attn); d_scores.scale(s)`).
-// Saves one extra kernel launch + one extra round-trip through the runtime
-// ABI per attention layer's backward.
-extern "C" __global__ void softmax_bwd_scaled(
-    const float* __restrict__ y,
-    const float* __restrict__ dy,
-    float*       __restrict__ dx,
-    float s,
-    int B, int D)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= B) return;
-    const float* yr  = y  + row * D;
-    const float* dyr = dy + row * D;
-    float*       dxr = dx + row * D;
-    float dot = 0.0f;
-    for (int j = 0; j < D; j++) dot += yr[j] * dyr[j];
-    for (int j = 0; j < D; j++) dxr[j] = (yr[j] * (dyr[j] - dot)) * s;
-}
-
-// Row-wise softmax backward. Given y = softmax(x), dy upstream:
-//   dx[i,j] = y[i,j] * (dy[i,j] - sum_k y[i,k] * dy[i,k])
-extern "C" __global__ void softmax_bwd(
-    const float* __restrict__ y,
-    const float* __restrict__ dy,
-    float*       __restrict__ dx,
-    int B, int D)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= B) return;
-    const float* yr  = y  + row * D;
-    const float* dyr = dy + row * D;
-    float*       dxr = dx + row * D;
-    float dot = 0.0f;
-    for (int j = 0; j < D; j++) dot += yr[j] * dyr[j];
-    for (int j = 0; j < D; j++) dxr[j] = yr[j] * (dyr[j] - dot);
-}
-
-// matt-voice FR-18.6-real leg 2 — full-sequence causal SDPA FORWARD (qwen3
-// training). The decode path (paged/seq1) is forward-only and never
-// materialises the [bh,s,s] attention probabilities the backward needs; this
-// kernel does, mirroring the CPU reference ops::sdpa_causal_f32 exactly
-// (max-subtract softmax over j<=i, scale = 1/sqrt(d)). One thread per (h,i)
-// query row: writes attn row i [s] (0 above the diagonal) and out row i [d].
-//
-// roadmap: P18
-extern "C" __global__ void sdpa_causal_fwd(
-    const float* __restrict__ q, const float* __restrict__ k,
-    const float* __restrict__ v,
-    float* __restrict__ out, float* __restrict__ attn,
-    float scale, int bh, int s_len, int d)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= bh * s_len) return;
-    int h = idx / s_len;
-    int i = idx - h * s_len;
-    const float* qh = q + h * s_len * d;
-    const float* kh = k + h * s_len * d;
-    const float* vh = v + h * s_len * d;
-    float* oh = out  + h * s_len * d;
-    float* ar = attn + h * s_len * s_len + i * s_len;
-    // scores[j] = (q[i] . k[j]) * scale for j<=i; track max for stable softmax.
-    float mx = -1e30f;
-    for (int j = 0; j <= i; j++) {
-        float acc = 0.0f;
-        for (int dd = 0; dd < d; dd++) acc += qh[i * d + dd] * kh[j * d + dd];
-        acc *= scale;
-        ar[j] = acc;
-        if (acc > mx) mx = acc;
-    }
-    float sum = 0.0f;
-    for (int j = 0; j <= i; j++) { float e = expf(ar[j] - mx); ar[j] = e; sum += e; }
-    float inv = 1.0f / sum;
-    for (int j = 0; j <= i; j++) ar[j] *= inv;
-    for (int j = i + 1; j < s_len; j++) ar[j] = 0.0f;
-    // out[i,dd] = sum_{j<=i} attn[i,j] * v[j,dd].
-    for (int dd = 0; dd < d; dd++) {
-        float acc = 0.0f;
-        for (int j = 0; j <= i; j++) acc += ar[j] * vh[j * d + dd];
-        oh[i * d + dd] = acc;
-    }
-}
-
-// matt-voice FR-18.6-real leg 2 — causal SDPA backward (qwen3 training).
-//
-// roadmap: P18
-//
-// Mirrors the CPU reference ops::sdpa_causal_backward_f32 exactly. Layout
-// [bh, s, d] for q/k/v/dout/dq/dk/dv; `attn` is the saved forward softmax
-// probs [bh, s, s] (0 above the diagonal). scale = 1/sqrt(d).
-//
-// Split by output element to avoid atomics:
-//   sdpa_causal_bwd_dq  — one thread per (h, i): builds d_scores row i into a
-//     [bh, s, s] scratch and writes dq row i.
-//   sdpa_causal_bwd_dkv — one thread per (h, j): reads the d_scores scratch +
-//     attn + dout + q to write dk and dv column j.
-// The dq kernel must run first (the dkv kernel reads its d_scores output).
-extern "C" __global__ void sdpa_causal_bwd_dq(
-    const float* __restrict__ q, const float* __restrict__ k,
-    const float* __restrict__ v, const float* __restrict__ attn,
-    const float* __restrict__ dout,
-    float* __restrict__ dq, float* __restrict__ d_scores,
-    float scale, int bh, int s_len, int d)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= bh * s_len) return;
-    int h = idx / s_len;
-    int i = idx - h * s_len;
-    const float* qh  = q    + h * s_len * d;
-    const float* kh  = k    + h * s_len * d;
-    const float* vh  = v    + h * s_len * d;
-    const float* ah  = attn + h * s_len * s_len;
-    const float* doh = dout + h * s_len * d;
-    float* dqh = dq       + h * s_len * d;
-    float* dsh = d_scores + h * s_len * s_len;
-    // d_attn[i,j] = sum_dd dout[i,dd]*v[j,dd] (j<=i); stash in dsh, accumulate dot.
-    float dot = 0.0f;
-    for (int j = 0; j <= i; j++) {
-        float da = 0.0f;
-        for (int dd = 0; dd < d; dd++) da += doh[i * d + dd] * vh[j * d + dd];
-        dsh[i * s_len + j] = da;
-        dot += ah[i * s_len + j] * da;
-    }
-    // d_scores[i,j] = attn[i,j]*(d_attn[i,j] - dot).
-    for (int j = 0; j <= i; j++) {
-        float da = dsh[i * s_len + j];
-        dsh[i * s_len + j] = ah[i * s_len + j] * (da - dot);
-    }
-    for (int j = i + 1; j < s_len; j++) dsh[i * s_len + j] = 0.0f;
-    // dq[i,dd] = scale * sum_{j<=i} d_scores[i,j]*k[j,dd].
-    for (int dd = 0; dd < d; dd++) {
-        float acc = 0.0f;
-        for (int j = 0; j <= i; j++) acc += dsh[i * s_len + j] * kh[j * d + dd];
-        dqh[i * d + dd] = scale * acc;
-    }
-}
-
-extern "C" __global__ void sdpa_causal_bwd_dkv(
-    const float* __restrict__ q, const float* __restrict__ attn,
-    const float* __restrict__ dout, const float* __restrict__ d_scores,
-    float* __restrict__ dk, float* __restrict__ dv,
-    float scale, int bh, int s_len, int d)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= bh * s_len) return;
-    int h = idx / s_len;
-    int j = idx - h * s_len;
-    const float* qh  = q        + h * s_len * d;
-    const float* ah  = attn     + h * s_len * s_len;
-    const float* doh = dout     + h * s_len * d;
-    const float* dsh = d_scores + h * s_len * s_len;
-    float* dkh = dk + h * s_len * d;
-    float* dvh = dv + h * s_len * d;
-    for (int dd = 0; dd < d; dd++) {
-        float accv = 0.0f, acck = 0.0f;
-        for (int i = j; i < s_len; i++) {
-            accv += ah[i * s_len + j] * doh[i * d + dd];
-            acck += dsh[i * s_len + j] * qh[i * d + dd];
-        }
-        dvh[j * d + dd] = accv;
-        dkh[j * d + dd] = scale * acck;
-    }
-}
-
 // Row-wise softmax across last dim D. y[i,j] = exp(x[i,j] - max_i) / sum_i.
 extern "C" __global__ void softmax_f32(
     const float* __restrict__ x,
@@ -5243,6 +5037,251 @@ extern "C" __global__ void bert_embed_sum(
 }
 "#;
 
+// matt-voice perf — training/aux kernels split into a SEPARATE nvrtc unit
+// (lazy, like PAGED_KERNEL_SRC) so they impose ZERO codegen/register pressure
+// on the decode kernels compiled in KERNEL_SRC. roadmap: P18 / nvrtc_kernel_unit_pressure.
+const TRAIN_KERNEL_SRC: &str = r#"
+extern "C" __global__ void cross_entropy_fwd(
+    const float* __restrict__ logits,
+    const int*   __restrict__ labels,
+    float*       __restrict__ probs,
+    float*       __restrict__ losses,
+    int B, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B) return;
+    const float* row = logits + i * V;
+    float* prow = probs + i * V;
+    float mx = row[0];
+    for (int j = 1; j < V; j++) if (row[j] > mx) mx = row[j];
+    float sum = 0.0f;
+    for (int j = 0; j < V; j++) { float e = expf(row[j] - mx); prow[j] = e; sum += e; }
+    float inv = 1.0f / sum;
+    for (int j = 0; j < V; j++) prow[j] *= inv;
+    int lab = labels[i];
+    float p = prow[lab];
+    if (p < 1e-12f) p = 1e-12f;
+    losses[i] = -logf(p);
+}
+
+extern "C" __global__ void cross_entropy_bwd(
+    const float* __restrict__ probs,
+    const int*   __restrict__ labels,
+    float*       __restrict__ dlogits,
+    int B, int V)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B * V) return;
+    int row = i / V;
+    int col = i % V;
+    float inv_b = 1.0f / (float)B;
+    float v = probs[i] * inv_b;
+    if (col == labels[row]) v -= inv_b;
+    dlogits[i] = v;
+}
+
+// matt-voice FR-18.6-real leg 2 — embedding lookup (token-id gather).
+// out[t, d] = table[ids[t] * D + d]. table is [V, D] row-major, ids is [T].
+// One thread per (t, d) of the [T, D] output.
+//
+// roadmap: P18
+extern "C" __global__ void embed_lookup(
+    const float* __restrict__ table, const int* __restrict__ ids,
+    float* __restrict__ out, int T, int D)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * D) return;
+    int t = idx / D;
+    int d = idx - t * D;
+    int id = ids[t];
+    out[idx] = table[id * D + d];
+}
+
+// matt-voice FR-18.6-real leg 2 — embedding backward (scatter-add).
+// Gradient of the gather: d_table[ids[t]*D + d] += d_out[t, d]. Distinct t can
+// share an id, so accumulate with atomicAdd. d_table must be zeroed first.
+// One thread per (t, d) of the [T, D] upstream grad.
+//
+// roadmap: P18
+extern "C" __global__ void embed_scatter_add(
+    const float* __restrict__ d_out, const int* __restrict__ ids,
+    float* __restrict__ d_table, int T, int D)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * D) return;
+    int t = idx / D;
+    int d = idx - t * D;
+    int id = ids[t];
+    atomicAdd(&d_table[id * D + d], d_out[idx]);
+}
+
+// Fused softmax-backward + in-place scale. Used by the attention-backward
+// fusion pattern (`d_scores = softmax_bwd(attn, d_attn); d_scores.scale(s)`).
+// Saves one extra kernel launch + one extra round-trip through the runtime
+// ABI per attention layer's backward.
+extern "C" __global__ void softmax_bwd_scaled(
+    const float* __restrict__ y,
+    const float* __restrict__ dy,
+    float*       __restrict__ dx,
+    float s,
+    int B, int D)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= B) return;
+    const float* yr  = y  + row * D;
+    const float* dyr = dy + row * D;
+    float*       dxr = dx + row * D;
+    float dot = 0.0f;
+    for (int j = 0; j < D; j++) dot += yr[j] * dyr[j];
+    for (int j = 0; j < D; j++) dxr[j] = (yr[j] * (dyr[j] - dot)) * s;
+}
+
+// Row-wise softmax backward. Given y = softmax(x), dy upstream:
+//   dx[i,j] = y[i,j] * (dy[i,j] - sum_k y[i,k] * dy[i,k])
+extern "C" __global__ void softmax_bwd(
+    const float* __restrict__ y,
+    const float* __restrict__ dy,
+    float*       __restrict__ dx,
+    int B, int D)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= B) return;
+    const float* yr  = y  + row * D;
+    const float* dyr = dy + row * D;
+    float*       dxr = dx + row * D;
+    float dot = 0.0f;
+    for (int j = 0; j < D; j++) dot += yr[j] * dyr[j];
+    for (int j = 0; j < D; j++) dxr[j] = yr[j] * (dyr[j] - dot);
+}
+
+// matt-voice FR-18.6-real leg 2 — full-sequence causal SDPA FORWARD (qwen3
+// training). The decode path (paged/seq1) is forward-only and never
+// materialises the [bh,s,s] attention probabilities the backward needs; this
+// kernel does, mirroring the CPU reference ops::sdpa_causal_f32 exactly
+// (max-subtract softmax over j<=i, scale = 1/sqrt(d)). One thread per (h,i)
+// query row: writes attn row i [s] (0 above the diagonal) and out row i [d].
+//
+// roadmap: P18
+extern "C" __global__ void sdpa_causal_fwd(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out, float* __restrict__ attn,
+    float scale, int bh, int s_len, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh * s_len) return;
+    int h = idx / s_len;
+    int i = idx - h * s_len;
+    const float* qh = q + h * s_len * d;
+    const float* kh = k + h * s_len * d;
+    const float* vh = v + h * s_len * d;
+    float* oh = out  + h * s_len * d;
+    float* ar = attn + h * s_len * s_len + i * s_len;
+    // scores[j] = (q[i] . k[j]) * scale for j<=i; track max for stable softmax.
+    float mx = -1e30f;
+    for (int j = 0; j <= i; j++) {
+        float acc = 0.0f;
+        for (int dd = 0; dd < d; dd++) acc += qh[i * d + dd] * kh[j * d + dd];
+        acc *= scale;
+        ar[j] = acc;
+        if (acc > mx) mx = acc;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j <= i; j++) { float e = expf(ar[j] - mx); ar[j] = e; sum += e; }
+    float inv = 1.0f / sum;
+    for (int j = 0; j <= i; j++) ar[j] *= inv;
+    for (int j = i + 1; j < s_len; j++) ar[j] = 0.0f;
+    // out[i,dd] = sum_{j<=i} attn[i,j] * v[j,dd].
+    for (int dd = 0; dd < d; dd++) {
+        float acc = 0.0f;
+        for (int j = 0; j <= i; j++) acc += ar[j] * vh[j * d + dd];
+        oh[i * d + dd] = acc;
+    }
+}
+
+// matt-voice FR-18.6-real leg 2 — causal SDPA backward (qwen3 training).
+//
+// roadmap: P18
+//
+// Mirrors the CPU reference ops::sdpa_causal_backward_f32 exactly. Layout
+// [bh, s, d] for q/k/v/dout/dq/dk/dv; `attn` is the saved forward softmax
+// probs [bh, s, s] (0 above the diagonal). scale = 1/sqrt(d).
+//
+// Split by output element to avoid atomics:
+//   sdpa_causal_bwd_dq  — one thread per (h, i): builds d_scores row i into a
+//     [bh, s, s] scratch and writes dq row i.
+//   sdpa_causal_bwd_dkv — one thread per (h, j): reads the d_scores scratch +
+//     attn + dout + q to write dk and dv column j.
+// The dq kernel must run first (the dkv kernel reads its d_scores output).
+extern "C" __global__ void sdpa_causal_bwd_dq(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ attn,
+    const float* __restrict__ dout,
+    float* __restrict__ dq, float* __restrict__ d_scores,
+    float scale, int bh, int s_len, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh * s_len) return;
+    int h = idx / s_len;
+    int i = idx - h * s_len;
+    const float* qh  = q    + h * s_len * d;
+    const float* kh  = k    + h * s_len * d;
+    const float* vh  = v    + h * s_len * d;
+    const float* ah  = attn + h * s_len * s_len;
+    const float* doh = dout + h * s_len * d;
+    float* dqh = dq       + h * s_len * d;
+    float* dsh = d_scores + h * s_len * s_len;
+    // d_attn[i,j] = sum_dd dout[i,dd]*v[j,dd] (j<=i); stash in dsh, accumulate dot.
+    float dot = 0.0f;
+    for (int j = 0; j <= i; j++) {
+        float da = 0.0f;
+        for (int dd = 0; dd < d; dd++) da += doh[i * d + dd] * vh[j * d + dd];
+        dsh[i * s_len + j] = da;
+        dot += ah[i * s_len + j] * da;
+    }
+    // d_scores[i,j] = attn[i,j]*(d_attn[i,j] - dot).
+    for (int j = 0; j <= i; j++) {
+        float da = dsh[i * s_len + j];
+        dsh[i * s_len + j] = ah[i * s_len + j] * (da - dot);
+    }
+    for (int j = i + 1; j < s_len; j++) dsh[i * s_len + j] = 0.0f;
+    // dq[i,dd] = scale * sum_{j<=i} d_scores[i,j]*k[j,dd].
+    for (int dd = 0; dd < d; dd++) {
+        float acc = 0.0f;
+        for (int j = 0; j <= i; j++) acc += dsh[i * s_len + j] * kh[j * d + dd];
+        dqh[i * d + dd] = scale * acc;
+    }
+}
+
+extern "C" __global__ void sdpa_causal_bwd_dkv(
+    const float* __restrict__ q, const float* __restrict__ attn,
+    const float* __restrict__ dout, const float* __restrict__ d_scores,
+    float* __restrict__ dk, float* __restrict__ dv,
+    float scale, int bh, int s_len, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh * s_len) return;
+    int h = idx / s_len;
+    int j = idx - h * s_len;
+    const float* qh  = q        + h * s_len * d;
+    const float* ah  = attn     + h * s_len * s_len;
+    const float* doh = dout     + h * s_len * d;
+    const float* dsh = d_scores + h * s_len * s_len;
+    float* dkh = dk + h * s_len * d;
+    float* dvh = dv + h * s_len * d;
+    for (int dd = 0; dd < d; dd++) {
+        float accv = 0.0f, acck = 0.0f;
+        for (int i = j; i < s_len; i++) {
+            accv += ah[i * s_len + j] * doh[i * d + dd];
+            acck += dsh[i * s_len + j] * qh[i * d + dd];
+        }
+        dvh[j * d + dd] = accv;
+        dkh[j * d + dd] = scale * acck;
+    }
+}
+
+"#;
+
 static CTX: OnceLock<CudaCtx> = OnceLock::new();
 // Single-threaded by construction: Aether-emitted programs run a single
 // thread of execution. The earlier `Mutex<Vec<Option<...>>>` registry
@@ -5287,15 +5326,13 @@ fn ctx() -> &'static CudaCtx {
         // JIT-compile the small custom kernels via nvrtc.
         let ptx = compile_ptx(KERNEL_SRC).expect("compile_ptx");
         device.load_ptx(ptx, "aether_kernels",
-            &["cross_entropy_fwd", "cross_entropy_bwd", "adamw_step",
+            &["adamw_step",
               "add_f32", "gelu_fwd", "gelu_bwd",
               "layer_norm_fwd", "layer_norm_bwd_dx", "layer_norm_bwd_params",
-              "softmax_f32", "softmax_bwd", "softmax_bwd_scaled",
-              "sdpa_causal_fwd", "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv", "scale_f32",
+              "softmax_f32", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv", "gqa_reduce_kv_grad",
-              "embed_lookup", "embed_scatter_add",
               "silu_inplace", "silu_bwd", "transpose_021", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
@@ -5323,8 +5360,6 @@ fn ctx() -> &'static CudaCtx {
               "bert_self_attention_fwd",
               "bert_embed_sum"])
             .expect("load_ptx");
-        let cross_entropy_fwd = device.get_func("aether_kernels", "cross_entropy_fwd").unwrap();
-        let cross_entropy_bwd = device.get_func("aether_kernels", "cross_entropy_bwd").unwrap();
         let adamw_step        = device.get_func("aether_kernels", "adamw_step").unwrap();
         let add_f32           = device.get_func("aether_kernels", "add_f32").unwrap();
         let gelu_fwd          = device.get_func("aether_kernels", "gelu_fwd").unwrap();
@@ -5333,11 +5368,6 @@ fn ctx() -> &'static CudaCtx {
         let layer_norm_bwd_dx     = device.get_func("aether_kernels", "layer_norm_bwd_dx").unwrap();
         let layer_norm_bwd_params = device.get_func("aether_kernels", "layer_norm_bwd_params").unwrap();
         let softmax_f32           = device.get_func("aether_kernels", "softmax_f32").unwrap();
-        let softmax_bwd           = device.get_func("aether_kernels", "softmax_bwd").unwrap();
-        let softmax_bwd_scaled    = device.get_func("aether_kernels", "softmax_bwd_scaled").unwrap();
-        let sdpa_causal_fwd       = device.get_func("aether_kernels", "sdpa_causal_fwd").unwrap();
-        let sdpa_causal_bwd_dq    = device.get_func("aether_kernels", "sdpa_causal_bwd_dq").unwrap();
-        let sdpa_causal_bwd_dkv   = device.get_func("aether_kernels", "sdpa_causal_bwd_dkv").unwrap();
         let scale_f32             = device.get_func("aether_kernels", "scale_f32").unwrap();
         let gelu_inplace          = device.get_func("aether_kernels", "gelu_inplace").unwrap();
         let add_layer_norm_fwd    = device.get_func("aether_kernels", "add_layer_norm_fwd").unwrap();
@@ -5348,8 +5378,6 @@ fn ctx() -> &'static CudaCtx {
         let rope_apply_backward   = device.get_func("aether_kernels", "rope_apply_backward").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let gqa_reduce_kv_grad    = device.get_func("aether_kernels", "gqa_reduce_kv_grad").unwrap();
-        let embed_lookup          = device.get_func("aether_kernels", "embed_lookup").unwrap();
-        let embed_scatter_add     = device.get_func("aether_kernels", "embed_scatter_add").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
         let silu_bwd              = device.get_func("aether_kernels", "silu_bwd").unwrap();
         let transpose_021         = device.get_func("aether_kernels", "transpose_021").unwrap();
@@ -5390,16 +5418,14 @@ fn ctx() -> &'static CudaCtx {
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
         let bert_embed_sum = device.get_func("aether_kernels", "bert_embed_sum").unwrap();
 
-        CudaCtx { device, blas, cross_entropy_fwd, cross_entropy_bwd, adamw_step,
+        CudaCtx { device, blas, adamw_step,
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
-                  softmax_f32, softmax_bwd, softmax_bwd_scaled,
-                  sdpa_causal_fwd, sdpa_causal_bwd_dq, sdpa_causal_bwd_dkv,
+                  softmax_f32,
                   scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
                   rope_apply, rope_apply_backward, gqa_repeat_kv, gqa_reduce_kv_grad,
-                  embed_lookup, embed_scatter_add,
                   silu_inplace, silu_bwd, transpose_021, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
@@ -5974,7 +6000,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         let logits_buf = &*logits_buf_p;
         let probs_buf  = &mut *probs_buf_p;
         let labels_buf = &*labels_buf_p;
-        ctx().cross_entropy_fwd.clone().launch(cfg, (logits_buf, labels_buf, probs_buf, &mut losses, b, v))
+        train_ctx().cross_entropy_fwd.clone().launch(cfg, (logits_buf, labels_buf, probs_buf, &mut losses, b, v))
             .expect("launch ce_fwd");
     }
     let host = ctx().device.dtoh_sync_copy(&losses).expect("d2h losses");
@@ -6000,7 +6026,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         let probs_buf   = &*probs_buf_p;
         let dlogits_buf = &mut *dlogits_buf_p;
         let labels_buf  = &*labels_buf_p;
-        ctx().cross_entropy_bwd.clone().launch(cfg, (probs_buf, labels_buf, dlogits_buf, b, v))
+        train_ctx().cross_entropy_bwd.clone().launch(cfg, (probs_buf, labels_buf, dlogits_buf, b, v))
             .expect("launch ce_bwd");
     }
     0
@@ -6290,7 +6316,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let cfg = LaunchConfig::for_num_elems(b as u32);
     unsafe {
         let yv = &*y_p; let dyv = &*dy_p; let dxv = &mut *dx_p;
-        ctx().softmax_bwd.clone().launch(cfg, (yv, dyv, dxv, b, d)).expect("launch softmax_bwd");
+        train_ctx().softmax_bwd.clone().launch(cfg, (yv, dyv, dxv, b, d)).expect("launch softmax_bwd");
     }
     0
 }
@@ -6310,7 +6336,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let cfg = LaunchConfig::for_num_elems(b as u32);
     unsafe {
         let yv = &*y_p; let dyv = &*dy_p; let dxv = &mut *dx_p;
-        ctx().softmax_bwd_scaled.clone()
+        train_ctx().softmax_bwd_scaled.clone()
             .launch(cfg, (yv, dyv, dxv, s, b, d))
             .expect("launch softmax_bwd_scaled");
     }
@@ -6342,7 +6368,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     unsafe {
         let qv = &*q_p; let kv = &*k_p; let vv = &*v_p;
         let ov = &mut *o_p; let av = &mut *a_p;
-        ctx().sdpa_causal_fwd.clone()
+        train_ctx().sdpa_causal_fwd.clone()
             .launch(cfg, (qv, kv, vv, ov, av, scale, bh, s_len, d))
             .expect("launch sdpa_causal_fwd");
     }
@@ -6385,13 +6411,13 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         // Pass 1: dq + d_scores.
         let qv = &*q_p; let kv = &*k_p; let vv = &*v_p; let av = &*a_p; let dov = &*do_p;
         let dqv = &mut *dq_p; let dsv = &mut *ds_p;
-        ctx().sdpa_causal_bwd_dq.clone()
+        train_ctx().sdpa_causal_bwd_dq.clone()
             .launch(cfg.clone(), (qv, kv, vv, av, dov, dqv, dsv, scale, bh, s_len, d))
             .expect("launch sdpa_causal_bwd_dq");
         // Pass 2: dk + dv (reads d_scores from pass 1; same stream → ordered).
         let dsv2 = &*ds_p;
         let dkv = &mut *dk_p; let dvv = &mut *dv_p;
-        ctx().sdpa_causal_bwd_dkv.clone()
+        train_ctx().sdpa_causal_bwd_dkv.clone()
             .launch(cfg, (qv, av, dov, dsv2, dkv, dvv, scale, bh, s_len, d))
             .expect("launch sdpa_causal_bwd_dkv");
     }
@@ -8069,7 +8095,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let cfg = LaunchConfig::for_num_elems((t * d) as u32);
     unsafe {
         let tab = &*tab_p; let outv = &mut *out_p; let ids = &*ids_p;
-        ctx().embed_lookup.clone().launch(cfg, (tab, ids, outv, t, d))
+        train_ctx().embed_lookup.clone().launch(cfg, (tab, ids, outv, t, d))
             .expect("launch embed_lookup");
     }
     0
@@ -8091,7 +8117,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let cfg = LaunchConfig::for_num_elems((t * d) as u32);
     unsafe {
         let dout = &*dout_p; let dtab = &mut *dtab_p; let ids = &*ids_p;
-        ctx().embed_scatter_add.clone().launch(cfg, (dout, ids, dtab, t, d))
+        train_ctx().embed_scatter_add.clone().launch(cfg, (dout, ids, dtab, t, d))
             .expect("launch embed_scatter_add");
     }
     0
