@@ -1,5 +1,122 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-25 (V2-Lite bisect — 3 fixes shipped, GLM coherent, V2-Lite isolated to YaRN path)
+🟢 Big session on cnc P100s (standing GPU access granted). 4 commits pushed
+(`84ef3a5`, `ffaf9c7`, `37d5050`, + this YaRN-diag `f31a4c0`). Each rebuilt on
+cnc GPU1 (workhorse evicted+restored every time, all reversible, workhorse
+active now).
+
+**HEADLINE WINS:**
+- **GLM-4.7-flash now CLEARLY coherent** ("The capital of France is Paris.",
+  valid Python) — was only loosely token-witnessed before. The MoE gating fix
+  (sigmoid + scale 1.8 + norm, all read from GGUF) did it.
+- **3 real bugs fixed + verified**: (1) YaRN ramp `84ef3a5`; (2) MoE gating
+  `ffaf9c7` (read expert_gating_func/weights_norm/weights_scale; softmax|sigmoid
+  over all experts; +GgufMeta::Bool; pure unit tests); (3) deepseek2 norm
+  default=false `37d5050`.
+
+**V2-Lite STILL incoherent** after all three (degenerate-repetitive). Bug is now
+TIGHTLY ISOLATED:
+- GLM (absorbed MLA, NON-yarn rope) coherent → MoE + embed + norms + lm_head +
+  o_proj + paged_attention_mla + the absorbed path all CORRECT.
+- `cuda_mla_e2e_synthetic` (non-absorbed MLA step, NON-yarn, hand-CPU ref) PASSES
+  → the non-absorbed assembly kernels (assemble_k/extract_v/split/kv_b) + attn
+  core are correct at short positions with plain rope.
+- **The ONLY V2-Lite-unique code exercised by NOTHING else = the YaRN rope path**
+  (`mla_rope_q_partial_yarn` / `mla_rope_k_shared_yarn`). GLM has yarn INACTIVE
+  (rope=1e6, no YaRN log line); the synthetic test uses plain rope. So yarn is
+  unwitnessed-in-integration. My ramp fix passes `cuda_yarn_rope_parity`, but
+  that test is the ONLY yarn check and can't catch a llama.cpp divergence my own
+  reference shares.
+
+**4th fix `7e24763` (done): llama.cpp deepseek2 YaRN scaling matched VERBATIM**
+(fetched src/models/deepseek2.cpp + ggml rope_yarn). rope cos/sin mscale=1.3689
+(was 1.0); attention kq_scale mscale=1.4046 → 0.1424 (was HF-style 0.1147). Aether
+had matched HF, not the GGUF's llama.cpp runtime. yarn parity 4/4.
+
+**PROMPT_IDS BYPASS REFRAME (key):** clean ids `[100000,549,6077,280,7239,317]`
+greedy → `" is is is is is is is is is the the the"`. REAL frequent words in a
+repetition loop, NOT char-garbage. So after 4 fixes V2-Lite went random "eu)" →
+"\n\n\n" → word-repetition. TWO residual problems, now separated:
+ (A) FORWARD: flat-attention repetition even on clean ids (real tokens, can't
+     progress past "is"). Closer but not right.
+ (B) TOKENIZER/TEMPLATE: chat path is WORSE than prompt_ids (adds char-garbage)
+     — a SEPARATE bug from the forward.
+
+**Phase 4.5 reached — 4 fixes, partial convergence. STOP incremental tweaks.**
+DEFINITIVE next step (NOT yet done — fresh effort, GPU access granted):
+1. **llama.cpp greedy + intermediate reference on the SAME 6 ids.** b8182
+   `llama-cli -no-cnv` SEGFAULTS on CPU → try `llama-completion` or `llama-server`
+   (likely needs GPU; evict workhorse). If llama.cpp → "Paris", dump its
+   position-0 logits + per-layer attn and diff vs Aether (`AETHER_DUMP_MLA=1`,
+   `AETHER_DUMP_BLOCKS=1`) to localize the flat-attention bug. This is the only
+   way left — formula-derivation from references is exhausted.
+2. NEOX-vs-NORM rope: deepseek2 is NEOX in llama.cpp (Aether matches) — checked,
+   not the bug. But the deepseek q_pe/k_pe weight-layout permute (HF interleave
+   vs GGUF) is unverified; the synthetic test is tautological on rope pairing.
+3. Separately debug the tokenizer/template (B) — compare aether encode_text +
+   deepseek chat template vs llama-tokenize on the rendered prompt.
+4. Re-smoke qwen3moe (insurance; gating default unchanged for it).
+
+**Honest status: 4 real fixes shipped (GLM now coherent — big win), V2-Lite
+improved but NOT solved. Do not claim V2-Lite done.**
+
+**mscale AUDIT (done):** attention softmax mscale²=1.5896 confirmed correct via
+load log; HF cos/sin _mscale=1.0 no-op for V2-Lite. Diagnostic log added
+(`[QwenSession] YaRN:` + `MoE:`).
+
+Original entry that kicked this off:
+🟢 Picked up handoff next-item #1 (V2-Lite MLA-non-absorbed forward bisect).
+Found the YaRN ramp bug by line-by-line comparison vs the HF/llama.cpp reference.
+
+**The bug** (`runtime/src/cuda.rs` `yarn_scale_factor`): two compounding errors —
+(1) correction-dim bounds named backwards, so `denom = max(i_high - i_low, 1e-3)`
+clamped a negative diff to 1e-3 and collapsed the smooth interpolation ramp into
+a misplaced step; (2) call sites passed `2*i` (full-dim index) instead of the
+rotary PAIR index `i`. Net: ~10 of 32 rope freq pairs got wrong scaling (9–50°
+rotation error even at short positions). **V2-Lite is the ONLY model on the YaRN
+path** — GLM-absorbed + qwen2.5 don't hit it → explains why it was V2-Lite-only.
+[[v2_lite_yarn_ramp_bug]]
+
+**Why it survived:** `cuda_yarn_rope_parity.rs` was tautological (CPU "reference"
+== kernel's buggy formula). Rewrote with an independent HF-math reference +
+`yarn_scale_factor_reference_anchors` (hand-computed: scale(0)=1.0, scale(16)=0.55,
+scale(23)=0.025) so it can't silently re-encode the bug.
+
+**Verified (kokonoe 3070 Ti):** 4/4 cuda_yarn_rope_parity (anchors + GPU parity
+1e-7 + factor=1 identity); qwen25_paged_parity unregressed (standard rope path
+untouched).
+
+**NOT yet confirmed:** actual V2-Lite *coherence*. The fix is in the nvrtc kernel
+SOURCE STRING, so the cnc binary must be REBUILT (`strings` won't show it). The
+decisive smoke needs a cnc GPU slot — scripted at `scratch/v2_lite_yarn_smoke.sh`
+(evict workhorse, V2-Lite Q4_K_M, --paged, chat-completion request → expect
+coherent text, not "eu)"). The pre-fix "incoherent" run may ALSO have predated
+the deepseek2 chat-template split, so the smoke is the real arbiter.
+
+**Re-smoke GLM too (insurance):** the absorbed path (`serving.rs:1587,1605`) also
+calls these yarn kernels when `yarn_active`. Fix is safe by reference-equivalence
+(now matches llama.cpp, which serves GLM coherently), but re-run the GLM witness
+after the cnc rebuild to be sure.
+
+**mscale — AUDITED, correct for V2-Lite (commit `f31a4c0`, diagnostic only):**
+chased the "missing rope cos/sin mscale?" question against HF DeepSeek-V2.
+(1) Attention softmax scale: Aether's `base_scale*mscale²` with
+`mscale = 1 + 0.0707*ln(40) = 1.2608` (mscale²=1.589) EXACTLY matches HF.
+(2) cos/sin `_mscale` = `yarn_get_mscale(s,mscale)/yarn_get_mscale(s,mscale_all_dim)`
+= 1.0 for V2-Lite because `mscale == mscale_all_dim == 0.707` — a genuine no-op,
+correctly omitted. (3) Only residual risk: the GGUF `yarn_log_multiplier` key
+not being read → mscale silently 1.0. Added a YaRN dump at session load
+(`[QwenSession] YaRN: factor=.. log_mul=.. -> mscale=.. mscale^2=..`) so the
+smoke output proves the read. **No mscale code change was warranted.**
+
+**Next:** (1) push + cnc V2-Lite coherence smoke (+ GLM re-smoke) — CHECK the new
+`[QwenSession] YaRN:` log shows `log_mul=0.0707 mscale^2≈1.589` (if it shows
+`log_mul=0`, that IS the bug — trivial GGUF-key fix); (2) qwen3moe forward bisect
+(still open from prior handoff); (3) the deferred 8h matt-voice run.
+
+---
+
 ## Last Updated — 2026-05-25 (per-arch session B — gemma3 CLOSED end-to-end)
 🟢 Picked up handoff items (a)+(b)+(d), then drove gemma3 all the way to
 coherent text serving. 4 commits (e5da06a, dca1510, 39bc261, d820cc8), all
