@@ -1,5 +1,48 @@
 # Aether — Session Handoff
 
+## 2026-05-25 — PER-ARCH VERIFICATION (live cnc smokes, NOT "fully ready")
+Ran real decode/embedding smokes against the deployed `aether-serve` binary on
+cnc P100s (workhorse evicted from GPU1 for the window, restored after; no
+training was running). Methodology + full notes in memory
+`reference_aether_per_arch_verification.md` + driver `cnc:/tmp/aether-perarch-smoke.sh`.
+
+| Arch | Model (quant) | Result |
+|---|---|---|
+| `qwen2`/2.5 | Qwen2.5-Math-7B Q4_K_M | ✅ coherent |
+| `deepseek2` MLA-**absorbed** (GLM) | glm-4.7-flash IQ3_XXS | ✅ coherent |
+| `bert`/bge | bge-large-en-v1.5 f16 | ✅ 1024-dim, L2=1.0000, finite (`/v1/embeddings`, `--bge-gguf`) |
+| `deepseek2` MLA non-absorbed (V2-Lite) | DeepSeek-Coder-V2-Lite Q4_K_M | 🟡 decodes real tokens, incoherent — retest w/ chat template |
+| `llama` | codestral-22b **IQ3_M** | ❌ NaN-pins to vocab-1 (32767×); forward broken for this quant + text-encode gap |
+| `gemma3` | gemma-3-12b Q4_K_M | ❌ panic `output.weight not found` (tied embeddings; need token_embd lm_head fallback @ serving.rs:2148) |
+| `qwen3moe` | Qwen3-30B-A3B **Q3_K_M** | ❌ panic `unsupported dtype 11` — Q3_K missing from `upload_tensor_u8`/`_opt` (761/843). **~2-line fix**: `11 => { let nb=n_elems/256; (nb, nb*110) }`. Kernel+dispatch already present. |
+| `qwen3` dense | Qwen3-32B Q4_K_M (19G) | ⛔ exceeds single P100; only 2×P100 PP training exercises it |
+
+**aether-serve.service crashloop FIXED:** unit had `--port 8081` (collides with
+workhorse llama-server) → 66 restarts of load-warm-die. Changed to `--port 18913`;
+NRestarts=0, listening, decode verified. Runs alongside workhorse on GPU0.
+
+### What's next (prioritized fixes from this verification)
+1. **qwen3moe — TRIVIAL (~2 lines):** add Q3_K (dt=11) arm to `upload_tensor_u8`
+   AND `upload_tensor_u8_opt` (serving.rs:761/843):
+   `11 => { let nb = n_elems / 256; (nb, nb * 110) }` (Q3_K super-block = 110B/256
+   elems). The matmul kernel (`fused_q3_k_matmul_seq1`) + `dispatch_matmul` dt=11
+   arm already exist — only the upload helpers reject it. Rebuild aether-serve on
+   cnc (`RUSTC_WRAPPER= cargo build --release --features cuda`, ~35s) + re-smoke
+   Qwen3-30B-A3B-Q3_K_M. Unblocks the entire qwen3moe arch.
+2. **V2-Lite coherence — retest, probably not a bug:** DeepSeek-Coder-V2-Lite
+   decoded real non-NaN tokens but incoherent output ("\n2)Pi_ -Ca"). Re-smoke with
+   the model's chat template applied (or known-good prompt_ids). Confirm before
+   filing as an MLA-non-absorbed forward bug.
+3. **gemma3 — MEDIUM (~15-30 LOC):** lm_head loader at serving.rs:2148 panics on
+   missing `output.weight`. Gemma3 ties embeddings → fall back to `token_embd.weight`
+   as lm_head when `output.weight` is absent. Then re-smoke gemma-3-12b.
+4. **codestral/llama IQ3_M NaN — HARD/open-ended:** forward emits NaN → vocab-1
+   pinning. Bisect like the GLM NaN chase (AETHER_DUMP_BLOCKS etc.). Likely
+   IQ3_M-quant-specific; "llama" arch may be fine on a Q4_K model — verify with a
+   Q4_K llama GGUF before assuming the arch path is broken.
+5. **qwen3 dense (32B) single-card decode** stays HW-blocked unless a smaller qwen3
+   GGUF is staged; the 2×P100 PP training path already exercises the arch.
+
 ## Last Updated
 2026-05-25 (**matt-voice REAL 32B QLoRA training pipeline VALIDATED end-to-end on
 2×P100. Built the real path (embed real tokens -> 64 qwen3 layers split 26/38 ->
@@ -3101,3 +3144,21 @@ LiteLLM container (bridge mode, 10.88.0.2)
 ```
 
 The route works. The cargo doesn't survive aether-serve's tokenization gap.
+
+## 2026-05-25 — PER-ARCH FIX RESULTS (post Matt's verification; 2 partial-blackout cnc smoke windows)
+
+Acted on the queue. aether-serve rebuilt on cnc with 2 fixes; batch re-smoked on GPU1 (workhorse-only evict, scout+aether-serve stayed up):
+
+| # | Fix shipped | Re-smoke result | State |
+|---|---|---|---|
+| 1 qwen3moe | Q3_K dt=11 upload arm (`upload_tensor_u8`+`_opt`, commit c8f882c) | **LOADS now** (was upload panic); NEXT gap: MoE **expert** matmul lacks Q3_K → panic serving.rs:1802 | 🟡 advanced |
+| 3 gemma3 | tied-embeddings → `token_embd` lm_head fallback (serving.rs:2150) | **LOADS now** (was output.weight panic); forward emits pad/vocab-1 | 🟡 advanced |
+| 2 V2-Lite | (retest only) | **NOT a bug** — 13 real varied tokens; incoherent only w/o chat template | ✅ closed |
+| 4 codestral/IQ3_M | (isolation probe) | **IQ3_M QUANT is the bug, not arch** — R1-Distill-Qwen-32B-IQ3_M (qwen2 arch, fine on Q4_K) ALSO NaN-pins vocab-1. codestral has a separate tokenizer vocab-byte-10 gap. | 🔍 root-caused |
+| 5 qwen3-dense | (none — HW) | No small qwen3-dense GGUF exists; 32B covered by 2×P100 PP path | ⛔ HW-blocked |
+
+### Remaining work (post-fix)
+- **qwen3moe expert Q3_K kernel** (~80 LoC, mirror IQ3_S/IQ4_XS expert kernels): new `fused_q3_k_expert_matmul_seq1` in cuda.rs + `ExpertDtype { dt:11, block_n_elems:256, kernel:... }` row in `MOE_EXPERT_DISPATCH`. The panic msg at serving.rs:1802 gives the exact template. Does NOT exist yet (grep cuda.rs = 0).
+- **gemma3 forward** (open-ended bisect, cnc): loads but pad/vocab-1 → gemma3-specific path (pre/post norms, attn logit softcap, embedding scale) not fully right. Bisect like the GLM NaN chase (AETHER_DUMP_BLOCKS).
+- **IQ3_M quant** (the high-value one): one fix clears ALL IQ3_M models. IQ3_M is NOT in the dispatch dtype set (12/8/6/21/23/18 + matmul dtypes) — it's a distinct GGUF quant (≈ mixed IQ3_S/IQ3_XXS). Either it's silently mis-dispatched → NaN, or needs its own dequant+matmul kernel. Investigate which dt code IQ3_M maps to + whether a kernel exists.
+- **V2-Lite**: just needs the chat template applied in the serving path (or known-good prompt_ids) — not a forward fix.
