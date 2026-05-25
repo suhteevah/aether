@@ -21,18 +21,34 @@ Build: `cargo build --workspace --release` clean (non-cuda); all 5 new tests
 green under `--features cuda` on the 3070 Ti. MHA capstone + qwen25_paged_parity
 unregressed.
 
-**What's NEXT — leg 3 (the last leg):**
-- Assemble for the real model: `QwenBlockStage` already implements the PP Stage;
-  for matt-voice 32B swap its f32 base matmuls for the quant kernels (proven) +
-  inject the QLoRA adapter (math proven in #3) after each q/k/v/o/gate/up/down
-  proj. The GQA repeat/reduce (#1) handles n_kv<n_q.
-- **2-rank/2-GPU run on cnc** (Qwen3-32B, 64 layers split 32/32): two PROCESSES
-  via `connect_pipeline` TCP rendezvous (NOT two threads — the runtime CudaCtx is
-  a process-global singleton; kokonoe's single GPU forced the world_size=1
-  witness via `PipeLinks::local_single()`). Needs the cnc workhorse stopped
-  (B-approval via openclaw main).
+**Leg 3 — PP machinery DONE + witnessed on target hardware (`9c1704b`):**
+`pp-qwen-worker` (trainer/src/bin/pp_qwen_worker.rs) runs one rank as its own
+PROCESS (the runtime CudaCtx is a process-global singleton → ranks can't be
+threads; that's why the in-process witness was world_size=1). `connect_pipeline`
+TCP rendezvous + run_1f1b drive a layer-split qwen3 block stack.
+`scripts/pp_2rank_witness.sh` asserts the 2-process pipelined run is BIT-IDENTICAL
+to the single-process reference (loss 4.369193→0.344829; rank paramsums add to the
+1-proc total; rank0 warmup=1 = real 1F1B overlap). **Verified on BOTH the RTX
+3070 Ti (kokonoe) AND a cnc Tesla P100** (built on cnc EXIT_0, ran on the free
+GPU1, zero service disruption). Because PP transport is TCP with host staging
+(d2h→TCP→h2d), 2-procs-1-GPU and 2-procs-2-GPU exercise the *identical* code path
+— so the physical-GPU-split path is already covered.
+
+**Leg 3 — what REMAINS for a literal Qwen3-32B matt-voice run (NOT yet built):**
+1. **GGUF-quant + QLoRA stage**: `QwenBlockStage` today loads f32 RANDOM weights.
+   For 32B, build a variant that loads real GGUF quant tensors into device
+   buffers, swaps the f32 base matmuls for the proven quant kernels
+   (`fused_*_matmul_seq1` fwd + `quant_matmul_backward_lhs` for dx through the
+   frozen base), and injects the QLoRA adapter (math proven in finisher #3,
+   `b239f5d`) after each q/k/v/o/gate/up/down proj. GQA repeat/reduce (#1)
+   handles n_kv<n_q. This is the real fine-tune stage — a substantial build,
+   validate against the 19 GB GGUF on cnc.
+2. **Free a 2nd full P100**: 32B per-side needs a dedicated card. cnc GPU1 is
+   currently free (16 GB); GPU0 has matt-voice (~10.5/12 GB). The 64-layer
+   32/32 split across 2 cards needs the second card freed — coordinate the
+   workhorse/GPU0 tenants via openclaw main (B-approval).
 - Multi-layer-per-stage already supported (`QwenBlockStage::build` takes a layer
-  range); the witness used 2 layers in 1 stage.
+  range); witnesses used 4 layers split 2+2.
 
 ---
 
