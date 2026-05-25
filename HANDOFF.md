@@ -3187,3 +3187,28 @@ don't hit. Code work on kokonoe; eviction smokes only to verify.
 
 ### Commits this round
 c8f882c Q3_K upload arm · (gemma3 lm_head) · (gemma3 embed scale) · Q3_K expert kernel · Q5_K expert kernel
+
+## 2026-05-25 — HIGH-VALUE LEAD RESOLVED: shared vocab-1 root cause = wrong token_embd dtype
+
+Found via a FREE GGUF dtype probe (no GPU/eviction): `dequant_embd_row` hardcoded
+Q4_K, but `token_embd` is **Q6_K (gemma3) / Q3_K (qwen3moe) / IQ3_S (R1-distill/IQ3_M)**
+→ garbage embeddings → the vocab-1/pad NaN-pin across all three. (qwen2.5/GLM worked:
+their token_embd is Q4_K.) Fix: dtype-aware `dequant_embd_row` + new host dequants
+`aether_dequant_q3_k` + `aether_dequant_iq3_s` (incl the 512-entry iq3s_grid),
+CPU ports of the device decoders.
+
+**Payoff smoke (one fix, three arches):**
+| arch | before | after |
+|---|---|---|
+| IQ3_M (R1-Distill-Qwen-32B-IQ3_M) | `[PAD152063]` | **"The ocean is a vast and vital"** — ✅ FULLY COHERENT |
+| qwen3moe (Qwen3-30B-A3B-Q3_K_M) | `[PAD151935]×17` | real varied tokens — forward FIXED (rambly only w/o chat template) |
+| gemma3 (gemma-3-12b) | `[PAD262207]` | `"T"`+stop — no longer pad-pinned, but **still degenerate → needs MORE** |
+
+### Updated per-arch ledger
+- **witness-ready:** qwen2.5, GLM(MLA-absorbed), BGE, **+ IQ3_M-class** (R1-Distill coherent).
+- **forward-fixed, pending chat-template wiring:** qwen3moe, V2-Lite (both real tokens; serving path needs per-model chat template applied for coherent instruct output).
+- **still parked (narrowed):** gemma3 — embed dtype was necessary but not sufficient; remaining gemma-specifics to check: attention logit soft-cap, `query_pre_attn_scalar` scaling, per-layer sliding-window alternation. Code work on kokonoe.
+
+### Commits (root-cause arc)
+Q3_K upload arm · gemma3 lm_head fallback · gemma3 embed scale · Q3_K expert kernel ·
+Q5_K expert kernel · **dtype-aware token_embd dequant (the root-cause fix)**
