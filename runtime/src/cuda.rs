@@ -1300,21 +1300,32 @@ extern "C" __device__ float yarn_correction_dim(
            / (2.0f * logf(base));
 }
 
+// `i` is the rotary PAIR index (0 .. head_dim/2).  Reference: llama.cpp
+// `rope_yarn_corr_dims` + `rope_yarn_ramp` and HF DeepSeek-V2 `yarn`.  The
+// correction dims are decreasing in num_rotations, so corr_dim(beta_fast) is
+// the LOW end and corr_dim(beta_slow) is the HIGH end of the ramp:
+//   low  = floor(corr_dim(beta_fast))   (clamped >= 0)
+//   high = ceil (corr_dim(beta_slow))   (clamped <= head_dim - 1)
+//   ramp = clip((i - low) / (high - low), 0, 1)
+//   scale_factor = (1 - ramp) + ramp / s
+// Small i (high freq) → ramp 0 → extrapolate (scale 1); large i (low freq) →
+// ramp 1 → interpolate (scale 1/s).
+//
+// NB: the prior version (a) compared the FULL-dim index 2*i instead of the
+// pair index, and (b) named the bounds backwards so `high - low` was negative
+// and got clamped to 1e-3 — collapsing the ramp into a misplaced step.  That
+// corrupted ~1/3 of the rope frequency pairs (the YaRN-only path that
+// DeepSeek-V2-Lite uniquely exercises).
 extern "C" __device__ float yarn_scale_factor(
     int i, int head_dim, float base, float yarn_s,
     float yarn_orig_ctx, float yarn_beta_fast, float yarn_beta_slow)
 {
-    float i_high = yarn_correction_dim(yarn_beta_fast, (float)head_dim, base, yarn_orig_ctx);
-    float i_low  = yarn_correction_dim(yarn_beta_slow, (float)head_dim, base, yarn_orig_ctx);
-    // The ramp goes from "no interpolation" (small i, high freq, ramp=0) to
-    // "full interpolation" (large i, low freq, ramp=1).  HF/llama.cpp use:
-    //   ramp = clip((i - i_low) / (i_high - i_low), 0, 1)  — but with the
-    //   roles flipped depending on which end is "high freq".  In this
-    //   parametrization (i increases → lower freq → longer wavelength):
-    //     ramp = clip((i - i_low) / (i_high - i_low), 0, 1)
-    //     scale_factor = (1 - ramp) + ramp / s
-    float denom = fmaxf(i_high - i_low, 1e-3f);
-    float ramp = ((float)i - i_low) / denom;
+    float low  = floorf(yarn_correction_dim(yarn_beta_fast, (float)head_dim, base, yarn_orig_ctx));
+    float high = ceilf (yarn_correction_dim(yarn_beta_slow, (float)head_dim, base, yarn_orig_ctx));
+    low  = fmaxf(low, 0.0f);
+    high = fminf(high, (float)(head_dim - 1));
+    float denom = fmaxf(high - low, 1e-3f);
+    float ramp = ((float)i - low) / denom;
     ramp = fmaxf(0.0f, fminf(1.0f, ramp));
     return (1.0f - ramp) + ramp / yarn_s;
 }
@@ -1335,10 +1346,8 @@ extern "C" __global__ void mla_rope_q_partial_yarn(
     int i = idx - h * hd_half;
     int base_off = h * qk_head_dim + qk_nope_head_dim;
     float pos = (float)step_args[0];
-    // For YaRN, the per-pair dim index used in correction_dim is the
-    // half-index doubled (i.e. 2*i), which corresponds to the "true" rotary
-    // frequency index in [0, qk_rope_head_dim).
-    float scale_factor = yarn_scale_factor(2 * i, qk_rope_head_dim, base,
+    // `i` is the rotary pair index — exactly what the ramp expects.
+    float scale_factor = yarn_scale_factor(i, qk_rope_head_dim, base,
         yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow);
     float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
     float theta = pos * scale_factor * powf(base, exp);
@@ -1361,7 +1370,7 @@ extern "C" __global__ void mla_rope_k_shared_yarn(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hd_half) return;
     float pos = (float)step_args[0];
-    float scale_factor = yarn_scale_factor(2 * i, qk_rope_head_dim, base,
+    float scale_factor = yarn_scale_factor(i, qk_rope_head_dim, base,
         yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow);
     float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
     float theta = pos * scale_factor * powf(base, exp);

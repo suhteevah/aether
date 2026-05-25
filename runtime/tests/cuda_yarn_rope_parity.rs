@@ -24,19 +24,29 @@ use aether_rt::cuda::{
 
 // ----- CPU reference matching the kernel exactly -----
 
+// Independent reference — derived from the HF DeepSeek-V2 `yarn` /
+// llama.cpp `rope_yarn_corr_dims` + `rope_yarn_ramp` formulas, NOT copied from
+// the kernel.  (The previous version of this file copied the kernel's buggy
+// `(i_high - i_low).max(1e-3)` step verbatim, so it validated the bug against
+// itself.  See `yarn_scale_factor_reference_anchors` for the hand-computed
+// values this reference must reproduce.)
 fn yarn_correction_dim(num_rotations: f32, head_dim: f32, base: f32, orig_ctx: f32) -> f32 {
     let two_pi = 2.0 * std::f32::consts::PI;
     head_dim * (orig_ctx / (num_rotations * two_pi)).ln() / (2.0 * base.ln())
 }
 
+/// `i` is the rotary PAIR index in `[0, head_dim/2)`.
 fn yarn_scale_factor(
     i: i32, head_dim: i32, base: f32, yarn_s: f32,
     orig_ctx: f32, beta_fast: f32, beta_slow: f32,
 ) -> f32 {
-    let i_high = yarn_correction_dim(beta_fast, head_dim as f32, base, orig_ctx);
-    let i_low  = yarn_correction_dim(beta_slow, head_dim as f32, base, orig_ctx);
-    let denom = (i_high - i_low).max(1e-3);
-    let ramp = ((i as f32 - i_low) / denom).clamp(0.0, 1.0);
+    // corr_dim is decreasing in num_rotations → beta_fast gives the LOW end.
+    let low  = yarn_correction_dim(beta_fast, head_dim as f32, base, orig_ctx)
+        .floor().max(0.0);
+    let high = yarn_correction_dim(beta_slow, head_dim as f32, base, orig_ctx)
+        .ceil().min((head_dim - 1) as f32);
+    let denom = (high - low).max(1e-3);
+    let ramp = ((i as f32 - low) / denom).clamp(0.0, 1.0);
     (1.0 - ramp) + ramp / yarn_s
 }
 
@@ -48,7 +58,7 @@ fn rope_k_shared_yarn_cpu(
     let d = k_rope.len() as i32;
     let hd_half = d / 2;
     for i in 0..hd_half {
-        let scale = yarn_scale_factor(2 * i, d, base, yarn_s, orig_ctx,
+        let scale = yarn_scale_factor(i, d, base, yarn_s, orig_ctx,
             beta_fast, beta_slow);
         let exp = -2.0 * (i as f32) / (d as f32);
         let theta = pos * scale * base.powf(exp);
@@ -71,7 +81,7 @@ fn rope_q_partial_yarn_cpu(
     for h in 0..n_heads {
         let base_off = (h * qk_head_dim + nope_dim) as usize;
         for i in 0..hd_half {
-            let scale = yarn_scale_factor(2 * i, rope_dim, base, yarn_s,
+            let scale = yarn_scale_factor(i, rope_dim, base, yarn_s,
                 orig_ctx, beta_fast, beta_slow);
             let exp = -2.0 * (i as f32) / (rope_dim as f32);
             let theta = pos * scale * base.powf(exp);
@@ -150,6 +160,40 @@ fn run_q_partial_gpu(
         aether_dev_free_f32(q_dev);
         aether_dev_free_i32(sa_dev);
         out
+    }
+}
+
+#[test]
+fn yarn_scale_factor_reference_anchors() {
+    // Hand-computed against the HF/llama.cpp YaRN formula for DeepSeek-V2-Lite
+    // (rope_dim=64, base=1e4, s=40, orig_ctx=4096, beta_fast=32, beta_slow=1):
+    //   corr_dim(32) = 10.472 -> floor -> low  = 10
+    //   corr_dim(1)  = 22.514 -> ceil  -> high = 23   (denom = 13)
+    //   scale(i) = (1 - ramp) + ramp/40,  ramp = clip((i - 10) / 13, 0, 1)
+    // These values are independent of the kernel; if a future refactor
+    // re-breaks the ramp (e.g. swaps the bounds or doubles the index), this
+    // test fails before any GPU work runs.
+    let (base, s, oc, bf, bs) = (10_000.0f32, 40.0f32, 4096.0f32, 32.0f32, 1.0f32);
+    let sf = |i: i32| yarn_scale_factor(i, 64, base, s, oc, bf, bs);
+    let cases = [
+        (0i32,  1.0f32),     // high freq -> pure extrapolation
+        (5,     1.0),        // still below the ramp
+        (10,    1.0),        // ramp start (ramp = 0)
+        (16,    0.550_0),    // mid ramp: 0.53846 + 0.46154/40
+        (23,    0.025),      // ramp end (ramp = 1) -> 1/s
+        (31,    0.025),      // clamped past the end
+    ];
+    for (i, want) in cases {
+        let got = sf(i);
+        assert!((got - want).abs() < 1e-3,
+            "yarn scale_factor(i={i}) = {got:.6}, want {want:.6}");
+    }
+    // Monotone non-increasing across the band (high freq -> low freq).
+    let mut prev = f32::INFINITY;
+    for i in 0..32 {
+        let v = sf(i);
+        assert!(v <= prev + 1e-6, "scale_factor not monotone at i={i}: {v} > {prev}");
+        prev = v;
     }
 }
 
