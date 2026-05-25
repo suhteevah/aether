@@ -2414,6 +2414,13 @@ impl QwenSession {
             row_f32.as_mut_ptr() as *mut c_void,
             blocks_per_row as c_int,
         );
+        // Gemma scales input embeddings by sqrt(d_model) (llama.cpp `inp_scale`);
+        // without it the residual stream is ~sqrt(d) too small and the forward
+        // produces degenerate logits (vocab-1/pad). Other archs use no scale.
+        if self.cfg.arch == "gemma3" {
+            let s = (self.cfg.d_model as f32).sqrt();
+            for v in row_f32.iter_mut() { *v *= s; }
+        }
         row_f32
     }
 
