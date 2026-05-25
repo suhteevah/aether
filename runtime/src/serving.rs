@@ -2309,6 +2309,20 @@ impl QwenSession {
             eprintln!("[QwenSession] arch={} layers={} d_model={} heads_q={} heads_kv={} head_dim={} d_ff={} vocab={} rope={} eps={:.2e}",
                 cfg.arch, cfg.n_layers, cfg.d_model, cfg.n_q_heads, cfg.n_kv_heads,
                 cfg.head_dim, cfg.d_ff, cfg.vocab, cfg.rope_base, cfg.norm_eps);
+            // YaRN diagnostic — surfaces the exact mscale inputs so an
+            // incoherent-decode smoke can tell at a glance whether the GGUF
+            // metadata was read.  mscale = 1 + yarn_log_multiplier*ln(factor)
+            // (llama.cpp writes yarn_log_multiplier = 0.1*mscale_all_dim, so
+            // for DeepSeek-V2-Lite this is 0.0707 → mscale≈1.261, and the
+            // attention softmax scale carries mscale²≈1.589).  If log_mul
+            // prints 0.0 here, the key wasn't read and the attention
+            // temperature is silently missing — a real bug.
+            if cfg.yarn_factor > 1.0 {
+                let mscale = 1.0 + cfg.yarn_log_multiplier * cfg.yarn_factor.ln();
+                eprintln!("[QwenSession] YaRN: factor={} log_mul={} orig_ctx={} beta=({},{}) -> mscale={:.4} mscale^2={:.4}",
+                    cfg.yarn_factor, cfg.yarn_log_multiplier, cfg.yarn_orig_ctx,
+                    cfg.yarn_beta_fast, cfg.yarn_beta_slow, mscale, mscale * mscale);
+            }
             // Kernel constraints (FR-17-extra-runtime-shape).  The fused
             // kernels work for any Qwen-style shape that satisfies these
             // bounds.  Everything else (n_layers, d_model, d_ff, vocab)
