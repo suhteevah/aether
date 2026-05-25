@@ -2147,7 +2147,19 @@ impl QwenSession {
 
             let blocks: Vec<BlockGpu> = (0..cfg.n_layers).map(|b| load_block(h, b)).collect();
             let final_norm_g = upload_f32_tensor(h, "output_norm.weight");
-            let (lm_head, lm_n_blocks, lm_dt) = upload_tensor_u8(h, "output.weight");
+            // Most archs ship an explicit `output.weight` lm head. Gemma3 (and other
+            // tied-embedding archs) omit it and reuse `token_embd.weight` as the lm
+            // head (logits = hidden @ token_embd^T). Fall back to token_embd when
+            // output.weight is absent rather than panicking.
+            let (lm_head, lm_n_blocks, lm_dt) = {
+                let (oh, on, odt) = upload_tensor_u8_opt(h, "output.weight");
+                if oh != 0 {
+                    (oh, on, odt)
+                } else {
+                    eprintln!("[QwenSession] output.weight absent (tied embeddings) — using token_embd.weight as lm head");
+                    upload_tensor_u8(h, "token_embd.weight")
+                }
+            };
 
             // FR-17-extra-mla-fwd: MLA archs (deepseek2, glm-4.7-flash) need
             // bigger Q (per-head qk_head_dim instead of head_dim) and an
