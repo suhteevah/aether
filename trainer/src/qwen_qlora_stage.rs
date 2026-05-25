@@ -238,11 +238,13 @@ pub struct QwenQLoraStage {
     rank_lo: usize,
     // cached dims
     t: usize,
-    // last-rank real LM head (loaded on demand): output_norm (f32) + output.weight (Q6_K)
+    // last-rank real LM head (loaded on demand): output_norm (f32) + output.weight
+    // (Q6_K) split into vocab-row CHUNKS so the f32 dequant transient stays small
+    // (~190 MB/chunk vs ~3.1 GB for the whole weight) — fits the 16 GB P100.
     lm_norm: i64,
-    lm_w: i64,
-    lm_dt: i32,
-    lm_nb: usize, // n super-blocks per vocab row
+    lm_chunks: Vec<i64>,     // per-chunk Q6_K u8 device handles
+    lm_chunk_rows: Vec<usize>, // vocab rows in each chunk
+    lm_nb_row: usize,        // super-blocks per vocab row (d/256)
 }
 
 impl QwenQLoraStage {
@@ -277,7 +279,7 @@ impl QwenQLoraStage {
             layers.first().map(|l| l.ad_q.n_params() + l.ad_k.n_params() + l.ad_v.n_params()
                 + l.ad_o.n_params() + l.ad_gate.n_params() + l.ad_up.n_params() + l.ad_down.n_params()).unwrap_or(0));
         Ok(QwenQLoraStage { cfg, gguf_handle: h, layers, fifo: VecDeque::new(), rank_lo, t,
-                            lm_norm: 0, lm_w: 0, lm_dt: 0, lm_nb: 0 })
+                            lm_norm: 0, lm_chunks: Vec::new(), lm_chunk_rows: Vec::new(), lm_nb_row: 0 })
     }
 
     pub fn n_layers(&self) -> usize { self.layers.len() }
@@ -544,56 +546,97 @@ impl QwenQLoraStage {
             assert!(wi >= 0, "[qlora] output.weight missing");
             let dt = aether_gguf_get_tensor_dtype(self.gguf_handle, wi);
             assert_eq!(dt, 14, "[qlora] lm_head dtype {} != Q6_K(14); add dispatch", dt);
-            let wne = aether_gguf_get_tensor_n_elems(self.gguf_handle, wi) as usize;
-            let nblocks = wne / 256;
-            let bytes = nblocks * 210; // Q6_K block = 210 bytes / 256 elems
-            let wp = aether_gguf_get_tensor_data_ptr(self.gguf_handle, wi);
-            self.lm_w = aether_dev_alloc_u8(bytes as c_int);
-            aether_dev_h2d_u8(wp, self.lm_w, bytes as c_int);
-            self.lm_dt = dt;
-            self.lm_nb = nblocks / vocab; // super-blocks per row (d/256)
-            eprintln!("[qlora] lm_head loaded: output.weight Q6_K {}x{} ({} blocks), output_norm f32[{}]",
-                vocab, d, nblocks, ne);
+            let nb_row = d / 256;             // super-blocks per vocab row
+            let bytes_row = nb_row * 210;     // Q6_K: 210 bytes / 256-elem block
+            let wp = aether_gguf_get_tensor_data_ptr(self.gguf_handle, wi) as *const u8;
+            self.lm_nb_row = nb_row;
+            // Split the vocab rows into ~16 chunks; upload each chunk's bytes as a
+            // separate Q6_K device buffer so the dequant transient is per-chunk.
+            let n_chunks = 16usize;
+            let rows_per = (vocab + n_chunks - 1) / n_chunks;
+            let mut r0 = 0usize;
+            while r0 < vocab {
+                let r1 = (r0 + rows_per).min(vocab);
+                let rows = r1 - r0;
+                let chunk_bytes = rows * bytes_row;
+                let h = aether_dev_alloc_u8(chunk_bytes as c_int);
+                aether_dev_h2d_u8(wp.add(r0 * bytes_row) as i64, h, chunk_bytes as c_int);
+                self.lm_chunks.push(h);
+                self.lm_chunk_rows.push(rows);
+                r0 = r1;
+            }
+            eprintln!("[qlora] lm_head loaded: output.weight Q6_K {}x{} in {} chunks (~{} rows ea), output_norm f32[{}]",
+                vocab, d, self.lm_chunks.len(), rows_per, ne);
         }
     }
 
-    /// (lm_norm, lm_w, lm_nb) handles for the free-fn loss (run_1f1b's loss closure
-    /// can't borrow the stage, which is already &mut-borrowed by the driver).
-    pub fn lm_handles(&self) -> (i64, i64, usize) { (self.lm_norm, self.lm_w, self.lm_nb) }
+    /// Handles the free-fn loss needs (run_1f1b's loss closure can't borrow the
+    /// &mut stage). Returns (lm_norm, chunk handles, chunk row counts, nb_per_row).
+    pub fn lm_handles(&self) -> (i64, Vec<i64>, Vec<usize>, usize) {
+        (self.lm_norm, self.lm_chunks.clone(), self.lm_chunk_rows.clone(), self.lm_nb_row)
+    }
 }
 
 /// Real next-token LM loss for hidden [T, D] (last rank). `targets[t]` is the
 /// gold token at position t (already shifted by the caller). Returns
 /// (mean CE, d_hidden[T*D]). Base lm_head is FROZEN (no weight grad). Free fn so
 /// run_1f1b's loss closure can call it without borrowing the &mut stage.
-pub fn lm_head_loss(lm_norm: i64, lm_w: i64, lm_nb: usize, vocab: usize, d: usize,
-                    t: usize, eps: f32, hidden: &[f32], targets: &[i32]) -> (f32, Vec<f32>) {
+pub fn lm_head_loss(lm_norm: i64, chunks: &[i64], chunk_rows: &[usize], nb_row: usize,
+                    vocab: usize, d: usize, t: usize, eps: f32,
+                    hidden: &[f32], targets: &[i32]) -> (f32, Vec<f32>) {
     assert_eq!(hidden.len(), t * d);
     let xb = upload(hidden);
     let xf = alloc(t * d);
     aether_op_rms_norm_f32_cuda(xb, lm_norm, xf, eps, ci(t), ci(d));
-    // Dequant the Q6_K lm head once to f32 [vocab, d] (transient ~vocab*d*4 B),
-    // then forward + backward via plain multi-row matmul. One dequant per step.
-    let wf = alloc(vocab * d);
-    aether_op_dequant_q6_k_f32_cuda(lm_w, wf, ci(lm_nb * vocab));
-    // logits[T,vocab] = xf[T,d] @ wf[vocab,d]^T  == matmul_backward_lhs(xf, wf, logits)
+    // FORWARD: build logits in [vocab, T] (logits_vt) so each chunk's rows are a
+    // CONTIGUOUS slice. Per chunk: dequant Wc[rows,d] (~190 MB transient) ->
+    // logits_vt[r0:r1,:] = Wc @ xf^T = matmul_backward_lhs(Wc, xf, scratch, rows, T, d)
+    // -> d2d-copy scratch into logits_vt at the row offset (opaque handles can't be
+    // written at an offset directly).
+    let max_rows = *chunk_rows.iter().max().unwrap();
+    let logits_vt = alloc(vocab * t);
+    let scratch = alloc(max_rows * t);
+    let mut r0 = 0usize;
+    for (i, &rows) in chunk_rows.iter().enumerate() {
+        let wc = alloc(rows * d);
+        aether_op_dequant_q6_k_f32_cuda(chunks[i], wc, ci(nb_row * rows));
+        aether_op_matmul_backward_lhs_f32_cuda(wc, xf, scratch, ci(rows), ci(t), ci(d));
+        aether_rt::cuda::aether_dev_d2d_f32_offset(scratch, 0, logits_vt, (r0 * t) as c_int, (rows * t) as c_int);
+        aether_dev_free_f32(wc); r0 += rows;
+    }
+    // transpose [vocab, T] -> [T, vocab] for CE (treat as [vocab, T, 1]).
     let logits = alloc(t * vocab);
-    aether_op_matmul_backward_lhs_f32_cuda(xf, wf, logits, ci(t), ci(vocab), ci(d));
+    aether_op_transpose_021_f32_cuda(logits_vt, logits, ci(vocab), ci(t), 1);
     let tgt = aether_dev_alloc_i32(ci(t));
     unsafe { aether_dev_h2d_i32(targets.as_ptr() as i64, tgt, ci(t)); }
     let probs = alloc(t * vocab);
     let loss = aether_op_cross_entropy_f32_cuda(logits, tgt, probs, ci(t), ci(vocab));
     let d_logits = alloc(t * vocab);
     aether_op_cross_entropy_backward_f32_cuda(probs, tgt, d_logits, ci(t), ci(vocab));
-    // d_xf = d_logits[T,vocab] @ wf[vocab,d]  (frozen lm head, no dW)
-    let d_xf = alloc(t * d);
-    aether_op_matmul_f32_cuda(d_logits, wf, d_xf, ci(t), ci(vocab), ci(d));
-    aether_dev_free_f32(wf);
+    // transpose dlogits [T,vocab] -> [vocab,T] for chunked backward.
+    let d_logits_vt = alloc(vocab * t);
+    aether_op_transpose_021_f32_cuda(d_logits, d_logits_vt, ci(t), ci(vocab), 1);
+    // BACKWARD: dxf[T,d] = sum_chunks d_logits_vt[r0:r1,:]^T @ Wc[rows,d]
+    //   = matmul_backward_rhs(dl_vt_chunk[rows,T], Wc[rows,d], dxf_part[T,d], rows, T, d)
+    let dxf = alloc(t * d);
+    let dl_scratch = alloc(max_rows * t);
+    let dxf_part = alloc(t * d);
+    r0 = 0;
+    for (i, &rows) in chunk_rows.iter().enumerate() {
+        let wc = alloc(rows * d);
+        aether_op_dequant_q6_k_f32_cuda(chunks[i], wc, ci(nb_row * rows));
+        aether_rt::cuda::aether_dev_d2d_f32_offset(d_logits_vt, (r0 * t) as c_int, dl_scratch, 0, (rows * t) as c_int);
+        aether_op_matmul_backward_rhs_f32_cuda(dl_scratch, wc, dxf_part, ci(rows), ci(t), ci(d));
+        aether_op_add_inplace_f32_cuda(dxf, dxf_part, ci(t * d));
+        aether_dev_free_f32(wc); r0 += rows;
+    }
     let d_xb = alloc(t * d); let inv = alloc(t);
-    aether_op_rms_norm_backward_dx_f32_cuda(xb, lm_norm, d_xf, d_xb, inv, eps, ci(t), ci(d));
+    aether_op_rms_norm_backward_dx_f32_cuda(xb, lm_norm, dxf, d_xb, inv, eps, ci(t), ci(d));
     let dh = download(d_xb, t * d);
     unsafe { aether_dev_sync(); }
-    for h in [xb, xf, logits, probs, d_logits, d_xf, d_xb, inv] { aether_dev_free_f32(h); }
+    for h in [xb, xf, logits_vt, scratch, logits, probs, d_logits, d_logits_vt, dxf, dl_scratch, dxf_part, d_xb, inv] {
+        aether_dev_free_f32(h);
+    }
     aether_rt::cuda::aether_dev_free_i32(tgt);
     (loss, dh)
 }

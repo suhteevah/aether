@@ -157,7 +157,7 @@ fn main() {
         }).collect();
         eprintln!("[pp-qlora rank {}] REAL data: {} tokens, t={} microbatch={} steps={}", rank, ntok, t, microbatch, steps);
         if is_last { stage.load_lm_head(); }
-        let (lm_norm, lm_w, lm_nb) = stage.lm_handles();
+        let (lm_norm, lm_chunks, lm_chunk_rows, lm_nb_row) = stage.lm_handles();
 
         for s in 0..steps {
             // rank 0: precompute embeddings for each microbatch window.
@@ -178,7 +178,7 @@ fn main() {
 
             let losses = run_1f1b(&mut stage, rank, world, &links, microbatch, lr, (s + 1) as i64,
                 |mb| emb[mb].clone(),
-                |mb, out| lm_head_loss(lm_norm, lm_w, lm_nb, vocab, d, t, eps, out, &tgts[mb]));
+                |mb, out| lm_head_loss(lm_norm, &lm_chunks, &lm_chunk_rows, lm_nb_row, vocab, d, t, eps, out, &tgts[mb]));
             if is_last {
                 let mean = losses.iter().sum::<f32>() / losses.len() as f32;
                 if s == 0 { first = mean; }
