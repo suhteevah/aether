@@ -63,6 +63,8 @@ struct CudaCtx {
     rope_apply_backward:CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     gqa_reduce_kv_grad:CudaFunction,
+    embed_lookup:      CudaFunction,
+    embed_scatter_add: CudaFunction,
     silu_inplace:      CudaFunction,
     silu_bwd:          CudaFunction,
     transpose_021:     CudaFunction,
@@ -1970,6 +1972,41 @@ extern "C" __global__ void cross_entropy_bwd(
     float v = probs[i] * inv_b;
     if (col == labels[row]) v -= inv_b;
     dlogits[i] = v;
+}
+
+// matt-voice FR-18.6-real leg 2 — embedding lookup (token-id gather).
+// out[t, d] = table[ids[t] * D + d]. table is [V, D] row-major, ids is [T].
+// One thread per (t, d) of the [T, D] output.
+//
+// roadmap: P18
+extern "C" __global__ void embed_lookup(
+    const float* __restrict__ table, const int* __restrict__ ids,
+    float* __restrict__ out, int T, int D)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * D) return;
+    int t = idx / D;
+    int d = idx - t * D;
+    int id = ids[t];
+    out[idx] = table[id * D + d];
+}
+
+// matt-voice FR-18.6-real leg 2 — embedding backward (scatter-add).
+// Gradient of the gather: d_table[ids[t]*D + d] += d_out[t, d]. Distinct t can
+// share an id, so accumulate with atomicAdd. d_table must be zeroed first.
+// One thread per (t, d) of the [T, D] upstream grad.
+//
+// roadmap: P18
+extern "C" __global__ void embed_scatter_add(
+    const float* __restrict__ d_out, const int* __restrict__ ids,
+    float* __restrict__ d_table, int T, int D)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= T * D) return;
+    int t = idx / D;
+    int d = idx - t * D;
+    int id = ids[t];
+    atomicAdd(&d_table[id * D + d], d_out[idx]);
 }
 
 // Fused softmax-backward + in-place scale. Used by the attention-backward
@@ -5258,6 +5295,7 @@ fn ctx() -> &'static CudaCtx {
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv", "gqa_reduce_kv_grad",
+              "embed_lookup", "embed_scatter_add",
               "silu_inplace", "silu_bwd", "transpose_021", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
@@ -5310,6 +5348,8 @@ fn ctx() -> &'static CudaCtx {
         let rope_apply_backward   = device.get_func("aether_kernels", "rope_apply_backward").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let gqa_reduce_kv_grad    = device.get_func("aether_kernels", "gqa_reduce_kv_grad").unwrap();
+        let embed_lookup          = device.get_func("aether_kernels", "embed_lookup").unwrap();
+        let embed_scatter_add     = device.get_func("aether_kernels", "embed_scatter_add").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
         let silu_bwd              = device.get_func("aether_kernels", "silu_bwd").unwrap();
         let transpose_021         = device.get_func("aether_kernels", "transpose_021").unwrap();
@@ -5359,6 +5399,7 @@ fn ctx() -> &'static CudaCtx {
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
                   rope_apply, rope_apply_backward, gqa_repeat_kv, gqa_reduce_kv_grad,
+                  embed_lookup, embed_scatter_add,
                   silu_inplace, silu_bwd, transpose_021, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
@@ -8008,6 +8049,50 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().gqa_reduce_kv_grad.clone()
             .launch(cfg, (ov, iv, seq, n_kv_heads, head_dim, n_q_heads))
             .expect("launch gqa_reduce_kv_grad");
+    }
+    0
+}
+
+/// matt-voice FR-18.6-real leg 2 — embedding lookup. out[T,D] = table[ids[t],:].
+/// `table` is an f32 handle [V*D], `ids_i32` an i32 handle [T], `out` f32 [T*D].
+#[no_mangle] pub extern "C" fn aether_op_embed_lookup_f32_cuda(
+    table: i64, ids_i32: i64, out: i64, t: c_int, d: c_int,
+) -> c_int {
+    let (Some(itab), Some(iout)) = (handle_to_idx(table), handle_to_idx(out))
+        else { return -1; };
+    let Some(iids) = handle_to_i32_idx(ids_i32) else { return -1; };
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let tab_p = bs[itab].as_ref().unwrap() as *const CudaSlice<f32>;
+    let out_p = bs[iout].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let ids_p = ibs[iids].as_ref().unwrap() as *const CudaSlice<i32>;
+    let cfg = LaunchConfig::for_num_elems((t * d) as u32);
+    unsafe {
+        let tab = &*tab_p; let outv = &mut *out_p; let ids = &*ids_p;
+        ctx().embed_lookup.clone().launch(cfg, (tab, ids, outv, t, d))
+            .expect("launch embed_lookup");
+    }
+    0
+}
+
+/// matt-voice FR-18.6-real leg 2 — embedding backward (scatter-add).
+/// d_table[ids[t],:] += d_out[t,:]. `d_table` must be pre-zeroed (atomicAdd).
+#[no_mangle] pub extern "C" fn aether_op_embed_scatter_add_f32_cuda(
+    d_out: i64, ids_i32: i64, d_table: i64, t: c_int, d: c_int,
+) -> c_int {
+    let (Some(idout), Some(idtab)) = (handle_to_idx(d_out), handle_to_idx(d_table))
+        else { return -1; };
+    let Some(iids) = handle_to_i32_idx(ids_i32) else { return -1; };
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let dout_p = bs[idout].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dtab_p = bs[idtab].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let ids_p = ibs[iids].as_ref().unwrap() as *const CudaSlice<i32>;
+    let cfg = LaunchConfig::for_num_elems((t * d) as u32);
+    unsafe {
+        let dout = &*dout_p; let dtab = &mut *dtab_p; let ids = &*ids_p;
+        ctx().embed_scatter_add.clone().launch(cfg, (dout, ids, dtab, t, d))
+            .expect("launch embed_scatter_add");
     }
     0
 }
