@@ -34,6 +34,11 @@ name = "pp-qwen-worker"
 path = "src/bin/pp_qwen_worker.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "qlora-smoke"
+path = "src/bin/qlora_smoke.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 # `cuda`: enable cuBLAS/cuDNN routing in aether_rt + unlock the

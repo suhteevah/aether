@@ -10,5 +10,8 @@ pub mod sample;
 #[cfg(feature = "cuda")]
 pub mod qwen_stage;
 
+#[cfg(feature = "cuda")]
+pub mod qwen_qlora_stage;
+
 #[cfg(feature = "nccl")]
 pub mod dp;

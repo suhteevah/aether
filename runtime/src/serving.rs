@@ -570,6 +570,55 @@ struct BlockGpu {
     dt_gate_shexp: i32, dt_up_shexp: i32, dt_down_shexp: i32,
 }
 
+/// matt-voice FR-18.6-real leg 3 — public per-layer quant weights for a dense
+/// Qwen3 layer, consumed by the QLoRA pipeline trainer (trainer/qwen_qlora_stage).
+/// Handles are device-buffer slots (frozen base, kept QUANTIZED in VRAM); dtypes
+/// are GGUF quant codes (12=Q4_K, 14=Q6_K, 18=IQ3_XXS, ...). The trainer dequants
+/// each proj to a transient f32 buffer per forward (base stays quantized) and runs
+/// the f32 matmul ops; the adapter is the only trainable part. Norm gains are F32.
+///
+/// roadmap: P18
+pub struct QwenLayerWeights {
+    pub attn_norm_g: i64, pub ffn_norm_g: i64,
+    pub attn_q_norm_g: i64, pub attn_k_norm_g: i64, // Qwen3 per-head Q/K RMSNorm (0=absent)
+    pub w_q: i64, pub w_k: i64, pub w_v: i64, pub w_o: i64,
+    pub w_gate: i64, pub w_up: i64, pub w_down: i64,
+    pub dt_q: i32, pub dt_k: i32, pub dt_v: i32, pub dt_o: i32,
+    pub dt_gate: i32, pub dt_up: i32, pub dt_down: i32,
+}
+
+/// Open a GGUF and read its ModelConfig. Returns (gguf_handle, cfg). The handle
+/// stays valid for subsequent `load_qwen_layer` calls.
+///
+/// roadmap: P18
+pub unsafe fn open_gguf_config(path: &str) -> Result<(i64, ModelConfig), String> {
+    if !std::path::Path::new(path).exists() {
+        return Err(format!("GGUF not found: {}", path));
+    }
+    aether_dev_init();
+    let h = aether_gguf_open(path.as_ptr() as i64, path.len() as c_int);
+    if h < 0 { return Err(format!("aether_gguf_open failed: {}", h)); }
+    let cfg = ModelConfig::from_gguf(h);
+    Ok((h, cfg))
+}
+
+/// Load one dense-Qwen3 layer's quant weights to device (frozen base). Reuses the
+/// internal `load_block`; any layer index works independently, so a pipeline rank
+/// can load just its range (e.g. 32..64).
+///
+/// roadmap: P18
+pub unsafe fn load_qwen_layer(h: i64, b: usize) -> QwenLayerWeights {
+    let bw = load_block(h, b);
+    QwenLayerWeights {
+        attn_norm_g: bw.attn_norm_g, ffn_norm_g: bw.ffn_norm_g,
+        attn_q_norm_g: bw.attn_q_norm_g, attn_k_norm_g: bw.attn_k_norm_g,
+        w_q: bw.w_q, w_k: bw.w_k, w_v: bw.w_v, w_o: bw.w_o,
+        w_gate: bw.w_gate, w_up: bw.w_up, w_down: bw.w_down,
+        dt_q: bw.dt_q, dt_k: bw.dt_k, dt_v: bw.dt_v, dt_o: bw.dt_o,
+        dt_gate: bw.dt_gate, dt_up: bw.dt_up, dt_down: bw.dt_down,
+    }
+}
+
 struct ActivationGpu {
     x: i64, x_norm: i64,
     q: i64, k_step: i64, v_step: i64,
