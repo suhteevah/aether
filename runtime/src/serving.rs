@@ -3135,6 +3135,13 @@ impl QwenSession {
                 Ok(s) => s.to_string(),
                 Err(_) => return String::new(),
             };
+            // SentencePiece detokenization: the decode_table already holds raw
+            // UTF-8 token bytes (e.g. "▁The"), so just turn the ▁ (U+2581) word
+            // boundary back into a space.  The GPT-2 byte remap below is for
+            // byte-level BPE vocabs only and would drop ▁ → no spaces.
+            if self.spm.is_some() {
+                return surface.replace('\u{2581}', " ");
+            }
             // GPT-2 inverse byte mapping: surface "Ġ" → byte 0x20, etc.
             let real_bytes: Vec<u8> = surface.chars()
                 .filter_map(|c| self.gpt2_u2b.get(&c).copied())
@@ -3347,7 +3354,11 @@ impl QwenSession {
 
     pub fn encode_text_with_specials(&self, text: &str) -> Vec<usize> {
         let ids = self.encode_text_with_specials_inner(text);
-        self.maybe_prepend_bos(ids)
+        let ids = self.maybe_prepend_bos(ids);
+        if std::env::var("AETHER_DUMP_TOK").is_ok() {
+            eprintln!("[encode] {} ids: {:?}", ids.len(), ids);
+        }
+        ids
     }
 
     fn encode_text_with_specials_inner(&self, text: &str) -> Vec<usize> {
