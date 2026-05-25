@@ -99,6 +99,7 @@ use crate::cuda::{
     aether_op_fused_q5_0_expert_matmul_seq1_cuda,
     aether_op_fused_iq3_s_expert_matmul_seq1_cuda,
     aether_op_fused_q3_k_expert_matmul_seq1_cuda,
+    aether_op_fused_q6_k_expert_matmul_seq1_cuda,
     aether_op_fused_q5_k_expert_matmul_seq1_cuda,
     aether_op_fused_iq4_xs_expert_matmul_seq1_cuda,
     aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda,
@@ -250,9 +251,23 @@ pub struct ModelConfig {
     pub n_experts_used: usize,
     /// FR-17-extra-gemma-fwd: sliding-window attention scope.  0 = full
     /// attention (default).  > 0 = restrict attention to last N positions.
-    /// Gemma3 specifically alternates sliding/full per layer (per-layer
-    /// alternation is a future refinement; today this is a uniform setting).
+    /// On gemma3 this applies only to LOCAL layers (see sliding_window_pattern);
+    /// global layers use full attention regardless.
     pub sliding_window: i32,
+    /// (a) gemma3 interleaved local/global attention.  0 = uniform attention
+    /// across all layers (every arch except gemma3).  >0 = every Nth layer
+    /// (the LAST of each group of N, i.e. `il % N == N-1`) is a GLOBAL
+    /// full-attention layer; the other N-1 are LOCAL sliding-window layers.
+    /// Gemma3 sets this to 6 (5 local : 1 global).  Read from
+    /// `<arch>.attention.sliding_window_pattern`.  Matches llama.cpp
+    /// `hparams.is_swa(il)` / `set_swa_pattern`.
+    pub sliding_window_pattern: i32,
+    /// (a) gemma3 dual RoPE base.  LOCAL (sliding-window) layers use this
+    /// smaller base; GLOBAL layers use `rope_base`.  Gemma3: local=10000,
+    /// global=1000000.  Read from `<arch>.rope.freq_base_swa`
+    /// (LLM_KV_ROPE_FREQ_BASE_SWA); defaults to 10000 for gemma3 when the key
+    /// is absent, else to `rope_base` (no per-layer difference).
+    pub rope_base_swa: f32,
     /// FR-17-extra-mla-fwd — DeepSeek-V2 Multi-head Latent Attention.
     /// 0 = standard attention (default).  >0 = use MLA with this latent KV
     /// rank.  When > 0 the per-block tensor layout switches to (attn_kv_a_mqa,
@@ -328,6 +343,7 @@ impl ModelConfig {
             arch: "qwen2".to_string(),
             n_experts: 0, n_experts_used: 0,
             sliding_window: 0,
+            sliding_window_pattern: 0, rope_base_swa: ROPE_BASE,
             kv_lora_rank: 0, q_lora_rank: 0,
             qk_head_dim: 0, qk_rope_head_dim: 0, v_head_dim: 0,
             key_length_mla: 0, value_length_mla: 0,
@@ -395,6 +411,16 @@ impl ModelConfig {
         let sliding_window = read_meta_u32(gguf_handle,
             &format!("{}.attention.sliding_window", prefix))
             .map(|v| v as i32).unwrap_or(0);
+        // (a) gemma3 interleaved local/global attention.
+        let sliding_window_pattern = read_meta_u32(gguf_handle,
+            &format!("{}.attention.sliding_window_pattern", prefix))
+            .map(|v| v as i32).unwrap_or(0);
+        // (a) gemma3 dual RoPE base.  Local (sliding-window) layers use the
+        // SWA base; absent → 10000 for gemma3 (llama.cpp's gemma3 default),
+        // else fall back to the global rope_base (no per-layer difference).
+        let rope_base_swa = read_meta_f32(gguf_handle,
+            &format!("{}.rope.freq_base_swa", prefix))
+            .unwrap_or(if arch == "gemma3" { 10000.0 } else { rope_base });
         // FR-17-extra-mla-fwd — DeepSeek-V2 MLA keys.
         //   deepseek2.attention.kv_lora_rank      (e.g. 512)
         //   deepseek2.attention.q_lora_rank       (optional; absent for V2-Lite)
@@ -468,6 +494,7 @@ impl ModelConfig {
             d_ff, vocab, rope_base, norm_eps, arch,
             n_experts, n_experts_used,
             sliding_window,
+            sliding_window_pattern, rope_base_swa,
             kv_lora_rank, q_lora_rank,
             qk_head_dim, qk_rope_head_dim, v_head_dim,
             key_length_mla, value_length_mla,
@@ -483,6 +510,29 @@ impl ModelConfig {
     /// attention.  GLM-4.7-flash sets this; V2-Lite does not.
     pub fn is_mla_absorbed(&self) -> bool {
         self.key_length_mla > 0 && self.value_length_mla > 0
+    }
+
+    /// (a) gemma3 per-layer attention parameters.  Returns
+    /// `(rope_base, effective_sliding_window)` for layer `il`.
+    ///
+    /// gemma3 interleaves LOCAL (sliding-window, smaller rope base) and GLOBAL
+    /// (full-attention, larger rope base) layers.  With pattern N, the LAST
+    /// layer of each group of N is global (`il % N == N-1`); the rest are
+    /// local — matching llama.cpp `hparams.is_swa(il)` (`set_swa_pattern`).
+    /// For every other arch (`sliding_window_pattern == 0`) this is uniform:
+    /// `(rope_base, sliding_window)`, so behaviour is unchanged.
+    pub fn attn_layer_params(&self, il: usize) -> (f32, i32) {
+        if self.sliding_window_pattern > 0 {
+            let p = self.sliding_window_pattern as usize;
+            let is_local = (il % p) != (p - 1);
+            if is_local {
+                (self.rope_base_swa, self.sliding_window)
+            } else {
+                (self.rope_base, 0) // global layer: full attention
+            }
+        } else {
+            (self.rope_base, self.sliding_window)
+        }
     }
 }
 
@@ -993,6 +1043,7 @@ unsafe fn block_forward_devarg(
     paged_cfg: Option<(i64, i32)>,
     cfg: &ModelConfig,
     max_seq: usize,
+    layer_idx: usize,
 ) {
     let d_model = cfg.d_model as c_int;
     let d_kv = cfg.d_kv as c_int;
@@ -1019,7 +1070,7 @@ unsafe fn block_forward_devarg(
             (cfg.n_q_heads * cfg.v_head_dim as usize) as c_int
         }
     } else {
-        standard_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
+        standard_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq, layer_idx);
         // o-proj input = n_q_heads * head_dim (= d_model for Qwen/Llama; smaller
         // for Mistral Small 24B with explicit head_dim).
         n_q_heads * head_dim
@@ -1085,13 +1136,16 @@ unsafe fn standard_attention_forward(
     paged_cfg: Option<(i64, i32)>,
     cfg: &ModelConfig,
     max_seq: usize,
+    layer_idx: usize,
 ) {
     let d_model = cfg.d_model as c_int;
     let d_kv = cfg.d_kv as c_int;
     let n_q_heads = cfg.n_q_heads as c_int;
     let n_kv_heads = cfg.n_kv_heads as c_int;
     let head_dim = cfg.head_dim as c_int;
-    let rope_base = cfg.rope_base;
+    // (a) gemma3 per-layer RoPE base + sliding window (local vs global layer);
+    // uniform (cfg.rope_base, cfg.sliding_window) for every other arch.
+    let (rope_base, eff_sliding_window) = cfg.attn_layer_params(layer_idx);
     let norm_eps = cfg.norm_eps;
 
     // Q projection output = n_q_heads * head_dim (= d_model for Qwen/Llama,
@@ -1122,7 +1176,9 @@ unsafe fn standard_attention_forward(
     aether_op_rope_apply_devarg_f32_cuda(act.k_step,
         1, n_kv_heads, head_dim, rope_base, step_args);
     let scale: f32 = 1.0 / (cfg.head_dim as f32).sqrt();
-    let needs_flex = (cfg.head_dim % 32) != 0 || cfg.sliding_window > 0;
+    // gemma3 global layers force eff_sliding_window=0 (full attention) even
+    // though cfg.sliding_window > 0; local layers keep it.
+    let needs_flex = (cfg.head_dim % 32) != 0 || eff_sliding_window > 0;
     if let Some((page_table_dev, block_size)) = paged_cfg {
         aether_op_paged_append_kv_devarg_f32_cuda(
             act.k_step, act.v_step, kv.k_cache, kv.v_cache, page_table_dev,
@@ -1131,7 +1187,7 @@ unsafe fn standard_attention_forward(
             aether_op_paged_attention_flex_devarg_f32_cuda(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
                 n_q_heads, n_kv_heads, head_dim,
-                block_size, cfg.sliding_window, scale, max_seq as c_int, step_args);
+                block_size, eff_sliding_window, scale, max_seq as c_int, step_args);
         } else {
             aether_op_paged_attention_seq1_devarg_f32_cuda(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
@@ -1788,6 +1844,7 @@ const MOE_EXPERT_DISPATCH: &[ExpertDtype] = &[
     ExpertDtype { dt:  6, block_n_elems:  32, kernel: aether_op_fused_q5_0_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 21, block_n_elems: 256, kernel: aether_op_fused_iq3_s_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 11, block_n_elems: 256, kernel: aether_op_fused_q3_k_expert_matmul_seq1_cuda },
+    ExpertDtype { dt: 14, block_n_elems: 256, kernel: aether_op_fused_q6_k_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 13, block_n_elems: 256, kernel: aether_op_fused_q5_k_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 23, block_n_elems: 256, kernel: aether_op_fused_iq4_xs_expert_matmul_seq1_cuda },
     ExpertDtype { dt: 18, block_n_elems: 256, kernel: aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda },
@@ -2467,7 +2524,7 @@ impl QwenSession {
                 let step_host = [pos, cur_seq, 0i32, 0i32];
                 aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
                 for b in 0..self.cfg.n_layers {
-                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
                 }
             }
             aether_dev_sync();
@@ -2485,7 +2542,7 @@ impl QwenSession {
         let dump_blocks = std::env::var("AETHER_DUMP_BLOCKS").is_ok();
         for b in 0..self.cfg.n_layers {
             block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b],
-                self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+                self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
             // FR-17-extra-mla-fwd debug — dump `act.x` stats after each
             // block to bisect where NaN first appears in the V2-Lite
             // forward.  AETHER_DUMP_BLOCKS=1 to enable.  Adds one D2H
@@ -2527,7 +2584,7 @@ impl QwenSession {
         let rc = aether_dev_graph_begin();
         assert_eq!(rc, 0, "aether_dev_graph_begin failed: {}", rc);
         for b in 0..self.cfg.n_layers {
-            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
         }
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
@@ -2950,14 +3007,30 @@ fn argmax(logits: &[f32]) -> usize {
 /// `apply_per_arch_template` below.  Each is a TINY shape — just the
 /// role markers + content — sufficient to put the model in
 /// "respond as assistant" mode.
-fn apply_per_arch_template(arch: &str, messages: &[(String, String)]) -> Option<String> {
+/// Per-arch chat template renderer.
+///
+/// `mla_absorbed` disambiguates the two distinct chat formats that BOTH
+/// report `general.architecture == "deepseek2"`:
+///   * GLM-4.7-flash et al. set `key_length_mla`/`value_length_mla` (MLA
+///     absorbed) and use the GLM `[gMASK]<sop><|user|>...` wire format.
+///   * DeepSeek-Coder-V2-Lite / V2 are NON-absorbed and use the
+///     `User:`/`Assistant:` plain-text format.  Feeding it GLM's `<|user|>`
+///     markers (which aren't in its vocab) byte-encodes to garbage and was
+///     the source of V2-Lite's incoherent decode.
+fn apply_per_arch_template(
+    arch: &str,
+    mla_absorbed: bool,
+    messages: &[(String, String)],
+) -> Option<String> {
     if messages.is_empty() { return None; }
     let mut out = String::new();
     match arch {
-        // GLM / DeepSeek-v2 / DeepSeek-v3 family (architecture = "deepseek2"
-        // in the GGUF for GLM-4.7-flash + V2-Lite + V3).  Wire format:
+        // GLM family.  Architecture == "deepseek2" in the GGUF for
+        // GLM-4.7-flash, but ONLY the MLA-absorbed deepseek2 models use this
+        // wire format; non-absorbed deepseek2 (DeepSeek-Coder-V2) falls
+        // through to the DeepSeek-Coder branch below.  Wire format:
         //   [gMASK]<sop><|user|>{content}<|assistant|>{content}...<|assistant|>
-        "deepseek2" | "glm" | "glm4" => {
+        "glm" | "glm4" => {
             out.push_str("[gMASK]<sop>");
             for (role, content) in messages {
                 match role.as_str() {
@@ -2968,6 +3041,37 @@ fn apply_per_arch_template(arch: &str, messages: &[(String, String)]) -> Option<
                 }
             }
             out.push_str("<|assistant|>");
+        }
+        // "deepseek2" splits on MLA-absorbed: GLM (absorbed) vs
+        // DeepSeek-Coder-V2 (non-absorbed).
+        "deepseek2" if mla_absorbed => {
+            out.push_str("[gMASK]<sop>");
+            for (role, content) in messages {
+                match role.as_str() {
+                    "system"    => { out.push_str("<|system|>"); out.push_str(content); }
+                    "user"      => { out.push_str("<|user|>");   out.push_str(content); }
+                    "assistant" => { out.push_str("<|assistant|>"); out.push_str(content); }
+                    _ => {}
+                }
+            }
+            out.push_str("<|assistant|>");
+        }
+        // DeepSeek-Coder-V2(-Lite)-Instruct: non-absorbed deepseek2.  Wire
+        // format (from the model's HF chat_template):
+        //   {system}\n\nUser: {content}\n\nAssistant: {content}<eos>...Assistant:
+        // BOS is prepended by prefill, not emitted as a surface marker (its
+        // surface `<｜begin▁of▁sentence｜>` isn't reliably in every quant's
+        // vocab, and byte-encoding it would corrupt the first tokens).
+        "deepseek2" => {
+            for (role, content) in messages {
+                match role.as_str() {
+                    "system"    => { out.push_str(content); out.push_str("\n\n"); }
+                    "user"      => { out.push_str("User: "); out.push_str(content); out.push_str("\n\n"); }
+                    "assistant" => { out.push_str("Assistant: "); out.push_str(content); }
+                    _ => {}
+                }
+            }
+            out.push_str("Assistant:");
         }
         // Qwen2 / Qwen2.5 / Qwen3:  <|im_start|>{role}\n{content}<|im_end|>\n
         "qwen2" | "qwen3" | "qwen3moe" | "qwen3vl" => {
@@ -3118,7 +3222,8 @@ impl QwenSession {
         // exactly the wire format the model was trained on, without
         // depending on jinja-lite handling every feature the GGUF
         // template might use (macros, filters, namespaces, etc.).
-        if let Some(s) = apply_per_arch_template(&self.cfg.arch, messages) {
+        if let Some(s) = apply_per_arch_template(
+            &self.cfg.arch, self.cfg.is_mla_absorbed(), messages) {
             return Some(s);
         }
         let template = self.chat_template.as_ref()?;
@@ -3677,7 +3782,7 @@ impl QwenSession {
                 for b in 0..self.cfg.n_layers {
                     block_forward_devarg(
                         &self.blocks[b], &self.act, &self.kvs[b],
-                        self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ);
+                        self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
                 }
             }
             aether_dev_sync();
@@ -3913,4 +4018,146 @@ fn build_gpt2_byte_to_unicode_array() -> [char; 256] {
         tbl[*b as usize] = char::from_u32(*c).unwrap_or('\0');
     }
     tbl
+}
+
+#[cfg(test)]
+mod chat_template_tests {
+    // FR-x-extra-chat-template: per-arch chat-template rendering is a pure
+    // string transform (no GPU, no GGUF), so it is fully unit-testable.
+    // These witness the wire format each arch is trained on, and in
+    // particular that the two distinct "deepseek2" chat formats (GLM vs
+    // DeepSeek-Coder-V2) are no longer conflated.
+    use super::apply_per_arch_template;
+
+    fn msgs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(r, c)| (r.to_string(), c.to_string())).collect()
+    }
+
+    #[test]
+    fn qwen_chatml_template() {
+        let m = msgs(&[("system", "You are helpful."), ("user", "Hi")]);
+        for arch in ["qwen2", "qwen3", "qwen3moe", "qwen3vl"] {
+            let s = apply_per_arch_template(arch, false, &m).unwrap();
+            assert_eq!(
+                s,
+                "<|im_start|>system\nYou are helpful.<|im_end|>\n\
+                 <|im_start|>user\nHi<|im_end|>\n\
+                 <|im_start|>assistant\n",
+                "arch {arch}",
+            );
+        }
+    }
+
+    #[test]
+    fn glm_template_for_absorbed_deepseek2() {
+        let m = msgs(&[("user", "Hi")]);
+        // GLM-4.7-flash is deepseek2 + MLA-absorbed.
+        let s = apply_per_arch_template("deepseek2", true, &m).unwrap();
+        assert_eq!(s, "[gMASK]<sop><|user|>Hi<|assistant|>");
+        // Explicit "glm"/"glm4" arch strings render identically regardless
+        // of the absorbed flag.
+        assert_eq!(apply_per_arch_template("glm", false, &m).unwrap(),
+                   "[gMASK]<sop><|user|>Hi<|assistant|>");
+    }
+
+    #[test]
+    fn deepseek_coder_template_for_nonabsorbed_deepseek2() {
+        // DeepSeek-Coder-V2-Lite is deepseek2 + NON-absorbed — must NOT get
+        // GLM's <|user|> markers (which aren't in its vocab).
+        let m = msgs(&[("system", "Be terse."), ("user", "2+2?"), ("assistant", "4")]);
+        let s = apply_per_arch_template("deepseek2", false, &m).unwrap();
+        assert_eq!(
+            s,
+            "Be terse.\n\nUser: 2+2?\n\nAssistant: 4Assistant:",
+        );
+        assert!(!s.contains("<|user|>"), "must not emit GLM markers");
+        assert!(!s.contains("[gMASK]"), "must not emit GLM markers");
+    }
+
+    #[test]
+    fn gemma3_template_maps_assistant_to_model() {
+        let m = msgs(&[("user", "Hi"), ("assistant", "Hello")]);
+        let s = apply_per_arch_template("gemma3", false, &m).unwrap();
+        assert_eq!(
+            s,
+            "<start_of_turn>user\nHi<end_of_turn>\n\
+             <start_of_turn>model\nHello<end_of_turn>\n\
+             <start_of_turn>model\n",
+        );
+    }
+
+    #[test]
+    fn llama3_template() {
+        let m = msgs(&[("user", "Hi")]);
+        let s = apply_per_arch_template("llama", false, &m).unwrap();
+        assert_eq!(
+            s,
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>\
+             <|start_header_id|>assistant<|end_header_id|>\n\n",
+        );
+    }
+
+    #[test]
+    fn unknown_arch_and_empty_return_none() {
+        assert!(apply_per_arch_template("mamba", false, &msgs(&[("user", "x")])).is_none());
+        assert!(apply_per_arch_template("qwen2", false, &[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod gemma3_attn_layer_tests {
+    // (a) gemma3 interleaved local/global attention is pure config logic
+    // (layer index → rope base + sliding window), so it is unit-testable
+    // without a GPU or GGUF.
+    use super::ModelConfig;
+
+    fn gemma3_cfg() -> ModelConfig {
+        let mut c = ModelConfig::qwen2_5_7b();
+        c.arch = "gemma3".to_string();
+        c.rope_base = 1_000_000.0;     // global base
+        c.rope_base_swa = 10_000.0;    // local base
+        c.sliding_window = 1024;
+        c.sliding_window_pattern = 6;  // 5 local : 1 global
+        c
+    }
+
+    #[test]
+    fn gemma3_local_layers_use_swa_base_and_window() {
+        let c = gemma3_cfg();
+        // Layers 0..=4, 6..=10, ... are LOCAL (il % 6 != 5).
+        for il in [0usize, 1, 2, 3, 4, 6, 7, 11 - 1, 12, 16] {
+            let (rope, win) = c.attn_layer_params(il);
+            assert_eq!(rope, 10_000.0, "layer {il} should be local (swa rope)");
+            assert_eq!(win, 1024, "layer {il} should keep sliding window");
+        }
+    }
+
+    #[test]
+    fn gemma3_global_layers_use_full_attention_and_global_base() {
+        let c = gemma3_cfg();
+        // Layers 5, 11, 17, 23 are GLOBAL (il % 6 == 5).
+        for il in [5usize, 11, 17, 23, 29] {
+            let (rope, win) = c.attn_layer_params(il);
+            assert_eq!(rope, 1_000_000.0, "layer {il} should be global (global rope)");
+            assert_eq!(win, 0, "layer {il} should be full attention (window=0)");
+        }
+    }
+
+    #[test]
+    fn non_gemma_arch_is_uniform() {
+        // Every other arch leaves sliding_window_pattern == 0 → uniform params,
+        // so behaviour is unchanged regardless of layer index.
+        let mut c = ModelConfig::qwen2_5_7b();
+        c.rope_base = 1_000_000.0;
+        c.sliding_window = 0;
+        for il in [0usize, 1, 5, 6, 47] {
+            assert_eq!(c.attn_layer_params(il), (1_000_000.0, 0));
+        }
+        // A uniform-sliding arch (e.g. some Qwen variants) keeps its window
+        // on every layer.
+        c.sliding_window = 4096;
+        for il in [0usize, 5, 6] {
+            assert_eq!(c.attn_layer_params(il), (1_000_000.0, 4096));
+        }
+    }
 }
