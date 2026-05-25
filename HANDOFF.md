@@ -1,6 +1,41 @@
 # Aether — Session Handoff
 
 ## Last Updated
+2026-05-24 (**FR-18.6-real pipeline-parallelism push — leg 1 (1F1B machinery)
+DONE+witnessed, leg 2 backward kernels (rms/rope/sdpa) ALL DONE+witnessed.
+6 commits this session, all built+tested on RTX 3070 Ti, ALL COMMITTED.**)
+
+## Project Status
+🟢 Pipeline parallelism (the matt-voice Qwen3-32B unlock) decomposed into 3
+legs (see [[fr_18_6_pp_three_legs]] memory). **Leg 1 + leg-2 backward kernels
+shipped this session:**
+
+| Commit | What | Witness |
+|---|---|---|
+| `5a3342b` | FR-17.14 IQ3_XXS standalone dequant for QLoRA backward (dt=18) | parity 3e-5 vs CPU; 70B base-quant target |
+| `efc928f` | **Leg 1**: 1F1B PP machinery `trainer/src/pipeline.rs` (connect_pipeline TCP rendezvous + Stage trait + run_1f1b) | 2-rank localhost-TCP, param max\|diff\|=0.000e0 vs single-process ref |
+| `dd4a257` | **Leg 2a**: RMSNorm backward CUDA (rms_norm_bwd_dx/gamma) | parity 1.19e-7 / 2.38e-7 |
+| `1de3c6b` | **Leg 2b**: RoPE backward CUDA (rope_apply_backward) | parity 1.19e-7 + round-trip identity |
+| `0e0bd5f` | **Leg 2c**: causal SDPA backward CUDA (sdpa_causal_bwd_dq/dkv) | parity 3e-8/6e-8/2e-7 vs CPU sdpa_causal_backward_f32 |
+
+qwen25_paged_parity GREEN after all 5 KERNEL_SRC additions
+(`[358,2776,264,220,17,20,4666,6284]` identical) — no nvrtc unit-pressure
+regression on the decode forward.
+
+**What's NEXT (leg 2 remainder → leg 3):**
+1. **Assemble a full-sequence qwen3 block forward+backward in the trainer** from
+   the new backward kernels + existing matmul/quant-matmul/gelu backward.
+   ⚠️ FIRST verify a GPU **full-sequence causal attention FORWARD** exists that
+   emits the attn-probs `[bh,s,s]` the new sdpa-backward consumes — serving.rs
+   is seq1/paged decode, NOT full-seq training. May be a forward-kernel gap.
+2. `Stage for QwenBlockGpu` (forward saves activations; backward chains the
+   kernels) wired into `run_1f1b`.
+3. **Leg 3**: real 2×P100 run on cnc (Qwen3-32B, 64 layers split 32/32) — needs
+   workhorse stopped (B-approval via openclaw main).
+
+---
+
+## (prior) Last Updated
 2026-05-24 evening (**Continuous-batching Phase 2b-2b ORCHESTRATION DONE +
 witnessed — `step_logits_for_batch` fuses N requests into one decode tick,
 token-identical to single-stream. + matt-voice LoRA-DP foundation (CPU-tested)
