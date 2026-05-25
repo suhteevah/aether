@@ -359,3 +359,23 @@ bit-intact + all training grad-checks still green. ~14 more training kernels
 (gelu/layer_norm_bwd/adamw/rms_bwd/rope_bwd/gqa/silu_bwd/transpose) remain in
 KERNEL_SRC interspersed with decode keepers — a follow-up batch toward the 37.2
 peak (add5216).
+
+## bench/graph_decode — batch 2 (2026-05-24, more backward kernels to lazy unit)
+
+Same harness/hardware. Moved 9 MORE backward/optimizer-only kernels (adamw_step,
+gelu_bwd, layer_norm_bwd_dx, layer_norm_bwd_params, rms_norm_bwd_dx,
+rms_norm_bwd_gamma, rope_apply_backward, silu_bwd, transpose_021) from KERNEL_SRC
+to TRAIN_KERNEL_SRC. These run on NO inference path (inference has no backward),
+so zero risk to decode/embedding serving.
+
+| state | warm tok/s | vs llama.cpp |
+|---|---|---|
+| pre-split | 32.6 | ~108% |
+| batch 1 (+9 train kernels lazy) | 33.7 | ~112% |
+| **batch 2 (+9 backward kernels lazy)** | **~35.0** (best 35.36) | **~117%** |
+
+Cumulative +7.4% single-stream decode from relieving nvrtc unit pressure; all
+training grad-checks (lm_loss/block/gqa) still green via the now-18-kernel lazy
+TRAIN unit. Remaining toward 37.2 peak: the inference-AMBIGUOUS kernels
+(gelu_fwd, layer_norm_fwd, add_layer_norm_fwd, bert_*, gqa_repeat/reduce) kept
+in KERNEL_SRC pending a BERT-inference smoke to confirm they're decode-unused.

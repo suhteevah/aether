@@ -37,28 +37,19 @@ struct CudaCtx {
     device: Arc<CudaDevice>,
     blas: CudaBlas,
     /// Per-kernel function handles, JIT-compiled once at first init.
-    adamw_step:        CudaFunction,
     add_f32:           CudaFunction,
     gelu_fwd:          CudaFunction,
-    gelu_bwd:          CudaFunction,
     layer_norm_fwd:    CudaFunction,
-    layer_norm_bwd_dx: CudaFunction,
-    layer_norm_bwd_params: CudaFunction,
     softmax_f32:       CudaFunction,
     scale_f32:         CudaFunction,
     gelu_inplace:      CudaFunction,
     add_layer_norm_fwd:CudaFunction,
     // matt-voice deploy: keep entire Qwen forward on device.
     rms_norm_fwd:      CudaFunction,
-    rms_norm_bwd_dx:   CudaFunction,
-    rms_norm_bwd_gamma:CudaFunction,
     rope_apply:        CudaFunction,
-    rope_apply_backward:CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     gqa_reduce_kv_grad:CudaFunction,
     silu_inplace:      CudaFunction,
-    silu_bwd:          CudaFunction,
-    transpose_021:     CudaFunction,
     mul_inplace:       CudaFunction,
     add_inplace:       CudaFunction,
     bias_add:          CudaFunction,
@@ -262,6 +253,16 @@ struct TrainCtx {
     sdpa_causal_fwd:    CudaFunction,
     sdpa_causal_bwd_dq: CudaFunction,
     sdpa_causal_bwd_dkv:CudaFunction,
+    // batch 2 — backward/optimizer-only (never used by inference)
+    adamw_step:        CudaFunction,
+    gelu_bwd:          CudaFunction,
+    layer_norm_bwd_dx: CudaFunction,
+    layer_norm_bwd_params: CudaFunction,
+    rms_norm_bwd_dx:   CudaFunction,
+    rms_norm_bwd_gamma:CudaFunction,
+    rope_apply_backward:CudaFunction,
+    silu_bwd:          CudaFunction,
+    transpose_021:     CudaFunction,
 }
 
 static TRAIN_CTX: OnceLock<TrainCtx> = OnceLock::new();
@@ -274,7 +275,10 @@ fn train_ctx() -> &'static TrainCtx {
             &["cross_entropy_fwd", "cross_entropy_bwd",
               "embed_lookup", "embed_scatter_add",
               "softmax_bwd_scaled", "softmax_bwd",
-              "sdpa_causal_fwd", "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv"])
+              "sdpa_causal_fwd", "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv",
+              "adamw_step", "gelu_bwd", "layer_norm_bwd_dx", "layer_norm_bwd_params",
+              "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply_backward",
+              "silu_bwd", "transpose_021"])
             .expect("load_ptx train");
         TrainCtx {
             cross_entropy_fwd: device.get_func("aether_train_kernels", "cross_entropy_fwd").unwrap(),
@@ -286,6 +290,15 @@ fn train_ctx() -> &'static TrainCtx {
             sdpa_causal_fwd:    device.get_func("aether_train_kernels", "sdpa_causal_fwd").unwrap(),
             sdpa_causal_bwd_dq: device.get_func("aether_train_kernels", "sdpa_causal_bwd_dq").unwrap(),
             sdpa_causal_bwd_dkv:device.get_func("aether_train_kernels", "sdpa_causal_bwd_dkv").unwrap(),
+            adamw_step:        device.get_func("aether_train_kernels", "adamw_step").unwrap(),
+            gelu_bwd:          device.get_func("aether_train_kernels", "gelu_bwd").unwrap(),
+            layer_norm_bwd_dx: device.get_func("aether_train_kernels", "layer_norm_bwd_dx").unwrap(),
+            layer_norm_bwd_params: device.get_func("aether_train_kernels", "layer_norm_bwd_params").unwrap(),
+            rms_norm_bwd_dx:   device.get_func("aether_train_kernels", "rms_norm_bwd_dx").unwrap(),
+            rms_norm_bwd_gamma:device.get_func("aether_train_kernels", "rms_norm_bwd_gamma").unwrap(),
+            rope_apply_backward:device.get_func("aether_train_kernels", "rope_apply_backward").unwrap(),
+            silu_bwd:          device.get_func("aether_train_kernels", "silu_bwd").unwrap(),
+            transpose_021:     device.get_func("aether_train_kernels", "transpose_021").unwrap(),
         }
     })
 }
@@ -2038,24 +2051,6 @@ extern "C" __global__ void gelu_fwd(
 }
 
 // GELU backward (tanh approx): dx = dy * (0.5*(1+tanh(t)) + 0.5*x*sech^2(t)*c*(1+3*0.044715*x^2))
-extern "C" __global__ void gelu_bwd(
-    const float* __restrict__ x,
-    const float* __restrict__ dy,
-    float*       __restrict__ dx,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float xi = x[i];
-    float c = 0.7978845608f;
-    float k = 0.044715f;
-    float t = c * (xi + k * xi * xi * xi);
-    float th = tanhf(t);
-    float sech2 = 1.0f - th * th;
-    float dt_dx = c * (1.0f + 3.0f * k * xi * xi);
-    float dy_dxi = 0.5f * (1.0f + th) + 0.5f * xi * sech2 * dt_dx;
-    dx[i] = dy[i] * dy_dxi;
-}
 
 // LayerNorm forward across last dim D for each of B rows.
 //   mean = sum(x)/D ; var = sum((x-mean)^2)/D
@@ -2088,34 +2083,6 @@ extern "C" __global__ void layer_norm_fwd(
 
 // LayerNorm backward to dx (gamma/beta grads not produced — sufficient for
 // "frozen-norm" experiments; full backward is on the roadmap).
-extern "C" __global__ void layer_norm_bwd_dx(
-    const float* __restrict__ x,
-    const float* __restrict__ gamma,
-    const float* __restrict__ mean,
-    const float* __restrict__ rstd,
-    const float* __restrict__ dy,
-    float*       __restrict__ dx,
-    int B, int D)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= B) return;
-    const float* xr = x + row * D;
-    const float* dyr = dy + row * D;
-    float* dxr = dx + row * D;
-    float m = mean[row]; float r = rstd[row];
-    // sum1 = sum(dy * gamma); sum2 = sum(dy * gamma * (x - m) * r)
-    float s1 = 0.0f, s2 = 0.0f;
-    for (int j = 0; j < D; j++) {
-        float dyg = dyr[j] * gamma[j];
-        s1 += dyg;
-        s2 += dyg * (xr[j] - m) * r;
-    }
-    float invD = 1.0f / (float)D;
-    for (int j = 0; j < D; j++) {
-        float dyg = dyr[j] * gamma[j];
-        dxr[j] = r * (dyg - invD * s1 - invD * (xr[j] - m) * r * s2);
-    }
-}
 
 // Fused add+LayerNorm: y = LN((a + b) * gamma + beta) over the last dim.
 // Equivalent to `add_f32(a, b, tmp); tmp.layer_norm(...)` but fuses the
@@ -2154,46 +2121,7 @@ extern "C" __global__ void add_layer_norm_fwd(
 //   dgamma[j] = sum_i dy[i,j] * (x[i,j] - mean[i]) * rstd[i]
 //   dbeta[j]  = sum_i dy[i,j]
 // Launch D threads — each accumulates across B rows.
-extern "C" __global__ void layer_norm_bwd_params(
-    const float* __restrict__ x,
-    const float* __restrict__ mean,
-    const float* __restrict__ rstd,
-    const float* __restrict__ dy,
-    float*       __restrict__ dgamma,
-    float*       __restrict__ dbeta,
-    int B, int D)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= D) return;
-    float dg = 0.0f, db = 0.0f;
-    for (int i = 0; i < B; i++) {
-        float dyi = dy[i * D + j];
-        db += dyi;
-        dg += dyi * (x[i * D + j] - mean[i]) * rstd[i];
-    }
-    dgamma[j] = dg;
-    dbeta[j]  = db;
-}
 
-extern "C" __global__ void adamw_step(
-    float*       __restrict__ param,
-    const float* __restrict__ grad,
-    float*       __restrict__ m,
-    float*       __restrict__ v,
-    float lr, float beta1, float beta2, float eps, float wd,
-    float bc1_inv, float bc2_inv,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float g = grad[i];
-    float mi = beta1 * m[i] + (1.0f - beta1) * g;
-    float vi = beta2 * v[i] + (1.0f - beta2) * g * g;
-    m[i] = mi; v[i] = vi;
-    float mh = mi * bc1_inv;
-    float vh = vi * bc2_inv;
-    param[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * param[i]);
-}
 
 // matt-voice / FR-17.5-extra — RMSNorm: y[r,i] = x[r,i] * gamma[i] / sqrt(mean(x[r,:]^2) + eps)
 // One thread per row. d ≤ 4096 fits in a single block's worth of shared work.
@@ -2225,49 +2153,9 @@ extern "C" __global__ void rms_norm_fwd(
 // rms_norm_bwd_dx: one thread per row, recomputes inv from x and also writes
 // it to inv_rms_out[r] so the gamma kernel needn't recompute it (keeps the
 // gamma pass O(rows*d) instead of O(rows*d^2)).
-extern "C" __global__ void rms_norm_bwd_dx(
-    const float* __restrict__ x,
-    const float* __restrict__ gamma,
-    const float* __restrict__ dy,
-    float*       __restrict__ dx,
-    float*       __restrict__ inv_rms_out,
-    float eps, int rows, int d)
-{
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const float* xr = x + r * d;
-    const float* dyr = dy + r * d;
-    float* dxr = dx + r * d;
-    float sumsq = 0.0f;
-    for (int i = 0; i < d; i++) sumsq += xr[i] * xr[i];
-    float inv = 1.0f / sqrtf(sumsq / (float)d + eps);
-    inv_rms_out[r] = inv;
-    float dot = 0.0f;
-    for (int i = 0; i < d; i++) dot += dyr[i] * gamma[i] * xr[i];
-    float inv2 = inv * inv;
-    for (int j = 0; j < d; j++) {
-        float g = dyr[j] * gamma[j];
-        dxr[j] = inv * (g - xr[j] * dot * inv2 / (float)d);
-    }
-}
 
 // rms_norm_bwd_gamma: one thread per column j, accumulates dgamma over all
 // rows using the per-row inv_rms produced by rms_norm_bwd_dx.
-extern "C" __global__ void rms_norm_bwd_gamma(
-    const float* __restrict__ x,
-    const float* __restrict__ dy,
-    const float* __restrict__ inv_rms,
-    float*       __restrict__ dgamma,
-    int rows, int d)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= d) return;
-    float acc = 0.0f;
-    for (int r = 0; r < rows; r++) {
-        acc += dy[r * d + j] * x[r * d + j] * inv_rms[r];
-    }
-    dgamma[j] = acc;
-}
 
 // matt-voice / FR-17.13-extra — RoPE in-place. Llama-style "half-half"
 // pair layout: pair (i, i + head_dim/2). One thread per (t, h, i) tuple
@@ -2306,30 +2194,6 @@ extern "C" __global__ void rope_apply(
 // transpose R^T = [[c,s],[-s,c]]. In-place on the gradient buffer: on entry
 // `g` holds dy (grad w.r.t. the roped output); on exit it holds dx. Same
 // index math as rope_apply so the per-pair theta matches exactly.
-extern "C" __global__ void rope_apply_backward(
-    float*       __restrict__ g,
-    int seq, int n_heads, int head_dim,
-    float base, int pos_start)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int hd_half = head_dim / 2;
-    int total = seq * n_heads * hd_half;
-    if (idx >= total) return;
-    int t = idx / (n_heads * hd_half);
-    int rem = idx - t * (n_heads * hd_half);
-    int h = rem / hd_half;
-    int i = rem - h * hd_half;
-    int base_off = (t * n_heads + h) * head_dim;
-    float pos = (float)(t + pos_start);
-    float exp = -2.0f * (float)i / (float)head_dim;
-    float theta = pos * powf(base, exp);
-    float c = cosf(theta), s = sinf(theta);
-    int i0 = base_off + i;
-    int i1 = base_off + i + hd_half;
-    float y0 = g[i0], y1 = g[i1];
-    g[i0] =  y0 * c + y1 * s;
-    g[i1] = -y0 * s + y1 * c;
-}
 
 // FR-17.14-extra-deepest-graph -- rope_apply variant that reads pos
 // from device memory instead of taking it as an immediate launch arg.
@@ -2428,17 +2292,6 @@ extern "C" __global__ void silu_inplace(
 // `x` is the pre-silu input saved from forward; `dy` the upstream grad.
 //
 // roadmap: P18
-extern "C" __global__ void silu_bwd(
-    const float* __restrict__ x, const float* __restrict__ dy,
-    float* __restrict__ dx, int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float xi = x[i];
-    float sig = 1.0f / (1.0f + expf(-xi));
-    float gp = sig * (1.0f + xi * (1.0f - sig));
-    dx[i] = dy[i] * gp;
-}
 
 // matt-voice FR-18.6-real leg 2 — transpose the first two dims of a 3-D
 // [d0, d1, d2] tensor → [d1, d0, d2] (021 permutation, last dim kept). The
@@ -2447,17 +2300,6 @@ extern "C" __global__ void silu_bwd(
 // between them (and back, by swapping d0/d1). One thread per element.
 //
 // roadmap: P18
-extern "C" __global__ void transpose_021(
-    const float* __restrict__ in, float* __restrict__ out,
-    int d0, int d1, int d2)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= d0 * d1 * d2) return;
-    int c = idx % d2;
-    int b = (idx / d2) % d1;
-    int a = idx / (d2 * d1);
-    out[(b * d0 + a) * d2 + c] = in[idx];
-}
 
 // matt-voice — element-wise multiply in place: x[i] *= y[i]. Used by
 // SwiGLU MLP after SiLU(gate) so we get silu(gate) * up.
@@ -5280,6 +5122,186 @@ extern "C" __global__ void sdpa_causal_bwd_dkv(
     }
 }
 
+
+extern "C" __global__ void gelu_bwd(
+    const float* __restrict__ x,
+    const float* __restrict__ dy,
+    float*       __restrict__ dx,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float xi = x[i];
+    float c = 0.7978845608f;
+    float k = 0.044715f;
+    float t = c * (xi + k * xi * xi * xi);
+    float th = tanhf(t);
+    float sech2 = 1.0f - th * th;
+    float dt_dx = c * (1.0f + 3.0f * k * xi * xi);
+    float dy_dxi = 0.5f * (1.0f + th) + 0.5f * xi * sech2 * dt_dx;
+    dx[i] = dy[i] * dy_dxi;
+}
+
+extern "C" __global__ void layer_norm_bwd_dx(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ mean,
+    const float* __restrict__ rstd,
+    const float* __restrict__ dy,
+    float*       __restrict__ dx,
+    int B, int D)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= B) return;
+    const float* xr = x + row * D;
+    const float* dyr = dy + row * D;
+    float* dxr = dx + row * D;
+    float m = mean[row]; float r = rstd[row];
+    // sum1 = sum(dy * gamma); sum2 = sum(dy * gamma * (x - m) * r)
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int j = 0; j < D; j++) {
+        float dyg = dyr[j] * gamma[j];
+        s1 += dyg;
+        s2 += dyg * (xr[j] - m) * r;
+    }
+    float invD = 1.0f / (float)D;
+    for (int j = 0; j < D; j++) {
+        float dyg = dyr[j] * gamma[j];
+        dxr[j] = r * (dyg - invD * s1 - invD * (xr[j] - m) * r * s2);
+    }
+}
+
+extern "C" __global__ void layer_norm_bwd_params(
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ rstd,
+    const float* __restrict__ dy,
+    float*       __restrict__ dgamma,
+    float*       __restrict__ dbeta,
+    int B, int D)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= D) return;
+    float dg = 0.0f, db = 0.0f;
+    for (int i = 0; i < B; i++) {
+        float dyi = dy[i * D + j];
+        db += dyi;
+        dg += dyi * (x[i * D + j] - mean[i]) * rstd[i];
+    }
+    dgamma[j] = dg;
+    dbeta[j]  = db;
+}
+
+extern "C" __global__ void adamw_step(
+    float*       __restrict__ param,
+    const float* __restrict__ grad,
+    float*       __restrict__ m,
+    float*       __restrict__ v,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1_inv, float bc2_inv,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = grad[i];
+    float mi = beta1 * m[i] + (1.0f - beta1) * g;
+    float vi = beta2 * v[i] + (1.0f - beta2) * g * g;
+    m[i] = mi; v[i] = vi;
+    float mh = mi * bc1_inv;
+    float vh = vi * bc2_inv;
+    param[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * param[i]);
+}
+
+extern "C" __global__ void rms_norm_bwd_dx(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ dy,
+    float*       __restrict__ dx,
+    float*       __restrict__ inv_rms_out,
+    float eps, int rows, int d)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + r * d;
+    const float* dyr = dy + r * d;
+    float* dxr = dx + r * d;
+    float sumsq = 0.0f;
+    for (int i = 0; i < d; i++) sumsq += xr[i] * xr[i];
+    float inv = 1.0f / sqrtf(sumsq / (float)d + eps);
+    inv_rms_out[r] = inv;
+    float dot = 0.0f;
+    for (int i = 0; i < d; i++) dot += dyr[i] * gamma[i] * xr[i];
+    float inv2 = inv * inv;
+    for (int j = 0; j < d; j++) {
+        float g = dyr[j] * gamma[j];
+        dxr[j] = inv * (g - xr[j] * dot * inv2 / (float)d);
+    }
+}
+
+extern "C" __global__ void rms_norm_bwd_gamma(
+    const float* __restrict__ x,
+    const float* __restrict__ dy,
+    const float* __restrict__ inv_rms,
+    float*       __restrict__ dgamma,
+    int rows, int d)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= d) return;
+    float acc = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        acc += dy[r * d + j] * x[r * d + j] * inv_rms[r];
+    }
+    dgamma[j] = acc;
+}
+
+extern "C" __global__ void rope_apply_backward(
+    float*       __restrict__ g,
+    int seq, int n_heads, int head_dim,
+    float base, int pos_start)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int hd_half = head_dim / 2;
+    int total = seq * n_heads * hd_half;
+    if (idx >= total) return;
+    int t = idx / (n_heads * hd_half);
+    int rem = idx - t * (n_heads * hd_half);
+    int h = rem / hd_half;
+    int i = rem - h * hd_half;
+    int base_off = (t * n_heads + h) * head_dim;
+    float pos = (float)(t + pos_start);
+    float exp = -2.0f * (float)i / (float)head_dim;
+    float theta = pos * powf(base, exp);
+    float c = cosf(theta), s = sinf(theta);
+    int i0 = base_off + i;
+    int i1 = base_off + i + hd_half;
+    float y0 = g[i0], y1 = g[i1];
+    g[i0] =  y0 * c + y1 * s;
+    g[i1] = -y0 * s + y1 * c;
+}
+
+extern "C" __global__ void silu_bwd(
+    const float* __restrict__ x, const float* __restrict__ dy,
+    float* __restrict__ dx, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float xi = x[i];
+    float sig = 1.0f / (1.0f + expf(-xi));
+    float gp = sig * (1.0f + xi * (1.0f - sig));
+    dx[i] = dy[i] * gp;
+}
+
+extern "C" __global__ void transpose_021(
+    const float* __restrict__ in, float* __restrict__ out,
+    int d0, int d1, int d2)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= d0 * d1 * d2) return;
+    int c = idx % d2;
+    int b = (idx / d2) % d1;
+    int a = idx / (d2 * d1);
+    out[(b * d0 + a) * d2 + c] = in[idx];
+}
 "#;
 
 static CTX: OnceLock<CudaCtx> = OnceLock::new();
@@ -5326,14 +5348,13 @@ fn ctx() -> &'static CudaCtx {
         // JIT-compile the small custom kernels via nvrtc.
         let ptx = compile_ptx(KERNEL_SRC).expect("compile_ptx");
         device.load_ptx(ptx, "aether_kernels",
-            &["adamw_step",
-              "add_f32", "gelu_fwd", "gelu_bwd",
-              "layer_norm_fwd", "layer_norm_bwd_dx", "layer_norm_bwd_params",
+            &["add_f32", "gelu_fwd",
+              "layer_norm_fwd",
               "softmax_f32", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
-              "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv", "gqa_reduce_kv_grad",
-              "silu_inplace", "silu_bwd", "transpose_021", "mul_inplace", "add_inplace", "bias_add",
+              "rms_norm_fwd", "rope_apply", "gqa_repeat_kv", "gqa_reduce_kv_grad",
+              "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
               "fused_q5_0_matmul_seq1",
@@ -5360,27 +5381,18 @@ fn ctx() -> &'static CudaCtx {
               "bert_self_attention_fwd",
               "bert_embed_sum"])
             .expect("load_ptx");
-        let adamw_step        = device.get_func("aether_kernels", "adamw_step").unwrap();
         let add_f32           = device.get_func("aether_kernels", "add_f32").unwrap();
         let gelu_fwd          = device.get_func("aether_kernels", "gelu_fwd").unwrap();
-        let gelu_bwd          = device.get_func("aether_kernels", "gelu_bwd").unwrap();
         let layer_norm_fwd    = device.get_func("aether_kernels", "layer_norm_fwd").unwrap();
-        let layer_norm_bwd_dx     = device.get_func("aether_kernels", "layer_norm_bwd_dx").unwrap();
-        let layer_norm_bwd_params = device.get_func("aether_kernels", "layer_norm_bwd_params").unwrap();
         let softmax_f32           = device.get_func("aether_kernels", "softmax_f32").unwrap();
         let scale_f32             = device.get_func("aether_kernels", "scale_f32").unwrap();
         let gelu_inplace          = device.get_func("aether_kernels", "gelu_inplace").unwrap();
         let add_layer_norm_fwd    = device.get_func("aether_kernels", "add_layer_norm_fwd").unwrap();
         let rms_norm_fwd          = device.get_func("aether_kernels", "rms_norm_fwd").unwrap();
-        let rms_norm_bwd_dx       = device.get_func("aether_kernels", "rms_norm_bwd_dx").unwrap();
-        let rms_norm_bwd_gamma    = device.get_func("aether_kernels", "rms_norm_bwd_gamma").unwrap();
         let rope_apply            = device.get_func("aether_kernels", "rope_apply").unwrap();
-        let rope_apply_backward   = device.get_func("aether_kernels", "rope_apply_backward").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let gqa_reduce_kv_grad    = device.get_func("aether_kernels", "gqa_reduce_kv_grad").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
-        let silu_bwd              = device.get_func("aether_kernels", "silu_bwd").unwrap();
-        let transpose_021         = device.get_func("aether_kernels", "transpose_021").unwrap();
         let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
         let add_inplace           = device.get_func("aether_kernels", "add_inplace").unwrap();
         let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
@@ -5418,15 +5430,15 @@ fn ctx() -> &'static CudaCtx {
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
         let bert_embed_sum = device.get_func("aether_kernels", "bert_embed_sum").unwrap();
 
-        CudaCtx { device, blas, adamw_step,
-                  add_f32, gelu_fwd, gelu_bwd,
-                  layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
+        CudaCtx { device, blas,
+                  add_f32, gelu_fwd,
+                  layer_norm_fwd,
                   softmax_f32,
                   scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
-                  rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
-                  rope_apply, rope_apply_backward, gqa_repeat_kv, gqa_reduce_kv_grad,
-                  silu_inplace, silu_bwd, transpose_021, mul_inplace, add_inplace, bias_add,
+                  rms_norm_fwd,
+                  rope_apply, gqa_repeat_kv, gqa_reduce_kv_grad,
+                  silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
                   fused_q5_0_matmul_seq1, fused_q8_0_matmul_seq1,
@@ -6054,7 +6066,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         let g = &*g_buf;
         let m = &mut *m_buf;
         let v = &mut *v_buf;
-        ctx().adamw_step.clone().launch(cfg, (p, g, m, v, lr, beta1, beta2, eps, wd, bc1_inv, bc2_inv, n))
+        train_ctx().adamw_step.clone().launch(cfg, (p, g, m, v, lr, beta1, beta2, eps, wd, bc1_inv, bc2_inv, n))
             .expect("launch adamw");
     }
     0
@@ -6107,7 +6119,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let cfg = LaunchConfig::for_num_elems(n as u32);
     unsafe {
         let xv = &*x_p; let dyv = &*dy_p; let dxv = &mut *dx_p;
-        ctx().gelu_bwd.clone().launch(cfg, (xv, dyv, dxv, n)).expect("launch gelu_bwd");
+        train_ctx().gelu_bwd.clone().launch(cfg, (xv, dyv, dxv, n)).expect("launch gelu_bwd");
     }
     0
 }
@@ -6164,7 +6176,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     unsafe {
         let xv = &*x_p; let gv = &*g_p; let mv = &*m_p; let rv = &*r_p;
         let dyv = &*dy_p; let dxv = &mut *dx_p;
-        ctx().layer_norm_bwd_dx.clone()
+        train_ctx().layer_norm_bwd_dx.clone()
             .launch(cfg, (xv, gv, mv, rv, dyv, dxv, b, d))
             .expect("launch layer_norm_bwd_dx");
     }
@@ -6192,7 +6204,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     unsafe {
         let xv = &*x_p; let mv = &*m_p; let rv = &*r_p; let dyv = &*dy_p;
         let dgv = &mut *dg_p; let dbv = &mut *db_p;
-        ctx().layer_norm_bwd_params.clone()
+        train_ctx().layer_norm_bwd_params.clone()
             .launch(cfg, (xv, mv, rv, dyv, dgv, dbv, b, d))
             .expect("launch layer_norm_bwd_params");
     }
@@ -6224,7 +6236,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     unsafe {
         let xv = &*x_p; let gv = &*g_p; let dyv = &*dy_p;
         let dxv = &mut *dx_p; let invv = &mut *inv_p;
-        ctx().rms_norm_bwd_dx.clone()
+        train_ctx().rms_norm_bwd_dx.clone()
             .launch(cfg, (xv, gv, dyv, dxv, invv, eps, rows, d))
             .expect("launch rms_norm_bwd_dx");
     }
@@ -6249,7 +6261,7 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let cfg = LaunchConfig::for_num_elems(d as u32);
     unsafe {
         let xv = &*x_p; let dyv = &*dy_p; let invv = &*inv_p; let dgv = &mut *dg_p;
-        ctx().rms_norm_bwd_gamma.clone()
+        train_ctx().rms_norm_bwd_gamma.clone()
             .launch(cfg, (xv, dyv, invv, dgv, rows, d))
             .expect("launch rms_norm_bwd_gamma");
     }
@@ -6633,7 +6645,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let cfg = LaunchConfig::for_num_elems(total);
     unsafe {
         let gv = &mut *g_p;
-        ctx().rope_apply_backward.clone()
+        train_ctx().rope_apply_backward.clone()
             .launch(cfg, (gv, seq, n_heads, head_dim, base, pos_start))
             .expect("launch rope_apply_backward");
     }
@@ -8152,7 +8164,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let cfg = LaunchConfig::for_num_elems(n as u32);
     unsafe {
         let xv = &*x_p; let dyv = &*dy_p; let dxv = &mut *dx_p;
-        ctx().silu_bwd.clone().launch(cfg, (xv, dyv, dxv, n)).expect("launch silu_bwd");
+        train_ctx().silu_bwd.clone().launch(cfg, (xv, dyv, dxv, n)).expect("launch silu_bwd");
     }
     0
 }
@@ -8172,7 +8184,7 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let cfg = LaunchConfig::for_num_elems((d0 * d1 * d2) as u32);
     unsafe {
         let iv = &*i_p; let ov = &mut *o_p;
-        ctx().transpose_021.clone().launch(cfg, (iv, ov, d0, d1, d2)).expect("launch transpose_021");
+        train_ctx().transpose_021.clone().launch(cfg, (iv, ov, d0, d1, d2)).expect("launch transpose_021");
     }
     0
 }
