@@ -30,7 +30,8 @@ use crate::{
     aether_gguf_open, aether_gguf_close,
     aether_gguf_find_tensor_by_name, aether_gguf_get_tensor_dtype,
     aether_gguf_get_tensor_data_ptr, aether_gguf_get_tensor_n_elems,
-    aether_dequant_q4_k_m, aether_f16_to_f32,
+    aether_dequant_q4_k_m, aether_dequant_q6_k, aether_dequant_q3_k, aether_dequant_iq3_s,
+    aether_f16_to_f32,
     aether_gguf_get_metadata_u32, aether_gguf_get_metadata_string,
     aether_gguf_get_metadata_array_string_n,
     aether_gguf_get_metadata_array_string_get,
@@ -2406,16 +2407,32 @@ impl QwenSession {
         let total_rows = n_elems / self.cfg.d_model;
         let dptr = aether_gguf_get_tensor_data_ptr(self.gguf_handle, idx) as *const u8;
         let blocks_per_row = self.cfg.d_model / 256;
-        let bytes_per_row = blocks_per_row * 144;
+        // token_embd dtype is NOT always Q4_K: gemma3=Q6_K, qwen3moe=Q3_K,
+        // IQ3_M models=IQ3_S. Hardcoding Q4_K dequant here garbled the embeddings
+        // for those → degenerate forward (vocab-1 pin). Dispatch on the real dtype.
+        let dt = aether_gguf_get_tensor_dtype(self.gguf_handle, idx);
+        let bytes_per_row = match dt {
+            12 => blocks_per_row * 144,  // Q4_K
+            14 => blocks_per_row * 210,  // Q6_K
+            11 => blocks_per_row * 110,  // Q3_K
+            21 => blocks_per_row * 110,  // IQ3_S
+            _  => panic!("dequant_embd_row: unsupported token_embd dtype {} \
+                          (have Q4_K/Q6_K/Q3_K/IQ3_S)", dt),
+        };
         assert!(token_id < total_rows, "token_id {} out of vocab {}", token_id, total_rows);
         let row_bytes = std::slice::from_raw_parts(
             dptr.add(token_id * bytes_per_row), bytes_per_row);
         let mut row_f32 = vec![0.0f32; self.cfg.d_model];
-        aether_dequant_q4_k_m(
-            row_bytes.as_ptr() as *const c_void,
-            row_f32.as_mut_ptr() as *mut c_void,
-            blocks_per_row as c_int,
-        );
+        let bp = blocks_per_row as c_int;
+        let src = row_bytes.as_ptr() as *const c_void;
+        let dst = row_f32.as_mut_ptr() as *mut c_void;
+        match dt {
+            12 => { aether_dequant_q4_k_m(src, dst, bp); }
+            14 => { aether_dequant_q6_k(src, dst, bp); }
+            11 => { aether_dequant_q3_k(src, dst, bp); }
+            21 => { aether_dequant_iq3_s(src, dst, bp); }
+            _  => unreachable!(),
+        }
         // Gemma scales input embeddings by sqrt(d_model) (llama.cpp `inp_scale`);
         // without it the residual stream is ~sqrt(d) too small and the forward
         // produces degenerate logits (vocab-1/pad). Other archs use no scale.
