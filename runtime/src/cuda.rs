@@ -49,6 +49,7 @@ struct CudaCtx {
     softmax_f32:       CudaFunction,
     softmax_bwd:       CudaFunction,
     softmax_bwd_scaled:CudaFunction,
+    sdpa_causal_fwd:    CudaFunction,
     sdpa_causal_bwd_dq: CudaFunction,
     sdpa_causal_bwd_dkv:CudaFunction,
     scale_f32:         CudaFunction,
@@ -2005,6 +2006,51 @@ extern "C" __global__ void softmax_bwd(
     float dot = 0.0f;
     for (int j = 0; j < D; j++) dot += yr[j] * dyr[j];
     for (int j = 0; j < D; j++) dxr[j] = yr[j] * (dyr[j] - dot);
+}
+
+// matt-voice FR-18.6-real leg 2 — full-sequence causal SDPA FORWARD (qwen3
+// training). The decode path (paged/seq1) is forward-only and never
+// materialises the [bh,s,s] attention probabilities the backward needs; this
+// kernel does, mirroring the CPU reference ops::sdpa_causal_f32 exactly
+// (max-subtract softmax over j<=i, scale = 1/sqrt(d)). One thread per (h,i)
+// query row: writes attn row i [s] (0 above the diagonal) and out row i [d].
+//
+// roadmap: P18
+extern "C" __global__ void sdpa_causal_fwd(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out, float* __restrict__ attn,
+    float scale, int bh, int s_len, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bh * s_len) return;
+    int h = idx / s_len;
+    int i = idx - h * s_len;
+    const float* qh = q + h * s_len * d;
+    const float* kh = k + h * s_len * d;
+    const float* vh = v + h * s_len * d;
+    float* oh = out  + h * s_len * d;
+    float* ar = attn + h * s_len * s_len + i * s_len;
+    // scores[j] = (q[i] . k[j]) * scale for j<=i; track max for stable softmax.
+    float mx = -1e30f;
+    for (int j = 0; j <= i; j++) {
+        float acc = 0.0f;
+        for (int dd = 0; dd < d; dd++) acc += qh[i * d + dd] * kh[j * d + dd];
+        acc *= scale;
+        ar[j] = acc;
+        if (acc > mx) mx = acc;
+    }
+    float sum = 0.0f;
+    for (int j = 0; j <= i; j++) { float e = expf(ar[j] - mx); ar[j] = e; sum += e; }
+    float inv = 1.0f / sum;
+    for (int j = 0; j <= i; j++) ar[j] *= inv;
+    for (int j = i + 1; j < s_len; j++) ar[j] = 0.0f;
+    // out[i,dd] = sum_{j<=i} attn[i,j] * v[j,dd].
+    for (int dd = 0; dd < d; dd++) {
+        float acc = 0.0f;
+        for (int j = 0; j <= i; j++) acc += ar[j] * vh[j * d + dd];
+        oh[i * d + dd] = acc;
+    }
 }
 
 // matt-voice FR-18.6-real leg 2 — causal SDPA backward (qwen3 training).
@@ -5140,7 +5186,7 @@ fn ctx() -> &'static CudaCtx {
               "add_f32", "gelu_fwd", "gelu_bwd",
               "layer_norm_fwd", "layer_norm_bwd_dx", "layer_norm_bwd_params",
               "softmax_f32", "softmax_bwd", "softmax_bwd_scaled",
-              "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv", "scale_f32",
+              "sdpa_causal_fwd", "sdpa_causal_bwd_dq", "sdpa_causal_bwd_dkv", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv",
@@ -5183,6 +5229,7 @@ fn ctx() -> &'static CudaCtx {
         let softmax_f32           = device.get_func("aether_kernels", "softmax_f32").unwrap();
         let softmax_bwd           = device.get_func("aether_kernels", "softmax_bwd").unwrap();
         let softmax_bwd_scaled    = device.get_func("aether_kernels", "softmax_bwd_scaled").unwrap();
+        let sdpa_causal_fwd       = device.get_func("aether_kernels", "sdpa_causal_fwd").unwrap();
         let sdpa_causal_bwd_dq    = device.get_func("aether_kernels", "sdpa_causal_bwd_dq").unwrap();
         let sdpa_causal_bwd_dkv   = device.get_func("aether_kernels", "sdpa_causal_bwd_dkv").unwrap();
         let scale_f32             = device.get_func("aether_kernels", "scale_f32").unwrap();
@@ -5236,7 +5283,8 @@ fn ctx() -> &'static CudaCtx {
                   add_f32, gelu_fwd, gelu_bwd,
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
                   softmax_f32, softmax_bwd, softmax_bwd_scaled,
-                  sdpa_causal_bwd_dq, sdpa_causal_bwd_dkv, scale_f32, gelu_inplace,
+                  sdpa_causal_fwd, sdpa_causal_bwd_dq, sdpa_causal_bwd_dkv,
+                  scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
                   rope_apply, rope_apply_backward, gqa_repeat_kv,
@@ -6153,6 +6201,38 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         ctx().softmax_bwd_scaled.clone()
             .launch(cfg, (yv, dyv, dxv, s, b, d))
             .expect("launch softmax_bwd_scaled");
+    }
+    0
+}
+
+/// Full-sequence causal SDPA forward (matt-voice FR-18.6-real leg 2, qwen3
+/// training). Mirrors ops::sdpa_causal_f32. `q`/`k`/`v`/`out` are [bh, s, d]
+/// device f32 handles; `attn` is the [bh, s, s] softmax-probs output (saved for
+/// backward). scale = 1/sqrt(d).
+///
+/// roadmap: P18
+#[no_mangle] pub extern "C" fn aether_op_sdpa_causal_forward_f32_cuda(
+    q: i64, k: i64, v: i64, out: i64, attn: i64,
+    bh: c_int, s_len: c_int, d: c_int,
+) -> c_int {
+    let (Some(iq), Some(ik), Some(iv), Some(io), Some(ia)) = (
+        handle_to_idx(q), handle_to_idx(k), handle_to_idx(v),
+        handle_to_idx(out), handle_to_idx(attn))
+        else { return -1; };
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let bs = unsafe { bufs() };
+    let q_p = bs[iq].as_ref().unwrap() as *const CudaSlice<f32>;
+    let k_p = bs[ik].as_ref().unwrap() as *const CudaSlice<f32>;
+    let v_p = bs[iv].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[io].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let a_p = bs[ia].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems((bh * s_len) as u32);
+    unsafe {
+        let qv = &*q_p; let kv = &*k_p; let vv = &*v_p;
+        let ov = &mut *o_p; let av = &mut *a_p;
+        ctx().sdpa_causal_fwd.clone()
+            .launch(cfg, (qv, kv, vv, ov, av, scale, bh, s_len, d))
+            .expect("launch sdpa_causal_fwd");
     }
     0
 }
