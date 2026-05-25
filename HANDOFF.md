@@ -1,9 +1,11 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 (**FR-18.6-real pipeline-parallelism push — leg 1 (1F1B machinery)
-DONE+witnessed, leg 2 backward kernels (rms/rope/sdpa) ALL DONE+witnessed.
-6 commits this session, all built+tested on RTX 3070 Ti, ALL COMMITTED.**)
+2026-05-24 (**FR-18.6-real PP push — leg 1 (1F1B machinery) DONE+witnessed;
+leg 2 DONE: all qwen3-block kernels (rms/rope/sdpa fwd+bwd, silu bwd,
+transpose) + CAPSTONE composition grad-check (qwen3 block fwd+bwd, finite-diff
+verified). 11 commits this session, all on RTX 3070 Ti, ALL COMMITTED.
+Plus Mistral Small 24B explicit-head_dim support (side quest).**)
 
 ## Project Status
 🟢 Pipeline parallelism (the matt-voice Qwen3-32B unlock) decomposed into 3
@@ -16,21 +18,34 @@ shipped this session:**
 | `efc928f` | **Leg 1**: 1F1B PP machinery `trainer/src/pipeline.rs` (connect_pipeline TCP rendezvous + Stage trait + run_1f1b) | 2-rank localhost-TCP, param max\|diff\|=0.000e0 vs single-process ref |
 | `dd4a257` | **Leg 2a**: RMSNorm backward CUDA (rms_norm_bwd_dx/gamma) | parity 1.19e-7 / 2.38e-7 |
 | `1de3c6b` | **Leg 2b**: RoPE backward CUDA (rope_apply_backward) | parity 1.19e-7 + round-trip identity |
-| `0e0bd5f` | **Leg 2c**: causal SDPA backward CUDA (sdpa_causal_bwd_dq/dkv) | parity 3e-8/6e-8/2e-7 vs CPU sdpa_causal_backward_f32 |
+| `0e0bd5f` | **Leg 2c**: causal SDPA backward CUDA (sdpa_causal_bwd_dq/dkv) | parity 3e-8/6e-8/2e-7 vs CPU |
+| `332bda3` | **Leg 2d**: full-seq causal SDPA FORWARD (emits [bh,s,s] attn probs training needs) | parity 1.19e-7/5.96e-8 |
+| `1fe33be` | **Leg 2e**: SiLU backward (SwiGLU) | parity 1.19e-7 |
+| `0b29652` | **Leg 2f + CAPSTONE**: transpose_021 + **qwen3 block fwd+bwd composition grad-check** | 99 entries, analytic vs finite-diff max rel err 3.66e-2 |
+| `6b16f10` | (side quest) Mistral Small 24B explicit-head_dim support (q_dim != d_model) | qwen25 byte-identical no-op |
 
-qwen25_paged_parity GREEN after all 5 KERNEL_SRC additions
+qwen25_paged_parity GREEN after all KERNEL_SRC additions
 (`[358,2776,264,220,17,20,4666,6284]` identical) — no nvrtc unit-pressure
 regression on the decode forward.
 
-**What's NEXT (leg 2 remainder → leg 3):**
-1. **Assemble a full-sequence qwen3 block forward+backward in the trainer** from
-   the new backward kernels + existing matmul/quant-matmul/gelu backward.
-   ⚠️ FIRST verify a GPU **full-sequence causal attention FORWARD** exists that
-   emits the attn-probs `[bh,s,s]` the new sdpa-backward consumes — serving.rs
-   is seq1/paged decode, NOT full-seq training. May be a forward-kernel gap.
-2. `Stage for QwenBlockGpu` (forward saves activations; backward chains the
-   kernels) wired into `run_1f1b`.
-3. **Leg 3**: real 2×P100 run on cnc (Qwen3-32B, 64 layers split 32/32) — needs
+**Leg 2 is substantially DONE**: every qwen3-block kernel (rms/rope/sdpa
+fwd+bwd, silu bwd, transpose, matmul fwd+bwd, quant-matmul bwd incl IQ3_XXS) is
+parity-witnessed, and `cuda_qwen3_block_grad_check.rs` proves they COMPOSE into
+a correct trainable block (forward + backward, all 9 weight grads finite-diff
+verified). MHA config.
+
+**What's NEXT (finish leg 2 → leg 3):**
+1. **GQA**: the block grad-check is MHA (n_kv==n_q). Add k/v repeat (fwd, have
+   `gqa_repeat_kv`) + grad sum-reduce (bwd) so n_kv < n_q works. Small.
+2. **Embed + lm_head + cross-entropy** wrapper around a stack of blocks → a
+   real scalar LM loss (cross_entropy_bwd kernel exists).
+3. **QLoRA adapter injection**: add LoRA delta after each q/k/v/o/gate/up/down
+   proj in the forward; backprop into adapters via the quant-matmul-backward
+   (frozen base) — pieces exist in trainer/src/lora.rs.
+4. **Wrap a layer-range of blocks as a PP `Stage`** (trait in trainer/src/
+   pipeline.rs) and run through `run_1f1b`. The CPU LinearReluStack proves the
+   scheduler; this swaps in the real GPU qwen3 stage.
+5. **Leg 3**: real 2×P100 run on cnc (Qwen3-32B, 64 layers split 32/32) — needs
    workhorse stopped (B-approval via openclaw main).
 
 ---
