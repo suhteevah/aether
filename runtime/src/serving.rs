@@ -484,8 +484,14 @@ impl ModelConfig {
         let expert_gating_func = read_meta_u32(gguf_handle,
             &format!("{}.expert_gating_func", prefix))
             .map(|v| v as i32).unwrap_or(1);
+        // Default matches llama.cpp: when the key is ABSENT, deepseek2 defaults
+        // to FALSE (DeepSeek-V2 / V2-Lite have norm_topk_prob=false and omit the
+        // key), while other MoE archs (qwen3moe) normalize.  GLM-4.7-flash is
+        // also arch "deepseek2" but stores the key explicitly (true), so it is
+        // unaffected by this default.
         let expert_weights_norm = read_meta_bool(gguf_handle,
-            &format!("{}.expert_weights_norm", prefix)).unwrap_or(true);
+            &format!("{}.expert_weights_norm", prefix))
+            .unwrap_or(arch != "deepseek2");
         let expert_weights_scale = read_meta_f32(gguf_handle,
             &format!("{}.expert_weights_scale", prefix)).unwrap_or(1.0);
         // FR-17-extra-mla-fwd YaRN — long-context RoPE scaling.  Only active
