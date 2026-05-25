@@ -54,6 +54,8 @@ struct CudaCtx {
     add_layer_norm_fwd:CudaFunction,
     // matt-voice deploy: keep entire Qwen forward on device.
     rms_norm_fwd:      CudaFunction,
+    rms_norm_bwd_dx:   CudaFunction,
+    rms_norm_bwd_gamma:CudaFunction,
     rope_apply:        CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     silu_inplace:      CudaFunction,
@@ -2246,6 +2248,61 @@ extern "C" __global__ void rms_norm_fwd(
     for (int i = 0; i < d; i++) sumsq += xr[i] * xr[i];
     float inv_rms = 1.0f / sqrtf(sumsq / (float)d + eps);
     for (int i = 0; i < d; i++) yr[i] = xr[i] * inv_rms * gamma[i];
+}
+
+// matt-voice FR-18.6-real leg 2 — RMSNorm backward (qwen3 training).
+//
+// roadmap: P18
+//
+// Forward: inv = 1/sqrt(mean(x^2)+eps); y[i] = x[i]*inv*gamma[i].
+// With g[i] = dy[i]*gamma[i] and dot = sum_i g[i]*x[i]:
+//   dx[j] = inv * (g[j] - x[j]*dot*inv^2/d)
+//   dgamma[j] = sum_rows dy[r,j]*x[r,j]*inv(r)
+// rms_norm_bwd_dx: one thread per row, recomputes inv from x and also writes
+// it to inv_rms_out[r] so the gamma kernel needn't recompute it (keeps the
+// gamma pass O(rows*d) instead of O(rows*d^2)).
+extern "C" __global__ void rms_norm_bwd_dx(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ dy,
+    float*       __restrict__ dx,
+    float*       __restrict__ inv_rms_out,
+    float eps, int rows, int d)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + r * d;
+    const float* dyr = dy + r * d;
+    float* dxr = dx + r * d;
+    float sumsq = 0.0f;
+    for (int i = 0; i < d; i++) sumsq += xr[i] * xr[i];
+    float inv = 1.0f / sqrtf(sumsq / (float)d + eps);
+    inv_rms_out[r] = inv;
+    float dot = 0.0f;
+    for (int i = 0; i < d; i++) dot += dyr[i] * gamma[i] * xr[i];
+    float inv2 = inv * inv;
+    for (int j = 0; j < d; j++) {
+        float g = dyr[j] * gamma[j];
+        dxr[j] = inv * (g - xr[j] * dot * inv2 / (float)d);
+    }
+}
+
+// rms_norm_bwd_gamma: one thread per column j, accumulates dgamma over all
+// rows using the per-row inv_rms produced by rms_norm_bwd_dx.
+extern "C" __global__ void rms_norm_bwd_gamma(
+    const float* __restrict__ x,
+    const float* __restrict__ dy,
+    const float* __restrict__ inv_rms,
+    float*       __restrict__ dgamma,
+    int rows, int d)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= d) return;
+    float acc = 0.0f;
+    for (int r = 0; r < rows; r++) {
+        acc += dy[r * d + j] * x[r * d + j] * inv_rms[r];
+    }
+    dgamma[j] = acc;
 }
 
 // matt-voice / FR-17.13-extra — RoPE in-place. Llama-style "half-half"
@@ -4967,7 +5024,7 @@ fn ctx() -> &'static CudaCtx {
               "softmax_f32", "softmax_bwd", "softmax_bwd_scaled", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
-              "rms_norm_fwd", "rope_apply", "gqa_repeat_kv",
+              "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "gqa_repeat_kv",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
@@ -5011,6 +5068,8 @@ fn ctx() -> &'static CudaCtx {
         let gelu_inplace          = device.get_func("aether_kernels", "gelu_inplace").unwrap();
         let add_layer_norm_fwd    = device.get_func("aether_kernels", "add_layer_norm_fwd").unwrap();
         let rms_norm_fwd          = device.get_func("aether_kernels", "rms_norm_fwd").unwrap();
+        let rms_norm_bwd_dx       = device.get_func("aether_kernels", "rms_norm_bwd_dx").unwrap();
+        let rms_norm_bwd_gamma    = device.get_func("aether_kernels", "rms_norm_bwd_gamma").unwrap();
         let rope_apply            = device.get_func("aether_kernels", "rope_apply").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
@@ -5056,7 +5115,7 @@ fn ctx() -> &'static CudaCtx {
                   layer_norm_fwd, layer_norm_bwd_dx, layer_norm_bwd_params,
                   softmax_f32, softmax_bwd, softmax_bwd_scaled, scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
-                  rms_norm_fwd, rope_apply, gqa_repeat_kv,
+                  rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma, rope_apply, gqa_repeat_kv,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
@@ -5826,6 +5885,63 @@ fn handle_to_idx(h: i64) -> Option<usize> {
         ctx().layer_norm_bwd_params.clone()
             .launch(cfg, (xv, mv, rv, dyv, dgv, dbv, b, d))
             .expect("launch layer_norm_bwd_params");
+    }
+    0
+}
+
+/// RMSNorm backward to `dx` (matt-voice FR-18.6-real leg 2, qwen3 training).
+///
+/// roadmap: P18
+///
+/// `x` is the forward input [rows, d], `gamma` [d], `dy` [rows, d] the upstream
+/// gradient. Writes `dx` [rows, d] and `inv_rms` [rows] (the per-row
+/// 1/sqrt(mean(x^2)+eps), consumed by the gamma kernel). One thread per row.
+#[no_mangle] pub extern "C" fn aether_op_rms_norm_backward_dx_f32_cuda(
+    x: i64, gamma: i64, dy: i64, dx: i64, inv_rms: i64,
+    eps: f32, rows: c_int, d: c_int,
+) -> c_int {
+    let (Some(ix), Some(ig), Some(idy), Some(idx_), Some(iinv)) = (
+        handle_to_idx(x), handle_to_idx(gamma), handle_to_idx(dy),
+        handle_to_idx(dx), handle_to_idx(inv_rms))
+        else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p   = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let g_p    = bs[ig].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dy_p  = bs[idy].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dx_p  = bs[idx_].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let inv_p = bs[iinv].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(rows as u32);
+    unsafe {
+        let xv = &*x_p; let gv = &*g_p; let dyv = &*dy_p;
+        let dxv = &mut *dx_p; let invv = &mut *inv_p;
+        ctx().rms_norm_bwd_dx.clone()
+            .launch(cfg, (xv, gv, dyv, dxv, invv, eps, rows, d))
+            .expect("launch rms_norm_bwd_dx");
+    }
+    0
+}
+
+/// RMSNorm parameter backward: `dgamma` [d] from `x` [rows, d], `dy` [rows, d],
+/// and the per-row `inv_rms` [rows] produced by the dx kernel. One thread per
+/// column j, accumulating over rows.
+#[no_mangle] pub extern "C" fn aether_op_rms_norm_backward_gamma_f32_cuda(
+    x: i64, dy: i64, inv_rms: i64, dgamma: i64,
+    rows: c_int, d: c_int,
+) -> c_int {
+    let (Some(ix), Some(idy), Some(iinv), Some(idg)) = (
+        handle_to_idx(x), handle_to_idx(dy), handle_to_idx(inv_rms), handle_to_idx(dgamma))
+        else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p   = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dy_p  = bs[idy].as_ref().unwrap() as *const CudaSlice<f32>;
+    let inv_p = bs[iinv].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dg_p  = bs[idg].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(d as u32);
+    unsafe {
+        let xv = &*x_p; let dyv = &*dy_p; let invv = &*inv_p; let dgv = &mut *dg_p;
+        ctx().rms_norm_bwd_gamma.clone()
+            .launch(cfg, (xv, dyv, invv, dgv, rows, d))
+            .expect("launch rms_norm_bwd_gamma");
     }
     0
 }
