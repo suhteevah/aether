@@ -777,6 +777,7 @@ unsafe fn upload_tensor_u8(h: i64, name: &str) -> (i64, usize, i32) {
         6  => { let nb = n_elems / 32; (nb, nb * 22) }       // Q5_0 (FR-17-extra-q5_0-fwd)
         8  => { let nb = n_elems / 32; (nb, nb * 34) }       // Q8_0 (FR-17-extra-q8_0-fwd)
         13 => { let nb = n_elems / 256; (nb, nb * 176) }     // Q5_K (FR-17-extra-q5_k-fwd)
+        11 => { let nb = n_elems / 256; (nb, nb * 110) }     // Q3_K (matmul+dispatch already present; unblocks qwen3moe Q3_K_M)
         18 => { let nb = n_elems / 256; (nb, nb * 98) }      // IQ3_XXS (FR-17-extra-iq3_xxs-fwd)
         20 => { let nb = n_elems / 32; (nb, nb * 18) }       // IQ4_NL (FR-17-extra-iq4_nl-fwd)
         21 => { let nb = n_elems / 256; (nb, nb * 110) }     // IQ3_S (FR-17-extra-iq3_s-fwd)
@@ -855,6 +856,7 @@ unsafe fn upload_tensor_u8_opt(h: i64, name: &str) -> (i64, usize, i32) {
         6  => { let nb = n_elems / 32; (nb, nb * 22) }
         8  => { let nb = n_elems / 32; (nb, nb * 34) }
         13 => { let nb = n_elems / 256; (nb, nb * 176) }
+        11 => { let nb = n_elems / 256; (nb, nb * 110) }     // Q3_K (unblocks qwen3moe Q3_K_M)
         18 => { let nb = n_elems / 256; (nb, nb * 98) }
         20 => { let nb = n_elems / 32; (nb, nb * 18) }
         21 => { let nb = n_elems / 256; (nb, nb * 110) }
