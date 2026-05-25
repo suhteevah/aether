@@ -82,6 +82,7 @@ struct CudaCtx {
     fused_q8_0_expert_matmul_seq1: CudaFunction,
     fused_q5_0_expert_matmul_seq1: CudaFunction,
     fused_iq3_s_expert_matmul_seq1: CudaFunction,
+    fused_q3_k_expert_matmul_seq1: CudaFunction,
     fused_iq4_xs_expert_matmul_seq1: CudaFunction,
     fused_iq3_xxs_expert_matmul_seq1: CudaFunction,
     bert_self_attention_fwd: CudaFunction,
@@ -3310,6 +3311,116 @@ extern "C" __global__ void fused_q3_k_matmul_seq1(
     if (ni < n) out[ni] = acc;
 }
 
+// matt-voice — Q3_K MoE expert matmul (offset into concatenated expert weights).
+// Mirrors fused_q3_k_matmul_seq1 + expert_offset_blocks. Unblocks Qwen3-MoE Q3_K_M experts.
+extern "C" __global__ void fused_q3_k_expert_matmul_seq1(
+    const float*         __restrict__ a,           // [k]
+    const unsigned char* __restrict__ w,           // n rows of (n_blocks * 110) bytes
+    float*               __restrict__ out,         // [n]
+    int n, int n_blocks, int expert_offset_blocks)                           // k = n_blocks * 256
+{
+    const int BLOCK_N = 32;
+    __shared__ float a_tile[256];
+
+    int ni = blockIdx.x * BLOCK_N + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // Cooperatively load 256 floats of A: each of 32 threads loads 8.
+        #pragma unroll
+        for (int p = 0; p < 8; p++) {
+            int kk = p * BLOCK_N + threadIdx.x;
+            a_tile[kk] = a[bi * 256 + kk];
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)expert_offset_blocks * 110 + (size_t)ni * n_blocks * 110 + (size_t)bi * 110;
+            const unsigned char* hm  = base;          // [32]
+            const unsigned char* qs  = base + 32;     // [64]
+            const unsigned char* sc  = base + 96;     // [12]
+            unsigned short d_bits =
+                ((unsigned short)base[109] << 8) | (unsigned short)base[108];
+            float d_all = aether_f16_to_f32_dev(d_bits);
+
+            // Unpack 16 signed 6-bit scales via kmask1/kmask2 trick.
+            // Mirrors ggml-quants.c lines that build `scales[0..15]` as
+            // signed 8-bit values (range will be 0..63, caller subtracts 32).
+            int scales[16];
+            {
+                unsigned int aux0 = (unsigned int)sc[0]
+                                  | ((unsigned int)sc[1] << 8)
+                                  | ((unsigned int)sc[2] << 16)
+                                  | ((unsigned int)sc[3] << 24);
+                unsigned int aux1 = (unsigned int)sc[4]
+                                  | ((unsigned int)sc[5] << 8)
+                                  | ((unsigned int)sc[6] << 16)
+                                  | ((unsigned int)sc[7] << 24);
+                unsigned int aux2 = (unsigned int)sc[8]
+                                  | ((unsigned int)sc[9] << 8)
+                                  | ((unsigned int)sc[10] << 16)
+                                  | ((unsigned int)sc[11] << 24);
+                unsigned int tmp  = aux2;
+                unsigned int km1  = 0x03030303u;
+                unsigned int km2  = 0x0f0f0f0fu;
+                unsigned int a0 = (aux0 & km2) | (((tmp >> 0) & km1) << 4);
+                unsigned int a1 = (aux1 & km2) | (((tmp >> 2) & km1) << 4);
+                unsigned int a2 = ((aux0 >> 4) & km2) | (((tmp >> 4) & km1) << 4);
+                unsigned int a3 = ((aux1 >> 4) & km2) | (((tmp >> 6) & km1) << 4);
+                scales[0]  = (int)( a0        & 0xFFu);
+                scales[1]  = (int)((a0 >>  8) & 0xFFu);
+                scales[2]  = (int)((a0 >> 16) & 0xFFu);
+                scales[3]  = (int)((a0 >> 24) & 0xFFu);
+                scales[4]  = (int)( a1        & 0xFFu);
+                scales[5]  = (int)((a1 >>  8) & 0xFFu);
+                scales[6]  = (int)((a1 >> 16) & 0xFFu);
+                scales[7]  = (int)((a1 >> 24) & 0xFFu);
+                scales[8]  = (int)( a2        & 0xFFu);
+                scales[9]  = (int)((a2 >>  8) & 0xFFu);
+                scales[10] = (int)((a2 >> 16) & 0xFFu);
+                scales[11] = (int)((a2 >> 24) & 0xFFu);
+                scales[12] = (int)( a3        & 0xFFu);
+                scales[13] = (int)((a3 >>  8) & 0xFFu);
+                scales[14] = (int)((a3 >> 16) & 0xFFu);
+                scales[15] = (int)((a3 >> 24) & 0xFFu);
+            }
+
+            // ggml outer loop:  n_outer over {0, 128}.  Inside, j in [0,4)
+            // with shift += 2 and m <<= 1 (m NOT reset between n_outer
+            // iterations — it advances bit positions 0..7 of hmask).
+            int is = 0;
+            int a_idx = 0;
+            unsigned char m = 1u;
+            for (int n_outer = 0; n_outer < 256; n_outer += 128) {
+                int shift = 0;
+                int qs_off = (n_outer == 0) ? 0 : 32;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    float dl_lo = d_all * (float)(scales[is++] - 32);
+                    #pragma unroll
+                    for (int l = 0; l < 16; l++) {
+                        int q2  = (int)((qs[qs_off + l] >> shift) & 3u);
+                        int sub = (hm[l] & m) ? 0 : 4;
+                        acc += a_tile[a_idx++] * (dl_lo * (float)(q2 - sub));
+                    }
+                    float dl_hi = d_all * (float)(scales[is++] - 32);
+                    #pragma unroll
+                    for (int l = 0; l < 16; l++) {
+                        int q2  = (int)((qs[qs_off + 16 + l] >> shift) & 3u);
+                        int sub = (hm[16 + l] & m) ? 0 : 4;
+                        acc += a_tile[a_idx++] * (dl_hi * (float)(q2 - sub));
+                    }
+                    shift += 2;
+                    m <<= 1;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (ni < n) out[ni] = acc;
+}
+
 // matt-voice / FR-17.14-extra-deepest — FUSED Q4_K matmul v2 (split-K).
 //
 // Each WARP owns one output column. Within a warp, the 32 lanes
@@ -5376,6 +5487,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q8_0_expert_matmul_seq1",
               "fused_q5_0_expert_matmul_seq1",
               "fused_iq3_s_expert_matmul_seq1",
+              "fused_q3_k_expert_matmul_seq1",
               "fused_iq4_xs_expert_matmul_seq1",
               "fused_iq3_xxs_expert_matmul_seq1",
               "bert_self_attention_fwd",
@@ -5425,6 +5537,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q8_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q8_0_expert_matmul_seq1").unwrap();
         let fused_q5_0_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q5_0_expert_matmul_seq1").unwrap();
         let fused_iq3_s_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_s_expert_matmul_seq1").unwrap();
+        let fused_q3_k_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_q3_k_expert_matmul_seq1").unwrap();
         let fused_iq4_xs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq4_xs_expert_matmul_seq1").unwrap();
         let fused_iq3_xxs_expert_matmul_seq1 = device.get_func("aether_kernels", "fused_iq3_xxs_expert_matmul_seq1").unwrap();
         let bert_self_attention_fwd = device.get_func("aether_kernels", "bert_self_attention_fwd").unwrap();
@@ -5459,6 +5572,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q8_0_expert_matmul_seq1,
                   fused_q5_0_expert_matmul_seq1,
                   fused_iq3_s_expert_matmul_seq1,
+                  fused_q3_k_expert_matmul_seq1,
                   fused_iq4_xs_expert_matmul_seq1,
                   fused_iq3_xxs_expert_matmul_seq1,
                   bert_self_attention_fwd, bert_embed_sum }
@@ -6937,6 +7051,38 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_iq3_s_expert_matmul_seq1.clone()
             .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
             .expect("launch fused_iq3_s_expert_matmul_seq1");
+    }
+    0
+}
+
+/// matt-voice — Q3_K MoE expert matmul. Mirrors the iq3_s expert wrapper but uses
+/// the standalone Q3_K kernel's 32-thread-block launch (BLOCK_N=32). Unblocks
+/// Qwen3-MoE Q3_K_M expert tensors (dt=11) in moe_ffn_forward.
+#[no_mangle] pub extern "C" fn aether_op_fused_q3_k_expert_matmul_seq1_cuda(
+    x: i64, w_base: i64, y: i64,
+    n_out: c_int, blocks_per_row: c_int, expert_idx: c_int,
+) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let Some(iw) = handle_to_u8_idx(w_base) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 || expert_idx < 0 { return -1; }
+    let expert_offset_blocks = expert_idx * n_out * blocks_per_row;
+    let bs = unsafe { bufs() };
+    let us = unsafe { u8_bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let w_p = us[iw].as_ref().unwrap() as *const CudaSlice<u8>;
+    let block_n = 32u32;
+    let grid_x = ((n_out as u32) + block_n - 1) / block_n;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (block_n, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p; let wv = &*w_p;
+        ctx().fused_q3_k_expert_matmul_seq1.clone()
+            .launch(cfg, (xv, wv, yv, n_out, blocks_per_row, expert_offset_blocks))
+            .expect("launch fused_q3_k_expert_matmul_seq1");
     }
     0
 }
