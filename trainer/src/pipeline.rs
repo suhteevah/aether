@@ -87,6 +87,16 @@ pub struct PipeLinks {
     listener: Option<i64>,
 }
 
+impl PipeLinks {
+    /// Links for a single-process run (`world_size == 1`): no upstream or
+    /// downstream neighbour. run_1f1b takes the is_first && is_last path and
+    /// never touches the (absent) streams. Useful for driving a `Stage` through
+    /// the 1F1B schedule on one device without TCP.
+    pub fn local_single() -> Self {
+        PipeLinks { up: None, down: None, listener: None }
+    }
+}
+
 impl Drop for PipeLinks {
     fn drop(&mut self) {
         unsafe {
