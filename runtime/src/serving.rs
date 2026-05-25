@@ -35,6 +35,8 @@ use crate::{
     aether_gguf_get_metadata_u32, aether_gguf_get_metadata_string,
     aether_gguf_get_metadata_array_string_n,
     aether_gguf_get_metadata_array_string_get,
+    aether_gguf_get_metadata_array_f32_n,
+    aether_gguf_get_metadata_array_f32,
     aether_bpe_tokenizer_new, aether_bpe_tokenizer_free,
     aether_bpe_add_token_with_id, aether_bpe_add_merge_by_id,
     aether_bpe_decode, aether_bpe_encode_ids, aether_bpe_lookup_bytes,
@@ -2062,10 +2064,136 @@ pub struct QwenSession {
     /// `apply_chat_template` to render `messages: [(role, content)]`
     /// into the wire text the model was trained to expect.
     chat_template: Option<String>,
+    /// SentencePiece Unigram encoder.  `Some` when `tokenizer.ggml.model
+    /// == "llama"` (gemma / llama-SPM / mistral-SPM): aether's default
+    /// GPT-2 byte-BPE `encode_text` can't tokenize these (different vocab
+    /// surface scheme), so `encode_text` dispatches here instead.
+    spm: Option<SpmModel>,
+    /// `tokenizer.ggml.add_bos_token` — gemma/llama prepend BOS to every
+    /// prompt.  Paired with `bos_token` (the id).  -1 bos = none.
+    add_bos: bool,
+    bos_token: i32,
     /// FR-19.5-extra-deep Phase 2b-2b — lazily-allocated batched-decode
     /// workspace.  `None` until the first `step_logits_for_batch` call.
     /// Single-stream decode never touches it (zero cost).
     batch_state: Option<BatchActivationGpu>,
+}
+
+/// SentencePiece Unigram tokenizer (gemma / llama-SPM family).  Encodes
+/// text by Viterbi over the vocab maximising the summed piece scores
+/// (log-probs), with single-byte fallback for unknown bytes.
+///
+/// gemma normalization (matched to llama.cpp / llama-tokenize): replace
+/// each ASCII space with U+2581 (`▁`); NO dummy-prefix is added (verified
+/// against llama-tokenize: "Hello world" -> [9259("Hello"), 1902("▁world")],
+/// " Hello" -> [26352("▁Hello")]).
+pub struct SpmModel {
+    /// piece bytes -> (id, score).  Excludes control/unused entries that
+    /// would never appear in normal text (they're emitted by the
+    /// special-token split path, not Viterbi).
+    pieces: std::collections::HashMap<Vec<u8>, (u32, f32)>,
+    /// byte b -> id of its `<0xNN>` byte-fallback token, or -1 if absent.
+    byte_fallback: [i32; 256],
+    /// longest piece in `pieces` (caps the Viterbi inner loop).
+    max_piece_len: usize,
+}
+
+impl SpmModel {
+    /// Build from the GGUF vocab + scores.  Skips empty (oversized-skipped)
+    /// entries.  `<0xNN>` byte tokens are registered for fallback and NOT
+    /// added as normal pieces (so Viterbi prefers real pieces).
+    fn build(vocab: &[Vec<u8>], scores: &[f32]) -> Self {
+        let mut pieces = std::collections::HashMap::with_capacity(vocab.len());
+        let mut byte_fallback = [-1i32; 256];
+        let mut max_piece_len = 1usize;
+        for (id, bytes) in vocab.iter().enumerate() {
+            if bytes.is_empty() { continue; }
+            // `<0xNN>` byte-fallback tokens (gemma stores all 256).
+            if bytes.len() == 6 && bytes[0] == b'<' && bytes[1] == b'0' && bytes[2] == b'x'
+                && bytes[5] == b'>'
+            {
+                let hex = |c: u8| -> Option<u8> {
+                    match c {
+                        b'0'..=b'9' => Some(c - b'0'),
+                        b'A'..=b'F' => Some(c - b'A' + 10),
+                        b'a'..=b'f' => Some(c - b'a' + 10),
+                        _ => None,
+                    }
+                };
+                if let (Some(hi), Some(lo)) = (hex(bytes[3]), hex(bytes[4])) {
+                    byte_fallback[(hi * 16 + lo) as usize] = id as i32;
+                    continue;
+                }
+            }
+            let score = scores.get(id).copied().unwrap_or(0.0);
+            // First-wins on duplicate surfaces (lowest id), matching SPM.
+            pieces.entry(bytes.clone()).or_insert((id as u32, score));
+            if bytes.len() > max_piece_len { max_piece_len = bytes.len(); }
+        }
+        SpmModel { pieces, byte_fallback, max_piece_len }
+    }
+
+    /// Encode a raw text fragment (already split away from special tokens).
+    /// Returns vocab ids.  Normalizes spaces to `▁` then Viterbi-segments.
+    fn encode(&self, text: &str) -> Vec<u32> {
+        if text.is_empty() { return Vec::new(); }
+        // Normalize: ASCII space -> U+2581 (▁, bytes E2 96 81).
+        let mut norm: Vec<u8> = Vec::with_capacity(text.len() + 8);
+        for &b in text.as_bytes() {
+            if b == b' ' { norm.extend_from_slice(&[0xE2, 0x96, 0x81]); }
+            else { norm.push(b); }
+        }
+        let n = norm.len();
+        // Viterbi: best[i] = best total score to cover norm[..i].
+        // back[i] = start index of the piece ending at i.
+        let neg = f32::NEG_INFINITY;
+        let mut best = vec![neg; n + 1];
+        let mut back = vec![0usize; n + 1];
+        let mut back_id = vec![u32::MAX; n + 1];
+        best[0] = 0.0;
+        for i in 1..=n {
+            // Try pieces ending at i, starting from max(0, i-max_piece_len).
+            let lo = i.saturating_sub(self.max_piece_len);
+            for j in lo..i {
+                if best[j] == neg { continue; }
+                if let Some(&(id, score)) = self.pieces.get(&norm[j..i]) {
+                    let cand = best[j] + score;
+                    if cand > best[i] {
+                        best[i] = cand;
+                        back[i] = j;
+                        back_id[i] = id;
+                    }
+                }
+            }
+            // Byte-fallback: cover the single byte ending at i if no piece
+            // reached i (or it improves nothing). Use a large penalty so
+            // real pieces always win; only fires when Viterbi is stuck.
+            if best[i] == neg && best[i - 1] != neg {
+                best[i] = best[i - 1] - 1.0e4;
+                back[i] = i - 1;
+                back_id[i] = u32::MAX; // marker: emit byte fallback for norm[i-1]
+            }
+        }
+        // Backtrace.
+        let mut out: Vec<u32> = Vec::new();
+        let mut i = n;
+        while i > 0 {
+            let j = back[i];
+            let id = back_id[i];
+            if id == u32::MAX {
+                // byte fallback for the single byte norm[j] (== norm[i-1])
+                let b = norm[j];
+                let fb = self.byte_fallback[b as usize];
+                if fb >= 0 { out.push(fb as u32); }
+                // else: unrepresentable byte, drop it.
+            } else {
+                out.push(id);
+            }
+            i = j;
+        }
+        out.reverse();
+        out
+    }
 }
 
 struct PagedCfg {
@@ -2334,7 +2462,9 @@ impl QwenSession {
                 None
             };
 
-            let (bpe_handle, eos_token) = load_tokenizer_from_gguf(h);
+            let tok = load_tokenizer_from_gguf(h);
+            let (bpe_handle, eos_token) = (tok.bpe, tok.eos);
+            let (spm, add_bos, bos_token) = (tok.spm, tok.add_bos, tok.bos);
             let gpt2_u2b = build_gpt2_unicode_to_byte();
             // FR-x-extra-chat-template: best-effort read of the GGUF's
             // `tokenizer.chat_template` string metadata.  Buffer is 64 KiB
@@ -2373,6 +2503,7 @@ impl QwenSession {
                 cfg,
                 byte_to_id_cache: std::sync::OnceLock::new(),
                 chat_template,
+                spm, add_bos, bos_token,
                 batch_state: None,
             })
         }
@@ -2813,19 +2944,30 @@ impl Drop for QwenSession {
 // deeper. See `runtime/tests/qwen25_tokenizer_roundtrip.rs` for the
 // reference impl this is factored from.
 
-unsafe fn load_tokenizer_from_gguf(h: i64) -> (i64, i32) {
+struct TokenizerLoad {
+    bpe: i64,
+    eos: i32,
+    spm: Option<SpmModel>,
+    add_bos: bool,
+    bos: i32,
+}
+impl TokenizerLoad {
+    fn failed() -> Self { Self { bpe: -1, eos: -1, spm: None, add_bos: false, bos: -1 } }
+}
+
+unsafe fn load_tokenizer_from_gguf(h: i64) -> TokenizerLoad {
     let tok_key = b"tokenizer.ggml.tokens";
     let n = aether_gguf_get_metadata_array_string_n(
         h, tok_key.as_ptr() as i64, tok_key.len() as c_int);
     if n <= 0 {
         eprintln!("[QwenSession] no tokenizer.ggml.tokens — text decode disabled");
-        return (-1, -1);
+        return TokenizerLoad::failed();
     }
 
     let bpe = aether_bpe_tokenizer_new();
     if bpe < 0 {
         eprintln!("[QwenSession] aether_bpe_tokenizer_new failed: {}", bpe);
-        return (-1, -1);
+        return TokenizerLoad::failed();
     }
 
     // GLM-4.7-flash has at least one vocab entry > 512 bytes (entry
@@ -2850,7 +2992,7 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> (i64, i32) {
         if nb < 0 {
             eprintln!("[QwenSession] vocab entry {} failed (nb={})", i, nb);
             aether_bpe_tokenizer_free(bpe);
-            return (-1, -1);
+            return TokenizerLoad::failed();
         }
         let bytes = buf[..nb as usize].to_vec();
         let rc = aether_bpe_add_token_with_id(
@@ -2858,7 +3000,7 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> (i64, i32) {
         if rc != 0 {
             eprintln!("[QwenSession] add_token({}) -> {}", i, rc);
             aether_bpe_tokenizer_free(bpe);
-            return (-1, -1);
+            return TokenizerLoad::failed();
         }
         vocab_bytes.push(bytes);
     }
@@ -2906,7 +3048,46 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> (i64, i32) {
         h, eos_key.as_ptr() as i64, eos_key.len() as c_int);
     let eos_token: i32 = if eos < 0 { -1 } else { eos as i32 };
     eprintln!("[QwenSession] EOS token id: {}", eos_token);
-    (bpe, eos_token)
+
+    // SentencePiece detection: `tokenizer.ggml.model == "llama"` means the
+    // vocab is SPM (gemma / llama-SPM), which the GPT-2 byte-BPE encode path
+    // cannot tokenize.  Build a Unigram Viterbi encoder from vocab + scores.
+    let model_kind = read_meta_string(h, "tokenizer.ggml.model").unwrap_or_default();
+    let spm = if model_kind == "llama" {
+        let sc_key = b"tokenizer.ggml.scores";
+        let ns = aether_gguf_get_metadata_array_f32_n(
+            h, sc_key.as_ptr() as i64, sc_key.len() as c_int);
+        if ns > 0 {
+            let mut scores = vec![0.0f32; ns as usize];
+            aether_gguf_get_metadata_array_f32(
+                h, sc_key.as_ptr() as i64, sc_key.len() as c_int,
+                scores.as_mut_ptr() as i64, ns);
+            let m = SpmModel::build(&vocab_bytes, &scores);
+            eprintln!("[QwenSession] SentencePiece(Unigram) encoder: {} pieces, max_len={}",
+                m.pieces.len(), m.max_piece_len);
+            Some(m)
+        } else {
+            eprintln!("[QwenSession] tokenizer.ggml.model=llama but no scores — SPM disabled");
+            None
+        }
+    } else {
+        None
+    };
+
+    // BOS handling — gemma/llama prepend BOS to every prompt.
+    let add_bos = {
+        let k = b"tokenizer.ggml.add_bos_token";
+        let v = aether_gguf_get_metadata_u32(h, k.as_ptr() as i64, k.len() as c_int);
+        // Default: SPM models (gemma/llama) add BOS; GPT-2 BPE models don't.
+        if v < 0 { spm.is_some() } else { v != 0 }
+    };
+    let bos = {
+        let k = b"tokenizer.ggml.bos_token_id";
+        let v = aether_gguf_get_metadata_u32(h, k.as_ptr() as i64, k.len() as c_int);
+        if v < 0 { -1 } else { v as i32 }
+    };
+
+    TokenizerLoad { bpe, eos: eos_token, spm, add_bos, bos }
 }
 
 /// Build the GPT-2 byte-to-unicode mapping and return its inverse. This
@@ -3148,7 +3329,28 @@ impl QwenSession {
     /// stream where each known marker becomes its single vocab id and
     /// the gaps are BPE-encoded normally.  Falls back to plain
     /// `encode_text` when no specials match.
+    /// Prepend the BOS token id when the tokenizer is configured to add it
+    /// (gemma/llama SPM).  Applied once at the chat-encode boundary; the
+    /// recursive `encode_text` gap-encoder stays BOS-free.
+    fn maybe_prepend_bos(&self, ids: Vec<usize>) -> Vec<usize> {
+        if self.add_bos && self.bos_token >= 0
+            && ids.first() != Some(&(self.bos_token as usize))
+        {
+            let mut v = Vec::with_capacity(ids.len() + 1);
+            v.push(self.bos_token as usize);
+            v.extend_from_slice(&ids);
+            v
+        } else {
+            ids
+        }
+    }
+
     pub fn encode_text_with_specials(&self, text: &str) -> Vec<usize> {
+        let ids = self.encode_text_with_specials_inner(text);
+        self.maybe_prepend_bos(ids)
+    }
+
+    fn encode_text_with_specials_inner(&self, text: &str) -> Vec<usize> {
         if self.bpe_handle < 0 || text.is_empty() { return Vec::new(); }
         let specials = arch_special_tokens(&self.cfg.arch);
         if specials.is_empty() { return self.encode_text(text); }
@@ -3416,6 +3618,13 @@ impl QwenSession {
     /// tokenizer wasn't loaded.
     pub fn encode_text(&self, text: &str) -> Vec<usize> {
         if self.bpe_handle < 0 || text.is_empty() { return Vec::new(); }
+
+        // SentencePiece (gemma / llama-SPM): the GPT-2 byte-BPE path below
+        // produces garbage for these vocabs.  Dispatch to the Unigram
+        // Viterbi encoder instead.
+        if let Some(spm) = self.spm.as_ref() {
+            return spm.encode(text).into_iter().map(|i| i as usize).collect();
+        }
 
         // Build (or get cached) byte→token_id table.  This is the
         // GPT-2 byte alphabet: byte 0 → 'Ā' (U+0100), byte 32 → 'Ġ'
@@ -4159,5 +4368,55 @@ mod gemma3_attn_layer_tests {
         for il in [0usize, 5, 6] {
             assert_eq!(c.attn_layer_params(il), (1_000_000.0, 4096));
         }
+    }
+}
+
+#[cfg(test)]
+mod spm_tests {
+    // SentencePiece Unigram Viterbi is pure CPU logic — unit-testable with a
+    // synthetic vocab + scores (no GPU, no GGUF).
+    use super::SpmModel;
+
+    #[test]
+    fn viterbi_picks_max_score_not_longest_match() {
+        // Pieces: "abc" exists but with a worse total than "a"+"b"+"c".
+        let toks: Vec<Vec<u8>> = ["a", "b", "c", "ab", "abc"]
+            .iter().map(|s| s.as_bytes().to_vec()).collect();
+        //          a     b     c     ab     abc
+        let scores = vec![-1.0, -1.0, -1.0, -5.0, -10.0];
+        let m = SpmModel::build(&toks, &scores);
+        // "abc": a+b+c = -3 (best) beats ab+c = -6 and abc = -10.
+        assert_eq!(m.encode("abc"), vec![0, 1, 2]);
+        // "ab": a+b = -2 beats ab = -5.
+        assert_eq!(m.encode("ab"), vec![0, 1]);
+    }
+
+    #[test]
+    fn space_normalizes_to_u2581() {
+        // "▁x" is U+2581 + 'x'.  Input " x" (ascii space) must hit it.
+        let toks: Vec<Vec<u8>> = vec![
+            "x".as_bytes().to_vec(),
+            "\u{2581}x".as_bytes().to_vec(),   // id 1
+            "\u{2581}".as_bytes().to_vec(),    // id 2
+        ];
+        let scores = vec![-3.0, -1.0, -3.0];
+        let m = SpmModel::build(&toks, &scores);
+        // " x" → "▁x": single piece id 1 (score -1) beats ▁(-3)+x(-3)=-6.
+        assert_eq!(m.encode(" x"), vec![1]);
+    }
+
+    #[test]
+    fn byte_fallback_for_unknown_char() {
+        // Vocab has the byte-fallback token <0x7A> ('z') but no "z" piece.
+        let toks: Vec<Vec<u8>> = vec![
+            "a".as_bytes().to_vec(),       // id 0
+            "<0x7A>".as_bytes().to_vec(),  // id 1 → byte 0x7A ('z')
+        ];
+        let scores = vec![-1.0, 0.0];
+        let m = SpmModel::build(&toks, &scores);
+        // '<0x7A>' is registered as byte-fallback, NOT a normal piece.
+        assert_eq!(m.byte_fallback[0x7A], 1);
+        // "az": "a"(id0) then byte-fallback for 'z' → id 1.
+        assert_eq!(m.encode("az"), vec![0, 1]);
     }
 }

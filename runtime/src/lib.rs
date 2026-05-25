@@ -8236,6 +8236,9 @@ enum GgufMeta {
     /// Array of strings — used for `tokenizer.ggml.tokens` (152064
     /// entries on Qwen2.5) and `_merges`.
     StringArray(Vec<String>),
+    /// Array of f32 — used for `tokenizer.ggml.scores` (SentencePiece
+    /// Unigram log-probs; one per vocab entry).
+    F32Array(Vec<f32>),
 }
 
 struct GgufFile {
@@ -8325,6 +8328,14 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
                     items.push(gguf_read_string(b, off)?);
                 }
                 Some(Some(GgufMeta::StringArray(items)))
+            } else if elem_type == 6 {  // f32 array -- captured (SPM scores)
+                let mut items = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if *off + 4 > b.len() { return None; }
+                    items.push(f32::from_le_bytes(b[*off..*off + 4].try_into().ok()?));
+                    *off += 4;
+                }
+                Some(Some(GgufMeta::F32Array(items)))
             } else {
                 for _ in 0..count { gguf_skip_value(b, off, elem_type)?; }
                 Some(None)
@@ -8654,6 +8665,48 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
             if n > max as usize { return -2; }
             let dst = std::slice::from_raw_parts_mut(out as *mut u8, n);
             dst.copy_from_slice(s.as_bytes());
+            n as c_int
+        }
+        _ => -1,
+    }
+}
+
+/// Number of elements in an f32-array metadata value (e.g.
+/// `tokenizer.ggml.scores`). -1 on bad args / wrong type.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_array_f32_n(
+    handle: i64, key: i64, key_len: c_int,
+) -> c_int {
+    if handle < 0 || key == 0 || key_len <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::F32Array(v)) => v.len() as c_int,
+        _ => -1,
+    }
+}
+
+/// Bulk-copy an f32-array metadata value into a caller f32 buffer.
+/// Returns the count copied (= min(array len, max)), -1 on bad
+/// args / wrong type.  One call loads the whole SPM scores array.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_array_f32(
+    handle: i64, key: i64, key_len: c_int, out: i64, max: c_int,
+) -> c_int {
+    if handle < 0 || key == 0 || key_len <= 0 || out == 0 || max <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::F32Array(v)) => {
+            let n = v.len().min(max as usize);
+            let dst = std::slice::from_raw_parts_mut(out as *mut f32, n);
+            dst.copy_from_slice(&v[..n]);
             n as c_int
         }
         _ => -1,
