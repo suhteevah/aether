@@ -63,6 +63,7 @@ struct CudaCtx {
     rope_apply_backward:CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     silu_inplace:      CudaFunction,
+    silu_bwd:          CudaFunction,
     mul_inplace:       CudaFunction,
     add_inplace:       CudaFunction,
     bias_add:          CudaFunction,
@@ -2558,6 +2559,23 @@ extern "C" __global__ void silu_inplace(
     if (i >= n) return;
     float xi = x[i];
     x[i] = xi / (1.0f + expf(-xi));
+}
+
+// matt-voice FR-18.6-real leg 2 — SiLU backward for SwiGLU training.
+// silu(x) = x*sigmoid(x); silu'(x) = sig*(1 + x*(1 - sig)). dx = dy*silu'(x).
+// `x` is the pre-silu input saved from forward; `dy` the upstream grad.
+//
+// roadmap: P18
+extern "C" __global__ void silu_bwd(
+    const float* __restrict__ x, const float* __restrict__ dy,
+    float* __restrict__ dx, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float xi = x[i];
+    float sig = 1.0f / (1.0f + expf(-xi));
+    float gp = sig * (1.0f + xi * (1.0f - sig));
+    dx[i] = dy[i] * gp;
 }
 
 // matt-voice — element-wise multiply in place: x[i] *= y[i]. Used by
@@ -5190,7 +5208,7 @@ fn ctx() -> &'static CudaCtx {
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "rms_norm_bwd_dx", "rms_norm_bwd_gamma", "rope_apply", "rope_apply_backward", "gqa_repeat_kv",
-              "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
+              "silu_inplace", "silu_bwd", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
               "fused_q5_0_matmul_seq1",
@@ -5242,6 +5260,7 @@ fn ctx() -> &'static CudaCtx {
         let rope_apply_backward   = device.get_func("aether_kernels", "rope_apply_backward").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let silu_inplace          = device.get_func("aether_kernels", "silu_inplace").unwrap();
+        let silu_bwd              = device.get_func("aether_kernels", "silu_bwd").unwrap();
         let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
         let add_inplace           = device.get_func("aether_kernels", "add_inplace").unwrap();
         let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
@@ -5288,7 +5307,7 @@ fn ctx() -> &'static CudaCtx {
                   add_layer_norm_fwd,
                   rms_norm_fwd, rms_norm_bwd_dx, rms_norm_bwd_gamma,
                   rope_apply, rope_apply_backward, gqa_repeat_kv,
-                  silu_inplace, mul_inplace, add_inplace, bias_add,
+                  silu_inplace, silu_bwd, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
                   fused_q5_0_matmul_seq1, fused_q8_0_matmul_seq1,
@@ -7926,6 +7945,27 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     unsafe {
         let xv = &mut *x_p;
         ctx().silu_inplace.clone().launch(cfg, (xv, n)).expect("launch silu_inplace");
+    }
+    0
+}
+
+/// matt-voice FR-18.6-real leg 2 — SiLU backward: dx = dy * silu'(x), where
+/// `x` is the pre-silu input saved from forward. For SwiGLU training.
+///
+/// roadmap: P18
+#[no_mangle] pub extern "C" fn aether_op_silu_backward_f32_cuda(
+    x: i64, dy: i64, dx: i64, n: c_int,
+) -> c_int {
+    let (Some(ix), Some(idy), Some(idx_)) = (handle_to_idx(x), handle_to_idx(dy), handle_to_idx(dx))
+        else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p  = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dy_p = bs[idy].as_ref().unwrap() as *const CudaSlice<f32>;
+    let dx_p = bs[idx_].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        let xv = &*x_p; let dyv = &*dy_p; let dxv = &mut *dx_p;
+        ctx().silu_bwd.clone().launch(cfg, (xv, dyv, dxv, n)).expect("launch silu_bwd");
     }
     0
 }
