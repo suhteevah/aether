@@ -8142,9 +8142,78 @@ unsafe fn cuda_matmul_through(
 //   then padding to align (usually 32) bytes
 //   then tensor data
 //
-// We load the full blob into memory (mmap is a future op). For
-// matt-voice's 4.7 GB Qwen2.5-7B this is fine on a 32+ GB host.
+// The blob is mmap'd on unix (lazy, reclaimable file-backed pages → host RSS
+// stays bounded even for models LARGER than host RAM; matt-voice FR-18.6-real
+// leg 3: the 19 GB Qwen3-32B GGUF OOM-killed the loader on cnc's 15 GB box when
+// it was a full std::fs::read). Falls back to an owned Vec on non-unix.
 // =====================================================================
+
+/// GGUF byte store: an mmap (unix) or an owned buffer (fallback). Derefs to
+/// `[u8]` so all blob indexing / `.as_ptr()` / `.len()` sites are unchanged.
+/// matt-voice FR-18.6-real leg 3.
+enum GgufBlob {
+    Owned(Vec<u8>),
+    #[cfg(unix)]
+    Mmap { ptr: *mut std::os::raw::c_void, len: usize },
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn mmap(addr: *mut std::os::raw::c_void, len: usize, prot: c_int, flags: c_int,
+            fd: c_int, off: i64) -> *mut std::os::raw::c_void;
+    fn munmap(addr: *mut std::os::raw::c_void, len: usize) -> c_int;
+}
+
+impl std::ops::Deref for GgufBlob {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            GgufBlob::Owned(v) => &v[..],
+            #[cfg(unix)]
+            GgufBlob::Mmap { ptr, len } =>
+                unsafe { std::slice::from_raw_parts(*ptr as *const u8, *len) },
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GgufBlob {
+    fn drop(&mut self) {
+        if let GgufBlob::Mmap { ptr, len } = self {
+            unsafe { munmap(*ptr, *len); }
+        }
+    }
+}
+
+// The blob lives in a process-global table; the raw mmap pointer is read-only
+// and never aliased mutably, so it's safe to share across threads.
+unsafe impl Send for GgufBlob {}
+unsafe impl Sync for GgufBlob {}
+
+/// Open a GGUF as a `GgufBlob` — mmap (read-only, private) on unix, owned read
+/// otherwise. mmap keeps host RSS bounded for models larger than RAM.
+fn open_gguf_blob(path: &str) -> std::io::Result<GgufBlob> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(path)?;
+        let len = f.metadata()?.len() as usize;
+        if len == 0 { return Ok(GgufBlob::Owned(Vec::new())); }
+        const PROT_READ: c_int = 1;
+        const MAP_PRIVATE: c_int = 2;
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+        // MAP_FAILED == (void*)-1
+        if ptr as isize == -1 {
+            return Ok(GgufBlob::Owned(std::fs::read(path)?));
+        }
+        // `f` may drop here; the mapping outlives the fd.
+        Ok(GgufBlob::Mmap { ptr, len })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(GgufBlob::Owned(std::fs::read(path)?))
+    }
+}
 
 struct GgufTensorInfo {
     name: String,
@@ -8170,7 +8239,7 @@ enum GgufMeta {
 }
 
 struct GgufFile {
-    blob: Vec<u8>,
+    blob: GgufBlob,
     version: u32,
     tensor_count: u64,
     metadata_kv_count: u64,
@@ -8277,7 +8346,7 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
     if path == 0 || n_path <= 0 { return -1; }
     let path_bytes = std::slice::from_raw_parts(path as *const u8, n_path as usize);
     let Ok(path_str) = std::str::from_utf8(path_bytes) else { return -1; };
-    let Ok(blob) = std::fs::read(path_str) else { return -1; };
+    let Ok(blob) = open_gguf_blob(path_str) else { return -1; };
     let b = &blob[..];
     if b.len() < 24 || &b[..4] != b"GGUF" { return -2; }
     let mut off = 4usize;
