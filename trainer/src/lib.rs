@@ -3,6 +3,7 @@ pub mod data;
 pub mod lora;
 pub mod lora_dp;
 pub mod model;
+pub mod pipeline;
 pub mod rng;
 pub mod sample;
 
