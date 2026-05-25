@@ -8232,6 +8232,9 @@ enum GgufMeta {
     U64(u64),
     /// Float scalar metadata — rope.freq_base, layer_norm_rms_epsilon, etc.
     F32(f32),
+    /// Boolean (GGUF value type 7, 1 byte) — e.g. deepseek2.expert_weights_norm,
+    /// tokenizer.ggml.add_bos_token.
+    Bool(bool),
     String(String),
     /// Array of strings — used for `tokenizer.ggml.tokens` (152064
     /// entries on Qwen2.5) and `_merges`.
@@ -8314,6 +8317,12 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
         10 => {  // u64 -- captured
             let v = gguf_read_u64(b, off)?;
             Some(Some(GgufMeta::U64(v)))
+        }
+        7 => {  // bool (1 byte) -- captured
+            if *off + 1 > b.len() { return None; }
+            let v = b[*off] != 0;
+            *off += 1;
+            Some(Some(GgufMeta::Bool(v)))
         }
         8 => {  // string -- captured
             let s = gguf_read_string(b, off)?;
@@ -8575,6 +8584,25 @@ fn gguf_read_or_skip_value(b: &[u8], off: &mut usize, vtype: u32) -> Option<Opti
     match g.metadata.get(key_str) {
         Some(GgufMeta::U32(v)) => *v as i64,
         Some(GgufMeta::U64(v)) => *v as i64,
+        _ => -1,
+    }
+}
+
+/// Read a boolean metadata value (GGUF type 7).  Returns 1 (true), 0 (false),
+/// or -1 on missing key / wrong type — caller distinguishes "absent" from
+/// "false" via the -1 sentinel.
+#[no_mangle] pub unsafe extern "C" fn aether_gguf_get_metadata_bool(
+    handle: i64, key: i64, key_len: c_int,
+) -> i64 {
+    if handle < 0 || key == 0 || key_len <= 0 { return -1; }
+    let tbl = gguf_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    let Some(g) = tbl[h].as_ref() else { return -1; };
+    let key_bytes = std::slice::from_raw_parts(key as *const u8, key_len as usize);
+    let Ok(key_str) = std::str::from_utf8(key_bytes) else { return -1; };
+    match g.metadata.get(key_str) {
+        Some(GgufMeta::Bool(v)) => if *v { 1 } else { 0 },
         _ => -1,
     }
 }

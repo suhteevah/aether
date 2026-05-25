@@ -314,6 +314,20 @@ pub struct ModelConfig {
     /// `n_shared_experts * expert_ff_dim`.  DeepSeek-V2-Lite: 1408.
     /// 0 = N/A.  Read from `<arch>.expert_feed_forward_length`.
     pub expert_ff_dim: usize,
+    /// MoE router gating function: 1 = softmax (DeepSeek-V2 / Qwen3-MoE),
+    /// 2 = sigmoid (DeepSeek-V3 / GLM-4.7-flash).  Scores are computed over
+    /// ALL experts with this op, THEN the top-k are selected.  Read from
+    /// `<arch>.expert_gating_func`; default 1 (softmax).
+    pub expert_gating_func: i32,
+    /// MoE: whether to renormalize the selected top-k expert weights to sum
+    /// to 1 (`norm_topk_prob`).  Read from `<arch>.expert_weights_norm`;
+    /// default true (Qwen3-MoE / GLM).  DeepSeek-V2-Lite stores FALSE — the
+    /// raw softmax-over-all-experts probabilities are used as-is.
+    pub expert_weights_norm: bool,
+    /// MoE: post-normalization scale applied to the routed-expert weights
+    /// (`routed_scaling_factor`).  Read from `<arch>.expert_weights_scale`;
+    /// default 1.0.  GLM-4.7-flash uses 1.8; DeepSeek-V2-Lite uses 1.0.
+    pub expert_weights_scale: f32,
     /// FR-17-extra-mla-fwd YaRN — RoPE scaling factor (s).  0 or 1 = no
     /// scaling (standard RoPE).  > 1 = YaRN-by-parts scaling with this
     /// factor.  DeepSeek-V2-Lite uses 40.
@@ -351,6 +365,8 @@ impl ModelConfig {
             key_length_mla: 0, value_length_mla: 0,
             leading_dense_blocks: 0, n_shared_experts: 0,
             expert_ff_dim: 0,
+            expert_gating_func: 1, expert_weights_norm: true,
+            expert_weights_scale: 1.0,
             yarn_factor: 1.0, yarn_log_multiplier: 0.0,
             yarn_orig_ctx: 4096.0,
             yarn_beta_fast: 32.0, yarn_beta_slow: 1.0,
@@ -461,6 +477,17 @@ impl ModelConfig {
         let expert_ff_dim = read_meta_u32(gguf_handle,
             &format!("{}.expert_feed_forward_length", prefix))
             .map(|v| v as usize).unwrap_or(0);
+        // MoE router gating — matches llama.cpp build_moe_ffn.  gating_func
+        // 1=softmax (DeepSeek-V2 / Qwen3-MoE), 2=sigmoid (V3 / GLM-4.7-flash);
+        // weights_norm = renormalize top-k (false for V2-Lite!); weights_scale
+        // = routed_scaling_factor (1.8 for GLM, 1.0 elsewhere).
+        let expert_gating_func = read_meta_u32(gguf_handle,
+            &format!("{}.expert_gating_func", prefix))
+            .map(|v| v as i32).unwrap_or(1);
+        let expert_weights_norm = read_meta_bool(gguf_handle,
+            &format!("{}.expert_weights_norm", prefix)).unwrap_or(true);
+        let expert_weights_scale = read_meta_f32(gguf_handle,
+            &format!("{}.expert_weights_scale", prefix)).unwrap_or(1.0);
         // FR-17-extra-mla-fwd YaRN — long-context RoPE scaling.  Only active
         // when `<arch>.rope.scaling.type == "yarn"`; for "linear" / absent
         // we keep the standard RoPE path.  Defaults match the YaRN paper +
@@ -501,6 +528,7 @@ impl ModelConfig {
             qk_head_dim, qk_rope_head_dim, v_head_dim,
             key_length_mla, value_length_mla,
             leading_dense_blocks, n_shared_experts, expert_ff_dim,
+            expert_gating_func, expert_weights_norm, expert_weights_scale,
             yarn_factor, yarn_log_multiplier, yarn_orig_ctx,
             yarn_beta_fast, yarn_beta_slow,
         }
@@ -555,6 +583,11 @@ unsafe fn read_meta_string(h: i64, key: &str) -> Option<String> {
         buf.as_mut_ptr() as i64, buf.len() as c_int);
     if n <= 0 { return None; }
     String::from_utf8(buf[..n as usize].to_vec()).ok()
+}
+unsafe fn read_meta_bool(h: i64, key: &str) -> Option<bool> {
+    let v = crate::aether_gguf_get_metadata_bool(
+        h, key.as_ptr() as i64, key.len() as c_int);
+    if v < 0 { None } else { Some(v != 0) }
 }
 
 struct BlockGpu {
@@ -1872,6 +1905,49 @@ fn lookup_expert_kernel(dt: i32) -> &'static ExpertDtype {
         dt, supported.join(","), dt);
 }
 
+/// MoE router weighting, matching llama.cpp `build_moe_ffn`.  Returns the
+/// selected expert indices (top-k by score) and their combination weights.
+///
+///   scores  = gating(logits) over ALL experts (1=softmax, 2=sigmoid)
+///   select  = top-k by score (== top-k by logit; both gating fns monotone)
+///   weights = scores[select]
+///   if norm:  weights /= (sum + 1e-20)        (norm_topk_prob)
+///   weights *= scale                          (routed_scaling_factor)
+///
+/// Pure + side-effect-free so it is unit-testable without a GPU — see
+/// `moe_select_weights_*` tests.  `moe_ffn_forward` calls THIS (no duplicated
+/// math), so the tests guard the real path.
+fn moe_select_weights(
+    logits: &[f32], n_used: usize, gating_func: i32,
+    norm: bool, scale: f32,
+) -> (Vec<usize>, Vec<f32>) {
+    let n_experts = logits.len();
+    let k = n_used.min(n_experts).max(1);
+    let scores: Vec<f32> = if gating_func == 2 {
+        // sigmoid (DeepSeek-V3 / GLM-4.7-flash)
+        logits.iter().map(|&l| 1.0f32 / (1.0f32 + (-l).exp())).collect()
+    } else {
+        // softmax (DeepSeek-V2 / Qwen3-MoE) over ALL experts
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|&l| (l - max_l).exp()).collect();
+        let z: f32 = exps.iter().sum::<f32>().max(1e-20);
+        exps.iter().map(|&e| e / z).collect()
+    };
+    let mut idx_sorted: Vec<usize> = (0..n_experts).collect();
+    idx_sorted.sort_unstable_by(|a, b|
+        scores[*b].partial_cmp(&scores[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    let selected: Vec<usize> = idx_sorted[..k].to_vec();
+    let mut weights: Vec<f32> = selected.iter().map(|&i| scores[i]).collect();
+    if norm {
+        let sum: f32 = weights.iter().sum::<f32>() + 1e-20;
+        for w in &mut weights { *w /= sum; }
+    }
+    if scale != 1.0 {
+        for w in &mut weights { *w *= scale; }
+    }
+    (selected, weights)
+}
+
 unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig) {
     let d_model = cfg.d_model;
     // Per-expert FFN hidden dim.  DeepSeek-V2 / GLM-4.7-flash store this in
@@ -1901,18 +1977,28 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
         bw.w_router, act.x_norm, router_logits,
         n_experts as c_int, d_model as c_int, 1);
 
-    // 2. D2H + top-k + softmax on host.
+    // 2. D2H, then compute routed-expert weights exactly as llama.cpp
+    //    build_moe_ffn does:
+    //      scores  = gating(logits) over ALL n_experts (softmax | sigmoid)
+    //      select  = top-k by score (== top-k by logit; both gating fns are
+    //                monotone, so selection is identical either way)
+    //      weights = scores[select]
+    //      if expert_weights_norm: weights /= (sum + 1e-20)   (norm_topk_prob)
+    //      weights *= expert_weights_scale                    (routed_scaling)
+    //
+    //    The previous code took softmax over ONLY the top-k logits and ALWAYS
+    //    renormalized to 1.0.  For norm=true softmax archs (Qwen3-MoE) that is
+    //    algebraically identical (softmax-over-all then renorm-top-k == softmax
+    //    over just the top-k), so they are unchanged.  But DeepSeek-V2-Lite has
+    //    expert_weights_norm=FALSE (raw softmax-over-64 probs, summing <1) and
+    //    GLM-4.7-flash uses sigmoid gating + scale 1.8 — both were wrong before.
     let mut logits = vec![0f32; n_experts];
     aether_dev_sync();
     aether_dev_d2h_f32(router_logits, logits.as_mut_ptr() as i64, n_experts as c_int);
-    let mut idx_sorted: Vec<usize> = (0..n_experts).collect();
-    idx_sorted.sort_unstable_by(|a, b|
-        logits[*b].partial_cmp(&logits[*a]).unwrap_or(std::cmp::Ordering::Equal));
-    let selected = &idx_sorted[..n_used];
-    let max_l = selected.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
-    let mut weights: Vec<f32> = selected.iter().map(|&i| (logits[i] - max_l).exp()).collect();
-    let sum: f32 = weights.iter().sum();
-    for w in &mut weights { *w /= sum; }
+    let (selected, weights) = moe_select_weights(
+        &logits, n_used, cfg.expert_gating_func,
+        cfg.expert_weights_norm, cfg.expert_weights_scale);
+    let selected = selected.as_slice();
 
     // 3. Per-expert forward.  Dispatch on dtype-per-tensor via the
     // MOE_EXPERT_DISPATCH table above.  `blocks_per_row` is derived from the
@@ -2322,6 +2408,11 @@ impl QwenSession {
                 eprintln!("[QwenSession] YaRN: factor={} log_mul={} orig_ctx={} beta=({},{}) -> mscale={:.4} mscale^2={:.4}",
                     cfg.yarn_factor, cfg.yarn_log_multiplier, cfg.yarn_orig_ctx,
                     cfg.yarn_beta_fast, cfg.yarn_beta_slow, mscale, mscale * mscale);
+            }
+            if cfg.n_experts > 0 {
+                eprintln!("[QwenSession] MoE: experts={} used={} shared={} gating={} (1=softmax 2=sigmoid) weights_norm={} weights_scale={}",
+                    cfg.n_experts, cfg.n_experts_used, cfg.n_shared_experts,
+                    cfg.expert_gating_func, cfg.expert_weights_norm, cfg.expert_weights_scale);
             }
             // Kernel constraints (FR-17-extra-runtime-shape).  The fused
             // kernels work for any Qwen-style shape that satisfies these
@@ -4503,5 +4594,58 @@ mod spm_tests {
         assert_eq!(m.byte_fallback[0x7A], 1);
         // "az": "a"(id0) then byte-fallback for 'z' → id 1.
         assert_eq!(m.encode("az"), vec![0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod moe_gating_tests {
+    // MoE router weighting is pure CPU logic — unit-testable without a GPU.
+    // These lock the per-arch gating to the llama.cpp build_moe_ffn reference;
+    // moe_ffn_forward calls the SAME fn, so a regression fails here first.
+    use super::moe_select_weights;
+
+    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-5 }
+
+    #[test]
+    fn v2_lite_softmax_no_norm() {
+        // DeepSeek-V2-Lite: softmax over ALL experts, top-k, NO renorm, scale 1.
+        // 4 experts, top-2.  logits [2,1,0,0]: exp=[7.389,2.718,1,1] sum 12.107
+        // → softmax = [.6103,.2245,.0826,.0826].  Selected top-2 = experts 0,1
+        // with their RAW softmax probs (sum 0.8348, NOT 1.0 — the point of
+        // norm=false).
+        let (sel, w) = moe_select_weights(&[2.0, 1.0, 0.0, 0.0], 2, 1, false, 1.0);
+        assert_eq!(sel, vec![0, 1]);
+        assert!(approx(w[0], 0.610_30), "w0={}", w[0]);
+        assert!(approx(w[1], 0.224_52), "w1={}", w[1]);
+        let sum: f32 = w.iter().sum();
+        assert!(sum < 0.95, "no-norm weights must sum <1, got {}", sum);
+    }
+
+    #[test]
+    fn qwen3moe_softmax_norm_matches_old_behavior() {
+        // norm=true softmax: softmax-over-all then renorm-top-k is algebraically
+        // identical to the OLD softmax-over-just-top-k → weights sum to 1 and the
+        // ratio matches exp(2)/exp(1). This is why Qwen3-MoE was unaffected.
+        let (sel, w) = moe_select_weights(&[2.0, 1.0, 0.0, 0.0], 2, 1, true, 1.0);
+        assert_eq!(sel, vec![0, 1]);
+        let sum: f32 = w.iter().sum();
+        assert!(approx(sum, 1.0), "norm weights sum to 1, got {}", sum);
+        // ratio w0/w1 == e^(2-1) == e.
+        assert!(approx(w[0] / w[1], std::f32::consts::E), "ratio={}", w[0] / w[1]);
+    }
+
+    #[test]
+    fn glm_sigmoid_norm_scale() {
+        // GLM-4.7-flash: sigmoid gating, norm=true, scale=1.8.
+        // logits [2,1,..] → sigmoid(2)=.8808, sigmoid(1)=.7311; top-2 selected,
+        // renorm to 1, then ×1.8 → weights sum to 1.8.
+        let (sel, w) = moe_select_weights(&[2.0, 1.0, -5.0, -5.0], 2, 2, true, 1.8);
+        assert_eq!(sel, vec![0, 1]);
+        let sum: f32 = w.iter().sum();
+        assert!(approx(sum, 1.8), "scaled sum should be 1.8, got {}", sum);
+        // pre-scale ratio = sigmoid(2)/sigmoid(1).
+        let s2 = 1.0f32 / (1.0 + (-2.0f32).exp());
+        let s1 = 1.0f32 / (1.0 + (-1.0f32).exp());
+        assert!(approx(w[0] / w[1], s2 / s1), "sigmoid ratio={}", w[0] / w[1]);
     }
 }
