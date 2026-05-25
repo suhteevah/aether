@@ -1,12 +1,34 @@
 # Aether — Session Handoff
 
 ## Last Updated
-2026-05-24 (**FR-18.6-real leg 2 ALL FOUR FINISHERS DONE this session — GQA,
-LM-loss, QLoRA, GPU pipeline Stage. 5 commits, all witnessed on RTX 3070 Ti, all
-committed. Leg 2 is fully closed; only leg 3 (real 2×P100 run on cnc) remains,
-and that's coordination (workhorse stop via openclaw main), not code.**)
+2026-05-24 (**FR-18.6-real LEG 3 FINISHED — the matt-voice Qwen3-32B unlock is
+DONE. Full 64-layer Qwen3-32B-Q4_K_M QLoRA-trained across 2×P100 on cnc via
+Aether pipeline parallelism: both ranks loaded (28/36 split, no OOM), both GPUs
+100%% alternating through the pipe, 8 steps loss 5.70→3.09, 67M LoRA params live
+across both stages, exit 0/0, clean trap restart of GPU-0 services. All 3 legs
+of FR-18.6-real now closed. ~12 commits this session.**)
 
-## Project Status — leg 2 CLOSED
+## Project Status — FR-18.6-real ALL THREE LEGS CLOSED
+🟢 **Leg 3 done.** The full path is proven on real hardware:
+- **mmap GGUF loader** (`6a2b94b`) — `aether_gguf_open` now mmaps (was a whole-file
+  `std::fs::read` that OOM-killed the 19 GB load on cnc's 15 GB box). `GgufBlob`
+  enum, unix mmap / owned-Vec fallback, Derefs to `[u8]` (all sites unchanged).
+- **QwenQLoraStage** (`efe557a`) — frozen quant base + trainable LoRA adapters,
+  full-seq fwd/bwd, GQA, Qwen3 per-head Q/K norm. Validated on real 7B AND 32B.
+- **pp-qlora-worker** (`f8...`/`--splits`) — N-way PP QLoRA worker; uneven split
+  (28 on the 12 GB P100, 36 on the 16 GB).
+- **Witnessed on cnc 2×P100**: full 64-layer Qwen3-32B, 28/36 split, both GPUs
+  100%, loss 5.70→3.09 (synthetic-objective smoke — noisy by design), adapter |B|
+  0→46k/59k both stages, exit 0/0. Every cnc cycle reversible (restart trap +
+  openclaw-main (B) coordination; ~8 min blackout, services verified restored).
+
+**What a REAL matt-voice fine-tune needs beyond this smoke** (machinery is all
+proven): swap the synthetic loss head for the GGUF lm_head + real tokenized
+matt-voice corpus + a DataLoader; tune lr/steps/microbatch (the smoke loss is
+noisy from microbatch=1 + random targets); save the trained adapters to a
+.lora.gguf. None of that is new machinery — it's data + a save path.
+
+## (prior) Project Status — leg 2 CLOSED
 🟢 The 4 leg-2 finishers the prior handoff listed as NEXT are all shipped +
 finite-diff/loss-curve witnessed:
 
