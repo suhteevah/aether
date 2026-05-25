@@ -58,8 +58,31 @@ DEFINITIVE next step (NOT yet done — fresh effort, GPU access granted):
    deepseek chat template vs llama-tokenize on the rendered prompt.
 4. Re-smoke qwen3moe (insurance; gating default unchanged for it).
 
-**Honest status: 4 real fixes shipped (GLM now coherent — big win), V2-Lite
-improved but NOT solved. Do not claim V2-Lite done.**
+**UPDATE — empirical reference + lead-chase done:**
+- **llama.cpp `llama-completion` (greedy) → "The capital of France is Paris."**
+  Model + GGUF PERFECT. Bug is 100% Aether's forward. (b8182 `llama-cli -no-cnv`
+  segfaults; use `llama-completion`.) Aether on same 6 ids → " is is is".
+- **RULED OUT** (systematically, with dtype probes via cnc gguf python):
+  - FFN: blk.0.ffn_down=Q8_0 (10944%32=0, ALIGNED); the `d_ff%256` WARN is a
+    FALSE ALARM. All ffn/attn tensors aligned-by-dtype + shapes match.
+  - Embeddings: token_embd=Q4_K (dequant_embd_row handles it). output=Q6_K.
+  - Prefill: both `prefill` + `prefill_for_slot` correct (token-by-token,
+    cur_seq=pos+1, causal-safe). `max_concurrent` defaults 1 → SINGLE-SESSION
+    path (not scheduler).
+  - MoE: GLM coherence proves the shared MoE/gating path.
+  - Scales: now match llama.cpp deepseek2 verbatim.
+- **REMAINING SUSPECT:** real-weights forward numerics. `cuda_mla_e2e_synthetic`
+  (the only passing MLA integration test) uses F32 weights + non-yarn + short
+  positions → does NOT cover the real QUANT matmuls (w_q/w_kv_b/w_kv_a Q4_K) or
+  yarn-at-real-positions. Bug hides there.
+- **DEFINITIVE NEXT STEP:** per-layer activation diff Aether-vs-llama.cpp on the
+  6 ids — instrument llama.cpp (eval-callback / GGML_DEBUG) to dump blk.0
+  attn_out + ffn_out, run Aether `AETHER_DUMP_MLA=1`, find first divergent
+  layer/stage. One run localizes it. All cheaper avenues exhausted.
+
+**Honest status: 5 commits / 4 real fixes shipped (GLM now coherent — big win),
+V2-Lite improved (char-garbage → word-repetition) + model proven fine + bug
+narrowed to real-weights forward numerics, but NOT solved. Do not claim done.**
 
 **mscale AUDIT (done):** attention softmax mscale²=1.5896 confirmed correct via
 load log; HF cos/sin _mscale=1.0 no-op for V2-Lite. Diagnostic log added
