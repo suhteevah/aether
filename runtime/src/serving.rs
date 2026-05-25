@@ -351,7 +351,22 @@ impl ModelConfig {
             .map(|v| v as usize).unwrap_or(N_Q_HEADS);
         let n_kv_heads = read_meta_u32(gguf_handle, &format!("{}.attention.head_count_kv", prefix))
             .map(|v| v as usize).unwrap_or(N_KV_HEADS);
-        let head_dim = if n_q_heads > 0 { d_model / n_q_heads } else { HEAD_DIM };
+        // head_dim is usually d_model / n_q_heads, but several llama-family
+        // models set an EXPLICIT head_dim via {arch}.attention.key_length that
+        // does NOT divide d_model evenly: Mistral Small 24B (32 heads * 128 =
+        // 4096 != 5120 hidden), Gemma3 (head_dim 256, not 240), Qwen3-MoE
+        // (head_dim 128, not 64). Prefer the explicit value when present and
+        // this is NOT an MLA arch (where key_length means the composite
+        // qk_nope+qk_rope dim, handled separately below).
+        let explicit_head_dim = read_meta_u32(gguf_handle,
+            &format!("{}.attention.key_length", prefix)).map(|v| v as usize).unwrap_or(0);
+        let is_mla_arch = read_meta_u32(gguf_handle,
+            &format!("{}.attention.kv_lora_rank", prefix)).map(|v| v as usize).unwrap_or(0) > 0;
+        let head_dim = if explicit_head_dim > 0 && !is_mla_arch {
+            explicit_head_dim
+        } else if n_q_heads > 0 {
+            d_model / n_q_heads
+        } else { HEAD_DIM };
         let d_kv = n_kv_heads * head_dim;
         let d_ff = read_meta_u32(gguf_handle, &format!("{}.feed_forward_length", prefix))
             .map(|v| v as usize).unwrap_or(D_FF);
@@ -951,7 +966,9 @@ unsafe fn block_forward_devarg(
         }
     } else {
         standard_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
-        d_model
+        // o-proj input = n_q_heads * head_dim (= d_model for Qwen/Llama; smaller
+        // for Mistral Small 24B with explicit head_dim).
+        n_q_heads * head_dim
     };
 
     // ---- Common post-attention tail: O proj + residual + LN + FFN ----
@@ -1023,9 +1040,12 @@ unsafe fn standard_attention_forward(
     let rope_base = cfg.rope_base;
     let norm_eps = cfg.norm_eps;
 
-    dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, d_model, d_model);
+    // Q projection output = n_q_heads * head_dim (= d_model for Qwen/Llama,
+    // but 4096 != 5120 for Mistral Small 24B where head_dim is explicit).
+    let q_dim = n_q_heads * head_dim;
+    dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, q_dim, d_model);
     if bw.b_q != 0 {
-        aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, d_model);
+        aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, q_dim);
     }
     dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
     if bw.b_k != 0 {
@@ -2086,7 +2106,10 @@ impl QwenSession {
             let q_total = if is_mla {
                 cfg.n_q_heads * cfg.qk_head_dim as usize
             } else {
-                cfg.d_model
+                // Q projection output = n_q_heads * head_dim. Equals d_model for
+                // Qwen/Llama; differs for Mistral Small 24B / Gemma3 (explicit
+                // head_dim). See ModelConfig::from_gguf head_dim derivation.
+                cfg.n_q_heads * cfg.head_dim
             };
             let d_k_row = if is_mla {
                 cfg.n_q_heads * cfg.qk_head_dim as usize
@@ -2101,7 +2124,9 @@ impl QwenSession {
             let attn_out_dim = if is_mla {
                 cfg.n_q_heads * cfg.v_head_dim as usize
             } else {
-                cfg.d_model
+                // = n_q_heads * head_dim (o-proj input). d_model for Qwen/Llama;
+                // smaller for Mistral Small 24B (4096 < 5120 hidden).
+                cfg.n_q_heads * cfg.head_dim
             };
             if is_mla {
                 eprintln!("[QwenSession] MLA mode: q_total={} d_k_row={} d_v_row={} attn_out_dim={}",
