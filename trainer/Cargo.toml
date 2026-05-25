@@ -39,6 +39,11 @@ name = "qlora-smoke"
 path = "src/bin/qlora_smoke.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "pp-qlora-worker"
+path = "src/bin/pp_qlora_worker.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 # `cuda`: enable cuBLAS/cuDNN routing in aether_rt + unlock the
