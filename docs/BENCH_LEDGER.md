@@ -379,3 +379,31 @@ training grad-checks (lm_loss/block/gqa) still green via the now-18-kernel lazy
 TRAIN unit. Remaining toward 37.2 peak: the inference-AMBIGUOUS kernels
 (gelu_fwd, layer_norm_fwd, add_layer_norm_fwd, bert_*, gqa_repeat/reduce) kept
 in KERNEL_SRC pending a BERT-inference smoke to confirm they're decode-unused.
+
+## perf investigation — the "last 2 tok/s" (2026-05-24): #2 profile, #4 ptxas, #1 split
+
+Goal: recover decode from ~35.0 (post batch-2) toward the 37.2 peak (add5216).
+Three levers tried; net: the nvrtc-pressure lever is EXHAUSTED at ~35 — the
+remainder is measurement variance + genuine common-path kernel cost.
+
+- **#2 per-op profile** (qwen25_perf_breakdown, no-graph per-op shares): decode is
+  ~85% in the fused QUANT MATMULS (attn_norm+Q/K/V+rope 30.7%, FFN gate/up 34.6%,
+  down 19.4%); attention only 4.2%. No single anomalous/regressed kernel → the
+  loss is DIFFUSE register pressure on the quant-matmul hot path, not one slow op.
+- **#4 ptxas maxrregcount=64** on the decode unit: REGRESSED 35.0→33.2. The hot
+  seq1 quant matmuls are register-HUNGRY (not occupancy-limited); a cap spills.
+  Default allocation is optimal. Reverted.
+- **#1 per-arch decode split** (moved 18 non-common-path decode kernels — 9 rare
+  quant dtypes + 6 MoE expert + 2 bert + iq3 dequant — to a lazy AUXD unit):
+  measured 33.3/34.0/35.4 = within the ~2 tok/s noise of batch-2's ~35. NO clear
+  gain — the hot kernels' register allocation wasn't bottlenecked by those 18's
+  co-residence (batches 1+2 already relieved the pressure that mattered). Reverted
+  (also avoids unverifiable lazy-compile risk to GLM/MoE/BGE inference on this card).
+
+Conclusion: batches 1+2 (+7.4%, 32.6→~35.0, ~117% of llama.cpp) captured the
+recoverable nvrtc-pressure win. The gap to 37.2 is (a) measurement: 37.2 was a
+4-run warm mean, ~35.4 is the best single warm run here — a clean mean-of-N would
+shrink the apparent gap; (b) genuine: more arch-required kernels in KERNEL_SRC vs
+add5216 that can't be removed without dropping arch support. Real further gains
+would need faster HOT kernels (a better q4k seq1 matmul / fused FFN), not more
+unit-splitting — a kernel-optimization task, not a pressure-relief one.
