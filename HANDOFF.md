@@ -1,6 +1,57 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-25 (session end)
+## Last Updated — 2026-05-25 (per-arch session B — gemma3 CLOSED end-to-end)
+🟢 Picked up handoff items (a)+(b)+(d), then drove gemma3 all the way to
+coherent text serving. 4 commits (e5da06a, dca1510, 39bc261, d820cc8), all
+pushed to origin/main; cnc /opt/aether fast-forwarded + rebuilt each step.
+
+**Headline: gemma-3-12b serves coherent text end-to-end on cnc.**
+- "List three primary colors, separated by commas." → **"Red, Yellow, Blue"**
+  (prompt_ids byte-identical to `llama-tokenize`: 18 ids).
+- "What is the capital of France?" → **"The capital of France is Paris."**
+Two bugs, both fixed:
+1. **Forward** — gemma3 per-layer local/global attention + dual RoPE base
+   (5 local rope=10k/win=1024 : 1 global rope=1M/full, `il%6==5`). Validated
+   first via `prompt_ids` (greedy → "Red,Yellow,Blue"). logit-softcap +
+   query_pre_attn_scalar were RED HERRINGS (gemma2-only / no-op for 12b);
+   RMSNorm `(1+w)` is baked into the GGUF — plain rms_norm stays correct.
+   [[gemma3_dual_rope_per_layer_swa]]
+2. **Tokenizer** — gemma is SentencePiece (`tokenizer.ggml.model=="llama"`),
+   aether had GPT-2 byte-BPE only. Built an SPM encoder. KEY: SPM is NOT
+   Unigram-Viterbi (Viterbi over-segments — gemma scores reward short pieces:
+   `user`=-1870 < `us`-111+`er`-3); llama.cpp uses iterative **bigram-merge**.
+   Reimplemented that way → byte-exact with llama-tokenize. Plus `▁`→space
+   detok + BOS prepend + f32-array (scores) GGUF getter.
+   [[spm_bigram_merge_tokenizer]]
+
+**Also shipped (the original a/b/d):**
+- **(b)** deepseek2 chat-template split — GLM (absorbed) vs DeepSeek-Coder-V2
+  (non-absorbed) via `is_mla_absorbed()`. V2-Lite no longer gets GLM markers
+  (prompt_tokens 15, correct). 6 unit tests. [[deepseek2_two_chat_templates]]
+- **(d)** Q6_K (dt=14) MoE expert matmul kernel + dispatch + 2 GPU parity
+  tests. qwen3moe smoke ran experts with zero dtype panic.
+
+**Per-arch ledger now:**
+- ✅ witness-ready: qwen2.5, GLM, BGE, IQ3_M-class, **gemma3 (NEW — coherent text)**
+- 🟡 forward still incoherent (separate, NOT started): **V2-Lite** (template now
+  correct → blocker is the MLA-non-absorbed FORWARD) + **qwen3moe** (Q6_K no
+  panic, ChatML correct → forward rambles). Both need an `AETHER_DUMP_BLOCKS`/
+  `AETHER_DUMP_LOGITS` NaN-bisect of their forwards — open-ended GPU debugging.
+
+**cnc state:** all smokes ran on GPU1 with the workhorse evicted+restored
+(watchdog + explicit restart each time); workhorse + scout both active now.
+Local: workspace builds clean (bare + cuda); audit 0 errors; new unit tests
+(6 template + 3 gemma3-layer + 4 SPM + 2 Q6_K-parity) all green.
+`AETHER_DUMP_TOK=1` dumps final prompt ids. `llama-tokenize` at
+`cnc:/opt/llama/llama-b8182/` is the tokenizer ground-truth.
+
+**Next:** (1) V2-Lite MLA-non-absorbed forward bisect; (2) qwen3moe forward
+bisect; (3) wire SPM-arch detection into the per-model chat path if any other
+SPM model is hosted; (4) the deferred 8h matt-voice run.
+
+---
+
+## Last Updated — 2026-05-25 (session end, prior block)
 🟢 Two big threads landed; both have clean carry-forward. (Older dated sections
 below are chronological; this block is the canonical current state.)
 
