@@ -586,7 +586,10 @@ fn consume_slot_logits(
     slot: &mut SessionSlot,
     mut logits: Vec<f32>,
 ) -> Result<bool, String> {
-    let max_pos = session.lock().unwrap().max_pos();
+    let (max_pos, eog_tokens) = {
+        let s = session.lock().unwrap();
+        (s.max_pos(), s.eog_tokens.clone())
+    };
 
     // Per-slot logit biases + repetition penalties + sample.
     if !slot.params.logit_bias.is_empty() {
@@ -606,7 +609,7 @@ fn consume_slot_logits(
 
     // Stop-token check happens BEFORE the token is recorded (matching
     // the legacy generate_sampled_v2 semantics).
-    if Some(id) == slot.stop_token {
+    if Some(id) == slot.stop_token || eog_tokens.contains(&id) {
         return Ok(true);
     }
 

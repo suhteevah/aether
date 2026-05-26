@@ -2231,6 +2231,11 @@ pub struct QwenSession {
     /// auto-stop in `generate()` when caller doesn't pass an explicit
     /// stop_token. -1 if metadata absent.
     pub eos_token: i32,
+    /// Full end-of-generation id set (eos + eot + eom, from the GGUF).
+    /// `generate*` stops on ANY of these — a single eos isn't enough for chat
+    /// models whose turn-end token differs (GLM-4.x ends on `<|user|>`/eot, not
+    /// eos). Empty falls back to `eos_token` / the caller's explicit stop.
+    pub eog_tokens: Vec<usize>,
     /// FR-19.4-extra paged-KV mode.  When Some, kvs[i].k_cache / v_cache point
     /// at the per-layer KV POOL (size pool_blocks * block_size * d_kv f32);
     /// `page_table_dev` holds an identity mapping [0,1,..,pool_blocks-1] used
@@ -2760,6 +2765,8 @@ impl QwenSession {
 
             let tok = load_tokenizer_from_gguf(h);
             let (bpe_handle, eos_token) = (tok.bpe, tok.eos);
+            let eog_tokens: Vec<usize> = tok.eog.iter().filter(|&&t| t >= 0)
+                .map(|&t| t as usize).collect();
             let (spm, add_bos, bos_token) = (tok.spm, tok.add_bos, tok.bos);
             let gpt2_u2b = build_gpt2_unicode_to_byte();
             // FR-x-extra-chat-template: best-effort read of the GGUF's
@@ -2792,7 +2799,7 @@ impl QwenSession {
                 next_pos: 0,
                 max_seq,
                 graph_captured: false,
-                bpe_handle, gpt2_u2b, eos_token,
+                bpe_handle, gpt2_u2b, eos_token, eog_tokens,
                 paged_cfg,
                 pool: None,
                 owned_blocks: Vec::new(),
@@ -3127,7 +3134,7 @@ impl QwenSession {
         let mut last = *prompt_ids.last().expect("prompt cannot be empty");
         for _ in 0..max_tokens {
             let id = self.decode_step(last);
-            if Some(id) == stop_token { break; }
+            if Some(id) == stop_token || self.eog_tokens.contains(&id) { break; }
             generated.push(id);
             last = id;
             if self.next_pos as usize >= self.max_seq - 1 { break; }
@@ -3248,12 +3255,15 @@ impl Drop for QwenSession {
 struct TokenizerLoad {
     bpe: i64,
     eos: i32,
+    /// Full end-of-generation id set (eos + eot + eom from the GGUF). Stopping
+    /// on any of these is what makes chat models end their turn correctly.
+    eog: Vec<i32>,
     spm: Option<SpmModel>,
     add_bos: bool,
     bos: i32,
 }
 impl TokenizerLoad {
-    fn failed() -> Self { Self { bpe: -1, eos: -1, spm: None, add_bos: false, bos: -1 } }
+    fn failed() -> Self { Self { bpe: -1, eos: -1, eog: Vec::new(), spm: None, add_bos: false, bos: -1 } }
 }
 
 unsafe fn load_tokenizer_from_gguf(h: i64) -> TokenizerLoad {
@@ -3350,6 +3360,26 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> TokenizerLoad {
     let eos_token: i32 = if eos < 0 { -1 } else { eos as i32 };
     eprintln!("[QwenSession] EOS token id: {}", eos_token);
 
+    // Full end-of-generation set, matching llama.cpp's EOG ids.  A single EOS
+    // is not enough for chat models that end a turn with a DIFFERENT token:
+    // GLM-4.x ends the assistant turn with `<|user|>` (eot=154827) /
+    // `<|observation|>` (eom=154829), NOT eos (154820) — so stopping only on
+    // eos (or, worse, on the bogus `--stop-token 154822`=[gMASK]) let GLM
+    // ramble past a correct answer.  Llama-3 similarly uses eot=128009.  Read
+    // every declared boundary id from the GGUF and stop on any of them.
+    let read_id = |key: &[u8]| -> i32 {
+        let v = aether_gguf_get_metadata_u32(h, key.as_ptr() as i64, key.len() as c_int);
+        if v < 0 { -1 } else { v as i32 }
+    };
+    let eot_token = read_id(b"tokenizer.ggml.eot_token_id");
+    let eom_token = read_id(b"tokenizer.ggml.eom_token_id");
+    let mut eog: Vec<i32> = Vec::new();
+    for t in [eos_token, eot_token, eom_token] {
+        if t >= 0 && !eog.contains(&t) { eog.push(t); }
+    }
+    eprintln!("[QwenSession] EOG token ids: {:?} (eos={} eot={} eom={})",
+        eog, eos_token, eot_token, eom_token);
+
     // SentencePiece detection: `tokenizer.ggml.model == "llama"` means the
     // vocab is SPM (gemma / llama-SPM), which the GPT-2 byte-BPE encode path
     // cannot tokenize.  Build a Unigram Viterbi encoder from vocab + scores.
@@ -3388,7 +3418,7 @@ unsafe fn load_tokenizer_from_gguf(h: i64) -> TokenizerLoad {
         if v < 0 { -1 } else { v as i32 }
     };
 
-    TokenizerLoad { bpe, eos: eos_token, spm, add_bos, bos }
+    TokenizerLoad { bpe, eos: eos_token, eog, spm, add_bos, bos }
 }
 
 /// Build the GPT-2 byte-to-unicode mapping and return its inverse. This
@@ -3862,7 +3892,7 @@ impl QwenSession {
                 sample_from_logits_v2(&mut logits,
                     params.temperature, params.top_p, params.top_k, &mut rng)
             };
-            if Some(id) == stop_token { break; }
+            if Some(id) == stop_token || self.eog_tokens.contains(&id) { break; }
             *seen.entry(id).or_insert(0) += 1;
             generated.push(id);
             // Stop-string check:  decode just the new piece and append.
