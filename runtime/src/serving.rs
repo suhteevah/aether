@@ -1507,6 +1507,7 @@ unsafe fn mla_attention_forward(
         aether_op_mla_rope_k_shared_f32_cuda(k_rope, qk_rope_head_dim,
             rope_base, step_args);
     }
+    dmp("mla_k_roped", k_rope, qk_rope_head_dim as usize);
 
     // 7. Assemble per-head K row = [K_nope | k_rope_shared] per head.
     aether_op_mla_assemble_k_f32_cuda(kv_b, k_rope, k_row,
