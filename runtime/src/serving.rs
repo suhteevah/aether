@@ -3466,12 +3466,34 @@ impl QwenSession {
                 Ok(s) => s.to_string(),
                 Err(_) => return String::new(),
             };
-            // SentencePiece detokenization: the decode_table already holds raw
-            // UTF-8 token bytes (e.g. "▁The"), so just turn the ▁ (U+2581) word
-            // boundary back into a space.  The GPT-2 byte remap below is for
-            // byte-level BPE vocabs only and would drop ▁ → no spaces.
+            // SentencePiece detokenization: the decode_table holds raw UTF-8
+            // token bytes (e.g. "▁The"), so turn the ▁ (U+2581) word boundary
+            // back into a space.  THEN decode byte-fallback pieces: SPM emits
+            // tokens of the exact form "<0xHH>" (HH = 2 hex digits) for any
+            // byte with no dedicated piece — newline (`<0x0A>`), non-Latin
+            // UTF-8 continuation bytes, etc.  llama.cpp renders these as the
+            // raw byte; without it codestral/llama-SPM output is littered with
+            // literal "<0x0A>".  Rebuild at the BYTE level so consecutive byte
+            // tokens reassemble multi-byte UTF-8 correctly.
             if self.spm.is_some() {
-                return surface.replace('\u{2581}', " ");
+                let spaced = surface.replace('\u{2581}', " ");
+                let s = spaced.as_bytes();
+                let mut out = Vec::with_capacity(s.len());
+                let mut i = 0;
+                while i < s.len() {
+                    if i + 6 <= s.len() && &s[i..i + 3] == b"<0x" && s[i + 5] == b'>'
+                        && s[i + 3].is_ascii_hexdigit() && s[i + 4].is_ascii_hexdigit()
+                    {
+                        let hi = (s[i + 3] as char).to_digit(16).unwrap() as u8;
+                        let lo = (s[i + 4] as char).to_digit(16).unwrap() as u8;
+                        out.push(hi * 16 + lo);
+                        i += 6;
+                    } else {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                }
+                return String::from_utf8_lossy(&out).into_owned();
             }
             // GPT-2 inverse byte mapping: surface "Ġ" → byte 0x20, etc.
             let real_bytes: Vec<u8> = surface.chars()
