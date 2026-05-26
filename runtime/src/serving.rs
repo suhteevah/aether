@@ -1175,7 +1175,7 @@ unsafe fn block_forward_devarg(
     }
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
     if bw.w_router != 0 {
-        moe_ffn_forward(bw, act, cfg);
+        moe_ffn_forward(bw, act, cfg, layer_idx);
     } else {
         if bw.dt_gate == 12 && bw.dt_up == 12 {
             aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
@@ -2018,7 +2018,12 @@ fn moe_select_weights(
     (selected, weights)
 }
 
-unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig) {
+unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig, layer_idx: usize) {
+    // V2-Lite-debug: dump routed/shared/combined at the first MoE layer (1) to
+    // localize vs llama.cpp ffn_moe_out-1 / ffn_shexp-1 / ffn_out-1.
+    let mdmp = |name: &str, h: i64, n: usize| {
+        if layer_idx == 1 { dump_act_vec(name, h, n); }
+    };
     let d_model = cfg.d_model;
     // Per-expert FFN hidden dim.  DeepSeek-V2 / GLM-4.7-flash store this in
     // `<arch>.expert_feed_forward_length`; we cached it as cfg.expert_ff_dim.
@@ -2113,6 +2118,7 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
         aether_op_add_inplace_f32_cuda(out_acc, down_e, d_model_c);
     }
 
+    mdmp("moe_routed", out_acc, d_model);
     // 4. Shared experts (FR-17-extra-mla-fwd MoE shared).  DeepSeek-V2 /
     // GLM-4.7-flash have a small always-on FFN alongside the routed
     // experts.  The GGUF pre-concatenates the n_shared experts into a
@@ -2135,6 +2141,7 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
             // down = gate @ w_down_shexp^T  [d_model]
             dispatch_matmul(gate_sh, bw.w_down_shexp, bw.dt_down_shexp,
                 down_sh, d_model as c_int, d_ff_shared as c_int);
+            mdmp("moe_shared", down_sh, d_model);
             // out_acc += shared_output (weight 1.0)
             aether_op_add_inplace_f32_cuda(out_acc, down_sh, d_model as c_int);
             let _ = aether_dev_free_f32(gate_sh);
@@ -2143,6 +2150,7 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig)
         }
     }
 
+    mdmp("moe_out", out_acc, d_model);
     // 5. x += out_acc (residual).
     aether_op_add_inplace_f32_cuda(act.x, out_acc, d_model as c_int);
 
