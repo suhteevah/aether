@@ -1,5 +1,41 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-25 (🟢 qwen3moe "rambling" SOLVED — it was MAX_SEQ=32, not a forward bug)
+
+**The carry-forward "qwen3moe forward rambles" item is CLOSED — and it was never
+a forward bug.** Built the per-layer activation diff for qwen3moe (same harness
+that cracked V2-Lite) and ran it on cnc against Qwen3-30B-A3B-Q3_K_M:
+- **forward is CORRECT**: logits cos **0.9996** vs llama.cpp, all 48 layers
+  ≥0.99, first greedy token "Paris" correct.
+- The real bug: `MAX_SEQ = 32` in `runtime/src/serving.rs` was a hard ceiling on
+  *total* context (prompt + generated). The per-session KV cache + 8-block paged
+  table were sized to 32 tokens, and `generate*()` breaks at `next_pos >= 31`.
+  Any ChatML-rendered prompt (15-30 tokens of markers+content) left a handful of
+  decode slots → generation stopped mid-sentence → looked like premature EOS /
+  "ramble". Every early-stop landed exactly at `prompt_len + generated == 32`
+  (France 15+7=22 → full answer; sky ~20+12=32 → stopped; planets 27+5=32 →
+  stopped at "1. **Mercury"). PREFILL of the full seq predicted the right token;
+  only DECODE at cur_seq==32 diverged (layer-0 attn ffn_inp-0 cos 0.35, paged
+  table overflow). [[max_seq_was_32_token_context_cap]]
+- **FIX (commit `48bf591`, pushed)**: MAX_SEQ 32 → 2048. Attention loops over
+  live `cur_seq` (not MAX_SEQ) and `scores[]` is launch-sized dynamic shared mem,
+  so the bump costs only ~0.2-0.4 GB KV (fits 16 GB P100 + 15 GB GGUF; verified
+  14831/16384 MiB after load). **Verified on cnc P100**: planets → full
+  Mercury..Neptune list; sky → full 2-paragraph Rayleigh answer, clean stop.
+- Tooling: reused `scratch/{actdiff.rs,eval-callback-dump.cpp}` + `AETHER_DUMP_ACT`
+  — the generic per-layer names (inp_embd/ffn_inp-N/l_out-N/result_norm/
+  result_output) work for any arch with zero changes. New cnc scripts in /tmp/.
+- **Q3_K MoE expert kernel audited clean** (byte-identical to the standalone
+  Q3_K matmul kernel + expert_offset) — not the bug, confirming the prior audit.
+
+**NEXT (carry-forward):** (1) re-test ANY model previously called
+"incoherent/rambling" from a CHAT smoke (V2-Lite/gemma3 were verified with short
+prompt_ids that fit in 32, but confirm) under the 2048 cap before chasing
+numerics; (2) the opt-in concurrent path (`--max-concurrent N>1`) is still capped
+by `--blocks-per-slot` (default 8 = 32 tok/slot) — raise for long concurrent
+contexts; (3) consider a `--max-seq` CLI flag so MAX_SEQ is operator-tunable per
+GPU (currently a const); (4) deferred 8h matt-voice run.
+
 ## Last Updated — 2026-05-25 (🟢 V2-Lite SOLVED — coherent end-to-end via per-layer activation diff vs llama.cpp)
 
 **The lead-chase from the prior handoff is CLOSED.** Built the per-layer
