@@ -1359,8 +1359,11 @@ extern "C" __global__ void mla_rope_q_partial_yarn(
     // double-applied the temperature and broke V2-Lite's forward.
     float rope_mscale = 1.0f;
     float c = cosf(theta) * rope_mscale, s = sinf(theta) * rope_mscale;
-    int i0 = base_off + i;
-    int i1 = base_off + i + hd_half;
+    // deepseek2 rope_type = LLAMA_ROPE_TYPE_NORM (interleaved): rotate adjacent
+    // pairs (2i, 2i+1), NOT NEOX half-split (i, i+d/2).  Verified empirically:
+    // llama.cpp's k_pe preserves (2i,2i+1) pair magnitudes exactly through RoPE.
+    int i0 = base_off + 2 * i;
+    int i1 = base_off + 2 * i + 1;
     float x0 = q[i0], x1 = q[i1];
     q[i0] = x0 * c - x1 * s;
     q[i1] = x0 * s + x1 * c;
@@ -1385,9 +1388,12 @@ extern "C" __global__ void mla_rope_k_shared_yarn(
     // folds YaRN temperature into kq_scale).
     float rope_mscale = 1.0f;
     float c = cosf(theta) * rope_mscale, s = sinf(theta) * rope_mscale;
-    float x0 = k_rope[i], x1 = k_rope[i + hd_half];
-    k_rope[i] = x0 * c - x1 * s;
-    k_rope[i + hd_half] = x0 * s + x1 * c;
+    // deepseek2 = interleaved (NORM) rope: rotate adjacent pairs (2i, 2i+1).
+    int j0 = 2 * i;
+    int j1 = 2 * i + 1;
+    float x0 = k_rope[j0], x1 = k_rope[j1];
+    k_rope[j0] = x0 * c - x1 * s;
+    k_rope[j1] = x0 * s + x1 * c;
 }
 
 // FR-17-extra-mla-absorbed — GLM-4.7-flash absorbed-MLA Q-side absorption.
