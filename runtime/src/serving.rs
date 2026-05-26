@@ -1132,7 +1132,7 @@ unsafe fn block_forward_devarg(
     // tail below works for either.
     let is_mla = cfg.kv_lora_rank > 0 || bw.w_kv_a_mqa != 0;
     let attn_out_n_in: c_int = if is_mla {
-        mla_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
+        mla_attention_forward(bw, act, kv, step_args, paged_cfg, cfg, max_seq, layer_idx);
         // Absorbed MLA reduces per-head attn_out to value_length_mla via wv_b;
         // non-absorbed leaves it at v_head_dim.
         if cfg.is_mla_absorbed() {
@@ -1421,6 +1421,7 @@ unsafe fn mla_attention_forward(
     paged_cfg: Option<(i64, i32)>,
     cfg: &ModelConfig,
     max_seq: usize,
+    layer_idx: usize,
 ) {
     if cfg.is_mla_absorbed() {
         mla_attention_forward_absorbed(bw, act, kv, step_args, paged_cfg, cfg, max_seq);
@@ -1460,11 +1461,20 @@ unsafe fn mla_attention_forward(
         eprintln!("[MLA {}] n={} nan={} inf={} min={:.4e} max={:.4e}",
             label, n, nan, inf, mn, mx);
     };
+    // V2-Lite-debug: full-vector dump of layer-0 MLA sub-stages, aligned to
+    // llama.cpp eval-callback names: mla_x_norm↔attn_norm-0, mla_kv_a↔kv_cmpr_pe-0,
+    // mla_c_kv_n↔kv_cmpr-0, mla_q_proj↔q-0 (pre-rope).  Localizes the divergence
+    // to a specific op.  Only layer 0 (its input embedding is shared, cleanest).
+    let dmp = |name: &str, h: i64, n: usize| {
+        if layer_idx == 0 { dump_act_vec(name, h, n); }
+    };
     probe("x_norm_IN", act.x_norm, d_model as usize);
+    dmp("mla_x_norm", act.x_norm, d_model as usize);
     // 1. kv_a_mqa: x_norm @ W → [kv_lora_rank + qk_rope_head_dim]
     dispatch_matmul(act.x_norm, bw.w_kv_a_mqa, bw.dt_kv_a_mqa,
         kv_a, kv_lora_rank + qk_rope_head_dim, d_model);
     probe("kv_a", kv_a, (kv_lora_rank + qk_rope_head_dim) as usize);
+    dmp("mla_kv_a", kv_a, (kv_lora_rank + qk_rope_head_dim) as usize);
 
     // 2. Split kv_a into c_kv + k_rope_shared.
     aether_op_mla_split_kv_a_f32_cuda(kv_a, c_kv, k_rope,
@@ -1475,10 +1485,12 @@ unsafe fn mla_attention_forward(
         norm_eps, 1, kv_lora_rank);
 
     probe("c_kv_n", c_kv_n, kv_lora_rank as usize);
+    dmp("mla_c_kv_n", c_kv_n, kv_lora_rank as usize);
     // 4. kv_b: c_kv_normed @ W → [n_heads * (qk_nope + v_head)]
     dispatch_matmul(c_kv_n, bw.w_kv_b, bw.dt_kv_b,
         kv_b, n_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank);
     probe("kv_b", kv_b, (n_heads * (qk_nope_head_dim + v_head_dim)) as usize);
+    dmp("mla_kv_b", kv_b, (n_heads * (qk_nope_head_dim + v_head_dim)) as usize);
 
     // 5. Extract V from kv_b → v_row.
     aether_op_mla_extract_v_f32_cuda(kv_b, v_row,
@@ -1521,6 +1533,7 @@ unsafe fn mla_attention_forward(
         dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q,
             q_full, n_heads * qk_head_dim, d_model);
     }
+    dmp("mla_q_proj", q_full, (n_heads * qk_head_dim) as usize);
 
     // 9. Partial RoPE on Q's rope sub-region (YaRN-aware).
     if yarn_active {
@@ -1532,6 +1545,7 @@ unsafe fn mla_attention_forward(
         aether_op_mla_rope_q_partial_f32_cuda(q_full,
             n_heads, qk_head_dim, qk_nope_head_dim, rope_base, step_args);
     }
+    dmp("mla_q_roped", q_full, (n_heads * qk_head_dim) as usize);
 
     // 10. Paged append + paged MLA attention.  Caller's KV cache MUST be
     // sized to MLA dims — see top-of-fn contract.
@@ -1569,6 +1583,7 @@ unsafe fn mla_attention_forward(
         n_heads, qk_head_dim, v_head_dim, block_size,
         scale, max_seq as c_int, step_args);
     probe("attn_out", act.attn_out, (n_heads * v_head_dim) as usize);
+    dmp("mla_attn_out", act.attn_out, (n_heads * v_head_dim) as usize);
     let _ = matmul_nt_f32_cuda_unused();  // silence dead-import warning
 
     // Free per-call workspace.  (Drop on QwenSession owns persistent bufs.)
