@@ -1070,6 +1070,29 @@ unsafe fn load_block(h: i64, b: usize) -> BlockGpu {
     }
 }
 
+/// V2-Lite-debug: dump a full device f32 vector to `$AETHER_DUMP_ACT/<name>.bin`
+/// for a byte-level activation diff against llama.cpp eval-callback.  File format
+/// is `[u32 len_le][f32 * len_le]`.  Free for prod (env unset → early return).
+/// Because prefill processes every prompt position in order, the final file for
+/// each name reflects the LAST prompt token (the one that produces the first
+/// output logit) — exactly the position we diff against llama.cpp's last column.
+unsafe fn dump_act_vec(name: &str, h: i64, n: usize) {
+    let dir = match std::env::var("AETHER_DUMP_ACT") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    aether_dev_sync();
+    let mut v = vec![0.0f32; n];
+    aether_dev_d2h_f32(h, v.as_mut_ptr() as i64, n as c_int);
+    let path = format!("{}/{}.bin", dir, name);
+    let mut bytes = Vec::with_capacity(4 + n * 4);
+    bytes.extend_from_slice(&(n as u32).to_le_bytes());
+    for x in &v { bytes.extend_from_slice(&x.to_le_bytes()); }
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("[DUMP_ACT] write {} failed: {}", path, e);
+    }
+}
+
 /// Forward one block.  Takes a `cfg: &ModelConfig` so the runtime dims
 /// flow into every kernel launch.  Hardcoded Qwen2.5-7B shape removed
 /// — same kernel code path works for any model whose ops are
@@ -1094,6 +1117,13 @@ unsafe fn block_forward_devarg(
     let head_dim = cfg.head_dim as c_int;
     let rope_base = cfg.rope_base;
     let norm_eps = cfg.norm_eps;
+    // V2-Lite-debug: residual stream entering this layer.  At layer 0 this is the
+    // token embedding (matches llama.cpp `inp_embd`); otherwise it equals the
+    // prior layer's `l_out`, so dumping per-layer input is redundant with l_out —
+    // we only emit the embedding once.
+    if layer_idx == 0 {
+        dump_act_vec("inp_embd", act.x, d_model as usize);
+    }
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
     // FR-17-extra-mla-fwd — pre-attention dispatch.  MLA path runs the
     // compressed-KV → decompression → partial-RoPE → MLA-attention chain;
@@ -1124,6 +1154,9 @@ unsafe fn block_forward_devarg(
             norm_eps, 1, d_model);
     }
     aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
+    // V2-Lite-debug: residual after attention + o-proj, before FFN.  Maps to
+    // llama.cpp `ffn_inp-{b}`.  Diff localizes a divergence to attention vs FFN.
+    dump_act_vec(&format!("ffn_inp-{}", layer_idx), act.x, d_model as usize);
     // glm-debug: dump x AFTER attention residual, BEFORE second RMSnorm + FFN.
     // Pinpoints whether NaN enters via attn vs FFN at layer 1 (first MoE).
     // Gated on AETHER_DUMP_INTRA_BLOCK so it's free for prod paths.
@@ -1167,6 +1200,9 @@ unsafe fn block_forward_devarg(
         }
         aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
     }
+    // V2-Lite-debug: residual after the full layer (attn + FFN).  Maps to
+    // llama.cpp `l_out-{b}`.  This is the per-layer hidden state we diff.
+    dump_act_vec(&format!("l_out-{}", layer_idx), act.x, d_model as usize);
 }
 
 /// Standard Qwen/Llama/Gemma3 attention path: Q/K/V matmul → optional bias →
@@ -2876,6 +2912,10 @@ impl QwenSession {
             self.cfg.norm_eps, 1, self.cfg.d_model as c_int);
         dispatch_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
             self.cfg.vocab as c_int, self.cfg.d_model as c_int);
+        // V2-Lite-debug: final-norm hidden + logits.  Maps to llama.cpp
+        // `result_norm` and `result_output`.
+        dump_act_vec("final_norm", self.act.x_norm, self.cfg.d_model as usize);
+        dump_act_vec("logits", self.act.logits, self.cfg.vocab as usize);
     }
 
     /// Capture the per-step decode into a CUDA graph. Lazy: called on
