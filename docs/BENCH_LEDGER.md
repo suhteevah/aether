@@ -440,3 +440,37 @@ TODO to close it: (1) re-run the identical bench on the 3070 Ti to quantify the
 Ampere-vs-Pascal split with a clean mean-of-N (the "117%" was a best-single-run
 claim); (2) a Pascal-aware quant matmul (dp4a int8 path like llama's mmq) is the
 real lever — unit-splitting is exhausted.
+
+### Ampere/Windows follow-up — same workload on the 3070 Ti (WDDM)
+
+Re-ran the identical workload on kokonoe (RTX 3070 Ti, Win10/WDDM, CUDA 12.x).
+llama.cpp reference here is **ollama 0.24.0** (embeds llama.cpp; only local
+option — no standalone llama-server on Windows). Both engines served the
+**identical GGUF** (ollama blob `sha256-2bada8a7…`, Qwen2.5-7B Q4_K_M). GPU
+clocks LOCKED (`-lgc 1700,2115 -lmc 9501`) after discovering the card idles at
+mem 810 MHz / sm 210 MHz (P8) — decode is memory-bound, the idle mem clock alone
+was an 11.7× throttle. Same 4 prompts, max_tokens=128, temp 0, warm + N=3.
+
+| date       | engine          | hardware        | model            | end-to-end tok/s | GPU util | power | verdict |
+|------------|-----------------|-----------------|------------------|-----------------:|---------:|------:|---------|
+| 2026-05-26 | aether-serve    | 3070 Ti / WDDM  | Qwen2.5-7B Q4_K_M | **28.1** | **98%** | 210W | **1.6× ollama** |
+| 2026-05-26 | ollama (llama.cpp) | 3070 Ti / WDDM | Qwen2.5-7B Q4_K_M | **17.5** | ~12%   |  88W | launch-bound |
+
+**The result INVERTS vs the P100/Linux row above** — and the cause is the
+platform, not the kernels. On Windows/WDDM, single-stream decode fires ~200 tiny
+sequential kernels/token and per-submission WDDM overhead dominates: ollama sits
+at **~12% GPU util** (idle 88%, launch-latency-bound). aether's **CUDA-graph
+decode** (non-MoE path captures the whole step into one graph launch) bypasses
+that and hits **98% util / 210W** → 1.6× ollama. On the P100/Linux box there is
+no WDDM tax, kernels issue back-to-back, and raw kernel quality decides → raw
+llama-server b8182 wins 2.7× (its Pascal mmq/dp4a quant matmuls beat aether's
+generic nvrtc seq1 matmul).
+
+**Net (honest):** "aether vs llama.cpp" has NO single answer — it's
+platform-and-GPU-dependent:
+- **Linux server GPU, compute-bound:** llama.cpp wins on kernel quality (P100 2.7×; worst case Pascal).
+- **Windows/WDDM, launch-bound:** aether's CUDA-graph decode wins (1.6× vs ollama; 98% vs 12% util).
+Caveats: ollama ≠ raw llama-server (adds a scheduler layer, may not enable CUDA
+graphs on Windows — part of the gap is ollama's, not llama.cpp-the-kernels'); a
+raw llama.cpp Windows build with graphs would be the fairer Ampere reference and
+is the TODO. Both rows used the identical GGUF + locked clocks.
