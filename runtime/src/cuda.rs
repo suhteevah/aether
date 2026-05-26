@@ -1351,12 +1351,13 @@ extern "C" __global__ void mla_rope_q_partial_yarn(
         yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow);
     float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
     float theta = pos * scale_factor * powf(base, exp);
-    // llama.cpp rope_yarn: with ext_factor != 0, cos/sin are scaled by mscale =
-    // attn_factor * (1 + 0.1*ln(1/freq_scale)).  attn_factor defaults to 1.0 and
-    // 1/freq_scale = yarn_s, so mscale = 1 + 0.1*ln(yarn_s).  (DeepSeek-V2 folds
-    // the rest of the YaRN temperature into the attention kq_scale; see
-    // mla_attention_forward.)
-    float rope_mscale = 1.0f + 0.1f * logf(yarn_s);
+    // DeepSeek-V2 rope is a PURE rotation: llama.cpp sets rope.attn_factor to
+    // CANCEL rope_yarn's mscale (net cos/sin mscale = 1.0), folding the entire
+    // YaRN temperature into the attention kq_scale instead (see
+    // mla_attention_forward).  Empirically verified: llama.cpp k_pe norm is
+    // preserved (ratio 1.0) through RoPE.  A prior `1 + 0.1*ln(yarn_s)` here
+    // double-applied the temperature and broke V2-Lite's forward.
+    float rope_mscale = 1.0f;
     float c = cosf(theta) * rope_mscale, s = sinf(theta) * rope_mscale;
     int i0 = base_off + i;
     int i1 = base_off + i + hd_half;
@@ -1380,8 +1381,9 @@ extern "C" __global__ void mla_rope_k_shared_yarn(
         yarn_s, yarn_orig_ctx, yarn_beta_fast, yarn_beta_slow);
     float exp = -2.0f * (float)i / (float)qk_rope_head_dim;
     float theta = pos * scale_factor * powf(base, exp);
-    // Match llama.cpp rope_yarn cos/sin mscale (see mla_rope_q_partial_yarn).
-    float rope_mscale = 1.0f + 0.1f * logf(yarn_s);
+    // Pure rotation — see mla_rope_q_partial_yarn (deepseek2 cancels rope mscale,
+    // folds YaRN temperature into kq_scale).
+    float rope_mscale = 1.0f;
     float c = cosf(theta) * rope_mscale, s = sinf(theta) * rope_mscale;
     float x0 = k_rope[i], x1 = k_rope[i + hd_half];
     k_rope[i] = x0 * c - x1 * s;
