@@ -1,5 +1,56 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-25 (🟢 V2-Lite SOLVED — coherent end-to-end via per-layer activation diff vs llama.cpp)
+
+**The lead-chase from the prior handoff is CLOSED.** Built the per-layer
+activation diff it called for and it localized THREE real bugs in one session.
+**DeepSeek-Coder-V2-Lite-Q4_K_M now produces coherent text** on cnc:
+- "What is the capital of France?" → **"Paris.\n\nThe capital of France is Paris."**
+- "Write a Python function that adds two numbers." → **"Certainly! Below is a simple Python function that takes two numbers as input and returns their..."**
+- logits cos vs llama.cpp: **0.207 → 0.997**; all 27 layers match cos >0.99.
+
+**Methodology (reusable — scripts in `scratch/`):** patched llama.cpp b8182
+`eval-callback` (CPU, `/opt/llama/llama-src/build-cpu/bin/llama-eval-callback`)
+to dump full last-token activation columns for named tensors on the exact 6 ids
+`[100000,549,6077,280,7239,317]`; added `AETHER_DUMP_ACT=<dir>` to
+`runtime/src/serving.rs` (env-gated, free in prod) dumping the matching Aether
+vectors (inp_embd / ffn_inp-N / l_out-N / final_norm / logits + per-layer MLA
+sub-stages + MoE routed/shared/per-expert); diffed with `scratch/actdiff.rs`
+(cosine + maxabs, compiled with rustc on cnc). `scratch/`: eval-callback-dump.cpp,
+run_llama_dump.sh, run_aether_dump.sh, actdiff.rs, moe_expert_check.py.
+
+**THREE bugs (all committed + pushed, each verified by the diff):**
+1. `dc2e85c` **rope mscale 1.369 → 1.0.** deepseek2 RoPE is a PURE rotation —
+   llama sets rope.attn_factor to cancel rope_yarn's mscale (net 1.0), folding
+   the YaRN temperature into kq_scale. The prior `7e24763` "fix" (mscale=1.369)
+   was WRONG (empirical: llama k_pe norm preserved at ratio 1.0). Fixed magnitude.
+2. `8f25a35` **rope NEOX → INTERLEAVED (NORM).** `LLM_ARCH_DEEPSEEK2 →
+   LLAMA_ROPE_TYPE_NORM` (pairs (2i,2i+1)), not NEOX (i,i+d/2). Confirmed in llama
+   source + empirically. Flipped both yarn rope kernels. Closed layer 0
+   (l_out-0 cos 0.90→0.999). Prior "deepseek2 is NEOX" handoff claim was wrong.
+3. `4a1a975` **Q4_K MoE expert kernel interleaved → split nibble layout.**
+   `fused_q4k_expert_matmul_seq1` paired element si*32+k with qs[si*16+k/2]
+   (interleaved), but Q4_K's canonical layout (llama + Aether's own non-expert
+   kernel) is split: sub-block si → byte group (si/2)*32, low/high by si&1.
+   Scrambled weight↔input → routed-expert output orthogonal (cos 0.06) despite
+   correct selection/weights/offset. **Audited Q5_K/Q3_K/Q6_K expert kernels: all
+   correct — only Q4_K was wrong, so qwen3moe's separate issue is NOT this.**
+
+**No regressions to other models:** yarn rope kernels only fire for deepseek2-yarn
+(Qwen/Llama use standard rope; GLM yarn-inactive). Q4_K expert kernel only hit by
+Q4_K MoE experts (GLM uses IQ-quant experts; qwen3moe uses Q3_K/Q5_K/Q6_K). The
+diagnostic dump code is all env-gated.
+
+**NEXT (carry-forward):** (1) re-smoke GLM as insurance (should be untouched);
+(2) qwen3moe forward still rambles — SEPARATE bug, NOT the Q4_K nibble layout
+(its experts audited clean); needs its own activation diff; (3) the diff tooling
+in scratch/ is reusable for any future arch — generalize if another model needs it;
+(4) deferred 8h matt-voice run. The `cuda_yarn_rope_parity` test and the per-expert
+dequant both shared the kernel's own (buggy) formula — consider an independent
+reference test for the rope + expert kernels to lock these in.
+
+---
+
 ## Last Updated — 2026-05-25 (V2-Lite bisect — 3 fixes shipped, GLM coherent, V2-Lite isolated to YaRN path)
 🟢 Big session on cnc P100s (standing GPU access granted). 4 commits pushed
 (`84ef3a5`, `ffaf9c7`, `37d5050`, + this YaRN-diag `f31a4c0`). Each rebuilt on
