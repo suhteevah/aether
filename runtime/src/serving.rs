@@ -221,7 +221,20 @@ pub const D_FF: usize = 18944;
 pub const VOCAB: usize = 152064;
 pub const ROPE_BASE: f32 = 1_000_000.0;
 pub const NORM_EPS: f32 = 1e-6;
-pub const MAX_SEQ: usize = 32;  // FIXME: bump after profiling per-MAX_SEQ cost
+// Total KV-cache capacity (prompt + generated tokens) per session/slot.  This
+// is the hard ceiling on sequence length: prefill writes positions 0..n-1 and
+// decode appends from there, and `generate*` breaks at `next_pos >= MAX_SEQ-1`.
+// It was 32 — far too small: any chat prompt rendered through the ChatML
+// template (~15-30 tokens of markers + content) left only a handful of decode
+// slots, so generation hit the wall mid-sentence and looked like a premature
+// stop / "rambling" (the model emitted EOS or garbage once the cache overflowed
+// the 8-block paged table).  Attention kernels loop over the live `cur_seq`
+// (step_args[1]), NOT this constant, so the only cost of raising it is the
+// eager per-layer KV allocation (`MAX_SEQ * d_kv_row` f32) + the launch-sized
+// `scores[]` dynamic shared mem (`MAX_SEQ * 4` bytes, well under the 48 KiB
+// SM cap at 2048).  2048 covers ordinary chat at ~0.2-0.4 GB of KV across the
+// supported models — comfortably inside a 16 GB card alongside a ~15 GB GGUF.
+pub const MAX_SEQ: usize = 2048;
 
 /// FR-19.5-extra-deep Phase 2b-2b — max requests fused into one batched
 /// decode tick.  Capped at 8 because `fused_q4k_matmul_seqB_v3` rejects

@@ -109,7 +109,11 @@ struct Cli {
     max_concurrent: usize,
     /// FR-19.5-extra-deep — paged-KV blocks per scheduler slot.  Multiplied
     /// by `max_concurrent` to size the SharedKvPool when `max_concurrent
-    /// > 1`.  Default 8 (32 tokens of KV per slot, matches MAX_SEQ).
+    /// > 1`.  Default 8 = 32 tokens of KV per concurrent slot (block_size 4);
+    /// raise via `--blocks-per-slot` for longer concurrent contexts (memory
+    /// scales with `max_concurrent * blocks_per_slot`).  NOTE: the default
+    /// single-session path (`max_concurrent == 1`) is NOT bounded by this —
+    /// it uses the full `serving::MAX_SEQ` (2048) KV cache.
     blocks_per_slot: i32,
 }
 
