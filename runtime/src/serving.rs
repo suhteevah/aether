@@ -2074,6 +2074,11 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig,
         &logits, n_used, cfg.expert_gating_func,
         cfg.expert_weights_norm, cfg.expert_weights_scale);
     let selected = selected.as_slice();
+    mdmp("moe_logits", router_logits, n_experts);
+    if layer_idx == 1 && std::env::var("AETHER_DUMP_ACT").is_ok() {
+        eprintln!("[MoE L1] selected={:?} weights={:?}", selected,
+            weights.iter().map(|w| (w*1e4).round()/1e4).collect::<Vec<_>>());
+    }
 
     // 3. Per-expert forward.  Dispatch on dtype-per-tensor via the
     // MOE_EXPERT_DISPATCH table above.  `blocks_per_row` is derived from the
