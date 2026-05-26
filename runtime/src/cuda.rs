@@ -5833,6 +5833,17 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let _ = ctx(); 0
 }
 
+/// Free device memory in bytes (cuMemGetInfo on the current context).
+/// Returns 0 on error.  Used to auto-size the KV cache to the card so a big
+/// model on a small GPU picks a smaller MAX_SEQ instead of OOMing at load.
+#[no_mangle] pub extern "C" fn aether_dev_mem_free_bytes() -> i64 {
+    let _ = ctx(); // ensure the device/context is initialised + current
+    match cudarc::driver::result::mem_get_info() {
+        Ok((free, _total)) => free as i64,
+        Err(_) => 0,
+    }
+}
+
 /// Allocate `n` f32s on the device, zero-initialised. Returns an opaque
 /// `i64` handle (1-based slot index) — 0 is the null sentinel.
 #[no_mangle] pub extern "C" fn aether_dev_alloc_f32(n: c_int) -> i64 {

@@ -45,6 +45,7 @@ use crate::{
 };
 use crate::cuda::{
     aether_dev_init, aether_dev_alloc_f32, aether_dev_free_f32,
+    aether_dev_mem_free_bytes,
     aether_dev_h2d_f32, aether_dev_d2h_f32, aether_dev_sync,
     aether_dev_h2d_f32_n, aether_dev_d2h_f32_n, aether_dev_h2d_i32_n,
     aether_dev_alloc_u8, aether_dev_free_u8, aether_dev_h2d_u8,
@@ -2210,6 +2211,13 @@ pub struct QwenSession {
     ///     logits for "what comes after the prompt").
     ///   - After each decode_step: next_pos += 1.
     next_pos: i32,
+    /// Effective KV-cache capacity (total tokens: prompt + generated) for THIS
+    /// session.  Auto-sized at construction to fit the model in available VRAM,
+    /// capped at the `MAX_SEQ` const.  The per-session KV buffers, the decode/
+    /// prefill `max_seq` kernel stride, the `generate*` length guard, and
+    /// `max_pos()` all read this — NOT the const — so a 13 GB GLM on a 16 GB
+    /// card lands on ~450 tokens while a 7 GB model gets the full 2048.
+    max_seq: usize,
     /// True after the per-step graph has been captured.
     graph_captured: bool,
     /// BPE tokenizer handle loaded from the GGUF's `tokenizer.ggml.*`
@@ -2700,9 +2708,38 @@ impl QwenSession {
                 mla_abs_q_a, mla_abs_q_a_n, mla_abs_q_proj, mla_abs_q_full,
                 mla_abs_k_row, mla_abs_v_row, mla_abs_attn_v_out,
             };
+            // Auto-size the KV-cache capacity to fit the loaded model in the
+            // VRAM that's left after weights + activations are resident.  KV is
+            // the only allocation that scales with sequence length, and for an
+            // MLA model storing uncompressed per-head K/V (GLM-4.7-flash:
+            // d_k_row=11520, d_v_row=10240 -> 4.09 MiB/token across 47 layers) a
+            // blanket MAX_SEQ=2048 is 8.4 GiB and OOMs a 16 GB card next to a
+            // 13 GB GGUF.  We reserve headroom for cuBLAS/nvrtc workspace + the
+            // captured graph + fragmentation, give 70% of the rest to KV, and
+            // clamp to [256, MAX_SEQ] rounded to the paged block_size (4).
+            // Attention loops over the live cur_seq, so a larger cap costs only
+            // this allocation — never compute.
+            let max_seq: usize = {
+                let kv_per_tok = cfg.n_layers
+                    .saturating_mul(d_k_row + d_v_row)
+                    .saturating_mul(4);
+                let free = aether_dev_mem_free_bytes();
+                let chosen = if free <= 0 || kv_per_tok == 0 {
+                    MAX_SEQ
+                } else {
+                    let reserve: usize = 768 * 1024 * 1024;
+                    let usable = (free as usize).saturating_sub(reserve) * 7 / 10;
+                    (usable / kv_per_tok).min(MAX_SEQ).max(256)
+                };
+                (chosen / 4) * 4
+            };
+            eprintln!("[QwenSession] max_seq={} (cap={}, KV {:.1} MiB/token, free {:.2} GiB)",
+                max_seq, MAX_SEQ,
+                (cfg.n_layers * (d_k_row + d_v_row) * 4) as f64 / 1_048_576.0,
+                aether_dev_mem_free_bytes() as f64 / 1_073_741_824.0);
             let kvs: Vec<KvCacheGpu> = (0..cfg.n_layers).map(|_| KvCacheGpu {
-                k_cache: aether_dev_alloc_f32((MAX_SEQ * d_k_row) as c_int),
-                v_cache: aether_dev_alloc_f32((MAX_SEQ * d_v_row) as c_int),
+                k_cache: aether_dev_alloc_f32((max_seq * d_k_row) as c_int),
+                v_cache: aether_dev_alloc_f32((max_seq * d_v_row) as c_int),
             }).collect();
             let step_args = aether_dev_alloc_i32(4);  // [pos, cur_seq, 0, 0]
 
@@ -2753,6 +2790,7 @@ impl QwenSession {
                 lm_head, lm_n_blocks, lm_dt,
                 act, kvs, step_args,
                 next_pos: 0,
+                max_seq,
                 graph_captured: false,
                 bpe_handle, gpt2_u2b, eos_token,
                 paged_cfg,
@@ -2914,7 +2952,7 @@ impl QwenSession {
                 let step_host = [pos, cur_seq, 0i32, 0i32];
                 aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
                 for b in 0..self.cfg.n_layers {
-                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
+                    block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, self.max_seq, b);
                 }
             }
             aether_dev_sync();
@@ -2932,7 +2970,7 @@ impl QwenSession {
         let dump_blocks = std::env::var("AETHER_DUMP_BLOCKS").is_ok();
         for b in 0..self.cfg.n_layers {
             block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b],
-                self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
+                self.step_args, self.paged_arg(), &self.cfg, self.max_seq, b);
             // FR-17-extra-mla-fwd debug — dump `act.x` stats after each
             // block to bisect where NaN first appears in the V2-Lite
             // forward.  AETHER_DUMP_BLOCKS=1 to enable.  Adds one D2H
@@ -2978,7 +3016,7 @@ impl QwenSession {
         let rc = aether_dev_graph_begin();
         assert_eq!(rc, 0, "aether_dev_graph_begin failed: {}", rc);
         for b in 0..self.cfg.n_layers {
-            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, MAX_SEQ, b);
+            block_forward_devarg(&self.blocks[b], &self.act, &self.kvs[b], self.step_args, self.paged_arg(), &self.cfg, self.max_seq, b);
         }
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
@@ -3092,7 +3130,7 @@ impl QwenSession {
             if Some(id) == stop_token { break; }
             generated.push(id);
             last = id;
-            if self.next_pos as usize >= MAX_SEQ - 1 { break; }
+            if self.next_pos as usize >= self.max_seq - 1 { break; }
         }
         generated
     }
@@ -3860,7 +3898,7 @@ impl QwenSession {
                 }
             }
             last = id;
-            if self.next_pos as usize >= MAX_SEQ - 1 { break; }
+            if self.next_pos as usize >= self.max_seq - 1 { break; }
         }
         generated
     }
@@ -4050,8 +4088,8 @@ impl QwenSession {
     pub fn is_moe(&self) -> bool { self.cfg.n_experts > 0 }
 
     /// Maximum decode position before the slot must stop (matches the
-    /// MAX_SEQ - 1 guard inside `generate*`).
-    pub fn max_pos(&self) -> i32 { (MAX_SEQ as i32) - 1 }
+    /// `self.max_seq - 1` guard inside `generate*`).
+    pub fn max_pos(&self) -> i32 { (self.max_seq as i32) - 1 }
 
     /// Decode-step entry point used by the batched scheduler.  Binds the
     /// supplied per-slot state (page_table + position), runs ONE forward
