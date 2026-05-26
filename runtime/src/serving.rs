@@ -3561,6 +3561,7 @@ fn argmax(logits: &[f32]) -> usize {
 fn apply_per_arch_template(
     arch: &str,
     mla_absorbed: bool,
+    is_spm: bool,
     messages: &[(String, String)],
 ) -> Option<String> {
     if messages.is_empty() { return None; }
@@ -3625,7 +3626,34 @@ fn apply_per_arch_template(
             }
             out.push_str("<|im_start|>assistant\n");
         }
-        // Llama-3:  <|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
+        // Mistral / Codestral / Llama-2 (arch=llama + SPM tokenizer):
+        //   <s>[INST] {user} [/INST]{assistant}</s>[INST] {user2} [/INST]...
+        // BOS (<s>) is prepended by maybe_prepend_bos, not emitted here; a
+        // system message folds into the first user turn (Mistral has no system
+        // role).  Ends after the final [/INST] so the model generates the reply.
+        "llama" if is_spm => {
+            let mut sys = String::new();
+            for (role, content) in messages {
+                match role.as_str() {
+                    "system" => {
+                        if !sys.is_empty() { sys.push_str("\n\n"); }
+                        sys.push_str(content);
+                    }
+                    "user" => {
+                        out.push_str("[INST] ");
+                        if !sys.is_empty() {
+                            out.push_str(&sys); out.push_str("\n\n"); sys.clear();
+                        }
+                        out.push_str(content);
+                        out.push_str(" [/INST]");
+                    }
+                    "assistant" => { out.push_str(content); out.push_str("</s>"); }
+                    _ => {}
+                }
+            }
+        }
+        // Llama-3 (arch=llama + BPE tokenizer):
+        //   <|begin_of_text|><|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
         "llama" => {
             out.push_str("<|begin_of_text|>");
             for (role, content) in messages {
@@ -3662,7 +3690,7 @@ fn apply_per_arch_template(
 /// special tokens and emit each as its proper id rather than letting
 /// BPE byte-encode the raw `<|...|>` markers (which the model has
 /// never seen at training time).
-fn arch_special_tokens(arch: &str) -> &'static [&'static str] {
+fn arch_special_tokens(arch: &str, is_spm: bool) -> &'static [&'static str] {
     match arch {
         "deepseek2" | "glm" | "glm4" => &[
             "[gMASK]", "<sop>",
@@ -3674,6 +3702,11 @@ fn arch_special_tokens(arch: &str) -> &'static [&'static str] {
             "<|object_ref_start|>", "<|object_ref_end|>",
             "<|box_start|>", "<|box_end|>",
         ],
+        // arch="llama" covers BOTH Llama-3 (BPE) and the Mistral/Codestral/
+        // Llama-2 family (SPM).  They use different chat markers, so split on
+        // the tokenizer kind: SPM → Mistral `[INST]`/`[/INST]` (single special
+        // tokens, ids 3/4 in Codestral) + `<s>`/`</s>`; BPE → Llama-3 headers.
+        "llama" if is_spm => &["[INST]", "[/INST]", "<s>", "</s>"],
         "llama" => &[
             "<|begin_of_text|>", "<|end_of_text|>",
             "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>",
@@ -3716,7 +3749,7 @@ impl QwenSession {
 
     fn encode_text_with_specials_inner(&self, text: &str) -> Vec<usize> {
         if self.bpe_handle < 0 || text.is_empty() { return Vec::new(); }
-        let specials = arch_special_tokens(&self.cfg.arch);
+        let specials = arch_special_tokens(&self.cfg.arch, self.spm.is_some());
         if specials.is_empty() { return self.encode_text(text); }
 
         // Lookup each special surface → vocab id once.  Skip any that
@@ -3789,7 +3822,7 @@ impl QwenSession {
         // depending on jinja-lite handling every feature the GGUF
         // template might use (macros, filters, namespaces, etc.).
         if let Some(s) = apply_per_arch_template(
-            &self.cfg.arch, self.cfg.is_mla_absorbed(), messages) {
+            &self.cfg.arch, self.cfg.is_mla_absorbed(), self.spm.is_some(), messages) {
             return Some(s);
         }
         let template = self.chat_template.as_ref()?;
@@ -4610,7 +4643,7 @@ mod chat_template_tests {
     fn qwen_chatml_template() {
         let m = msgs(&[("system", "You are helpful."), ("user", "Hi")]);
         for arch in ["qwen2", "qwen3", "qwen3moe", "qwen3vl"] {
-            let s = apply_per_arch_template(arch, false, &m).unwrap();
+            let s = apply_per_arch_template(arch, false, false, &m).unwrap();
             assert_eq!(
                 s,
                 "<|im_start|>system\nYou are helpful.<|im_end|>\n\
@@ -4625,11 +4658,11 @@ mod chat_template_tests {
     fn glm_template_for_absorbed_deepseek2() {
         let m = msgs(&[("user", "Hi")]);
         // GLM-4.7-flash is deepseek2 + MLA-absorbed.
-        let s = apply_per_arch_template("deepseek2", true, &m).unwrap();
+        let s = apply_per_arch_template("deepseek2", true, false, &m).unwrap();
         assert_eq!(s, "[gMASK]<sop><|user|>Hi<|assistant|>");
         // Explicit "glm"/"glm4" arch strings render identically regardless
         // of the absorbed flag.
-        assert_eq!(apply_per_arch_template("glm", false, &m).unwrap(),
+        assert_eq!(apply_per_arch_template("glm", false, false, &m).unwrap(),
                    "[gMASK]<sop><|user|>Hi<|assistant|>");
     }
 
@@ -4638,7 +4671,7 @@ mod chat_template_tests {
         // DeepSeek-Coder-V2-Lite is deepseek2 + NON-absorbed — must NOT get
         // GLM's <|user|> markers (which aren't in its vocab).
         let m = msgs(&[("system", "Be terse."), ("user", "2+2?"), ("assistant", "4")]);
-        let s = apply_per_arch_template("deepseek2", false, &m).unwrap();
+        let s = apply_per_arch_template("deepseek2", false, false, &m).unwrap();
         assert_eq!(
             s,
             "Be terse.\n\nUser: 2+2?\n\nAssistant: 4Assistant:",
@@ -4650,7 +4683,7 @@ mod chat_template_tests {
     #[test]
     fn gemma3_template_maps_assistant_to_model() {
         let m = msgs(&[("user", "Hi"), ("assistant", "Hello")]);
-        let s = apply_per_arch_template("gemma3", false, &m).unwrap();
+        let s = apply_per_arch_template("gemma3", false, false, &m).unwrap();
         assert_eq!(
             s,
             "<start_of_turn>user\nHi<end_of_turn>\n\
@@ -4661,8 +4694,9 @@ mod chat_template_tests {
 
     #[test]
     fn llama3_template() {
+        // arch=llama + BPE tokenizer (is_spm=false) -> Llama-3 header format.
         let m = msgs(&[("user", "Hi")]);
-        let s = apply_per_arch_template("llama", false, &m).unwrap();
+        let s = apply_per_arch_template("llama", false, false, &m).unwrap();
         assert_eq!(
             s,
             "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|>\
@@ -4671,9 +4705,27 @@ mod chat_template_tests {
     }
 
     #[test]
+    fn mistral_inst_template_for_spm_llama() {
+        // arch=llama + SPM tokenizer (is_spm=true) -> Mistral/Codestral [INST].
+        // <s> (BOS) is prepended by maybe_prepend_bos, not in the surface.
+        let single = apply_per_arch_template("llama", false, true, &msgs(&[("user", "Hi")])).unwrap();
+        assert_eq!(single, "[INST] Hi [/INST]");
+        // system folds into the first user turn.
+        let sys = apply_per_arch_template("llama", false, true,
+            &msgs(&[("system", "Be terse."), ("user", "2+2?")])).unwrap();
+        assert_eq!(sys, "[INST] Be terse.\n\n2+2? [/INST]");
+        // multi-turn: assistant turns close with </s>.
+        let multi = apply_per_arch_template("llama", false, true,
+            &msgs(&[("user", "Hi"), ("assistant", "Hello"), ("user", "Bye")])).unwrap();
+        assert_eq!(multi, "[INST] Hi [/INST]Hello</s>[INST] Bye [/INST]");
+        // must NOT emit Llama-3 headers.
+        assert!(!single.contains("<|start_header_id|>"));
+    }
+
+    #[test]
     fn unknown_arch_and_empty_return_none() {
-        assert!(apply_per_arch_template("mamba", false, &msgs(&[("user", "x")])).is_none());
-        assert!(apply_per_arch_template("qwen2", false, &[]).is_none());
+        assert!(apply_per_arch_template("mamba", false, false, &msgs(&[("user", "x")])).is_none());
+        assert!(apply_per_arch_template("qwen2", false, false, &[]).is_none());
     }
 }
 
