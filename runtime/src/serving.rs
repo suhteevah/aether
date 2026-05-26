@@ -2104,6 +2104,7 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig,
         (entry.kernel)(x_in, w_base, y, n_out, bpr, expert_idx);
     };
 
+    if layer_idx == 1 { mdmp("moe_xnorm", act.x_norm, d_model); }
     for (k, &expert_idx) in selected.iter().enumerate() {
         let w_i = weights[k];
         // gate_e = expert_matmul(x_norm, w_gate_exps, expert_idx)  [expert_ff]
@@ -2112,12 +2113,17 @@ unsafe fn moe_ffn_forward(bw: &BlockGpu, act: &ActivationGpu, cfg: &ModelConfig,
         // up_e = expert_matmul(x_norm, w_up_exps, expert_idx)
         dispatch_expert(act.x_norm, bw.w_up_exps, bw.dt_up_exps,
             up_e, exp_ff_c, true, expert_idx as c_int);
+        if k == 0 {
+            mdmp("moe_gate0", gate_e, expert_ff);  // expert `selected[0]`, pre-silu
+            mdmp("moe_up0", up_e, expert_ff);
+        }
         // silu(gate_e); gate_e *= up_e
         aether_op_silu_f32_cuda(gate_e, exp_ff_c);
         aether_op_mul_inplace_f32_cuda(gate_e, up_e, exp_ff_c);
         // down_e = expert_matmul(gate_e, w_down_exps, expert_idx)  [d_model]
         dispatch_expert(gate_e, bw.w_down_exps, bw.dt_down_exps,
             down_e, d_model_c, false, expert_idx as c_int);
+        if k == 0 { mdmp("moe_down0", down_e, d_model); }
         // out_acc += w_i * down_e
         aether_op_scale_f32_cuda(down_e, w_i, d_model_c);
         aether_op_add_inplace_f32_cuda(out_acc, down_e, d_model_c);
