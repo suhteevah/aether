@@ -4242,12 +4242,19 @@ extern "C" __global__ void fused_q4k_expert_matmul_seq1(
             }
             float scale = d * (float)sc6;
             float bias  = dmin * (float)m6;
-            for (int k = 0; k < 32; k++) {
-                int byte_idx = si * 16 + (k >> 1);
-                unsigned char by = qs[byte_idx];
-                int q = (k & 1) == 0 ? (by & 0xF) : (by >> 4);
+            // Q4_K element layout (must match llama dequant_row_q4_K AND the
+            // non-expert fused_q4k_matmul_seq1 kernel): sub-block `si` reads byte
+            // group (si/2)*32, low nibble when si is even, high when odd — NOT
+            // interleaved low/high within a byte.  The old interleaved layout
+            // (`qs[si*16 + k/2]`) scrambled weight<->input pairing, making every
+            // MoE routed-expert output orthogonal to llama (cos 0.06).
+            int qs_off = (si >> 1) * 32;
+            int is_hi  = si & 1;
+            for (int l = 0; l < 32; l++) {
+                unsigned char by = qs[qs_off + l];
+                int q = is_hi ? (by >> 4) : (by & 0xF);
                 float dq = scale * (float)q - bias;
-                blk_acc += x_blk[si * 32 + k] * dq;
+                blk_acc += x_blk[si * 32 + l] * dq;
             }
         }
         acc += blk_acc;
