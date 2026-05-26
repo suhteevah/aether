@@ -407,3 +407,36 @@ shrink the apparent gap; (b) genuine: more arch-required kernels in KERNEL_SRC v
 add5216 that can't be removed without dropping arch support. Real further gains
 would need faster HOT kernels (a better q4k seq1 matmul / fused FFN), not more
 unit-splitting — a kernel-optimization task, not a pressure-relief one.
+
+## serving e2e — aether-serve vs llama.cpp (real-world chat, 1:1)
+
+First **end-to-end serving** head-to-head (prior rows were micro-benches /
+single-kernel). Same GPU, same GGUF, same workload, served through each engine's
+OpenAI `/v1/chat/completions`. Workload: 4 open-ended chat prompts (transformer
+explainer, LRU-cache code, French-Revolution essay, TCP handshake), `max_tokens=128`,
+`temperature=0`; 2 warmup requests discarded, then N=3 × 4 prompts = 12 timed
+requests; both engines emitted exactly 128 tokens/req (clean, no early-stop skew).
+End-to-end = `completion_tokens / client_wall_time` (the user-facing rate).
+
+**Hardware: cnc Tesla P100-16GB (Pascal/sm_60), CUDA 12.8.** Qwen2.5-7B-Instruct
+Q4_K_M (4.47 GiB). llama.cpp b8182 `llama-server -ngl 99 -c 2048`; aether-serve
+`--paged` (CUDA-graph decode). Both default sampler flags.
+
+| date       | engine    | hardware   | model            | end-to-end tok/s | self-reported decode | verdict |
+|------------|-----------|------------|------------------|-----------------:|---------------------:|---------|
+| 2026-05-25 | llama.cpp b8182 | P100 16GB | Qwen2.5-7B Q4_K_M | **37.4** | 39.1 (eval) | leader  |
+| 2026-05-25 | aether-serve    | P100 16GB | Qwen2.5-7B Q4_K_M | **13.8** | 13.5–14.1 (gen) | **0.37×** |
+
+**Honest verdict: aether is ~2.7× slower than llama.cpp on the P100 for
+real-world chat decode.** This is hardware-dependent and does NOT match the
+earlier 3070-Ti (Ampere) rows where aether's nvrtc decode reached ~117% of
+llama.cpp — llama.cpp ships hand-tuned Pascal kernels (mmq / dp4a paths) that
+aether's generic nvrtc Q4_K seq1 matmul + fused FFN don't approach on sm_60. The
+per-op profile (above) already located ~85% of aether decode in those quant
+matmuls; on Pascal that hot path is the whole gap. Prefill is negligible here
+(prompts ~21–42 tokens) so e2e ≈ decode for both.
+
+TODO to close it: (1) re-run the identical bench on the 3070 Ti to quantify the
+Ampere-vs-Pascal split with a clean mean-of-N (the "117%" was a best-single-run
+claim); (2) a Pascal-aware quant matmul (dp4a int8 path like llama's mmq) is the
+real lever — unit-splitting is exhausted.
