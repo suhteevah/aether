@@ -474,3 +474,38 @@ Caveats: ollama ≠ raw llama-server (adds a scheduler layer, may not enable CUD
 graphs on Windows — part of the gap is ollama's, not llama.cpp-the-kernels'); a
 raw llama.cpp Windows build with graphs would be the fairer Ampere reference and
 is the TODO. Both rows used the identical GGUF + locked clocks.
+
+### P100 decode profiling — v6 matvec win does NOT move e2e (matmul isn't the bottleneck)
+
+Autonomous perf sprint (full-P100 window). Goal was to close the P100 decode gap
+(aether 13.8 vs llama 37.4 tok/s, Qwen2.5-7B Q4_K_M). Built a vectorized Q4_K
+seq1 matvec (`fused_q4k_matmul_seq1_v6`: uint loads + per-lane 2-scale dequant)
+and microbenched it (`runtime/tests/cuda_q4k_matvec_bench.rs`) against the prod
+v2/v3:
+
+| kernel | aggregate GB/s | vs v3 | notes |
+|--------|---------------:|------:|-------|
+| v3 (shared-tiled) | 73 | 1.0x | prior |
+| v4 (no-shared/inline) | 58 | 0.79x | regressed |
+| v5 (multi-row MLP) | 70 | 0.96x | no help |
+| **v6 (vectorized uint)** | **105** | **1.43x** | parity-clean (rel 5e-5) |
+| membw probe (uint, no dequant) | ~200 | — | wide-load mem ceiling, 28% peak |
+| membw probe (byte, no dequant) | ~134 | — | byte-load ceiling, 19% peak |
+
+**But wiring v6 into decode gave ZERO e2e gain: aether 13.85 vs 13.8 tok/s.**
+Decode-phase timing (AETHER_DECODE_TIMING) on a real 128-token decode:
+- forward (embed+h2d+GPU forward+sync+logits-d2h) = **62994 us/tok (99.7%)**
+- sampling + host = **171 us/tok (0.3%)**
+
+So: (1) sampling/host is NOT the bottleneck; (2) decode is GPU-forward-bound at
+~63 ms/tok = ~71 GB/s effective over the 4.5 GB model, vs llama's ~25 ms =
+~180 GB/s; (3) the seq1 matvec v6 sped up is only PART of the forward — the gap
+is the AGGREGATE of all decode kernels (FFN-fused gate/up/down + attention +
+matmuls + norms), broadly ~2.5x slow, not one hot kernel. v6 reverted from the
+default dispatch (no e2e benefit, avoid risk on all Q4_K models); kept registered
++ benched, ready for batched decode / once the forward bottleneck is addressed.
+
+**Next lever (per gpu_perf_surpass_strategy): NOT one faster kernel — reduce the
+whole forward's cost (fusion = fewer/bigger kernels, + raise every kernel's
+achieved BW toward the ~200 probe ceiling). Need per-category profiling
+(matmul vs FFN-fused vs attention) of the 63 ms to target the biggest chunk.**

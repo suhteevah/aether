@@ -73,6 +73,7 @@ struct CudaCtx {
     fused_q4k_matmul_seq1_v4: CudaFunction,
     fused_q4k_matmul_seq1_v5: CudaFunction,
     fused_q4k_membw_probe: CudaFunction,
+    fused_q4k_matmul_seq1_v6: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
     rope_apply_devarg: CudaFunction,
     append_kv_devarg: CudaFunction,
@@ -3818,6 +3819,72 @@ extern "C" __global__ void fused_q4k_matmul_seq1_v5(
     }
 }
 
+// v6 -- vectorized-load Q4_K seq1 mat-vec (the surpass candidate).
+//
+// Two diagnosed limits on v3 (~73 GB/s, 10% peak): (a) ALU-bound on per-element
+// float dequant (membw probe hit 134 with trivial ALU), (b) byte-load access
+// pattern caps memory at ~134 even trivial-ALU; a uint/lane (128-byte coalesced)
+// probe lifted that to ~200 GB/s. v6 captures both:
+//   - VECTORIZED weight load: each lane reads ONE uint (4 contiguous qs bytes)
+//     -> the warp's 128-byte qs block is one coalesced transaction, vs v3's 4
+//     strided byte-loads.
+//   - new lane->element map: lane owns sub-block PAIR ii=lane/8 (subs 2*ii,
+//     2*ii+1) at the 4 contiguous positions 4*(lane%8)+0..3. So each lane needs
+//     only ITS pair's 2 scales (vs v3 precomputing all 8) -> less scale ALU.
+// Reads the same bytes + same products as v3; the per-lane sum groups
+// differently, so output equals v3 to fp-reassociation tolerance (not bitwise).
+// Keeps the shared activation tile (v4 proved global reads are slower).
+extern "C" __global__ void fused_q4k_matmul_seq1_v6(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks)
+{
+    __shared__ float a_tile[256];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps_per_block = blockDim.x >> 5;
+    const int ni = blockIdx.x * warps_per_block + warp;
+
+    const int ii     = lane >> 3;        // sub-block pair 0..3
+    const int p0     = (lane & 7) << 2;  // base position 0,4,..,28
+    const int sub_lo = ii << 1;
+    const int sub_hi = sub_lo + 1;
+
+    float acc = 0.0f;
+    for (int bi = 0; bi < n_blocks; bi++) {
+        for (int k = threadIdx.x; k < 256; k += blockDim.x) a_tile[k] = a[bi * 256 + k];
+        __syncthreads();
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)ni * (size_t)n_blocks * 144 + (size_t)bi * 144;
+            unsigned short d_bits    = ((unsigned short)base[1] << 8) | (unsigned short)base[0];
+            unsigned short dmin_bits = ((unsigned short)base[3] << 8) | (unsigned short)base[2];
+            const float d    = aether_f16_to_f32_dev(d_bits);
+            const float dmin = aether_f16_to_f32_dev(dmin_bits);
+            const unsigned char* scales = base + 4;
+            const float d_lo = d * (float)q4k_get_scale(sub_lo, scales);
+            const float m_lo = dmin * (float)q4k_get_min(sub_lo, scales);
+            const float d_hi = d * (float)q4k_get_scale(sub_hi, scales);
+            const float m_hi = dmin * (float)q4k_get_min(sub_hi, scales);
+            // one 4-byte coalesced load (this lane's 4 contiguous qs bytes).
+            const unsigned int packed = ((const unsigned int*)(base + 16))[lane];
+            const float* a_lo = a_tile + sub_lo * 32 + p0;
+            const float* a_hi = a_tile + sub_hi * 32 + p0;
+            #pragma unroll
+            for (int b = 0; b < 4; b++) {
+                const unsigned int byte = (packed >> (b * 8)) & 0xFFu;
+                const float w_lo = d_lo * (float)(byte & 0xFu) - m_lo;
+                const float w_hi = d_hi * (float)((byte >> 4) & 0xFu) - m_hi;
+                acc += a_lo[b] * w_lo + a_hi[b] * w_hi;
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, o);
+    if (lane == 0 && ni < n) out[ni] = acc;
+}
+
 // DIAGNOSTIC probe -- isolates MEMORY ceiling from dequant ALU. Same launch +
 // same byte reads (weight qs/scales + shared activation tile) as v3, but the
 // inner loop does MINIMAL arithmetic (integer adds, no f16 convert, no scale
@@ -5824,6 +5891,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_ffn_gate_up_silu_mul",
               "fused_q4k_matmul_seq1_v3", "fused_q4k_matmul_seq1_v4",
               "fused_q4k_matmul_seq1_v5", "fused_q4k_membw_probe",
+              "fused_q4k_matmul_seq1_v6",
               "fused_q4k_ffn_gate_up_silu_mul_v2",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
@@ -5876,6 +5944,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_matmul_seq1_v4 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v4").unwrap();
         let fused_q4k_matmul_seq1_v5 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v5").unwrap();
         let fused_q4k_membw_probe = device.get_func("aether_kernels", "fused_q4k_membw_probe").unwrap();
+        let fused_q4k_matmul_seq1_v6 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v6").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
         let rope_apply_devarg = device.get_func("aether_kernels", "rope_apply_devarg").unwrap();
         let append_kv_devarg = device.get_func("aether_kernels", "append_kv_devarg").unwrap();
@@ -5920,6 +5989,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_matmul_seq1_v4,
                   fused_q4k_matmul_seq1_v5,
                   fused_q4k_membw_probe,
+                  fused_q4k_matmul_seq1_v6,
                   fused_q4k_ffn_gate_up_silu_mul_v2,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1, fused_f16_matmul_seq1,
@@ -9377,6 +9447,43 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().fused_q4k_membw_probe.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks))
             .expect("launch fused_q4k_membw_probe");
+    }
+    0
+}
+
+/// v6 Q4_K seq1 mat-vec — vectorized uint loads + per-lane 2-scale dequant.
+/// Output equals v3 to fp tolerance (different per-lane sum grouping).
+/// `warps_per_block` tunable via `AETHER_Q4K_V6_WPB` (1..=32, default 8).
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_matmul_seq1_v6_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 { return -1; }
+    // cache the (optional) tuning env once — this is on the decode hot path.
+    static V6_WPB: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let wpb: u32 = *V6_WPB.get_or_init(|| {
+        std::env::var("AETHER_Q4K_V6_WPB").ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&w| (1..=32).contains(&w))
+            .unwrap_or(8)
+    });
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let grid_x = ((n as u32) + wpb - 1) / wpb;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1), block_dim: (wpb * 32, 1, 1), shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        ctx().fused_q4k_matmul_seq1_v6.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks))
+            .expect("launch fused_q4k_matmul_seq1_v6");
     }
     0
 }

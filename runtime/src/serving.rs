@@ -84,6 +84,7 @@ use crate::cuda::{
     aether_op_mul_inplace_f32_cuda, aether_op_silu_f32_cuda,
     aether_op_scale_f32_cuda,
     aether_op_fused_q4k_matmul_seq1_v2_cuda,
+    aether_op_fused_q4k_matmul_seq1_v6_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
@@ -134,6 +135,13 @@ unsafe fn dispatch_matmul(
         }
         12 => {
             // Q4_K: 256-elem super-blocks; blocks_per_row = n_in / 256.
+            // NOTE: v6 (aether_op_fused_q4k_matmul_seq1_v6_cuda) is a verified
+            // 1.43x-faster vectorized matvec (microbench cuda_q4k_matvec_bench),
+            // but swapping it in gave ZERO single-stream decode gain (e2e 13.85
+            // vs 13.8 tok/s) — the matmul is not the single-stream decode
+            // bottleneck. Kept registered + benched; wire it in once the real
+            // overhead bottleneck is fixed, and for batched decode where matmul
+            // throughput dominates. Default stays v2 (no-risk, no e2e regression).
             aether_op_fused_q4k_matmul_seq1_v2_cuda(x_norm, w, y, n_out, n_in / 256);
         }
         14 => {
@@ -3932,8 +3940,15 @@ impl QwenSession {
         let mut seen: std::collections::HashMap<usize, u32> =
             std::collections::HashMap::new();
         let mut running_text = String::new();
+        // AETHER_DECODE_TIMING=1 — coarse per-token phase breakdown (forward
+        // [embed+h2d+graph/imperative+sync+logits-d2h] vs host sampling) to
+        // locate the single-stream decode bottleneck.
+        let timing = std::env::var("AETHER_DECODE_TIMING").is_ok();
+        let (mut t_fwd_us, mut t_samp_us, mut nsteps) = (0u128, 0u128, 0u64);
         for _ in 0..max_tokens {
+            let t0 = std::time::Instant::now();
             let mut logits = self.step_logits(last);
+            let t1 = std::time::Instant::now();
             if !params.logit_bias.is_empty() {
                 apply_logit_bias(&mut logits, &params.logit_bias);
             }
@@ -3947,6 +3962,11 @@ impl QwenSession {
                 sample_from_logits_v2(&mut logits,
                     params.temperature, params.top_p, params.top_k, &mut rng)
             };
+            if timing {
+                t_fwd_us += (t1 - t0).as_micros();
+                t_samp_us += t1.elapsed().as_micros();
+                nsteps += 1;
+            }
             if Some(id) == stop_token || self.eog_tokens.contains(&id) { break; }
             *seen.entry(id).or_insert(0) += 1;
             generated.push(id);
@@ -3984,6 +4004,12 @@ impl QwenSession {
             }
             last = id;
             if self.next_pos as usize >= self.max_seq - 1 { break; }
+        }
+        if timing && nsteps > 0 {
+            let f = t_fwd_us as f64 / nsteps as f64;
+            let s = t_samp_us as f64 / nsteps as f64;
+            eprintln!("[DECODE TIMING] {} steps | forward(embed+h2d+fwd+sync+logits-d2h) {:.0}us | sampling+host {:.0}us | total {:.0}us/tok ({:.1} tok/s)",
+                nsteps, f, s, f + s, 1e6 / (f + s));
         }
         generated
     }
