@@ -43,13 +43,45 @@ All kernel candidates (v4, v5, membw_probe) registered in cuda.rs behind their
 own `aether_op_..._cuda` entry points — NOT wired into decode (dispatch_matmul
 still uses v3). Harmless until a winner is proven + wired.
 
-**NEXT:** if wide loads lift the ceiling → build v6 = vectorized uint4 weight
-loads + reduced per-element float (defer/amortize the d*scale to per-sub-block,
-or integer-MAC q8-style — note sm_60 has no dp4a so int-MAC's win is only the
-amortized scaling, not SIMD packing). Parity within fp tolerance (activation
-quant changes bits). Wire winner into dispatch_matmul dt=12, verify
-qwen25_paged_parity still greedy→"Paris", e2e re-bench vs llama, BENCH_LEDGER row.
-RESTORE WORKHORSE (systemctl start openclaw-inference-workhorse) before ~7 PDT.
+**SPRINT RESULT (commit 01cbc75) — v6 kernel shipped, but the real bottleneck is
+NOT the matmul:**
+- Built `fused_q4k_matmul_seq1_v6` (vectorized uint loads + per-lane 2-scale
+  dequant): **1.43× the prod kernel's bandwidth** (73→105 GB/s aggregate,
+  microbench `cuda_q4k_matvec_bench`), parity-clean. v4 (no-shared) + v5
+  (multi-row) explored and lost. Wide-load mem ceiling probe = ~200 GB/s.
+- **Wiring v6 into decode gave ZERO e2e gain (13.85 vs 13.8 tok/s).** REVERTED
+  from default dispatch (kept registered+benched for batched decode).
+- `AETHER_DECODE_TIMING` (added to generate_sampled_v2): forward 99.7%,
+  sampling/host 0.3%. Decode is **GPU-forward-bound** (~63ms/tok, ~71 GB/s over
+  4.5GB) vs llama ~25ms (~180 GB/s). The seq1 matvec is only PART of the forward;
+  the ~2.5× gap is the AGGREGATE of all decode kernels, broadly slow.
+  [[gpu_perf_surpass_strategy]] [[aether_vs_llama_perf_pascal_vs_ampere]]
+
+**SPRINT OUTCOME (commit fe6bbfd) — +8.7% P100 decode, witnessed:**
+Per-section profiling (AETHER_DECODE_TIMING, env-gated, forces imperative) split
+decode ~60% FFN / ~40% attention. The FFN gate/up kernel
+(`fused_q4k_ffn_gate_up_silu_mul`, 76MB/layer = biggest weight chunk) used 8
+byte-loads/lane and was NOT covered by v6. Vectorized it (2 uint loads/lane,
+bit-identical) + wired v6 into dispatch_matmul dt=12. **Result: decode 15.5→17.1
+tok/s pure, e2e 4-prompt bench 13.85→15.05 (+8.7%, 0.37→0.40× of llama 37.33),
+coherent.** The FFN gate/up vectorization is the win; v6 on the smaller matmuls
+(q/k/v/o/down/lm_head) was e2e-NEUTRAL (latency-bound single-shot, not
+bandwidth-bound — key lesson: isolated microbench ≠ in-decode impact).
+
+**NEXT (to close the remaining ~2.5× vs llama):**
+1. **The attention section (40%, ~24ms) is the priority** — it reads only ~16MB
+   weights (~18 GB/s effective) so it's NOT bandwidth-bound; it's the paged
+   attention kernel + rope + norms + per-kernel latency/launch gaps. The lever is
+   FUSION (fewer/bigger kernels per layer) + a faster paged-attention seq1
+   kernel, NOT per-kernel matmul bandwidth. This is the #2 strategy lever
+   [[gpu_perf_surpass_strategy]].
+2. Further FFN: `down` (38MB/layer, via v6 dispatch) + the gate/up could push
+   toward the ~200 GB/s wide-load ceiling (currently FFN ~78→~90 GB/s).
+3. Tooling left in place: AETHER_DECODE_TIMING (forward/sampling + attn/ffn
+   split), `cuda_q4k_matvec_bench` (v3/v4/v5/v6 + membw probe). Always validate
+   with e2e decode tok/s, never microbench alone.
+
+WORKHORSE restored (GPU1, llama-server active); scout active; cnc synced fe6bbfd.
 
 ## Last Updated — 2026-05-25 (🟢 qwen3moe "rambling" SOLVED — it was MAX_SEQ=32, not a forward bug)
 
