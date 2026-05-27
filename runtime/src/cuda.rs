@@ -105,6 +105,7 @@ struct CudaCtx {
 struct PagedCtx {
     paged_append_kv_devarg: CudaFunction,
     paged_attention_seq1_devarg: CudaFunction,
+    paged_attention_seq1_v2_devarg: CudaFunction,
     batched_paged_attention_seqB_devarg: CudaFunction,
     batched_paged_append_kv_seqB_devarg: CudaFunction,
     batched_paged_attention_hetero_devarg: CudaFunction,
@@ -146,6 +147,7 @@ fn paged_ctx() -> &'static PagedCtx {
         let paged_ptx = compile_ptx(PAGED_KERNEL_SRC).expect("compile_ptx paged");
         device.load_ptx(paged_ptx, "aether_paged_kernels",
             &["paged_append_kv_devarg", "paged_attention_seq1_devarg",
+              "paged_attention_seq1_v2_devarg",
               "batched_paged_attention_seqB_devarg",
               "batched_paged_append_kv_seqB_devarg",
               "batched_paged_attention_hetero_devarg",
@@ -182,6 +184,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "paged_append_kv_devarg").unwrap(),
             paged_attention_seq1_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_seq1_devarg").unwrap(),
+            paged_attention_seq1_v2_devarg:
+                device.get_func("aether_paged_kernels", "paged_attention_seq1_v2_devarg").unwrap(),
             batched_paged_attention_seqB_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_attention_seqB_devarg").unwrap(),
             batched_paged_append_kv_seqB_devarg:
@@ -1038,6 +1042,136 @@ extern "C" __global__ void paged_attention_seq1_devarg(
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         if (i < per_lane) out_ptr[lane * per_lane + i] = out_local[i];
+    }
+}
+
+// attention-section perf — multi-warp seq1 paged attention.  Identical math to
+// paged_attention_seq1_devarg, but splits the KV loop across blockDim.y warps
+// to raise occupancy and hide HBM latency.  The v1 kernel ran ONE warp per head
+// (grid=n_q_heads, block=32) -> ~28 warps on a 56-SM P100, a single warp per
+// occupied SM with nothing to interleave against the long K/V loads.  Here each
+// head's block carries NW warps; warp w handles KV positions {w, w+NW, ...}.
+//
+// Exactness: softmax is computed GLOBALLY over all t (block-wide max+sum), then
+// pass-3 is a LINEAR weighted V-sum, so per-warp partial sums add EXACTLY (no
+// online-softmax rescale).  Only the float accumulation ORDER differs from v1
+// (per-warp stripes summed, vs v1's strict t-order) -> rel err ~1e-6.
+//
+// Launch: grid (n_q_heads,1,1), block (32, NW, 1),
+//   shared = (max_seq + NW*head_dim) floats.
+// Requires head_dim % 32 == 0 (same constraint as v1).
+extern "C" __global__ void paged_attention_seq1_v2_devarg(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int*   __restrict__ page_table,
+    float*       __restrict__ attn_out,
+    int n_q_heads, int n_kv_heads, int head_dim, int block_size,
+    float scale, int max_seq, const int* __restrict__ step_args)
+{
+    int cur_seq = step_args[1];
+    int head = blockIdx.x;
+    int lane = threadIdx.x;          // 0..31
+    int warp = threadIdx.y;          // 0..NW-1
+    int nw   = blockDim.y;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head  = head / kv_per_q;
+    int d_kv     = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;
+
+    extern __shared__ float smem[];
+    float* scores  = smem;               // [max_seq]
+    float* partial = smem + max_seq;     // [nw * head_dim]; partial[0..nw) also
+                                         // doubles as the pass-2 warp-reduce
+                                         // scratch (nw <= head_dim), overwritten
+                                         // before pass-3 reads it.
+
+    const float* q_ptr = q + head * head_dim;
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane * per_lane + i];
+    }
+
+    // Pass 1: scores[t] = (Q . K[t]) * scale, t distributed across warps.
+    for (int t = warp; t < cur_seq; t += nw) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        const float* k_ptr = k_pool + row * d_kv + kv_head * head_dim;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane * per_lane + i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) scores[t] = acc * scale;
+    }
+    __syncthreads();
+
+    // Pass 2: block-wide softmax over scores[0, cur_seq).
+    int tid = warp * 32 + lane;
+    int nthreads = nw * 32;
+    float lm = -3.4028235e38f;
+    for (int t = tid; t < cur_seq; t += nthreads) lm = fmaxf(lm, scores[t]);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        lm = fmaxf(lm, __shfl_down_sync(0xFFFFFFFFu, lm, off));
+    if (lane == 0) partial[warp] = lm;
+    __syncthreads();
+    float max_val = -3.4028235e38f;
+    for (int w = 0; w < nw; w++) max_val = fmaxf(max_val, partial[w]);
+    __syncthreads();
+
+    float ls = 0.0f;
+    for (int t = tid; t < cur_seq; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        ls += e;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        ls += __shfl_down_sync(0xFFFFFFFFu, ls, off);
+    if (lane == 0) partial[warp] = ls;
+    __syncthreads();
+    float sum_val = 0.0f;
+    for (int w = 0; w < nw; w++) sum_val += partial[w];
+    float inv_sum = 1.0f / sum_val;
+    __syncthreads();
+    for (int t = tid; t < cur_seq; t += nthreads) scores[t] *= inv_sum;
+    __syncthreads();
+
+    // Pass 3: each warp aggregates its t-stripe; partials summed across warps.
+    float out_acc[8] = {0.0f};
+    for (int t = warp; t < cur_seq; t += nw) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk * block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        float wgt = scores[t];
+        const float* v_ptr = v_pool + row * d_kv + kv_head * head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) out_acc[i] += wgt * v_ptr[lane * per_lane + i];
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) partial[warp * head_dim + lane * per_lane + i] = out_acc[i];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) {
+                float s = 0.0f;
+                for (int w = 0; w < nw; w++) s += partial[w * head_dim + lane * per_lane + i];
+                attn_out[head * head_dim + lane * per_lane + i] = s;
+            }
+        }
     }
 }
 
@@ -7377,6 +7511,68 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         paged_ctx().paged_attention_seq1_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, sv))
             .expect("launch paged_attention_seq1_devarg");
+    }
+    0
+}
+
+/// attention-section perf — warp count for the multi-warp seq1 paged attention
+/// kernel.  Tunable via AETHER_ATTN_WARPS (default 8) so the cnc P100 sweep
+/// (4/8/16) needs no recompile.  Cached: the env is read once.  Clamped to
+/// [1, 32] (block = 32*nw threads <= 1024).
+fn attn_warps() -> u32 {
+    use std::sync::OnceLock;
+    static W: OnceLock<u32> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("AETHER_ATTN_WARPS").ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(8)
+            .clamp(1, 32)
+    })
+}
+
+/// attention-section perf — multi-warp drop-in for
+/// `aether_op_paged_attention_seq1_devarg_f32_cuda`.  Same args + result; the
+/// kernel splits the KV loop across `attn_warps()` warps per head to hide HBM
+/// latency (v1 ran a single warp per head).  Bit-close to v1 (rel ~1e-6, float
+/// sum-order only).  See the `paged_attention_seq1_v2_devarg` kernel comment.
+#[no_mangle] pub extern "C" fn aether_op_paged_attention_seq1_v2_devarg_f32_cuda(
+    q_dev: i64, k_pool: i64, v_pool: i64,
+    page_table_dev: i64,
+    attn_out: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int, block_size: c_int,
+    scale: f32, max_seq: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_dev) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0 || block_size <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    if (head_dim % 32) != 0 { return -3; }
+    let nw = attn_warps();
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp_p = bs[i_kp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vp_p = bs[i_vp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pt_p = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp  = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    // scores[max_seq] + partial[nw*head_dim]
+    let shmem = ((max_seq as u32) + nw * (head_dim as u32)) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, nw, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
+        let ov = &mut *o_p; let sv = &*sp;
+        paged_ctx().paged_attention_seq1_v2_devarg.clone()
+            .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, max_seq, sv))
+            .expect("launch paged_attention_seq1_v2_devarg");
     }
     0
 }

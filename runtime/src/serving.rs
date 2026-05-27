@@ -56,6 +56,7 @@ use crate::cuda::{
     aether_op_attention_seq1_devarg_f32_cuda,
     aether_op_paged_append_kv_devarg_f32_cuda,
     aether_op_paged_attention_seq1_devarg_f32_cuda,
+    aether_op_paged_attention_seq1_v2_devarg_f32_cuda,
     aether_op_paged_attention_flex_devarg_f32_cuda,
     aether_op_paged_append_kv_mla_devarg_f32_cuda,
     aether_op_paged_attention_mla_devarg_f32_cuda,
@@ -241,6 +242,19 @@ pub const NORM_EPS: f32 = 1e-6;
 // SM cap at 2048).  2048 covers ordinary chat at ~0.2-0.4 GB of KV across the
 // supported models — comfortably inside a 16 GB card alongside a ~15 GB GGUF.
 pub const MAX_SEQ: usize = 2048;
+
+/// attention-section perf — selects the multi-warp seq1 paged attention kernel
+/// (v2, occupancy fix) over the single-warp v1.  Default ON; set
+/// `AETHER_ATTN_V2=0` to fall back to v1 for an in-binary A/B baseline (avoids
+/// cross-commit bench attribution error).  Cached: env read once.
+#[cfg(feature = "cuda")]
+fn paged_attn_v2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("AETHER_ATTN_V2").map(|v| v != "0").unwrap_or(true)
+    })
+}
 
 /// AETHER_DECODE_TIMING per-section profiler (env-gated, off by default → zero
 /// cost in production). Accumulates GPU-synced wall time for the attention vs
@@ -1309,6 +1323,12 @@ unsafe fn standard_attention_forward(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
                 n_q_heads, n_kv_heads, head_dim,
                 block_size, eff_sliding_window, scale, max_seq as c_int, step_args);
+        } else if paged_attn_v2_enabled() {
+            // attention-section perf — multi-warp seq1 attention (occupancy fix).
+            aether_op_paged_attention_seq1_v2_devarg_f32_cuda(
+                act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+                n_q_heads, n_kv_heads, head_dim,
+                block_size, scale, max_seq as c_int, step_args);
         } else {
             aether_op_paged_attention_seq1_devarg_f32_cuda(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,

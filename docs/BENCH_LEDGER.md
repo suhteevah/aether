@@ -539,3 +539,35 @@ vectorization (the bandwidth-bound chunk); v6 on the smaller matmuls
 bandwidth-bound. Coherence intact ("Paris"). Remaining ~2.5x gap: the attention
 section (40%, latency/overhead-bound) needs FUSION (fewer/bigger kernels), not
 more per-kernel bandwidth — that is the next lever per gpu_perf_surpass_strategy.
+
+---
+
+## 2026-05-27 — attention-section: multi-warp paged seq1 attention (v2)
+
+Picking up the prior handoff's #1 lever (attention section, ~40% of decode,
+latency/occupancy-bound). The `paged_attention_seq1_devarg` kernel ran ONE warp
+per head (grid=n_q_heads=28, block=32) → ~28 warps on a 56-SM P100, a single
+warp per occupied SM with nothing to interleave against the long serial K/V
+loads. New `paged_attention_seq1_v2_devarg` splits the per-head KV loop across
+`AETHER_ATTN_WARPS` warps (block = 32×NW); softmax is global and pass-3 is a
+linear weighted-V sum, so per-warp partial sums add EXACTLY (parity test
+`cuda_paged_attention_v2_parity`: max_abs ≤ 2.4e-7, max_rel ≤ 2.4e-4 across
+cur_seq 1..257). Coherence preserved (`qwen25_paged_parity` token-identical).
+
+cnc P100 (GPU1, workhorse evicted+restored), Qwen2.5-Math-7B Q4_K_M, --paged,
+4-prompt × 3-rep e2e bench, **same binary** (env A/B → clean attribution):
+
+| config | e2e tok/s | vs v1 |
+|--------|----------:|-------|
+| v1 baseline (AETHER_ATTN_V2=0) | 15.05 | 1.000x (reproduces committed baseline exactly) |
+| v2 AETHER_ATTN_WARPS=4  | 15.69 | 1.043x |
+| v2 AETHER_ATTN_WARPS=8 (default) | 15.79 | 1.049x |
+| v2 AETHER_ATTN_WARPS=16 | 15.85 | 1.053x |
+| llama-server b8182 (ref) | 37.33 | 2.36x ahead |
+
+**Honest: +4.9% e2e (0.40x → 0.42x of llama), warp count within noise (8↔16
+≈ 0.4%).** Modest because 28 heads = 28 blocks fills only half a 56-SM P100;
+the multi-warp fix helps the OCCUPIED SMs hide latency but leaves 28 SMs idle.
+Next lever to fill all SMs: split-KV (grid-Y KV chunks + a combine kernel) —
+the multi-warp structure here is the basis for it. Shipped default-on,
+env-toggleable (AETHER_ATTN_V2=0 → v1), zero regression risk.
