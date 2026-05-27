@@ -571,3 +571,42 @@ the multi-warp fix helps the OCCUPIED SMs hide latency but leaves 28 SMs idle.
 Next lever to fill all SMs: split-KV (grid-Y KV chunks + a combine kernel) —
 the multi-warp structure here is the basis for it. Shipped default-on,
 env-toggleable (AETHER_ATTN_V2=0 → v1), zero regression risk.
+
+---
+
+## 2026-05-27 — FFN gate/up: factored-dequant (v3) — NEGATIVE RESULT
+
+Pivoted to the FFN section (the bigger 59% of decode forward). Added FFN
+sub-split timing (AETHER_DECODE_TIMING now prints norm+gate/up vs down-proj).
+cnc P100, Qwen2.5-Math-7B Q4_K_M, --paged, per-token ×28 layers:
+
+| FFN sub-section | per-token | % FFN | % forward |
+|-----------------|----------:|------:|----------:|
+| norm + gate/up  | 23.5ms | 66% | ~38% |
+| down-proj       | 12.0ms | 34% | ~20% |
+
+So the fused gate/up kernel is the single biggest chunk of decode (~38%),
+running ~91 GB/s vs a ~200 GB/s wide-load ceiling. Hypothesis: it's ALU-bound on
+per-element float dequant, so factor `a·(d_eff·nibble−m_eff)` → `d_eff·Σ(a·nibble)
+− m_eff·Σa` (scale/min applied once per sub-block; Σa shared gate/up).
+
+**Result: factoring REGRESSES the kernel on P100.**
+
+| config (attn v2 in all) | e2e tok/s | gate/up µs/tok |
+|-------------------------|----------:|---------------:|
+| base gate/up | 15.79 | 23532 |
+| v3 (factored, a8[] reg cache) | 15.58 | 24169 |
+| v3 (fused single-loop, 1 act read) | 15.41 | 24743 |
+
+Both restructurings add live registers (dot_g/dot_u/asum/8 hoisted scale-mins)
+→ register pressure → lower occupancy → slower, despite ~1/3 fewer per-element
+FLOPs. The base per-element-FMA form is already well-tuned for P100. Coherence
+held throughout (qwen25_paged_parity token-identical with v3).
+
+**Conclusion: ALU-factoring the float-activation gate/up kernel is a dead end on
+P100. The real lever to approach llama's ~180 GB/s is INT8 ACTIVATION
+QUANTIZATION (Q8_1) + int8×int4 dot products with one float scale per block —
+llama's MMVQ approach — which removes all per-element float dequant. That's a
+fundamentally different, larger build (activation-quant kernel + int-MAC gate/up
++ scale handling), not a micro-tweak. v3 kernel reverted; FFN sub-split timing
+kept as a permanent diagnostic.**

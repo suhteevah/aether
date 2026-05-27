@@ -265,14 +265,22 @@ mod block_timing {
     pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static FFN_NS: AtomicU64 = AtomicU64::new(0);
     pub static N: AtomicU64 = AtomicU64::new(0);
+    // FFN sub-section split (dense path): gate/up fused kernel vs down-proj.
+    pub static GATEUP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DOWN_NS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
         static E: OnceLock<bool> = OnceLock::new();
         *E.get_or_init(|| std::env::var("AETHER_DECODE_TIMING").is_ok())
     }
     pub fn add_attn(ns: u64) { ATTN_NS.fetch_add(ns, Ordering::Relaxed); }
     pub fn add_ffn(ns: u64) { FFN_NS.fetch_add(ns, Ordering::Relaxed); N.fetch_add(1, Ordering::Relaxed); }
+    pub fn add_gateup(ns: u64) { GATEUP_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_down(ns: u64) { DOWN_NS.fetch_add(ns, Ordering::Relaxed); }
     pub fn snapshot() -> (u64, u64, u64) {
         (ATTN_NS.load(Ordering::Relaxed), FFN_NS.load(Ordering::Relaxed), N.load(Ordering::Relaxed))
+    }
+    pub fn snapshot_ffn() -> (u64, u64) {
+        (GATEUP_NS.load(Ordering::Relaxed), DOWN_NS.load(Ordering::Relaxed))
     }
 }
 
@@ -1250,7 +1258,13 @@ unsafe fn block_forward_devarg(
             aether_op_mul_inplace_f32_cuda(act.gate, up_tmp, d_ff);
             let _ = aether_dev_free_f32(up_tmp);
         }
+        // FFN sub-split: GATEUP_NS = norm+gate/up (since FFN start t_sec),
+        // DOWN_NS = down-proj only.  t_sec is NOT reset, so the closing add_ffn
+        // still measures the whole FFN section.
+        if bt { aether_dev_sync(); block_timing::add_gateup(t_sec.elapsed().as_nanos() as u64); }
+        let t_down = std::time::Instant::now();
         dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
+        if bt { aether_dev_sync(); block_timing::add_down(t_down.elapsed().as_nanos() as u64); }
         if bw.post_ffn_norm_g != 0 {
             aether_op_rms_norm_f32_cuda(act.down, bw.post_ffn_norm_g, act.down,
                 norm_eps, 1, d_model);
@@ -4065,6 +4079,13 @@ impl QwenSession {
                 eprintln!("[DECODE TIMING] per-block: attn-section {:.1}us  ffn-section {:.1}us  (ratio attn:ffn = {:.2}:{:.2}) | per-token x{} layers: attn {:.0}us ffn {:.0}us",
                     attn_blk, ffn_blk, attn_blk/(attn_blk+ffn_blk), ffn_blk/(attn_blk+ffn_blk),
                     self.cfg.n_layers, attn_blk*nl, ffn_blk*nl);
+                let (gateup_ns, down_ns) = block_timing::snapshot_ffn();
+                if gateup_ns > 0 || down_ns > 0 {
+                    let gu_blk = gateup_ns as f64 / nblk as f64 / 1000.0;
+                    let dn_blk = down_ns as f64 / nblk as f64 / 1000.0;
+                    eprintln!("[DECODE TIMING] FFN sub-split: norm+gate/up {:.1}us  down-proj {:.1}us  (per-token x{} layers: gate/up {:.0}us down {:.0}us)",
+                        gu_blk, dn_blk, self.cfg.n_layers, gu_blk*nl, dn_blk*nl);
+                }
             }
         }
         generated
