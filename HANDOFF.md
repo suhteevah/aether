@@ -1,5 +1,62 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-27
+
+## Project Status
+🟢 Autonomous P100 perf-sprint milestone shipped: **+8.7% decode** (Qwen2.5-7B
+Q4_K_M, 13.85→15.05 tok/s e2e, coherent, parity-clean). Still 2.5× behind
+llama-server (37.33) but the gap is now precisely localized. Workspace clean,
+fleet healthy, everything committed+pushed (HEAD on origin/main).
+
+## What Was Done This Session
+- **Vectorized the FFN gate/up kernel** (`fused_q4k_ffn_gate_up_silu_mul` in
+  runtime/src/cuda.rs): 8 byte-loads/lane → 2 uint loads/lane (1 coalesced 8-byte
+  read), bit-identical. This was the real win (the biggest weight chunk).
+- **Built `fused_q4k_matmul_seq1_v6`** (vectorized uint loads + per-lane 2-scale
+  dequant): 1.43× the prod kernel's bandwidth in isolation (73→105 GB/s,
+  microbench). Wired into dispatch_matmul dt=12 (q/k/v/o/down/lm_head).
+- **`AETHER_DECODE_TIMING`** env-gated profiler added to generate_sampled_v2 +
+  block_forward_devarg (forward/sampling split + attn/ffn section split).
+- New microbench `runtime/tests/cuda_q4k_matvec_bench.rs` (v3/v4/v5/v6 + membw
+  probe). 3 BENCH_LEDGER rows appended (1:1 vs llama on P100+3070Ti; v6 profiling;
+  FFN-vec result). Memory: [[gpu_perf_surpass_strategy]],
+  [[aether_vs_llama_perf_pascal_vs_ampere]].
+
+## Current State
+- Working: aether-serve decode at 15.05 tok/s e2e (was 13.85), coherent on
+  Qwen2.5-7B Q4_K_M. v6 + vectorized FFN both wired + committed. Bare + cuda
+  builds clean. v4/v5/membw-probe kernels registered (dead code, for reference).
+- Not a regression risk: FFN-vec is bit-identical; v6 is parity-clean (rel 5e-5).
+
+## Blocking Issues
+None. (Honest caveat: a `github-uploader-buildout` external process keeps making
+"Initial commit" auto-commits on top of the work + pushing — harmless, touches
+only README, but worth knowing something automated commits to this repo.)
+
+## What's Next (prioritized)
+1. **Attention-section fusion** — the remaining ~2.5× vs llama lives here. It's
+   40% of decode (~24ms) but reads only ~16MB weights (~18 GB/s effective) → NOT
+   bandwidth-bound; it's the paged-attn kernel + rope + norms + per-kernel
+   latency/launch gaps. Lever = FUSION (fewer/bigger kernels per layer) + a
+   faster paged seq1 attention kernel. NOT more matmul bandwidth.
+2. Push FFN further toward the ~200 GB/s wide-load ceiling (currently ~90 GB/s).
+3. Validate EVERY kernel change with e2e decode tok/s + AETHER_DECODE_TIMING —
+   the hard lesson this session: a 1.43× microbench win gave ZERO e2e gain
+   because the small matmuls are latency-bound, not bandwidth-bound.
+
+## Notes for Next Session
+- P100 = sm_60, NO dp4a. cnc GPU bench MUST evict workhorse (standing perm,
+  restore after). 3070 Ti (kokonoe/Windows) needs `nvidia-smi -lgc/-lmc` clock
+  locks or numbers are garbage (idle mem clock = 11.7× throttle).
+- v6/FFN microbench: `cargo test --release --features cuda -p aether_rt --test
+  cuda_q4k_matvec_bench -- --ignored --nocapture`. e2e: bench_client.py +
+  AETHER_DECODE_TIMING=1 on aether-serve.
+- "aether vs llama" is platform-dependent (Linux/P100 llama wins 2.5×;
+  Windows/WDDM aether's CUDA-graph wins 1.6× vs ollama). Always state GPU+OS.
+
+---
+### (sprint detail, superseded by the structured block above)
+
 ## Last Updated — 2026-05-26 (🟡 IN PROGRESS: autonomous GPU-perf sprint — close the P100 decode gap vs llama.cpp)
 
 **Mandate:** Matt granted full P100 use for ~14h (away until ~7 PDT 2026-05-26).
