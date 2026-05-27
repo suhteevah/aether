@@ -1,5 +1,56 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-26 (🟡 IN PROGRESS: autonomous GPU-perf sprint — close the P100 decode gap vs llama.cpp)
+
+**Mandate:** Matt granted full P100 use for ~14h (away until ~7 PDT 2026-05-26).
+Goal: close the 2.7× decode gap on P100 (aether 13.8 vs llama 37.4 tok/s,
+Qwen2.5-7B Q4_K_M) — see [[aether_vs_llama_perf_pascal_vs_ampere]],
+[[gpu_perf_surpass_strategy]]. The hot path is the Q4_K seq1 mat-vec
+(`fused_q4k_matmul_seq1_v3` in runtime/src/cuda.rs), ~85% of decode.
+
+**Workspace state:** cnc workhorse EVICTED (GPU1 free for dev) — MUST
+`systemctl start openclaw-inference-workhorse` to restore before Matt's back /
+session end. cnc at origin/main HEAD 6bc03c0.
+
+**Key facts established this sprint:**
+- P100 = sm_60, NO dp4a (sm_61+). llama.cpp uses MMVQ with scalar int8-MAC
+  fallback, fp32 accumulate, does NOT exploit P100's 2× fp16. Reference algorithm
+  doc: `scratch/llama_q4k_matvec_reference.md` (subagent-extracted, exact).
+- Decode is memory-BW-bound on 4-bit weight reads. Effective BW: aether ~62 GB/s,
+  llama ~175 GB/s, P100 peak ~720. Target = raise aether's achieved BW.
+- v3 weaknesses: 2× syncthreads per block-iter (activation reload), d_eff[8]/
+  m_eff[8] register arrays → likely low occupancy → can't hide HBM latency.
+
+**Tooling built:** `runtime/tests/cuda_q4k_matvec_bench.rs` (#[ignore]) — times
+seq1_v3 at all Qwen2.5-7B decode shapes, reports achieved GB/s vs 720 peak.
+Correctness oracle: `cuda_q4k_matmul_seqB_parity.rs` (seq1_v3 vs CPU/seqB,
+bit-exact) + qwen25_paged_parity (must still greedy→"Paris").
+
+**DIAGNOSIS (witnessed via `runtime/tests/cuda_q4k_matvec_bench.rs`):**
+- Baseline v3 = ~73 GB/s aggregate (10% of P100 720 peak) across decode shapes.
+- v4 (no-shared/no-sync/inline-scale) = 0.79× SLOWER — removing shared made
+  activation reads L2-latency-bound; shared+sync HELPS. Kept as dead code.
+- v5 (multi-row-per-warp R=4, MLP) = 0.96× — no help. So NOT occupancy/MLP/sync
+  limited (lm_head already full-occupancy at 10%).
+- **MEMORY-CEILING PROBE** (minimal ALU, same byte reads): ~134 GB/s = 19% peak.
+  → TWO limits: (a) v3 is ALU-bound on per-element float dequant (72 vs 134 when
+  stripped, ~1.85×); (b) the byte-load access pattern caps memory at ~134 even
+  with trivial ALU. Beating llama (~175 GB/s effective) needs BOTH fixes.
+- [in flight] vectorized-load probe (uint/lane, 128B coalesced vs 4 strided
+  byte-loads) to see if wide loads lift the 134 ceiling.
+
+All kernel candidates (v4, v5, membw_probe) registered in cuda.rs behind their
+own `aether_op_..._cuda` entry points — NOT wired into decode (dispatch_matmul
+still uses v3). Harmless until a winner is proven + wired.
+
+**NEXT:** if wide loads lift the ceiling → build v6 = vectorized uint4 weight
+loads + reduced per-element float (defer/amortize the d*scale to per-sub-block,
+or integer-MAC q8-style — note sm_60 has no dp4a so int-MAC's win is only the
+amortized scaling, not SIMD packing). Parity within fp tolerance (activation
+quant changes bits). Wire winner into dispatch_matmul dt=12, verify
+qwen25_paged_parity still greedy→"Paris", e2e re-bench vs llama, BENCH_LEDGER row.
+RESTORE WORKHORSE (systemctl start openclaw-inference-workhorse) before ~7 PDT.
+
 ## Last Updated — 2026-05-25 (🟢 qwen3moe "rambling" SOLVED — it was MAX_SEQ=32, not a forward bug)
 
 **The carry-forward "qwen3moe forward rambles" item is CLOSED — and it was never
