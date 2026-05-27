@@ -509,3 +509,33 @@ default dispatch (no e2e benefit, avoid risk on all Q4_K models); kept registere
 whole forward's cost (fusion = fewer/bigger kernels, + raise every kernel's
 achieved BW toward the ~200 probe ceiling). Need per-category profiling
 (matmul vs FFN-fused vs attention) of the 63 ms to target the biggest chunk.**
+
+### P100 decode: per-section profiling → FFN-kernel vectorization → +8.7% e2e
+
+Followed the profiling finding (above) with AETHER_DECODE_TIMING per-section
+timers (forced imperative; env-gated). Steady-state decode of Qwen2.5-7B Q4_K_M
+on the cnc P100 splits:
+- **FFN section ~60%** (~1270 us/block x28 = ~35 ms/tok) — memory-bound on
+  gate/up/down weights (~114 MB/layer, ~78 GB/s).
+- **attention section ~40%** (~840 us/block x28 = ~24 ms/tok) — only ~16 MB
+  weights (~18 GB/s effective) → NOT bandwidth-bound; dominated by the paged
+  attention kernel + rope + norms + per-kernel latency.
+
+The biggest weight chunk (FFN gate/up, 76 MB/layer) ran through the SEPARATE
+`fused_q4k_ffn_gate_up_silu_mul` kernel (8 byte-loads/lane), which v6 never
+touched. Vectorizing it (2 uint loads/lane, bit-identical) + wiring v6 into
+dispatch_matmul dt=12 (q/k/v/o/down/lm_head):
+
+| config | decode (pure) | e2e (4-prompt bench) | vs baseline |
+|--------|--------------:|---------------------:|-------------|
+| v2 baseline | 15.5 tok/s | 13.85 tok/s | 1.0x |
+| + vectorized FFN gate/up | 17.0 | — | |
+| + v6 dispatch (combined) | 17.1 | **15.05** | **1.087x** |
+| llama-server b8182 (ref) | — | 37.33 | 2.48x ahead |
+
+**Honest: +8.7% e2e (0.37x → 0.40x of llama).** The win is the FFN gate/up
+vectorization (the bandwidth-bound chunk); v6 on the smaller matmuls
+(q/k/v/o/down/lm_head) was e2e-neutral — they're latency-bound single-shot, not
+bandwidth-bound. Coherence intact ("Paris"). Remaining ~2.5x gap: the attention
+section (40%, latency/overhead-bound) needs FUSION (fewer/bigger kernels), not
+more per-kernel bandwidth — that is the next lever per gpu_perf_surpass_strategy.

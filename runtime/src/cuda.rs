@@ -3988,10 +3988,14 @@ extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul(
                 unsigned int mn = q4k_get_min(sub, scales);
                 float d_eff = d * (float)sc;
                 float m_eff = dmin * (float)mn;
+                // vectorized: this lane's 8 contiguous qs bytes as 2 uint loads
+                // (1 coalesced 8-byte read) instead of 8 byte loads. Bit-identical.
+                const unsigned int* qsw = (const unsigned int*)(qs + qs_off);
+                unsigned int w0 = qsw[0], w1 = qsw[1];
                 #pragma unroll
                 for (int p = 0; p < 8; p++) {
-                    unsigned char byte = qs[qs_off + p];
-                    unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+                    unsigned int byte = ((((p < 4) ? w0 : w1) >> ((p & 3) * 8)) & 0xFFu);
+                    unsigned int nibble = is_hi ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
                     float w_val = d_eff * (float)nibble - m_eff;
                     acc_g += a_tile[a_off + p] * w_val;
                 }
@@ -4011,10 +4015,12 @@ extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul(
                 unsigned int mn = q4k_get_min(sub, scales);
                 float d_eff = d * (float)sc;
                 float m_eff = dmin * (float)mn;
+                const unsigned int* qsw = (const unsigned int*)(qs + qs_off);
+                unsigned int w0 = qsw[0], w1 = qsw[1];
                 #pragma unroll
                 for (int p = 0; p < 8; p++) {
-                    unsigned char byte = qs[qs_off + p];
-                    unsigned int nibble = is_hi ? (((unsigned int)byte >> 4) & 0xFu) : ((unsigned int)byte & 0xFu);
+                    unsigned int byte = ((((p < 4) ? w0 : w1) >> ((p & 3) * 8)) & 0xFFu);
+                    unsigned int nibble = is_hi ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
                     float w_val = d_eff * (float)nibble - m_eff;
                     acc_u += a_tile[a_off + p] * w_val;
                 }

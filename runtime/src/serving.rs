@@ -135,14 +135,11 @@ unsafe fn dispatch_matmul(
         }
         12 => {
             // Q4_K: 256-elem super-blocks; blocks_per_row = n_in / 256.
-            // NOTE: v6 (aether_op_fused_q4k_matmul_seq1_v6_cuda) is a verified
-            // 1.43x-faster vectorized matvec (microbench cuda_q4k_matvec_bench),
-            // but swapping it in gave ZERO single-stream decode gain (e2e 13.85
-            // vs 13.8 tok/s) — the matmul is not the single-stream decode
-            // bottleneck. Kept registered + benched; wire it in once the real
-            // overhead bottleneck is fixed, and for batched decode where matmul
-            // throughput dominates. Default stays v2 (no-risk, no e2e regression).
-            aether_op_fused_q4k_matmul_seq1_v2_cuda(x_norm, w, y, n_out, n_in / 256);
+            // v6 = vectorized uint loads + per-lane 2-scale dequant, 1.43x v2/v3
+            // achieved bandwidth (microbench cuda_q4k_matvec_bench). Covers
+            // q/k/v/o/down/lm_head; combined with the vectorized FFN gate/up
+            // kernel this raises P100 decode (see BENCH_LEDGER). Parity-clean.
+            aether_op_fused_q4k_matmul_seq1_v6_cuda(x_norm, w, y, n_out, n_in / 256);
         }
         14 => {
             aether_op_fused_q6k_matmul_seq1_v2_cuda(x_norm, w, y, n_out, n_in / 256);
@@ -244,6 +241,26 @@ pub const NORM_EPS: f32 = 1e-6;
 // SM cap at 2048).  2048 covers ordinary chat at ~0.2-0.4 GB of KV across the
 // supported models — comfortably inside a 16 GB card alongside a ~15 GB GGUF.
 pub const MAX_SEQ: usize = 2048;
+
+/// AETHER_DECODE_TIMING per-section profiler (env-gated, off by default → zero
+/// cost in production). Accumulates GPU-synced wall time for the attention vs
+/// FFN sections of every block_forward, to localize the decode bottleneck.
+mod block_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static N: AtomicU64 = AtomicU64::new(0);
+    pub fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| std::env::var("AETHER_DECODE_TIMING").is_ok())
+    }
+    pub fn add_attn(ns: u64) { ATTN_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_ffn(ns: u64) { FFN_NS.fetch_add(ns, Ordering::Relaxed); N.fetch_add(1, Ordering::Relaxed); }
+    pub fn snapshot() -> (u64, u64, u64) {
+        (ATTN_NS.load(Ordering::Relaxed), FFN_NS.load(Ordering::Relaxed), N.load(Ordering::Relaxed))
+    }
+}
 
 /// FR-19.5-extra-deep Phase 2b-2b — max requests fused into one batched
 /// decode tick.  Capped at 8 because `fused_q4k_matmul_seqB_v3` rejects
@@ -1146,6 +1163,9 @@ unsafe fn block_forward_devarg(
     if layer_idx == 0 {
         dump_act_vec("inp_embd", act.x, d_model as usize);
     }
+    let bt = block_timing::enabled();
+    let mut t_sec = std::time::Instant::now();
+    if bt { aether_dev_sync(); t_sec = std::time::Instant::now(); }
     aether_op_rms_norm_f32_cuda(act.x, bw.attn_norm_g, act.x_norm, norm_eps, 1, d_model);
     // FR-17-extra-mla-fwd — pre-attention dispatch.  MLA path runs the
     // compressed-KV → decompression → partial-RoPE → MLA-attention chain;
@@ -1195,6 +1215,7 @@ unsafe fn block_forward_devarg(
         eprintln!("[POST-ATTN x] nan={} inf={} min={:.4e} max={:.4e} mean={:.4e}",
             n_nan, n_inf, mn, mx, mean);
     }
+    if bt { aether_dev_sync(); block_timing::add_attn(t_sec.elapsed().as_nanos() as u64); t_sec = std::time::Instant::now(); }
     aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
     if bw.w_router != 0 {
         moe_ffn_forward(bw, act, cfg, layer_idx);
@@ -1222,6 +1243,7 @@ unsafe fn block_forward_devarg(
         }
         aether_op_add_inplace_f32_cuda(act.x, act.down, d_model);
     }
+    if bt { aether_dev_sync(); block_timing::add_ffn(t_sec.elapsed().as_nanos() as u64); }
     // V2-Lite-debug: residual after the full layer (attn + FFN).  Maps to
     // llama.cpp `l_out-{b}`.  This is the per-layer hidden state we diff.
     dump_act_vec(&format!("l_out-{}", layer_idx), act.x, d_model as usize);
@@ -3888,7 +3910,9 @@ impl QwenSession {
             let step_host = [pos, cur_seq, 0i32, 0i32];
             aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
 
-            if self.cfg.n_experts > 0 {
+            // block_timing forces the imperative path: its per-section
+            // aether_dev_sync() calls are illegal inside CUDA graph capture.
+            if self.cfg.n_experts > 0 || block_timing::enabled() {
                 self.run_forward_imperative();
             } else {
                 if !self.graph_captured {
@@ -4010,6 +4034,18 @@ impl QwenSession {
             let s = t_samp_us as f64 / nsteps as f64;
             eprintln!("[DECODE TIMING] {} steps | forward(embed+h2d+fwd+sync+logits-d2h) {:.0}us | sampling+host {:.0}us | total {:.0}us/tok ({:.1} tok/s)",
                 nsteps, f, s, f + s, 1e6 / (f + s));
+            let (attn_ns, ffn_ns, nblk) = block_timing::snapshot();
+            if nblk > 0 {
+                // per-token = per-block-section * n_layers; nblk counts all
+                // block_forward calls (prefill + decode). Report per-block-call
+                // averages + the per-token totals over n_layers.
+                let nl = self.cfg.n_layers as f64;
+                let attn_blk = attn_ns as f64 / nblk as f64 / 1000.0;
+                let ffn_blk = ffn_ns as f64 / nblk as f64 / 1000.0;
+                eprintln!("[DECODE TIMING] per-block: attn-section {:.1}us  ffn-section {:.1}us  (ratio attn:ffn = {:.2}:{:.2}) | per-token x{} layers: attn {:.0}us ffn {:.0}us",
+                    attn_blk, ffn_blk, attn_blk/(attn_blk+ffn_blk), ffn_blk/(attn_blk+ffn_blk),
+                    self.cfg.n_layers, attn_blk*nl, ffn_blk*nl);
+            }
         }
         generated
     }
