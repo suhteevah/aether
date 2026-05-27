@@ -1,6 +1,70 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-27
+## Last Updated — 2026-05-27 (🟢 attention v2 +4.9% shipped; FFN gate/up factoring = negative result)
+
+## Project Status
+🟢 Two commits, both pushed + cnc synced. (1) `adbd4f0` multi-warp paged seq1
+attention (v2): **15.05 → 15.79 tok/s (+4.9%)** e2e on cnc P100, coherent,
+parity-clean, env-toggleable. (2) `dcf6cd4` FFN sub-split timing + a NEGATIVE
+result: ALU-factoring the gate/up dequant regresses on P100 (reverted, timing
+kept). Workspace clean, fleet restored (workhorse active).
+
+### FFN section findings (this session, committed in dcf6cd4)
+- FFN sub-split (cnc P100, per-token ×28): **norm+gate/up 23.5ms (66% FFN, ~38%
+  forward)** / down-proj 12.0ms (34% FFN). gate/up is the single biggest chunk of
+  decode, ~91 GB/s vs ~200 GB/s ceiling.
+- Tried factoring `a·(d_eff·nibble−m_eff)` → `d_eff·Σ(a·nibble) − m_eff·Σa`
+  (2 variants). BOTH regressed e2e (15.79→15.58/15.41) — extra live registers cut
+  occupancy more than the FLOP saving helped. The base per-element-FMA form is
+  already well-tuned. **DO NOT re-try ALU-factoring the float gate/up kernel.**
+- **Real lever for gate/up = INT8 ACTIVATION QUANT (Q8_1) + int8×int4 MMVQ**
+  (llama's approach → ~180 GB/s): removes all per-element float dequant. Larger
+  build (activation-quant kernel + int-MAC gate/up + per-block scale). This is the
+  path to closing the 2.36× llama gap on the biggest decode chunk.
+- down-proj (12ms, 34% FFN) is split Q4_K-v6 / Q6_K-`fused_q6k_matmul_seq1_v2`
+  per layer ([[qwen25_q4km_mixed_precision]]); the Q6_K kernel's vectorization
+  state is UNCHECKED — a possible smaller win there (vectorize like v6 did Q4_K).
+- Tooling: scratch/{attn_v2_bench,attn_timing,ffn_v3_bench}.sh (all trap-restore
+  the workhorse). AETHER_DECODE_TIMING now prints the FFN sub-split.
+
+### What Was Done
+- **`paged_attention_seq1_v2_devarg`** (runtime/src/cuda.rs): v1 ran ONE warp per
+  head (grid=28, block=32) → ~28 warps on a 56-SM P100, single warp per occupied
+  SM, no HBM-latency hiding. v2 splits the per-head KV loop across
+  `AETHER_ATTN_WARPS` warps (block 32×NW). Softmax is global + pass-3 is a linear
+  weighted-V sum → per-warp partials add EXACTLY. Default-on; `AETHER_ATTN_V2=0`
+  → v1 fallback (clean in-binary A/B).
+- **Parity**: `cuda_paged_attention_v2_parity` (max_abs ≤ 2.4e-7, max_rel ≤ 2.4e-4,
+  cur_seq 1..257) + `qwen25_paged_parity` token-identical (coherence guard).
+- **Measured** (cnc P100 GPU1, same-binary env A/B → clean attribution):
+  v1 15.05 (reproduces committed baseline EXACTLY) → v2 warps8 15.79 / warps4
+  15.69 / warps16 15.85 tok/s. Warp count within noise. BENCH_LEDGER row appended.
+
+### KEY PROFILING FINDING (AETHER_DECODE_TIMING, imperative, per-token ×28 layers)
+- v1 attn 26473µs / ffn 35269µs → v2 attn 24681µs / ffn 35466µs. v2's entire
+  gain is the attn-section (−1792µs); FFN untouched (clean attribution).
+- **The attn-section is now MATMUL-dominated, not paged-kernel-dominated.** The
+  remaining 24.7ms is the q/k/v/o quant mat-vecs (latency-bound single-shot,
+  v6-neutral per prior sprint) + small ops (bias×3, rope×2, norms, append).
+  → split-KV on the paged attention kernel = DIMINISHING returns (already got
+    the multi-warp occupancy win there).
+  → **Next lever = FUSE the q/k/v/o matmuls** (fewer/bigger kernels, the
+    handoff's explicit fusion lever). Meatier build: new fused Q4_K/Q6_K kernel
+    over 3 weight tensors (mixed dtype per [[qwen25_q4km_mixed_precision]]),
+    3× output rows in one grid → better occupancy on the latency-bound mat-vecs.
+    Also: under CUDA graphs (prod) small-op launch overhead is already hidden, so
+    small-op fusion gains are muted — attack the matmuls, not the tiny kernels.
+- Tooling left: scratch/attn_v2_bench.sh (A/B e2e), scratch/attn_timing.sh
+  (attn:ffn split). Both evict+restore workhorse via trap EXIT. Still 2.36× behind
+  llama-server (37.33).
+
+### Note
+Deployed aether-serve.service runs the OLD fe6bbfd binary (was inactive); v2 is
+default-on so a rebuild+redeploy of /opt/openclaw-inference/bin picks it up.
+
+---
+
+## (prior) Last Updated — 2026-05-27
 
 ## Project Status
 🟢 Autonomous P100 perf-sprint milestone shipped: **+8.7% decode** (Qwen2.5-7B
