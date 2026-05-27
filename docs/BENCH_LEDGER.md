@@ -610,3 +610,39 @@ llama's MMVQ approach — which removes all per-element float dequant. That's a
 fundamentally different, larger build (activation-quant kernel + int-MAC gate/up
 + scale handling), not a micro-tweak. v3 kernel reverted; FFN sub-split timing
 kept as a permanent diagnostic.**
+
+---
+
+## 2026-05-27 — FFN gate/up: int8×int4 MMVQ (Q8_1 activation) — NEGATIVE RESULT on P100
+
+The real attempt at llama's approach: quantize the activation to Q8_1 (per-32
+int8 + f32 scale + f32 block-sum) and replace the float gate/up dequant with an
+INTEGER dot (int8×int4) + one float scale per sub-block. Built both kernels
+(quantize_q8_1 + fused_q4k_q8_1_ffn_gate_up_silu_mul, shared-staged like base),
+wired behind AETHER_FFN_Q8.
+
+- **Correct**: MMVQ vs float base rms_rel 0.66% (int8 activation-quant error;
+  a bug in the int dot/scale/min-term would blow past 5%).
+- **Coherent**: real Qwen2.5-7B greedy unchanged — qwen25 8-token output
+  byte-identical to float `[358,2776,264,220,17,20,4666,6284]`; chat gives
+  "The capital of France is Paris."
+
+| config (attn v2, cnc P100) | e2e tok/s |
+|----------------------------|----------:|
+| float base gate/up | 15.79 |
+| int8×int4 MMVQ (Q8_1) | 15.44 (−2.2%) |
+
+**MMVQ is SLOWER on P100.** sm_60 has no dp4a and strong fp32 / weak int32-mul,
+so scalar int8-MAC does not beat fp32-FMA; the extra quantize launch + int↔float
+conversions make it net slower. Reverted (kept bench scripts).
+
+**KEY CONCLUSION:** Two independent gate/up rewrites (ALU-factoring + int8 MMVQ)
+both LOSE to the base fp32 kernel on Pascal. The base is well-matched to P100's
+fp32 strength, and **llama's ~180 GB/s on P100 is NOT explained by int8-MMVQ
+arithmetic being faster.** The P100 decode gap vs llama is therefore NOT in
+gate/up per-kernel arithmetic — it's elsewhere (memory access pattern /
+whole-layer kernel fusion & scheduling / occupancy), or the 180 GB/s reference
+figure needs re-derivation. Stop micro-optimizing the gate/up math for P100;
+re-examine where llama actually wins (profile llama's kernel occupancy/timeline,
+or pursue whole-layer fusion). An Ampere (sm_86, dp4a) int8 MMVQ path could win
+but needs the __dp4a intrinsic, not this scalar kernel.
