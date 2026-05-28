@@ -59,6 +59,7 @@ use crate::cuda::{
     aether_op_paged_attention_seq1_v2_devarg_f32_cuda,
     aether_op_paged_attention_seq1_v3_devarg_f32_cuda,
     aether_op_paged_attention_seq1_v4_devarg_f32_cuda,
+    aether_op_fused_add_rmsnorm_f32_cuda,
     aether_op_paged_attention_flex_devarg_f32_cuda,
     aether_op_paged_append_kv_mla_devarg_f32_cuda,
     aether_op_paged_attention_mla_devarg_f32_cuda,
@@ -271,6 +272,23 @@ fn paged_attn_v3_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         std::env::var("AETHER_ATTN_V3").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// whole-layer-fusion perf — fuse the post-attention residual-add + FFN
+/// rmsnorm into one kernel.  Measured WASH on cnc P100 with parallel
+/// rms_norm_fwd already in place (33.58 → 33.43 tok/s, -0.4% = noise) — the
+/// fusion saves one launch but the launch isn't the bottleneck.  Default OFF;
+/// `AETHER_FUSE_OPS=1` enables.  Kept registered (the fused kernel is correct,
+/// token-identical, and a building block for future multi-op fusions).
+/// Skipped when block_timing is on (the split timing depends on the boundary
+/// between residual and ffn_norm).
+#[cfg(feature = "cuda")]
+fn fuse_ops_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("AETHER_FUSE_OPS").map(|v| v == "1").unwrap_or(false)
     })
 }
 
@@ -1322,7 +1340,17 @@ unsafe fn block_forward_devarg(
         aether_op_rms_norm_f32_cuda(act.proj, bw.post_attn_norm_g, act.proj,
             norm_eps, 1, d_model);
     }
-    aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
+    // whole-layer-fusion perf — when not in timing mode, the post-attn
+    // residual-add + the FFN rmsnorm can be one kernel call (act.x += proj;
+    // act.x_norm = rmsnorm(act.x, ffn_norm_g)).  The dump_act_vec ("ffn_inp")
+    // below still sees the correct post-add act.x.
+    let post_attn_fused = fuse_ops_enabled() && !bt;
+    if post_attn_fused {
+        aether_op_fused_add_rmsnorm_f32_cuda(
+            act.x, act.proj, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
+    } else {
+        aether_op_add_inplace_f32_cuda(act.x, act.proj, d_model);
+    }
     // V2-Lite-debug: residual after attention + o-proj, before FFN.  Maps to
     // llama.cpp `ffn_inp-{b}`.  Diff localizes a divergence to attention vs FFN.
     dump_act_vec(&format!("ffn_inp-{}", layer_idx), act.x, d_model as usize);
@@ -1343,7 +1371,9 @@ unsafe fn block_forward_devarg(
             n_nan, n_inf, mn, mx, mean);
     }
     if bt { aether_dev_sync(); block_timing::add_attn(t_sec.elapsed().as_nanos() as u64); t_sec = std::time::Instant::now(); }
-    aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
+    if !post_attn_fused {
+        aether_op_rms_norm_f32_cuda(act.x, bw.ffn_norm_g, act.x_norm, norm_eps, 1, d_model);
+    }
     if bw.w_router != 0 {
         moe_ffn_forward(bw, act, cfg, layer_idx);
     } else {

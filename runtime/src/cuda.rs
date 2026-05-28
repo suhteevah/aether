@@ -46,6 +46,7 @@ struct CudaCtx {
     add_layer_norm_fwd:CudaFunction,
     // matt-voice deploy: keep entire Qwen forward on device.
     rms_norm_fwd:      CudaFunction,
+    fused_add_rmsnorm: CudaFunction,
     rope_apply:        CudaFunction,
     gqa_repeat_kv:     CudaFunction,
     gqa_reduce_kv_grad:CudaFunction,
@@ -2602,6 +2603,57 @@ extern "C" __global__ void add_layer_norm_fwd(
 
 // matt-voice / FR-17.5-extra — RMSNorm: y[r,i] = x[r,i] * gamma[i] / sqrt(mean(x[r,:]^2) + eps)
 // One thread per row. d ≤ 4096 fits in a single block's worth of shared work.
+// whole-layer-fusion perf — fused residual-add + RMSNorm in one kernel.
+// Pattern: `x += residual; y = rmsnorm(x, gamma)`.  Replaces TWO launches
+// (add_inplace + rms_norm_fwd) with ONE.  Also: parallelized across threads
+// (the existing rms_norm_fwd is 1-thread-per-row, which is 1 thread total
+// during decode rows=1 → serial 3584-element reduce).  This kernel uses
+// blockDim.x threads to cooperatively reduce + write.
+// Launch: grid=(rows, 1, 1), block=(256, 1, 1), shared=256 floats.
+extern "C" __global__ void fused_add_rmsnorm(
+    float*       __restrict__ x,           // [rows*d] in-place: x += residual
+    const float* __restrict__ residual,    // [rows*d]
+    const float* __restrict__ gamma,       // [d]
+    float*       __restrict__ y,           // [rows*d] output = rmsnorm(x_new, gamma)
+    float eps, int rows, int d)
+{
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    int tid = threadIdx.x;
+    int n   = blockDim.x;
+
+    float* xr        = x + r*d;
+    const float* res = residual + r*d;
+    float*       yr  = y + r*d;
+
+    // Phase 1: x[r,i] += residual[r,i]; partial Σ x²
+    extern __shared__ float sh[];
+    float partial = 0.0f;
+    for (int i = tid; i < d; i += n) {
+        float v = xr[i] + res[i];
+        xr[i] = v;
+        partial += v * v;
+    }
+    sh[tid] = partial;
+    __syncthreads();
+    // Block-wide reduce on sh[] → sh[0]
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / (float)d + eps);
+    // Phase 2: y[r,i] = x[r,i] * inv * gamma[i]
+    for (int i = tid; i < d; i += n) {
+        yr[i] = xr[i] * inv * gamma[i];
+    }
+}
+
+// whole-layer-fusion perf — PARALLEL rmsnorm.  Existing impl was 1-thread-per-
+// row, i.e. ONE thread doing a 3584-element serial reduce + scale during decode
+// rows=1 — hundreds of µs × 57 calls/token = ~25ms/token of pure waste.
+// New layout: grid=rows, block=nthreads cooperating per row (same pattern as
+// fused_add_rmsnorm above).  Drop-in for the existing wrapper (which updates
+// the launch config to match).  Backward-compatible — same outputs.
 extern "C" __global__ void rms_norm_fwd(
     const float* __restrict__ x,
     const float* __restrict__ gamma,
@@ -2609,14 +2661,29 @@ extern "C" __global__ void rms_norm_fwd(
     float eps,
     int rows, int d)
 {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.x;
     if (r >= rows) return;
+    int tid = threadIdx.x;
+    int n   = blockDim.x;
     const float* xr = x + r * d;
     float*       yr = y + r * d;
-    float sumsq = 0.0f;
-    for (int i = 0; i < d; i++) sumsq += xr[i] * xr[i];
-    float inv_rms = 1.0f / sqrtf(sumsq / (float)d + eps);
-    for (int i = 0; i < d; i++) yr[i] = xr[i] * inv_rms * gamma[i];
+
+    extern __shared__ float sh[];
+    float partial = 0.0f;
+    for (int i = tid; i < d; i += n) {
+        float v = xr[i];
+        partial += v * v;
+    }
+    sh[tid] = partial;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / (float)d + eps);
+    for (int i = tid; i < d; i += n) {
+        yr[i] = xr[i] * inv * gamma[i];
+    }
 }
 
 // matt-voice FR-18.6-real leg 2 — RMSNorm backward (qwen3 training).
@@ -6674,7 +6741,7 @@ fn ctx() -> &'static CudaCtx {
               "softmax_f32", "scale_f32",
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
-              "rms_norm_fwd", "rope_apply", "gqa_repeat_kv", "gqa_reduce_kv_grad",
+              "rms_norm_fwd", "fused_add_rmsnorm", "rope_apply", "gqa_repeat_kv", "gqa_reduce_kv_grad",
               "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
@@ -6720,6 +6787,7 @@ fn ctx() -> &'static CudaCtx {
         let gelu_inplace          = device.get_func("aether_kernels", "gelu_inplace").unwrap();
         let add_layer_norm_fwd    = device.get_func("aether_kernels", "add_layer_norm_fwd").unwrap();
         let rms_norm_fwd          = device.get_func("aether_kernels", "rms_norm_fwd").unwrap();
+        let fused_add_rmsnorm     = device.get_func("aether_kernels", "fused_add_rmsnorm").unwrap();
         let rope_apply            = device.get_func("aether_kernels", "rope_apply").unwrap();
         let gqa_repeat_kv         = device.get_func("aether_kernels", "gqa_repeat_kv").unwrap();
         let gqa_reduce_kv_grad    = device.get_func("aether_kernels", "gqa_reduce_kv_grad").unwrap();
@@ -6778,7 +6846,7 @@ fn ctx() -> &'static CudaCtx {
                   softmax_f32,
                   scale_f32, gelu_inplace,
                   add_layer_norm_fwd,
-                  rms_norm_fwd,
+                  rms_norm_fwd, fused_add_rmsnorm,
                   rope_apply, gqa_repeat_kv, gqa_reduce_kv_grad,
                   silu_inplace, mul_inplace, add_inplace, bias_add,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
@@ -7961,12 +8029,49 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
     let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
     let g_p = bs[ig].as_ref().unwrap() as *const CudaSlice<f32>;
     let o_p = bs[io].as_mut().unwrap() as *mut CudaSlice<f32>;
-    let cfg = LaunchConfig::for_num_elems(rows as u32);
+    // Parallel rmsnorm: grid=rows, block=256 threads cooperate per row.
+    let nthreads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim:  (rows as u32, 1, 1),
+        block_dim: (nthreads, 1, 1),
+        shared_mem_bytes: nthreads * 4,
+    };
     unsafe {
         let xv = &*x_p; let gv = &*g_p; let ov = &mut *o_p;
         ctx().rms_norm_fwd.clone()
             .launch(cfg, (xv, gv, ov, eps, rows, d))
             .expect("launch rms_norm_fwd");
+    }
+    0
+}
+
+/// whole-layer-fusion perf — fused (in-place) residual add + RMSNorm.
+/// `x += residual; y = rmsnorm(x, gamma)`.  Replaces 2 launches with 1 AND
+/// parallelizes the rmsnorm reduce (existing rms_norm_fwd is 1-thread-per-row).
+#[no_mangle] pub extern "C" fn aether_op_fused_add_rmsnorm_f32_cuda(
+    x: i64, residual: i64, gamma: i64, out: i64,
+    eps: f32, rows: c_int, d: c_int,
+) -> c_int {
+    let (Some(ix), Some(ir), Some(ig), Some(io)) = (
+        handle_to_idx(x), handle_to_idx(residual), handle_to_idx(gamma), handle_to_idx(out)
+    ) else { return -1; };
+    if rows <= 0 || d <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let r_p = bs[ir].as_ref().unwrap() as *const CudaSlice<f32>;
+    let g_p = bs[ig].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p = bs[io].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let nthreads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim:  (rows as u32, 1, 1),
+        block_dim: (nthreads, 1, 1),
+        shared_mem_bytes: nthreads * 4,
+    };
+    unsafe {
+        let xv = &mut *x_p; let rv = &*r_p; let gv = &*g_p; let ov = &mut *o_p;
+        ctx().fused_add_rmsnorm.clone()
+            .launch(cfg, (xv, rv, gv, ov, eps, rows, d))
+            .expect("launch fused_add_rmsnorm");
     }
     0
 }

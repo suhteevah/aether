@@ -910,3 +910,46 @@ Same lesson as v3: attention-kernel optimizations on Qwen2.5-7B at current
 attn/ffn split (~46/54) have diminishing returns.  The real remaining gap to
 llama lives elsewhere — likely the per-kernel scheduling/launch + KV access
 patterns that flash-attn-vec's tile-based design addresses more holistically.
+
+---
+
+## 2026-05-28 — Whole-layer fusion attempt → PARALLEL RMS_NORM is the real win (+39.6% on bare base, +60.3% on LLAMA)
+
+Set out to fuse post-attn residual-add + ffn_norm (one launch instead of two);
+ended up finding that the existing rms_norm_fwd was the actual bottleneck — it
+was 1-thread-per-row, which during decode (rows=1) means ONE thread doing a
+3584-element serial reduce + scale ~57 times per token = ~25 ms/token of pure
+serial waste.  Rewrote it as parallel (grid=rows, block=256, shared-mem reduce);
+the fused add+rmsnorm variant is registered + correct + default-OFF (its
+measurable benefit is gone once rmsnorm is parallel).
+
+cnc P100 GPU1, Qwen2.5-Math-7B Q4_K_M, --paged, attn v2 in all:
+
+| config | e2e tok/s | from old BASE (15.79) | from old LLAMA (20.95) |
+|--------|----------:|----------------------:|-----------------------:|
+| BASE (parallel rms_norm, no MMVQ) | **22.05** | **+39.6%** | — |
+| LLAMA (+ all MMVQ, no fuse)        | **33.58** | **+112.7%** | **+60.3%** |
+| LLAMA + AETHER_FUSE_OPS=1          | 33.43 | +111.7% | +59.6% (-0.4% wash) |
+| llama-bench tg128 (ref)            | 39.07 | — | — |
+
+**0.86× of llama 39.07** (was 0.40× pre-port, 0.54× at this session's end-of-day).
+
+Coherent: qwen25_paged_parity token-identical
+(`[358,2776,264,220,17,20,4666,6284]`) with all changes on.
+
+**Session cumulative this conversation: 15.05 → 33.58 = +123%, 2.23×.**
+**From pre-perf-sprint baseline (13.85): 33.58 = +142%, 2.42×, 0.37× → 0.86× of llama.**
+
+The lesson: **micro-optimizing matmul kernels for 23% lifts was leaving a 40%
+single-kernel parallelism-fix on the table.**  The serial rms_norm_fwd was hiding
+behind the matmul-dominated decode picture; it cost ~25 ms/token on a 63 ms/token
+budget — bigger than any single matmul change I shipped.  Always profile each
+kernel for its own parallelism, even the "tiny" elementwise ones.
+
+What's left to reach llama parity (1.16× gap):
+1. **Inspect every "tiny" kernel for 1-thread-per-row laziness** — append_kv,
+   bias_add, rope_apply, add_inplace, silu*mul.  Each may have the same trap.
+2. **Re-test v3/v4 attention now that rmsnorm isn't the bottleneck** — the
+   ~22ms freed-up budget may shift the picture; previously-wash attention
+   optimizations might now move e2e.
+3. **Whole-block FFN fusion** (norm + gate/up in one launch).
