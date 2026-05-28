@@ -1,6 +1,60 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-27 (🟢 P100 decode 15.05 → 19.49 tok/s = +29.5%, 0.40× → 0.50× of llama, via faithful llama-MMVQ port)
+## Last Updated — 2026-05-28 (🟢 P100 decode 15.05 → 20.95 tok/s = +39.2%, 0.40× → 0.54× of llama; flash-attn v3 measured wash, default-off)
+
+## Project Status
+🟢 Session compounded further: shipped Phase 2c (lm_head + Q6_K MMVQ, +7.5% on
+prior) + ruled out flash-attn v3 as a wash via measurement (default-off, kept
+registered for long-context paths). Two more commits (4f94d76 wired Phase 2c +
+bcb175e wired v3; 4a2eb0c benched both). Workspace clean, fleet restored.
+
+| commit | what | cnc P100 e2e |
+|--------|------|-------------:|
+| (session start, fe6bbfd) | prior HEAD | 15.05 |
+| adbd4f0 | attention v2 (multi-warp paged seq1) +4.9% | 15.78 |
+| (3 negatives doc'd) | dcf6cd4, 0c9e022, 2cb2898 | — |
+| 48f0445 | **Phase 1**: faithful llama-MMVQ (gate/up + SwiGLU) +11.1% | 17.54 |
+| 7748bd4 | **Phase 2a**: down-proj MMVQ +16.5% | 18.39 |
+| 2881564 | **Phase 2b**: q/k/v/o MMVQ +23.5% | 19.49 |
+| 4f94d76 | **Phase 2c**: lm_head + Q6_K MMVQ +7.5% on prior | **20.95** |
+| bcb175e | flash-attn v3 (online softmax + fused K+V) — wash, default-off | 21.04 (+0.4%) |
+| llama-bench tg128 (ref) | — | 39.07 |
+
+**Total this session: 15.05 → 20.95 = +39.2%, 0.40× → 0.54× of llama. From the
+pre-perf-sprint baseline (13.85): +51.3%, 0.37× → 0.54×.**
+
+### Default flags (all shipped on; env-overridable)
+- `AETHER_ATTN_V2=1` (default-on): multi-warp paged seq1 attention.
+- `AETHER_FFN_LLAMA=1` (default-on): faithful llama-MMVQ for gate/up + down +
+  q/k/v/o + lm_head, Q4_K via Q4_K kernel and Q6_K via Q6_K kernel (alignment-
+  safe via uint16 reads per llama's get_int_b2).
+
+### Default-off (env-only)
+- `AETHER_ATTN_V3=1`: flash-attention-style paged seq1 (online softmax + fused
+  K+V pass). Correct + coherent (qwen25 token-identical) but +0.4% e2e is
+  noise. Kept registered for long-context decode (where per-token KV bandwidth
+  might dominate).
+- `AETHER_ATTN_WARPS=N`, `AETHER_FFN_MW_WARPS=N`: warp-count knobs (defaults 8/4).
+- `AETHER_DECODE_TIMING=1`: forward/sampling + attn/ffn + FFN sub-split timing
+  (imperative mode; use `--warmup 0`).
+
+### What's left to close the 1.87× remaining gap to llama
+1. **Flash-attn with proper K-split** (grid (n_q_heads, n_split)): v3 keeps
+   grid=n_heads = only 28 blocks on a 56-SM P100. Split-KV would fill all SMs.
+   Larger build but the right direction for further attention-section gains.
+2. **Q6_K MMVQ on gate/up SwiGLU** (if any future model has Q6_K gate/up; not
+   Qwen2.5-7B's profile).
+3. **MMVQ variants for Q5_K, Q3_K, IQ3_S** etc. to cover other models — same
+   pattern as Q6_K, just different vec_dot inner.
+
+### Bench/tooling
+- scratch/{final_3way_bench, ffn_llama_bench, attn_v2_bench, attn_timing,
+  ffn_v3_bench, ffn_q8_bench, ffn_mw_bench, llama_bench}.sh — all trap-restore
+  the workhorse; use `--warmup 0` for AETHER_DECODE_TIMING runs.
+
+---
+
+## (prior) Last Updated — 2026-05-27 (🟢 P100 decode 15.05 → 19.49 tok/s = +29.5%, 0.40× → 0.50× of llama, via faithful llama-MMVQ port)
 
 ## Project Status
 🟢 **Major session win.** From frustration ("if we don't get P100 to parity this
