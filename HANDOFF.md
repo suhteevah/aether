@@ -1,6 +1,61 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-27 (🟢 attn v2 +4.9% shipped; llama-P100-gap profiled; THREE FFN rewrites lose; gap is SYSTEMIC)
+## Last Updated — 2026-05-27 (🟢 P100 decode 15.05 → 19.49 tok/s = +29.5%, 0.40× → 0.50× of llama, via faithful llama-MMVQ port)
+
+## Project Status
+🟢 **Major session win.** From frustration ("if we don't get P100 to parity this
+was pointless") to +29.5% e2e on P100 by porting llama's whole integrated MMVQ
+design as ONE unit instead of piecemeal. 5 commits this session, all pushed +
+cnc synced + fleet restored.
+
+| commit | what | cnc P100 e2e |
+|--------|------|-------------:|
+| (start) | prior session HEAD (fe6bbfd) | 15.05 |
+| adbd4f0 | attention v2 (multi-warp paged seq1) +4.9% | 15.78 |
+| (dcf6cd4, 0c9e022, 2cb2898) | FFN sub-split timing diagnostic + 3 documented negatives | — |
+| 48f0445 | **Phase 1**: faithful llama-MMVQ port (gate/up + SwiGLU) +11.1% | 17.54 |
+| 7748bd4 | **Phase 2a**: down-proj via MMVQ +16.5% | 18.39 |
+| 2881564 | **Phase 2b**: q/k/v/o via MMVQ +23.5% | **19.49** |
+| llama-bench tg128 (ref) | — | 39.07 |
+
+**From the pre-perf-sprint baseline (13.85): 19.49 = +40.7%, 0.37× → 0.50× of llama.**
+
+### How it happened
+1. The four single-aspect FFN rewrites (ALU-factor, int8 alone, multi-warp
+   K-split alone, no-sync stream) all LOST because each kept the rest of
+   aether's structure. The negatives are documented in BENCH_LEDGER.
+2. Clean re-derivation: `llama-bench tg128 = 39.07 tok/s ≈ 170 GB/s` (the
+   handoff's 180 figure was approximately right; came from a clean kernel-only
+   bench, not just serving).
+3. Read llama-src ggml-cuda/{mmvq.cu, vecdotq.cuh} deeply — found `nwarps=4,
+   rows_per_cuda_block=1, vdr=2`, SwiGLU fusion built into the kernel, scalar
+   dp4a fallback for sm_60 that llama itself uses on P100.
+4. Built the WHOLE integrated kernel (Q8_1 quantize + K-split mmvq + SwiGLU)
+   matching llama verbatim. First version had a `sc[1]↔m[0]` swap bug in the
+   aux-unpacking; synthetic parity (all scale bytes==0x22) missed it, real-model
+   coherence (qwen25_paged_parity) caught it.
+5. Generalized to single-output (no SwiGLU) → applied to down, then q/k/v/o
+   compoundingly.
+
+### What's left to close the gap (now 2× behind, not 2.36×)
+- **lm_head** (Q4_K, 152064 outputs, called once/token): one-line MMVQ
+  application. Probably +2-4% e2e — quick win.
+- **Attention kernels**: aether's `paged_attention_seq1_devarg` (with v2's
+  multi-warp fix) is still ~24ms/token (~40% of forward). llama uses
+  flash-attention-style kernels; porting those is a substantial build.
+- The base float `dispatch_matmul` still serves Q6_K weights (mixed in
+  Qwen2.5-7B k/v ~half of layers); a Q6_K mmvq port would help those layers.
+
+### Tooling kept
+- Default-on: `AETHER_FFN_LLAMA=0` falls back to float base for A/B.
+- `AETHER_ATTN_V2=0` falls back to v1 paged attention.
+- AETHER_DECODE_TIMING now reports FFN sub-split (norm+gate/up / down-proj).
+- scratch/{attn_v2_bench,attn_timing,ffn_*,ffn_llama_bench,llama_bench}.sh
+  (all trap-restore the workhorse; use `--warmup 0` for AETHER_DECODE_TIMING).
+
+---
+
+## (prior) Last Updated — 2026-05-27 (🟢 attn v2 +4.9% shipped; llama-P100-gap profiled; THREE FFN rewrites lose; gap is SYSTEMIC)
 
 ## Project Status
 🟢 attention v2 shipped (+4.9%). Profiled where llama wins on P100 and ruled out
