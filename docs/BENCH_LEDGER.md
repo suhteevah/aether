@@ -825,3 +825,48 @@ The remaining 2× gap to llama is now (1) attention kernels (still aether's
 seq1 paged attention, not llama's flash-attention style), and (2) the lm_head
 matmul (Q4_K but n_out=152064 = much bigger grid, same 1-warp/row issue).
 Applying MMVQ to lm_head is a one-line follow-on.
+
+---
+
+## 2026-05-28 — Phase 2c MMVQ measured: +7.5% on prior (+32.7% total) + flash-attn v3 = wash
+
+Three pieces wired locally yesterday (commits 4f94d76, bcb175e) benched on cnc
+P100 GPU1 (workhorse evicted, restored).
+
+| config | e2e tok/s | from BASE | from prior LLAMA |
+|--------|----------:|----------:|-----------------:|
+| BASE (FFN_LLAMA=0, ATTN_V2=1)            | 15.79 | 1.000× | — |
+| LLAMA (all MMVQ + lm_head + Q6_K)        | **20.95** | **+32.7%** | +1.46 (+7.5%) |
+| LLAMA + flash-attn v3 (ATTN_V3=1)        | 21.04 | +33.3% | +0.4% (noise) |
+| llama-bench tg128 (ref)                  | 39.07 | 2.13× | 1.87× |
+
+**lm_head + Q6_K MMVQ — WIN, stays default-on.** +7.5% e2e on the prior 19.49
+baseline (Phase 2b end).  Exceeded the +2-4% lm_head estimate — Q6_K MMVQ on
+Qwen2.5-7B's mixed Q6_K k/v layers contributed too.
+
+**Flash-attn v3 (online softmax + fused K+V pass) — MEASURED WASH, stays default-off.**
+Timing shows attn-section −2% (797→780µs/block — real, but small) and FFN
+unchanged (noise).  At the current 38/54 attn/ffn split, a 2% attn drop is
+~0.8% e2e, which gets eaten by run-to-run noise.  The kernel is correct +
+coherent (qwen25 token-identical with v3 on); it's just not enough lift to flip
+default-on.  Reasons:
+  - v2 multi-warp already addressed the major occupancy issue.
+  - Online softmax saves shared-mem (8KB → ~1KB) but P100 isn't shared-mem
+    constrained for this kernel at v2's occupancy.
+  - Fused K+V single pass theoretically halves KV bandwidth, but the attention
+    kernel's KV reads are only ~16MB/token (the section is latency/structural
+    -bound, not weight-bandwidth-bound per [[gpu_perf_surpass_strategy]]).
+  - The cross-warp online-softmax merge adds float ops that wash with the saving.
+
+Kept registered + env-toggleable (`AETHER_ATTN_V3=1` to enable) so it's available
+for future paths (e.g., long-context decode where the per-token KV grows) where
+the bandwidth halving might dominate.
+
+**Session cumulative: 15.05 → 20.95 = +39.2% e2e on P100, 0.40× → 0.54× of llama.**
+
+Remaining gap to llama (1.87×): attention section is now ~22ms (down from 24ms
+at session start) but still 38% of forward.  Real next levers: (1) flash-attn
+with proper K-split into multiple blocks per head (current v3 keeps grid=n_heads
+= only 28 blocks on 56 SMs), (2) Q6_K MMVQ on the gate/up SwiGLU kernel (if any
+Q6_K gate/up exists in other models), (3) further FFN micro-opts.  But the
+shipped 20.95 + flash-attn v3 building block is a clean session close.
