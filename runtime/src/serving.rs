@@ -58,6 +58,7 @@ use crate::cuda::{
     aether_op_paged_attention_seq1_devarg_f32_cuda,
     aether_op_paged_attention_seq1_v2_devarg_f32_cuda,
     aether_op_paged_attention_seq1_v3_devarg_f32_cuda,
+    aether_op_paged_attention_seq1_v4_devarg_f32_cuda,
     aether_op_paged_attention_flex_devarg_f32_cuda,
     aether_op_paged_append_kv_mla_devarg_f32_cuda,
     aether_op_paged_attention_mla_devarg_f32_cuda,
@@ -270,6 +271,27 @@ fn paged_attn_v3_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         std::env::var("AETHER_ATTN_V3").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+/// attention-section perf — flash-attention v4 SPLIT-KV (fill 56 SMs).
+/// Default OFF; AETHER_ATTN_V4=1 enables.  AETHER_ATTN_V4_SPLITS controls the
+/// per-head KV split count (default 2 → 28*2=56 blocks on Qwen2.5-7B/P100).
+#[cfg(feature = "cuda")]
+fn paged_attn_v4_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("AETHER_ATTN_V4").map(|v| v == "1").unwrap_or(false)
+    })
+}
+#[cfg(feature = "cuda")]
+fn attn_v4_splits() -> i32 {
+    use std::sync::OnceLock;
+    static S: OnceLock<i32> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("AETHER_ATTN_V4_SPLITS").ok()
+            .and_then(|s| s.parse::<i32>().ok()).unwrap_or(4).clamp(1, 8)
     })
 }
 
@@ -852,6 +874,9 @@ struct ActivationGpu {
     // (AETHER_FFN_LLAMA).  Quantize x_norm once per layer, feed both gate+up.
     // q8_aq u8[d_model], q8_ad/q8_as f32[d_model/32].
     q8_aq: i64, q8_ad: i64, q8_as: i64,
+    // attention-section perf — split-KV scratch for v4 paged attention.  Sized
+    // for n_q_heads × MAX_ATTN_V4_SPLITS × (2 + head_dim) floats; alloc once.
+    attn_v4_m: i64, attn_v4_l: i64, attn_v4_v: i64,
     // FR-17-extra-mla-absorbed-persist — persistent workspace buffers for
     // `mla_attention_forward_absorbed`.  Allocated once at session
     // construction (only if `cfg.is_mla_absorbed()`); reused across every
@@ -1438,6 +1463,13 @@ unsafe fn standard_attention_forward(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
                 n_q_heads, n_kv_heads, head_dim,
                 block_size, eff_sliding_window, scale, max_seq as c_int, step_args);
+        } else if paged_attn_v4_enabled() {
+            // flash-attention v4: SPLIT-KV per head → fills 56 SMs on P100.
+            aether_op_paged_attention_seq1_v4_devarg_f32_cuda(
+                act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+                act.attn_v4_m, act.attn_v4_l, act.attn_v4_v,
+                n_q_heads, n_kv_heads, head_dim,
+                block_size, scale, max_seq as c_int, attn_v4_splits(), step_args);
         } else if paged_attn_v3_enabled() {
             // flash-attention-style: online softmax + fused K+V pass.
             aether_op_paged_attention_seq1_v3_devarg_f32_cuda(
@@ -2885,6 +2917,10 @@ impl QwenSession {
                 q8_aq: aether_dev_alloc_u8(cfg.d_ff.max(cfg.d_model) as c_int),
                 q8_ad: aether_dev_alloc_f32((cfg.d_ff.max(cfg.d_model) / 32) as c_int),
                 q8_as: aether_dev_alloc_f32((cfg.d_ff.max(cfg.d_model) / 32) as c_int),
+                // attn-v4 split scratch: n_q_heads × MAX_SPLITS=8 × (m + l + V[head_dim])
+                attn_v4_m: aether_dev_alloc_f32((cfg.n_q_heads * 8) as c_int),
+                attn_v4_l: aether_dev_alloc_f32((cfg.n_q_heads * 8) as c_int),
+                attn_v4_v: aether_dev_alloc_f32((cfg.n_q_heads * 8 * cfg.head_dim) as c_int),
                 mla_abs_kv_a, mla_abs_c_kv, mla_abs_c_kv_n, mla_abs_k_pe,
                 mla_abs_q_a, mla_abs_q_a_n, mla_abs_q_proj, mla_abs_q_full,
                 mla_abs_k_row, mla_abs_v_row, mla_abs_attn_v_out,
@@ -3378,6 +3414,9 @@ impl Drop for QwenSession {
             let _ = aether_dev_free_u8(self.act.q8_aq);
             let _ = aether_dev_free_f32(self.act.q8_ad);
             let _ = aether_dev_free_f32(self.act.q8_as);
+            let _ = aether_dev_free_f32(self.act.attn_v4_m);
+            let _ = aether_dev_free_f32(self.act.attn_v4_l);
+            let _ = aether_dev_free_f32(self.act.attn_v4_v);
             // Persistent MLA-absorbed workspace buffers (0 if not allocated).
             for h in [self.act.mla_abs_kv_a, self.act.mla_abs_c_kv,
                       self.act.mla_abs_c_kv_n, self.act.mla_abs_k_pe,

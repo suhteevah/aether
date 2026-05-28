@@ -111,6 +111,8 @@ struct PagedCtx {
     paged_attention_seq1_devarg: CudaFunction,
     paged_attention_seq1_v2_devarg: CudaFunction,
     paged_attention_seq1_v3_devarg: CudaFunction,
+    paged_attention_seq1_v4_split_devarg: CudaFunction,
+    paged_attention_seq1_v4_combine: CudaFunction,
     batched_paged_attention_seqB_devarg: CudaFunction,
     batched_paged_append_kv_seqB_devarg: CudaFunction,
     batched_paged_attention_hetero_devarg: CudaFunction,
@@ -154,6 +156,8 @@ fn paged_ctx() -> &'static PagedCtx {
             &["paged_append_kv_devarg", "paged_attention_seq1_devarg",
               "paged_attention_seq1_v2_devarg",
               "paged_attention_seq1_v3_devarg",
+              "paged_attention_seq1_v4_split_devarg",
+              "paged_attention_seq1_v4_combine",
               "batched_paged_attention_seqB_devarg",
               "batched_paged_append_kv_seqB_devarg",
               "batched_paged_attention_hetero_devarg",
@@ -194,6 +198,10 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "paged_attention_seq1_v2_devarg").unwrap(),
             paged_attention_seq1_v3_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_seq1_v3_devarg").unwrap(),
+            paged_attention_seq1_v4_split_devarg:
+                device.get_func("aether_paged_kernels", "paged_attention_seq1_v4_split_devarg").unwrap(),
+            paged_attention_seq1_v4_combine:
+                device.get_func("aether_paged_kernels", "paged_attention_seq1_v4_combine").unwrap(),
             batched_paged_attention_seqB_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_attention_seqB_devarg").unwrap(),
             batched_paged_append_kv_seqB_devarg:
@@ -1300,6 +1308,181 @@ extern "C" __global__ void paged_attention_seq1_v3_devarg(
         for (int i = 0; i < 8; i++) {
             if (i < per_lane) out_ptr[lane*per_lane + i] = out_acc[i] * inv;
         }
+    }
+}
+
+// attention-section perf — flash-attention v4: SPLIT-KV per head (fill all SMs).
+//
+// v3 keeps grid = n_q_heads = 28 (Qwen2.5-7B) on a 56-SM P100 → half the SMs
+// idle.  v4 splits the KV sequence into n_split chunks per head: grid
+// (n_q_heads, n_split, 1) = 28*n_split blocks.  With n_split=2 → 56 blocks =
+// full SM occupancy on P100.
+//
+// Two-kernel design (mirrors llama's flash-attn-vec → flash-attn-vec-combine):
+//   v4_split   : per (head, split) writes partial (m, l, V[head_dim]) to scratch.
+//   v4_combine : per head, merges n_split partials via the flash-attn formula:
+//                  gmax = max_s m_s
+//                  gsum = Σ l_s * exp(m_s − gmax)
+//                  gV   = Σ V_s * exp(m_s − gmax)
+//                  out  = gV / gsum
+//
+// Empty splits (chunk_start ≥ cur_seq when n_split > cur_seq) get (m=-inf,
+// l=0, V=0) → contribute 0 to the merge.  Math is correct for any n_split ≥ 1.
+//
+// Scratch layout (caller-provided, sized n_q_heads * n_split * (2 + head_dim)):
+//   scratch_m[head * n_split + s]                              : float m
+//   scratch_l[head * n_split + s]                              : float l
+//   scratch_v[(head * n_split + s) * head_dim + i]             : float V_i
+extern "C" __global__ void paged_attention_seq1_v4_split_devarg(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int*   __restrict__ page_table,
+    float*       __restrict__ scratch_m,    // [n_q_heads * n_split]
+    float*       __restrict__ scratch_l,    // [n_q_heads * n_split]
+    float*       __restrict__ scratch_v,    // [n_q_heads * n_split * head_dim]
+    int n_q_heads, int n_kv_heads, int head_dim, int block_size,
+    float scale, int n_split, const int* __restrict__ step_args)
+{
+    int cur_seq = step_args[1];
+    int head = blockIdx.x;
+    int split_idx = blockIdx.y;
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int nw   = blockDim.y;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head  = head / kv_per_q;
+    int d_kv     = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;
+
+    // Determine this block's KV chunk.  Use ceil-div for chunk_size so the
+    // last split picks up the remainder.
+    int chunk_size  = (cur_seq + n_split - 1) / n_split;
+    int chunk_start = split_idx * chunk_size;
+    int chunk_end   = chunk_start + chunk_size;
+    if (chunk_end > cur_seq) chunk_end = cur_seq;
+
+    // Load Q (scaled).
+    const float* q_ptr = q + head * head_dim;
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane*per_lane + i] * scale;
+    }
+
+    // Per-warp online softmax state.
+    float local_max = -3.4028235e38f;
+    float local_sum = 0.0f;
+    float vkq[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Warp w handles {chunk_start+w, +w+nw, ...} within the chunk.
+    for (int t = chunk_start + warp; t < chunk_end; t += nw) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk*block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        const float* k_ptr = k_pool + row*d_kv + kv_head*head_dim;
+        const float* v_ptr = v_pool + row*d_kv + kv_head*head_dim;
+
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane*per_lane + i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        }
+        float kq = acc;
+        float new_max   = fmaxf(local_max, kq);
+        float scale_old = expf(local_max - new_max);
+        float weight    = expf(kq        - new_max);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) vkq[i] = vkq[i]*scale_old + weight*v_ptr[lane*per_lane + i];
+        }
+        local_sum = local_sum*scale_old + weight;
+        local_max = new_max;
+    }
+
+    // Cross-warp combine within block → (block_m, block_l, block_V) — same
+    // pattern as v3, but instead of normalizing + writing final out, we write
+    // the UNNORMALIZED (m, l, V) partial to scratch for the combine kernel.
+    extern __shared__ float smem[];
+    float* sh_max = smem;
+    float* sh_sum = smem + nw;
+    float* sh_vkq = smem + 2*nw;
+    if (lane == 0) { sh_max[warp] = local_max; sh_sum[warp] = local_sum; }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) sh_vkq[warp*head_dim + lane*per_lane + i] = vkq[i];
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float bmax = sh_max[0];
+        for (int w = 1; w < nw; w++) bmax = fmaxf(bmax, sh_max[w]);
+        float bsum = 0.0f;
+        for (int w = 0; w < nw; w++) bsum += sh_sum[w] * expf(sh_max[w] - bmax);
+        float bv[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (int w = 0; w < nw; w++) {
+            float sw = expf(sh_max[w] - bmax);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (i < per_lane) bv[i] += sh_vkq[w*head_dim + lane*per_lane + i] * sw;
+            }
+        }
+        int idx = head * n_split + split_idx;
+        if (lane == 0) {
+            scratch_m[idx] = bmax;
+            scratch_l[idx] = bsum;
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane)
+                scratch_v[(size_t)idx * head_dim + lane*per_lane + i] = bv[i];
+        }
+    }
+}
+
+// v4 combine: one block per head, single warp.  Reads all n_split partials,
+// merges via flash-attn formula, writes final normalized out[head][D].
+extern "C" __global__ void paged_attention_seq1_v4_combine(
+    const float* __restrict__ scratch_m,
+    const float* __restrict__ scratch_l,
+    const float* __restrict__ scratch_v,
+    float*       __restrict__ attn_out,
+    int head_dim, int n_split)
+{
+    int head = blockIdx.x;
+    int lane = threadIdx.x;
+    int per_lane = head_dim >> 5;
+
+    // gmax = max over splits
+    float gmax = scratch_m[head * n_split];
+    for (int s = 1; s < n_split; s++) {
+        float m_s = scratch_m[head * n_split + s];
+        gmax = fmaxf(gmax, m_s);
+    }
+    // gsum + gV (per-lane elements)
+    float gsum = 0.0f;
+    float gv[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int s = 0; s < n_split; s++) {
+        float m_s = scratch_m[head * n_split + s];
+        float l_s = scratch_l[head * n_split + s];
+        float sw  = expf(m_s - gmax);   // 0 for empty splits (m=-inf)
+        gsum += l_s * sw;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane)
+                gv[i] += scratch_v[(size_t)(head * n_split + s) * head_dim + lane*per_lane + i] * sw;
+        }
+    }
+    float inv = 1.0f / gsum;
+    float* out_ptr = attn_out + head*head_dim;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) out_ptr[lane*per_lane + i] = gv[i] * inv;
     }
 }
 
@@ -8105,6 +8288,77 @@ fn attn_warps() -> u32 {
         paged_ctx().paged_attention_seq1_v3_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, max_seq, sv))
             .expect("launch paged_attention_seq1_v3_devarg");
+    }
+    0
+}
+
+/// attention-section perf — flash-attention v4: SPLIT-KV per head (fill all SMs).
+/// Launches v4_split (grid (n_q_heads, n_split)) writing per-(head,split)
+/// partials to scratch, then v4_combine (grid n_q_heads) merging via the
+/// flash-attn formula.  Caller provides scratch_m/l/v sized for
+/// n_q_heads * n_split * (2 + head_dim) floats.  Math identical to v3 up to
+/// reassociation (n_split=1 ≡ v3 mod combine-kernel overhead).
+#[no_mangle] pub extern "C" fn aether_op_paged_attention_seq1_v4_devarg_f32_cuda(
+    q_dev: i64, k_pool: i64, v_pool: i64,
+    page_table_dev: i64,
+    attn_out: i64,
+    scratch_m_dev: i64, scratch_l_dev: i64, scratch_v_dev: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int, block_size: c_int,
+    scale: f32, max_seq: c_int, n_split: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q)  = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_dev) else { return -1; };
+    let Some(i_o)  = handle_to_idx(attn_out) else { return -1; };
+    let Some(i_sm) = handle_to_idx(scratch_m_dev) else { return -1; };
+    let Some(i_sl) = handle_to_idx(scratch_l_dev) else { return -1; };
+    let Some(i_sv) = handle_to_idx(scratch_v_dev) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0
+        || block_size <= 0 || n_split <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    if (head_dim % 32) != 0 { return -3; }
+    let _ = max_seq;
+    let nw = attn_warps();
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p  = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp_p = bs[i_kp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vp_p = bs[i_vp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pt_p = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let o_p  = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sm_p = bs[i_sm].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sl_p = bs[i_sl].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sv_p = bs[i_sv].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp   = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    // shared for split kernel = (nw + nw + nw*head_dim) * 4
+    let shmem_split = (nw * 2 + nw * (head_dim as u32)) * 4;
+    let split_cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, n_split as u32, 1),
+        block_dim: (32, nw, 1),
+        shared_mem_bytes: shmem_split,
+    };
+    let combine_cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let qv  = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
+        let smv = &mut *sm_p; let slv = &mut *sl_p; let svv = &mut *sv_p;
+        let ov  = &mut *o_p; let sv = &*sp;
+        paged_ctx().paged_attention_seq1_v4_split_devarg.clone()
+            .launch(split_cfg, (qv, kpv, vpv, ptv, smv, slv, svv,
+                n_q_heads, n_kv_heads, head_dim, block_size, scale, n_split, sv))
+            .expect("launch paged_attention_seq1_v4_split_devarg");
+        // Re-borrow scratch for combine (read-only).
+        let smv_r = &*(sm_p as *const CudaSlice<f32>);
+        let slv_r = &*(sl_p as *const CudaSlice<f32>);
+        let svv_r = &*(sv_p as *const CudaSlice<f32>);
+        paged_ctx().paged_attention_seq1_v4_combine.clone()
+            .launch(combine_cfg, (smv_r, slv_r, svv_r, ov, head_dim, n_split))
+            .expect("launch paged_attention_seq1_v4_combine");
     }
     0
 }

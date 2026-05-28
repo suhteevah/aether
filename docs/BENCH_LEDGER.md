@@ -870,3 +870,43 @@ with proper K-split into multiple blocks per head (current v3 keeps grid=n_heads
 = only 28 blocks on 56 SMs), (2) Q6_K MMVQ on the gate/up SwiGLU kernel (if any
 Q6_K gate/up exists in other models), (3) further FFN micro-opts.  But the
 shipped 20.95 + flash-attn v3 building block is a clean session close.
+
+---
+
+## 2026-05-28 — Flash-attn v4 SPLIT-KV (fill 56 SMs) — MEASURED WASH, default-off
+
+Goal: v3 grid = n_heads = 28 → only half P100's 56 SMs.  v4 splits the KV
+sequence per head: grid (n_q_heads, n_split, 1).  With n_split=2 → 28*2=56
+blocks = full SM occupancy.  Two-kernel design (mirrors llama's flash-attn-vec
+→ flash-attn-vec-combine): split kernel writes per-(head,split) partials
+(m, l, V) to scratch, combine kernel merges via the flash-attn formula.
+
+cnc P100 GPU1 clean A/B (Qwen2.5-Math-7B Q4_K_M, --paged, attn v2 + FFN_LLAMA on):
+
+| config | e2e tok/s | vs LLAMA |
+|--------|----------:|---------:|
+| BASE (FFN_LLAMA=0)            | 15.79 | — |
+| LLAMA (no v4)                 | 20.95 | — |
+| V4 splits=2 (56 blocks)       | 20.27 | −3.2% (variance: per-req 18.19) |
+| V4 splits=4 (112 blocks)      | 21.11 | +0.8% |
+| V4 splits=8 (224 blocks)      | 21.10 | +0.7% |
+
+attn-section per-block timing (LLAMA vs V4_2): 806 → 798 µs/block = -1%
+(within noise).  FFN unchanged.  Coherent ("Paris" ✓), token-identical to
+float on qwen25_paged_parity.
+
+**v4 is essentially a wash on Qwen2.5-7B / cnc P100 / short context.** The
+attn-section was already mostly latency-hidden after v2's multi-warp fix
+(4 warps/head × 28 heads = 112 active warps); further SM-fill via split-KV
+doesn't move e2e because the bottleneck has shifted from occupancy to
+per-kernel launch latency + KV-read structure.
+
+Default-off; env-toggleable (`AETHER_ATTN_V4=1` enables; `AETHER_ATTN_V4_SPLITS`
+default 4 = best observed).  Kept registered — long-context decode (KV grows
+into multi-thousand tokens) might tip the balance, AND it composes with future
+attention kernel changes (the split-KV machinery is reusable infrastructure).
+
+Same lesson as v3: attention-kernel optimizations on Qwen2.5-7B at current
+attn/ffn split (~46/54) have diminishing returns.  The real remaining gap to
+llama lives elsewhere — likely the per-kernel scheduling/launch + KV access
+patterns that flash-attn-vec's tile-based design addresses more holistically.
