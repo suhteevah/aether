@@ -91,6 +91,7 @@ use crate::cuda::{
     aether_op_quantize_q8_1_llama_cuda,
     aether_op_mmvq_q4k_q8_1_swiglu_cuda,
     aether_op_mmvq_q4k_q8_1_single_cuda,
+    aether_op_mmvq_q6k_q8_1_single_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
     aether_op_fused_f32_matmul_seq1_cuda,
     aether_op_fused_q4_0_matmul_seq1_cuda,
@@ -265,6 +266,42 @@ fn paged_attn_v2_enabled() -> bool {
 /// Qwen2.5-7B greedy.  LOSSY vs float base (activation quantized to int8) — so
 /// validated by coherence not bit-parity.  Default ON; `AETHER_FFN_LLAMA=0`
 /// falls back to the float base for in-binary A/B.  Cached: env read once.
+/// FFN-section perf — Phase 2c MMVQ dispatch by quant dtype.  Returns true if
+/// it ran a MMVQ kernel (Q4_K=12 or Q6_K=14), false to let the caller fall back
+/// to dispatch_matmul.  Caller must have already quantized the activation to
+/// Q8_1 in (aq, ad).  Currently only fires when AETHER_FFN_LLAMA is on AND the
+/// dtype is one of the two ported MMVQ variants AND n_in % 256 == 0.
+#[cfg(feature = "cuda")]
+unsafe fn mmvq_single_if_supported(
+    w: i64, dt: i32, out: i64, aq: i64, ad: i64, n_out: c_int, n_in: c_int,
+) -> bool {
+    if !ffn_llama_enabled() || (n_in % 256) != 0 { return false; }
+    match dt {
+        12 => { aether_op_mmvq_q4k_q8_1_single_cuda(w, aq, ad, out, n_out, n_in/256); true }
+        14 => { aether_op_mmvq_q6k_q8_1_single_cuda(w, aq, ad, out, n_out, n_in/256); true }
+        _  => false,
+    }
+}
+
+/// FFN-section perf — Phase 2c: lm_head matmul via MMVQ when Q4_K + FFN_LLAMA on.
+/// Called from BOTH the imperative step and the captured-graph step (same args).
+/// Quantizes x_norm (d_model) to Q8_1 then runs mmvq_single on the lm_head
+/// weight (n_out = vocab); falls back to dispatch_matmul for non-Q4_K dtypes.
+#[cfg(feature = "cuda")]
+unsafe fn lm_head_matmul(
+    x_norm: i64, lm_head: i64, lm_dt: i32, logits: i64,
+    q8_aq: i64, q8_ad: i64, q8_as: i64,
+    vocab: c_int, d_model: c_int,
+) {
+    let do_quant = ffn_llama_enabled() && (lm_dt == 12 || lm_dt == 14) && (d_model % 256) == 0;
+    if do_quant {
+        aether_op_quantize_q8_1_llama_cuda(x_norm, q8_aq, q8_ad, q8_as, d_model);
+    }
+    if !mmvq_single_if_supported(lm_head, lm_dt, logits, q8_aq, q8_ad, vocab, d_model) {
+        dispatch_matmul(x_norm, lm_head, lm_dt, logits, vocab, d_model);
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn ffn_llama_enabled() -> bool {
     use std::sync::OnceLock;
@@ -1234,12 +1271,13 @@ unsafe fn block_forward_devarg(
     };
 
     // ---- Common post-attention tail: O proj + residual + LN + FFN ----
-    // Phase 2b: o-proj reads attn_out; if Q4_K, quantize + mmvq_single.
-    if ffn_llama_enabled() && bw.dt_o == 12 && (attn_out_n_in % 256) == 0 {
+    // Phase 2b+2c: o-proj reads attn_out; if Q4_K/Q6_K, quantize + MMVQ.
+    let o_use_mmvq = ffn_llama_enabled() && (bw.dt_o == 12 || bw.dt_o == 14)
+        && (attn_out_n_in % 256) == 0;
+    if o_use_mmvq {
         aether_op_quantize_q8_1_llama_cuda(act.attn_out, act.q8_aq, act.q8_ad, act.q8_as, attn_out_n_in);
-        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_o, act.q8_aq, act.q8_ad, act.proj,
-            d_model, attn_out_n_in / 256);
-    } else {
+    }
+    if !mmvq_single_if_supported(bw.w_o, bw.dt_o, act.proj, act.q8_aq, act.q8_ad, d_model, attn_out_n_in) {
         dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, attn_out_n_in);
     }
     if bw.post_attn_norm_g != 0 {
@@ -1298,14 +1336,12 @@ unsafe fn block_forward_devarg(
         // still measures the whole FFN section.
         if bt { aether_dev_sync(); block_timing::add_gateup(t_sec.elapsed().as_nanos() as u64); }
         let t_down = std::time::Instant::now();
-        if ffn_llama_enabled() && bw.dt_down == 12 {
-            // FAITHFUL llama-MMVQ for down-proj: quantize gate-output (d_ff) to
-            // Q8_1 then single-output MMVQ.  Same K-split structure as gate/up.
+        // Phase 2a+2c: down-proj reads gate-output; if Q4_K/Q6_K, quantize + MMVQ.
+        let down_use_mmvq = ffn_llama_enabled() && (bw.dt_down == 12 || bw.dt_down == 14);
+        if down_use_mmvq {
             aether_op_quantize_q8_1_llama_cuda(act.gate, act.q8_aq, act.q8_ad, act.q8_as, d_ff);
-            aether_op_mmvq_q4k_q8_1_single_cuda(
-                bw.w_down, act.q8_aq, act.q8_ad, act.down,
-                d_model, d_ff / 256);
-        } else {
+        }
+        if !mmvq_single_if_supported(bw.w_down, bw.dt_down, act.down, act.q8_aq, act.q8_ad, d_model, d_ff) {
             dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
         }
         if bt { aether_dev_sync(); block_timing::add_down(t_down.elapsed().as_nanos() as u64); }
@@ -1344,41 +1380,26 @@ unsafe fn standard_attention_forward(
     // Q projection output = n_q_heads * head_dim (= d_model for Qwen/Llama,
     // but 4096 != 5120 for Mistral Small 24B where head_dim is explicit).
     let q_dim = n_q_heads * head_dim;
-    // Phase 2b: q/k/v all read x_norm.  If FFN_LLAMA is on AND any of dt_{q,k,v}
-    // is Q4_K (dt==12), quantize x_norm ONCE to Q8_1 and use mmvq_single for
-    // each Q4_K matmul; non-Q4_K dtypes fall back to dispatch_matmul.
-    let use_mmvq = ffn_llama_enabled()
-        && (bw.dt_q == 12 || bw.dt_k == 12 || bw.dt_v == 12);
-    if use_mmvq {
+    // Phase 2b+2c: q/k/v all read x_norm.  If FFN_LLAMA on AND any matmul can
+    // use MMVQ (Q4_K or Q6_K), quantize x_norm ONCE to Q8_1; each matmul then
+    // tries mmvq_single_if_supported and falls back to dispatch_matmul otherwise.
+    let mmvq_quant = |dt: i32| ffn_llama_enabled() && (dt == 12 || dt == 14);
+    let any_mmvq = mmvq_quant(bw.dt_q) || mmvq_quant(bw.dt_k) || mmvq_quant(bw.dt_v);
+    if any_mmvq {
         aether_op_quantize_q8_1_llama_cuda(act.x_norm, act.q8_aq, act.q8_ad, act.q8_as, d_model);
     }
-    if use_mmvq && bw.dt_q == 12 {
-        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_q, act.q8_aq, act.q8_ad, act.q,
-            q_dim, d_model / 256);
-    } else {
+    if !mmvq_single_if_supported(bw.w_q, bw.dt_q, act.q, act.q8_aq, act.q8_ad, q_dim, d_model) {
         dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, q_dim, d_model);
     }
-    if bw.b_q != 0 {
-        aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, q_dim);
-    }
-    if use_mmvq && bw.dt_k == 12 {
-        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_k, act.q8_aq, act.q8_ad, act.k_step,
-            d_kv, d_model / 256);
-    } else {
+    if bw.b_q != 0 { aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, q_dim); }
+    if !mmvq_single_if_supported(bw.w_k, bw.dt_k, act.k_step, act.q8_aq, act.q8_ad, d_kv, d_model) {
         dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
     }
-    if bw.b_k != 0 {
-        aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv);
-    }
-    if use_mmvq && bw.dt_v == 12 {
-        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_v, act.q8_aq, act.q8_ad, act.v_step,
-            d_kv, d_model / 256);
-    } else {
+    if bw.b_k != 0 { aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv); }
+    if !mmvq_single_if_supported(bw.w_v, bw.dt_v, act.v_step, act.q8_aq, act.q8_ad, d_kv, d_model) {
         dispatch_matmul(act.x_norm, bw.w_v, bw.dt_v, act.v_step, d_kv, d_model);
     }
-    if bw.b_v != 0 {
-        aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
-    }
+    if bw.b_v != 0 { aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv); }
     if bw.attn_q_norm_g != 0 {
         aether_op_rms_norm_f32_cuda(act.q, bw.attn_q_norm_g, act.q,
             norm_eps, n_q_heads, head_dim);
@@ -3139,7 +3160,8 @@ impl QwenSession {
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
             self.cfg.norm_eps, 1, self.cfg.d_model as c_int);
-        dispatch_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
+        lm_head_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
+            self.act.q8_aq, self.act.q8_ad, self.act.q8_as,
             self.cfg.vocab as c_int, self.cfg.d_model as c_int);
         // V2-Lite-debug: final-norm hidden + logits.  Maps to llama.cpp
         // `result_norm` and `result_output`.
@@ -3164,7 +3186,8 @@ impl QwenSession {
         aether_op_rms_norm_f32_cuda(
             self.act.x, self.final_norm_g, self.act.x_norm,
             self.cfg.norm_eps, 1, self.cfg.d_model as c_int);
-        dispatch_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
+        lm_head_matmul(self.act.x_norm, self.lm_head, self.lm_dt, self.act.logits,
+            self.act.q8_aq, self.act.q8_ad, self.act.q8_as,
             self.cfg.vocab as c_int, self.cfg.d_model as c_int);
         let rc = aether_dev_graph_end();
         assert_eq!(rc, 0, "aether_dev_graph_end failed: {}", rc);
