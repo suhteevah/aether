@@ -1,37 +1,47 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-27 (🟢 attention v2 +4.9% shipped; TWO FFN gate/up rewrites = negative results)
+## Last Updated — 2026-05-27 (🟢 attn v2 +4.9% shipped; llama-P100-gap profiled; THREE FFN rewrites lose; gap is SYSTEMIC)
 
 ## Project Status
-🟢 attention v2 shipped (+4.9%). Two FFN gate/up optimization attempts both
-measured-LOSE on P100 and were reverted — the base fp32 kernel is well-matched to
-Pascal. Workspace clean, fleet restored (workhorse active).
+🟢 attention v2 shipped (+4.9%). Profiled where llama wins on P100 and ruled out
+THREE gate/up rewrites — the gap is systemic, not a single-kernel fix. Workspace
+clean, fleet restored (workhorse active). Commits adbd4f0, dcf6cd4, 0c9e022 + a
+final docs commit.
 - `adbd4f0` multi-warp paged seq1 attention (v2): **15.05 → 15.79 tok/s (+4.9%)**
-  e2e cnc P100, coherent, parity-clean, env-toggleable. SHIPPED.
-- `dcf6cd4` FFN sub-split timing + NEGATIVE result #1: ALU-factoring the gate/up
-  dequant regresses (register pressure). Reverted, timing kept.
-- NEGATIVE result #2 (this session, doc-only commit): int8×int4 MMVQ (Q8_1
-  activation) — correct (rms 0.66%) + coherent (greedy unchanged) but **−2.2% on
-  P100** (15.79→15.44). sm_60 has no dp4a + strong fp32, so scalar int8-MAC loses
-  to fp32-FMA. Reverted. See [[ffn_gateup_alu_factoring_dead_end]] (now covers both).
+  e2e cnc P100, coherent, parity-clean, env-toggleable. **THE SHIPPED WIN.**
+- THREE FFN gate/up rewrites, ALL measured-LOSE on P100, all reverted:
+  1. ALU-factoring dequant (`dcf6cd4` kept the FFN sub-split timing): register pressure.
+  2. int8×int4 MMVQ (Q8_1 activation): −2.2%; sm_60 no-dp4a, scalar int8-MAC < fp32-FMA.
+  3. multi-warp-per-row K-split (llama's exact structure): −4.7%; loses the base's
+     8-rows/block shared-activation reuse.
+  See [[ffn_gateup_alu_factoring_dead_end]].
 
-### KEY CONCLUSION — stop micro-optimizing gate/up math for P100
-Two independent gate/up rewrites LOSE to the base fp32 kernel on Pascal.
-**llama's ~180 GB/s on P100 is NOT explained by int8-MMVQ arithmetic being
-faster.** The P100 decode gap (2.36× vs llama 37.33) is therefore NOT in gate/up
-per-kernel arithmetic — it's elsewhere:
-- **Re-examine where llama actually wins on P100**: profile llama-server's kernel
-  occupancy + timeline (nsys/ncu), or re-derive the "180 GB/s effective" figure
-  ([[aether_vs_llama_perf_pascal_vs_ampere]] is platform-specific; the P100 number
-  came from a 1:1 e2e serving compare, not a kernel profile).
-- **Whole-layer fusion** (fewer/bigger kernels across attn+ffn) may be the real
-  lever, not per-kernel arithmetic ([[gpu_perf_surpass_strategy]]).
-- **Ampere (3070 Ti, sm_86, dp4a)**: an int8 MMVQ path using the `__dp4a`
-  intrinsic (NOT the scalar kernel built+reverted here) could win — but aether
-  already beats ollama 1.6× on the 3070 Ti via CUDA-graph decode, so P100 is the
-  real frontier.
-- Bench scripts kept: scratch/{attn_v2_bench,attn_timing,ffn_v3_bench,ffn_q8_bench}.sh
-  (all trap-restore the workhorse).
+### Where llama wins on P100 (profiled, no nsys — Leap Micro immutable; used
+### llama-bench + llama.cpp source)
+- **Clean gap**: llama-bench tg128 = **39.07 tok/s** (≈170 GB/s, 24% of 720 peak);
+  aether ~15.8 (~71 GB/s, ~10%). 2.36× real, re-derived clean (the 37.33 was
+  serving). pp512 = 802 tok/s.
+- **Mechanism** (llama mmvq.cu, decode ncols_dst=1): `nwarps=4, rows_per_block=1`
+  → 4 warps cooperate per row (K-split + shared reduce). aether = 1 warp/row.
+- **But porting it regresses** (result #3) because aether's base amortizes the
+  activation across 8 rows/block; llama affords 1-row/block via int8 Q8_1
+  activations (4× smaller) + whole-pipeline co-design.
+
+### SYSTEMIC CONCLUSION — the real next move
+gate/up is only ~38% of decode; even a perfect gate/up caps aether at ~25 tok/s
+(< 39). **llama's P100 edge is systemic** — every kernel ~2.3× more HBM-efficient
+via co-designed int8-activation + multi-warp. The remaining options:
+1. **Holistic int8-activation decode rewrite** (Q8_1 activations threaded through
+   ALL matmuls + multi-warp) — major, P100-uncertain (int8 alone lost on sm_60).
+2. **Ampere focus** (3070 Ti sm_86): aether already beats ollama 1.6× there via
+   CUDA-graph decode; a `__dp4a` int8 path could extend that. The P100 gap may not
+   be worth chasing per-kernel.
+3. **Whole-layer kernel fusion** ([[gpu_perf_surpass_strategy]]).
+Recommendation: STOP per-kernel P100 gate/up work — three approaches exhausted.
+Bench scripts kept: scratch/{attn_v2_bench,attn_timing,ffn_v3_bench,ffn_q8_bench,
+ffn_mw_bench,llama_bench}.sh (trap-restore the workhorse; NOTE ffn_mw_bench's
+timing path uses --warmup 4 which crashes graph-capture under AETHER_DECODE_TIMING
+— use --warmup 0 for timing runs).
 
 ### FFN section findings (this session, committed in dcf6cd4)
 - FFN sub-split (cnc P100, per-token ×28): **norm+gate/up 23.5ms (66% FFN, ~38%

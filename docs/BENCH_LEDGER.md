@@ -646,3 +646,49 @@ figure needs re-derivation. Stop micro-optimizing the gate/up math for P100;
 re-examine where llama actually wins (profile llama's kernel occupancy/timeline,
 or pursue whole-layer fusion). An Ampere (sm_86, dp4a) int8 MMVQ path could win
 but needs the __dp4a intrinsic, not this scalar kernel.
+
+---
+
+## 2026-05-27 — Where llama wins on P100 + multi-warp gate/up (3rd NEGATIVE) + systemic conclusion
+
+Profiled the gap (no nsys/ncu — Leap Micro immutable OS; used llama-bench +
+llama.cpp source).
+
+**Clean re-derivation of the gap** (llama-bench, GPU1, same GGUF):
+- pp512 = 802 tok/s; **tg128 = 39.07 tok/s** decode → ≈170 GB/s effective
+  (24% of P100's 720 peak). aether ≈ 15.8 e2e (~71 GB/s, ~10%). Gap 2.36× is
+  real, re-derived from a clean bench (not just the 37.33 serving number).
+
+**Root cause (llama mmvq.cu, GENERIC table, decode ncols_dst=1):** llama uses
+`nwarps=4, rows_per_cuda_block=1` → **4 warps cooperate per output row** (K-split
++ shared-mem reduce) for 4× memory-level parallelism. aether's matmuls use
+**1 warp per row**. This explained why the prior 2 FFN attempts (ALU-factor,
+int8-MMVQ) failed — both kept 1-warp/row.
+
+**Ported llama's structure (multi-warp-per-row K-split gate/up). 3rd NEGATIVE:**
+
+| config (attn v2, cnc P100) | e2e tok/s |
+|----------------------------|----------:|
+| base (1 warp/row, 8 rows/block, shared act reuse) | 15.78 |
+| multi-warp K-split, MW_WARPS=2 | 15.04 (−4.7%) |
+| multi-warp K-split, MW_WARPS=4 (llama's choice) | 15.04 (−4.7%) |
+| multi-warp K-split, MW_WARPS=7 | 15.03 (−4.7%) |
+
+Correct + coherent (qwen25 token-identical), but slower. **Why porting the
+structure alone regresses:** aether's base does 8 rows/block with the activation
+staged in shared ONCE and reused across 8 rows. The 1-row/block multi-warp form
+loses that amortization (re-reads activation per block) + adds a cross-warp
+reduce. llama affords 1-row/block because its activation is int8 Q8_1 (4× smaller
+reads) and the whole pipeline is co-designed around it.
+
+**SYSTEMIC CONCLUSION:** Three independent gate/up rewrites (ALU-factor, int8
+MMVQ, multi-warp K-split) ALL lose to the well-tuned base on P100. And gate/up is
+only ~38% of decode — even a perfect gate/up caps aether at ~25 tok/s, still short
+of 39. **llama's P100 advantage is SYSTEMIC** (every kernel ~2.3× more
+HBM-efficient via co-designed int8-activation + multi-warp), not a single-kernel
+fix. Closing it needs a holistic decode rewrite (int8 activations throughout +
+multi-warp across all matmuls — a major, P100-uncertain effort), OR is better
+pursued on Ampere (3070 Ti, where aether already beats ollama 1.6× via CUDA-graph
+decode). Recommendation: stop per-kernel P100 gate/up work; the frontier is a
+co-designed int8 pipeline or the Ampere path. attention v2 (+4.9%, adbd4f0)
+remains this arc's shipped win.
