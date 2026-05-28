@@ -57,6 +57,7 @@ use crate::cuda::{
     aether_op_paged_append_kv_devarg_f32_cuda,
     aether_op_paged_attention_seq1_devarg_f32_cuda,
     aether_op_paged_attention_seq1_v2_devarg_f32_cuda,
+    aether_op_paged_attention_seq1_v3_devarg_f32_cuda,
     aether_op_paged_attention_flex_devarg_f32_cuda,
     aether_op_paged_append_kv_mla_devarg_f32_cuda,
     aether_op_paged_attention_mla_devarg_f32_cuda,
@@ -257,6 +258,18 @@ fn paged_attn_v2_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         std::env::var("AETHER_ATTN_V2").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// attention-section perf — selects the flash-attention-style paged seq1 (v3:
+/// online softmax + fused K+V single pass) over the v2 multi-warp kernel.
+/// Default OFF until cnc P100 A/B + coherence verify it.  Set `AETHER_ATTN_V3=1`.
+#[cfg(feature = "cuda")]
+fn paged_attn_v3_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("AETHER_ATTN_V3").map(|v| v == "1").unwrap_or(false)
     })
 }
 
@@ -1425,6 +1438,12 @@ unsafe fn standard_attention_forward(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
                 n_q_heads, n_kv_heads, head_dim,
                 block_size, eff_sliding_window, scale, max_seq as c_int, step_args);
+        } else if paged_attn_v3_enabled() {
+            // flash-attention-style: online softmax + fused K+V pass.
+            aether_op_paged_attention_seq1_v3_devarg_f32_cuda(
+                act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
+                n_q_heads, n_kv_heads, head_dim,
+                block_size, scale, max_seq as c_int, step_args);
         } else if paged_attn_v2_enabled() {
             // attention-section perf — multi-warp seq1 attention (occupancy fix).
             aether_op_paged_attention_seq1_v2_devarg_f32_cuda(

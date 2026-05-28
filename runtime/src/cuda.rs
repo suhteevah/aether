@@ -110,6 +110,7 @@ struct PagedCtx {
     paged_append_kv_devarg: CudaFunction,
     paged_attention_seq1_devarg: CudaFunction,
     paged_attention_seq1_v2_devarg: CudaFunction,
+    paged_attention_seq1_v3_devarg: CudaFunction,
     batched_paged_attention_seqB_devarg: CudaFunction,
     batched_paged_append_kv_seqB_devarg: CudaFunction,
     batched_paged_attention_hetero_devarg: CudaFunction,
@@ -152,6 +153,7 @@ fn paged_ctx() -> &'static PagedCtx {
         device.load_ptx(paged_ptx, "aether_paged_kernels",
             &["paged_append_kv_devarg", "paged_attention_seq1_devarg",
               "paged_attention_seq1_v2_devarg",
+              "paged_attention_seq1_v3_devarg",
               "batched_paged_attention_seqB_devarg",
               "batched_paged_append_kv_seqB_devarg",
               "batched_paged_attention_hetero_devarg",
@@ -190,6 +192,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "paged_attention_seq1_devarg").unwrap(),
             paged_attention_seq1_v2_devarg:
                 device.get_func("aether_paged_kernels", "paged_attention_seq1_v2_devarg").unwrap(),
+            paged_attention_seq1_v3_devarg:
+                device.get_func("aether_paged_kernels", "paged_attention_seq1_v3_devarg").unwrap(),
             batched_paged_attention_seqB_devarg:
                 device.get_func("aether_paged_kernels", "batched_paged_attention_seqB_devarg").unwrap(),
             batched_paged_append_kv_seqB_devarg:
@@ -1175,6 +1179,126 @@ extern "C" __global__ void paged_attention_seq1_v2_devarg(
                 for (int w = 0; w < nw; w++) s += partial[w * head_dim + lane * per_lane + i];
                 attn_out[head * head_dim + lane * per_lane + i] = s;
             }
+        }
+    }
+}
+
+// attention-section perf — flash-attention-style paged seq1 (v3).
+// vs v2 (the shipped multi-warp kernel from this session):
+//   - Online softmax: no `scores[max_seq]` shared array (v2 used 8 KB at
+//     max_seq=2048, capping occupancy).  v3 uses O(nw*head_dim) shared
+//     (~1 KB at nw=4/head_dim=128) — much higher occupancy headroom.
+//   - Fused K+V single pass: each token's K is read once for the dot, then V
+//     is read in the same loop iteration weighted by the online softmax weight.
+//     v2 made 2 passes over the KV cache (pass 1 for scores, pass 3 for V) →
+//     half the KV bandwidth gone in v3.
+//
+// Each warp w streams KV positions {w, w+nw, ...} maintaining (m_w, l_w, V_w)
+// via online softmax.  Final cross-warp combine (mirrors the standard
+// flash-attn merge): gmax = max_w m_w; gsum = Σ l_w * exp(m_w − gmax);
+// gV[d]   = Σ V_w[d] * exp(m_w − gmax); out[d] = gV[d] / gsum.
+//
+// Same launch shape as v2 (block (32, nw), grid n_q_heads); requires head_dim%32==0.
+extern "C" __global__ void paged_attention_seq1_v3_devarg(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int*   __restrict__ page_table,
+    float*       __restrict__ attn_out,
+    int n_q_heads, int n_kv_heads, int head_dim, int block_size,
+    float scale, int max_seq, const int* __restrict__ step_args)
+{
+    int cur_seq = step_args[1];
+    int head = blockIdx.x;
+    int lane = threadIdx.x;          // 0..31
+    int warp = threadIdx.y;          // 0..nw-1
+    int nw   = blockDim.y;
+    int kv_per_q = n_q_heads / n_kv_heads;
+    int kv_head  = head / kv_per_q;
+    int d_kv     = n_kv_heads * head_dim;
+    int per_lane = head_dim >> 5;
+    (void)max_seq;
+
+    // Load Q for this head into per-lane registers (scaled).
+    const float* q_ptr = q + head * head_dim;
+    float q_local[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) q_local[i] = q_ptr[lane*per_lane + i] * scale;
+    }
+
+    // Per-warp online softmax state + VKQ accumulator.
+    float local_max = -3.4028235e38f;
+    float local_sum = 0.0f;
+    float vkq[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Streamed K+V loop (fused single pass), warp w handles positions {w, w+nw, ...}.
+    for (int t = warp; t < cur_seq; t += nw) {
+        int logical_blk = t / block_size;
+        int in_blk_pos  = t - logical_blk*block_size;
+        int phys_blk    = page_table[logical_blk];
+        size_t row = (size_t)phys_blk * block_size + in_blk_pos;
+        const float* k_ptr = k_pool + row*d_kv + kv_head*head_dim;
+        const float* v_ptr = v_pool + row*d_kv + kv_head*head_dim;
+
+        // KQ = (Q*scale) . K[t], warp-cooperative (xor-reduce → broadcast).
+        float acc = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) acc += q_local[i] * k_ptr[lane*per_lane + i];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        }
+        float kq = acc;  // scale already folded into q_local
+
+        // Online-softmax update + V accumulation in ONE pass.
+        float new_max   = fmaxf(local_max, kq);
+        float scale_old = expf(local_max - new_max);
+        float weight    = expf(kq        - new_max);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) vkq[i] = vkq[i]*scale_old + weight * v_ptr[lane*per_lane + i];
+        }
+        local_sum = local_sum * scale_old + weight;
+        local_max = new_max;
+    }
+
+    // Cross-warp combine (flash-attn merge).
+    // shared: [max(nw)] [sum(nw)] [vkq(nw*head_dim)]
+    extern __shared__ float smem[];
+    float* sh_max = smem;
+    float* sh_sum = smem + nw;
+    float* sh_vkq = smem + 2*nw;
+    if (lane == 0) { sh_max[warp] = local_max; sh_sum[warp] = local_sum; }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (i < per_lane) sh_vkq[warp*head_dim + lane*per_lane + i] = vkq[i];
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        // gmax
+        float gmax = sh_max[0];
+        for (int w = 1; w < nw; w++) gmax = fmaxf(gmax, sh_max[w]);
+        // gsum
+        float gsum = 0.0f;
+        for (int w = 0; w < nw; w++) gsum += sh_sum[w] * expf(sh_max[w] - gmax);
+        float inv = 1.0f / gsum;
+        // Combine vkq across warps weighted by exp(m_w - gmax), normalize.
+        float out_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (int w = 0; w < nw; w++) {
+            float sw = expf(sh_max[w] - gmax);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (i < per_lane) out_acc[i] += sh_vkq[w*head_dim + lane*per_lane + i] * sw;
+            }
+        }
+        float* out_ptr = attn_out + head*head_dim;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < per_lane) out_ptr[lane*per_lane + i] = out_acc[i] * inv;
         }
     }
 }
@@ -7936,6 +8060,51 @@ fn attn_warps() -> u32 {
         paged_ctx().paged_attention_seq1_v2_devarg.clone()
             .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, max_seq, sv))
             .expect("launch paged_attention_seq1_v2_devarg");
+    }
+    0
+}
+
+/// attention-section perf — flash-attention-style paged seq1 (v3).  Online
+/// softmax + fused K+V single pass.  Drop-in for the v2 wrapper (same args).
+/// Bit-close to v2 (rel ~1e-5, online vs offline softmax differ in reassociation).
+#[no_mangle] pub extern "C" fn aether_op_paged_attention_seq1_v3_devarg_f32_cuda(
+    q_dev: i64, k_pool: i64, v_pool: i64,
+    page_table_dev: i64,
+    attn_out: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int, block_size: c_int,
+    scale: f32, max_seq: c_int, step_args_i32: i64,
+) -> c_int {
+    let Some(i_q) = handle_to_idx(q_dev) else { return -1; };
+    let Some(i_kp) = handle_to_idx(k_pool) else { return -1; };
+    let Some(i_vp) = handle_to_idx(v_pool) else { return -1; };
+    let Some(i_pt) = handle_to_i32_idx(page_table_dev) else { return -1; };
+    let Some(i_o) = handle_to_idx(attn_out) else { return -1; };
+    let Some(is)   = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || max_seq <= 0 || block_size <= 0 { return -1; }
+    if (n_q_heads % n_kv_heads) != 0 { return -2; }
+    if (head_dim % 32) != 0 { return -3; }
+    let nw = attn_warps();
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p = bs[i_q].as_ref().unwrap() as *const CudaSlice<f32>;
+    let kp_p = bs[i_kp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let vp_p = bs[i_vp].as_ref().unwrap() as *const CudaSlice<f32>;
+    let pt_p = ibs[i_pt].as_ref().unwrap() as *const CudaSlice<i32>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let sp  = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    // shared = (nw + nw + nw*head_dim) * 4
+    let shmem = (nw * 2 + nw * (head_dim as u32)) * 4;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_q_heads as u32, 1, 1),
+        block_dim: (32, nw, 1),
+        shared_mem_bytes: shmem,
+    };
+    unsafe {
+        let qv = &*q_p; let kpv = &*kp_p; let vpv = &*vp_p; let ptv = &*pt_p;
+        let ov = &mut *o_p; let sv = &*sp;
+        paged_ctx().paged_attention_seq1_v3_devarg.clone()
+            .launch(cfg, (qv, kpv, vpv, ptv, ov, n_q_heads, n_kv_heads, head_dim, block_size, scale, max_seq, sv))
+            .expect("launch paged_attention_seq1_v3_devarg");
     }
     0
 }
