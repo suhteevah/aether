@@ -1,5 +1,56 @@
 # NEXT-UP — v4 critical path + parked items
 
+## *Need to smoke* — renlys CT fleet reference inference targets (2026-05-27)
+
+Discovered while smoke-testing lattice on jitk's renlys (proxmox-renlys, jitk's
+Proxmox hypervisor). Every running CT serves a GGUF via `llama-server` on CPU
+(`-ngl 0` on the 70B confirms; no GPU offload visible across the fleet). 7
+distinct (arch × quant) models — flag each as a smoke target for aether's
+serving path. **Quant-coverage caveat:** aether's runtime currently handles
+**Q4_K_M** (matt-voice primary, deep kernel coverage) + **Q6_K** (V proj /
+ffn_down / lm_head mixed-precision). **Q5_K_M is NOT yet implemented** — 4 of
+the 7 targets below need a Q5_K dequant + matmul kernel pair before they can
+smoke. Flagged inline.
+
+| # | model | quant | aether status | renlys location(s) | ctx | flags / notes |
+|---|---|---|---|---|---|---|
+| 1 | Qwen2.5-32B-Instruct | Q4_K_M | needs smoke (new arch scale; existing Q4_K_M kernels apply) | CT100 (.51:8080) | 65k | t=20, parallel 2 |
+| 2 | Qwen2.5-14B-Instruct | Q4_K_M | needs smoke | CT105 ct3 (.103:8082) + CT111 kanban-qwen (.111:8080) | 8k | runs on two CTs (kanban + scratch); t=8/12 |
+| 3 | Qwen2.5-7B-Instruct | Q4_K_M | **already aether's primary target** — confirm renlys' build/split gguf matches kokonoe's reference, no kernel work | CT103 Quen7b (.54:8081) | 32k | split gguf 1-of-2 |
+| 4 | Hermes-3-Llama-3.1-70B | Q4_K_M | needs smoke (Llama-3.1 arch — Qwen2.5 is current; Llama-3.1 attn / rope-theta TBD) | CT108 qwen32b-orch (.108:8080) | 16k | **CT name misleading** — actually 70B Hermes, not Qwen-32B. `--jinja` template; CPU only `-ngl 0` |
+| 5 | Hermes-3-Llama-3.1-8B | **Q5_K_M** ⚠ no kernel | **BLOCKED on Q5_K dequant+matmul kernel pair** | CT104 ct2 (.102:8081, ctx 32k, flash-attn on) + CT121 blue-team (.121:8083 + .121:8084, ctx 64k each) | 32k/64k | 3 instances of the same model |
+| 6 | Foundation-Sec-8B | **Q5_K_M** ⚠ no kernel | **BLOCKED on Q5_K kernel pair** (same as #5) | CT120 red-team (.120:8080) + CT121 blue-team (.121:8082) | 64k | security-tuned Llama-3.1 |
+| 7 | Lily-7B-Instruct-v0.2 | **Q5_K_M** ⚠ no kernel | **BLOCKED on Q5_K kernel pair** | CT120 red-team (.120:8081) | 64k | rope yarn ×2 scaling |
+
+**Smoke harness shape (when each unblocks):** 4-prompt × 3-rep, max_tokens=128,
+temp=0, warm + N=3, compare to `llama-server` reference on the same GGUF
+(matches existing `bench/qwen25_7b_autoregressive` and `serving e2e` patterns
+in BENCH_LEDGER). Each smoke produces (a) coherence proof (output matches
+`llama-server` byte-for-byte at temp 0, or near-bitwise), (b) e2e tok/s on the
+chosen hardware (3070 Ti Ampere vs P100 Pascal — known to invert per the
+`serving e2e — aether-serve vs llama.cpp` rows).
+
+**Critical-path implications:**
+- Closing 4 of 7 (the Q5_K cohort: #5, #6, #7) requires a **Q5_K_M dequant +
+  fused-matmul-seq1 kernel pair** following the shipped Q4_K_M v2/v6 + Q6_K v2
+  pattern (see BENCH_LEDGER 2026-05-20 entries). Estimated effort: same shape
+  as the Q6_K v2 port (~1–2 sessions); Q5_K_M super-block layout is
+  `d[2] + dmin[2] + scales[12] + qh[32] + qs[128]` = 176 B per 256 weights
+  (5.5 bits/weight: 4-bit low nibble in `qs` + 1-bit high bit in `qh` +
+  6-bit scales/mins indexed via the K-quant common scheme).
+- The 70B Hermes-3 (#4) is the first **non-Qwen** arch target — Llama-3.1 attn
+  variant (GQA shape differences, possible rope-theta delta) needs an arch
+  smoke at the `BlockGpu` level before e2e.
+- The 32B Qwen (#1) and 14B Qwen (#2) reuse every existing kernel; smoke is
+  just "load + e2e + coherence" — no new code. **Lowest-effort first wins.**
+
+Provenance: smoke-test session 2026-05-27 (lattice client-side test parked on
+the cachyos box, but the proxmox guest enumeration surfaced this fleet).
+Sister entry in `docs/BENCH_LEDGER.md` under
+`bench/renlys_reference_models — planned`.
+
+---
+
 Generated 2026-05-09; reorganized from flat-catalog to critical-path on the
 same date. **Audit sits at 135/196 (68%)** after the 2026-05-10 batch
 (closures with captures, heap stdlib extras, println! interpolation,
