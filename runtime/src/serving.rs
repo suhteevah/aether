@@ -1234,7 +1234,14 @@ unsafe fn block_forward_devarg(
     };
 
     // ---- Common post-attention tail: O proj + residual + LN + FFN ----
-    dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, attn_out_n_in);
+    // Phase 2b: o-proj reads attn_out; if Q4_K, quantize + mmvq_single.
+    if ffn_llama_enabled() && bw.dt_o == 12 && (attn_out_n_in % 256) == 0 {
+        aether_op_quantize_q8_1_llama_cuda(act.attn_out, act.q8_aq, act.q8_ad, act.q8_as, attn_out_n_in);
+        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_o, act.q8_aq, act.q8_ad, act.proj,
+            d_model, attn_out_n_in / 256);
+    } else {
+        dispatch_matmul(act.attn_out, bw.w_o, bw.dt_o, act.proj, d_model, attn_out_n_in);
+    }
     if bw.post_attn_norm_g != 0 {
         aether_op_rms_norm_f32_cuda(act.proj, bw.post_attn_norm_g, act.proj,
             norm_eps, 1, d_model);
@@ -1337,15 +1344,38 @@ unsafe fn standard_attention_forward(
     // Q projection output = n_q_heads * head_dim (= d_model for Qwen/Llama,
     // but 4096 != 5120 for Mistral Small 24B where head_dim is explicit).
     let q_dim = n_q_heads * head_dim;
-    dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, q_dim, d_model);
+    // Phase 2b: q/k/v all read x_norm.  If FFN_LLAMA is on AND any of dt_{q,k,v}
+    // is Q4_K (dt==12), quantize x_norm ONCE to Q8_1 and use mmvq_single for
+    // each Q4_K matmul; non-Q4_K dtypes fall back to dispatch_matmul.
+    let use_mmvq = ffn_llama_enabled()
+        && (bw.dt_q == 12 || bw.dt_k == 12 || bw.dt_v == 12);
+    if use_mmvq {
+        aether_op_quantize_q8_1_llama_cuda(act.x_norm, act.q8_aq, act.q8_ad, act.q8_as, d_model);
+    }
+    if use_mmvq && bw.dt_q == 12 {
+        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_q, act.q8_aq, act.q8_ad, act.q,
+            q_dim, d_model / 256);
+    } else {
+        dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, q_dim, d_model);
+    }
     if bw.b_q != 0 {
         aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, q_dim);
     }
-    dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
+    if use_mmvq && bw.dt_k == 12 {
+        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_k, act.q8_aq, act.q8_ad, act.k_step,
+            d_kv, d_model / 256);
+    } else {
+        dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
+    }
     if bw.b_k != 0 {
         aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv);
     }
-    dispatch_matmul(act.x_norm, bw.w_v, bw.dt_v, act.v_step, d_kv, d_model);
+    if use_mmvq && bw.dt_v == 12 {
+        aether_op_mmvq_q4k_q8_1_single_cuda(bw.w_v, act.q8_aq, act.q8_ad, act.v_step,
+            d_kv, d_model / 256);
+    } else {
+        dispatch_matmul(act.x_norm, bw.w_v, bw.dt_v, act.v_step, d_kv, d_model);
+    }
     if bw.b_v != 0 {
         aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv);
     }

@@ -793,3 +793,35 @@ Coherent (qwen25 token-identical). Default-on; AETHER_FFN_LLAMA=0 falls back.
 the next compounding step. Only q and o are Q4_K on Qwen2.5-7B (k/v are Q6_K
 per layer per [[qwen25_q4km_mixed_precision]]) → ~half the attention matmuls
 get MMVQ. Attention section is 24ms currently; expect ~2-3 more % e2e.
+
+---
+
+## 2026-05-27 — Phase 2b: q/k/v/o also via llama-MMVQ → +23.5% total (0.50× of llama)
+
+Wired the single-output MMVQ kernel into the q/k/v matmuls in
+standard_attention_forward (quantize x_norm once, then per-matmul mmvq if
+dt==12) and the o-proj in block_forward_devarg's common tail (quantize attn_out,
+then mmvq). Non-Q4_K dtypes fall back to dispatch_matmul; for Qwen2.5-7B
+Q4_K_M, q and o are Q4_K and several layers' k/v are too.
+
+cnc P100 clean A/B (Qwen2.5-Math-7B Q4_K_M, --paged, AETHER_FFN_LLAMA=0 vs =1):
+
+| config (each row builds on the prior, all attn v2) | e2e tok/s | from base | from llama |
+|----------------------------------------------------|----------:|----------:|-----------:|
+| float base (FFN_LLAMA=0)                           | 15.78 | 1.000× | 0.40× |
+| + MMVQ gate/up (Phase 1)                           | 17.54 | +11.2% | 0.45× |
+| + MMVQ down (Phase 2a)                             | 18.39 | +16.5% | 0.47× |
+| + MMVQ q/k/v/o (Phase 2b — this)                   | **19.49** | **+23.5%** | **0.50×** |
+| llama-bench tg128 (ref)                             | 39.07 | 2.13× | 1.00× |
+
+Coherent: qwen25_paged_parity token-identical with all MMVQ paths on
+(`[358,2776,264,220,17,20,4666,6284]`). Default-on across the board;
+`AETHER_FFN_LLAMA=0` falls back to float for the whole decode.
+
+**Session cumulative (this conversation): 15.05 → 19.49 tok/s = +29.5%.**
+**From the pre-perf-sprint baseline (13.85): +40.7%, 0.37× → 0.50× of llama.**
+
+The remaining 2× gap to llama is now (1) attention kernels (still aether's
+seq1 paged attention, not llama's flash-attention style), and (2) the lm_head
+matmul (Q4_K but n_out=152064 = much bigger grid, same 1-warp/row issue).
+Applying MMVQ to lm_head is a one-line follow-on.
