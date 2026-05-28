@@ -767,3 +767,29 @@ Coherent: qwen25_paged_parity token-identical (`[358,2776,264,220,17,20,4666,
 v6 matmul (q/k/v/o/down — currently 1-warp-per-row Q4_K matmul) is the next
 lever and should compound: those kernels share the same MLP bottleneck this fix
 just addressed for gate/up. Phase 2 follow-on.
+
+---
+
+## 2026-05-27 — Phase 2a: down-proj also via faithful llama-MMVQ → +16.5% total
+
+Generalized the MMVQ structure to the single-output matmul (no SwiGLU) and
+wired it into the FFN down-proj.  Same kernel pattern (K-split 4 warps/row,
+Q8_1 activation, vdr=2, scalar dp4a fallback); the down-proj reads the gate
+SwiGLU output (d_ff=18944), so the q8 scratch was resized to max(d_ff, d_model).
+
+cnc P100 (same harness, clean A/B with explicit AETHER_FFN_LLAMA=0 for baseline):
+
+| config | e2e tok/s | vs base | gate/up µs | down µs |
+|--------|----------:|--------:|-----------:|--------:|
+| float base (AETHER_FFN_LLAMA=0) | 15.79 | 1.000× | 23578 | 11923 |
+| MMVQ gate/up only (Phase 1)     | 17.54 | +11.1% | 18059 (−23%) | 11923 |
+| MMVQ gate/up + down (Phase 2a)  | **18.39** | **+16.5%** | 18053 | **9789 (−18%)** |
+| llama-bench tg128 (ref)          | 39.07 | 2.12× | — | — |
+
+**Now 0.47× of llama (was 0.40× pre-port).** Down-proj alone added +4.8% e2e.
+Coherent (qwen25 token-identical). Default-on; AETHER_FFN_LLAMA=0 falls back.
+
+**Phase 2b** (q/k/v/o single-output matmuls in standard_attention_forward) is
+the next compounding step. Only q and o are Q4_K on Qwen2.5-7B (k/v are Q6_K
+per layer per [[qwen25_q4km_mixed_precision]]) → ~half the attention matmuls
+get MMVQ. Attention section is 24ms currently; expect ~2-3 more % e2e.

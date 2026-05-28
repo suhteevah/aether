@@ -77,6 +77,7 @@ struct CudaCtx {
     fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
     aether_quantize_q8_1: CudaFunction,
     aether_mmvq_q4k_q8_1_swiglu: CudaFunction,
+    aether_mmvq_q4k_q8_1_single: CudaFunction,
     rope_apply_devarg: CudaFunction,
     append_kv_devarg: CudaFunction,
     attention_seq1_devarg: CudaFunction,
@@ -4465,6 +4466,50 @@ extern "C" __global__ void aether_mmvq_q4k_q8_1_swiglu(
     }
 }
 
+// FFN-section perf — single-output llama-MMVQ Q4_K (for q/k/v/o/down).  Same
+// structure as the SwiGLU fused gate/up port (K-split 4 warps/row, Q8_1
+// activation, vdr=2, scalar_dp4a int8 dot) but with ONE weight tensor and no
+// SwiGLU — just out[row] = w·x.  Drop-in replacement for v6 matmul on Q4_K
+// weights when the caller has a Q8_1-quantized activation.
+extern "C" __global__ void aether_mmvq_q4k_q8_1_single(
+    const unsigned char* __restrict__ w,
+    const signed char*   __restrict__ aq,
+    const float*         __restrict__ ad,
+    float*               __restrict__ out,
+    int n_out, int blocks_per_row)
+{
+    int row = blockIdx.x;
+    if (row >= n_out) return;
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int tid  = warp * 32 + lane;
+
+    const int qi_over_vdr    = 16;
+    const int blocks_per_iter = 8;
+
+    int kbx_start = tid / qi_over_vdr;
+    int iqs       = 2 * (tid % qi_over_vdr);
+
+    const unsigned char* row_w = w + (size_t)row * blocks_per_row * 144;
+
+    float tmp = 0.0f;
+    for (int kbx = kbx_start; kbx < blocks_per_row; kbx += blocks_per_iter) {
+        int q8_blk_base = kbx * 8;
+        tmp += aether_vec_dot_q4k_q8_1_p100(row_w + (size_t)kbx*144, aq, ad, q8_blk_base, iqs);
+    }
+
+    __shared__ float sh[128];
+    sh[tid] = tmp;
+    __syncthreads();
+    if (warp == 0) {
+        float s = sh[lane] + sh[lane+32] + sh[lane+64] + sh[lane+96];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            s += __shfl_down_sync(0xFFFFFFFFu, s, off);
+        if (lane == 0) out[row] = s;
+    }
+}
+
 // matt-voice / FR-17.13-extra — append new K/V step to the on-device
 // KV cache at position `pos`. Simple memcpy-shaped kernel.
 extern "C" __global__ void append_kv(
@@ -6233,6 +6278,7 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_ffn_gate_up_silu_mul_v2",
               "aether_quantize_q8_1",
               "aether_mmvq_q4k_q8_1_swiglu",
+              "aether_mmvq_q4k_q8_1_single",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
               "fused_f16_matmul_seq1",
@@ -6288,6 +6334,7 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
         let aether_quantize_q8_1 = device.get_func("aether_kernels", "aether_quantize_q8_1").unwrap();
         let aether_mmvq_q4k_q8_1_swiglu = device.get_func("aether_kernels", "aether_mmvq_q4k_q8_1_swiglu").unwrap();
+        let aether_mmvq_q4k_q8_1_single = device.get_func("aether_kernels", "aether_mmvq_q4k_q8_1_single").unwrap();
         let rope_apply_devarg = device.get_func("aether_kernels", "rope_apply_devarg").unwrap();
         let append_kv_devarg = device.get_func("aether_kernels", "append_kv_devarg").unwrap();
         let attention_seq1_devarg = device.get_func("aether_kernels", "attention_seq1_devarg").unwrap();
@@ -6334,6 +6381,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_matmul_seq1_v6,
                   fused_q4k_ffn_gate_up_silu_mul_v2,
                   aether_quantize_q8_1, aether_mmvq_q4k_q8_1_swiglu,
+                  aether_mmvq_q4k_q8_1_single,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1, fused_f16_matmul_seq1,
                   fused_f32_matmul_seq1,
@@ -9784,6 +9832,40 @@ fn attn_warps() -> u32 {
         ctx().aether_mmvq_q4k_q8_1_swiglu.clone()
             .launch(cfg, (wgv, wuv, aqv, adv, ov, n_out, blocks_per_row))
             .expect("launch aether_mmvq_q4k_q8_1_swiglu");
+    }
+    0
+}
+
+/// FFN-section perf — FAITHFUL llama-MMVQ Q4_K single-output (no SwiGLU).
+/// For q/k/v/o/down matmuls.  Caller must have called `aether_op_quantize_q8_1_llama_cuda`
+/// on the activation first.  out[n_out] = w · x_q8_1.
+#[no_mangle] pub extern "C" fn aether_op_mmvq_q4k_q8_1_single_cuda(
+    w_dev_u8: i64,
+    aq_dev_u8: i64, ad_dev_f32: i64,
+    out_dev_f32: i64,
+    n_out: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let Some(i_w)  = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_aq) = handle_to_u8_idx(aq_dev_u8) else { return -1; };
+    let Some(i_ad) = handle_to_idx(ad_dev_f32) else { return -1; };
+    let Some(i_o)  = handle_to_idx(out_dev_f32) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let w_p  = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let aq_p = bs_u8[i_aq].as_ref().unwrap() as *const CudaSlice<u8>;
+    let ad_p = bs[i_ad].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p  = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_out as u32, 1, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let wv = &*w_p; let aqv = &*aq_p; let adv = &*ad_p; let ov = &mut *o_p;
+        ctx().aether_mmvq_q4k_q8_1_single.clone()
+            .launch(cfg, (wv, aqv, adv, ov, n_out, blocks_per_row))
+            .expect("launch aether_mmvq_q4k_q8_1_single");
     }
     0
 }

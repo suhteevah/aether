@@ -90,6 +90,7 @@ use crate::cuda::{
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
     aether_op_quantize_q8_1_llama_cuda,
     aether_op_mmvq_q4k_q8_1_swiglu_cuda,
+    aether_op_mmvq_q4k_q8_1_single_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
     aether_op_fused_f32_matmul_seq1_cuda,
     aether_op_fused_q4_0_matmul_seq1_cuda,
@@ -1290,7 +1291,16 @@ unsafe fn block_forward_devarg(
         // still measures the whole FFN section.
         if bt { aether_dev_sync(); block_timing::add_gateup(t_sec.elapsed().as_nanos() as u64); }
         let t_down = std::time::Instant::now();
-        dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
+        if ffn_llama_enabled() && bw.dt_down == 12 {
+            // FAITHFUL llama-MMVQ for down-proj: quantize gate-output (d_ff) to
+            // Q8_1 then single-output MMVQ.  Same K-split structure as gate/up.
+            aether_op_quantize_q8_1_llama_cuda(act.gate, act.q8_aq, act.q8_ad, act.q8_as, d_ff);
+            aether_op_mmvq_q4k_q8_1_single_cuda(
+                bw.w_down, act.q8_aq, act.q8_ad, act.down,
+                d_model, d_ff / 256);
+        } else {
+            dispatch_matmul(act.gate, bw.w_down, bw.dt_down, act.down, d_model, d_ff);
+        }
         if bt { aether_dev_sync(); block_timing::add_down(t_down.elapsed().as_nanos() as u64); }
         if bw.post_ffn_norm_g != 0 {
             aether_op_rms_norm_f32_cuda(act.down, bw.post_ffn_norm_g, act.down,
@@ -2800,9 +2810,11 @@ impl QwenSession {
                 gate: aether_dev_alloc_f32(cfg.d_ff as c_int),
                 down: aether_dev_alloc_f32(cfg.d_model as c_int),
                 logits: aether_dev_alloc_f32(cfg.vocab as c_int),
-                q8_aq: aether_dev_alloc_u8(cfg.d_model as c_int),
-                q8_ad: aether_dev_alloc_f32((cfg.d_model / 32) as c_int),
-                q8_as: aether_dev_alloc_f32((cfg.d_model / 32) as c_int),
+                // Sized to max(d_model, d_ff) so the same scratch serves both the
+                // gate/up MMVQ (n_in=d_model) and the down-proj MMVQ (n_in=d_ff).
+                q8_aq: aether_dev_alloc_u8(cfg.d_ff.max(cfg.d_model) as c_int),
+                q8_ad: aether_dev_alloc_f32((cfg.d_ff.max(cfg.d_model) / 32) as c_int),
+                q8_as: aether_dev_alloc_f32((cfg.d_ff.max(cfg.d_model) / 32) as c_int),
                 mla_abs_kv_a, mla_abs_c_kv, mla_abs_c_kv_n, mla_abs_k_pe,
                 mla_abs_q_a, mla_abs_q_a_n, mla_abs_q_proj, mla_abs_q_full,
                 mla_abs_k_row, mla_abs_v_row, mla_abs_attn_v_out,
