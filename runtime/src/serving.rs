@@ -88,6 +88,8 @@ use crate::cuda::{
     aether_op_fused_q4k_matmul_seq1_v6_cuda,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda,
+    aether_op_quantize_q8_1_llama_cuda,
+    aether_op_mmvq_q4k_q8_1_swiglu_cuda,
     aether_op_fused_f16_matmul_seq1_cuda,
     aether_op_fused_f32_matmul_seq1_cuda,
     aether_op_fused_q4_0_matmul_seq1_cuda,
@@ -253,6 +255,21 @@ fn paged_attn_v2_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         std::env::var("AETHER_ATTN_V2").map(|v| v != "0").unwrap_or(true)
+    })
+}
+
+/// FFN-section perf — selects the FAITHFUL llama-MMVQ Q4_K gate/up + SwiGLU
+/// fusion (K-split 4 warps/row + Q8_1 activation + dp4a-style int8 dot).
+/// Measured +11.1% e2e on cnc P100 (15.79 → 17.54 tok/s), token-identical on
+/// Qwen2.5-7B greedy.  LOSSY vs float base (activation quantized to int8) — so
+/// validated by coherence not bit-parity.  Default ON; `AETHER_FFN_LLAMA=0`
+/// falls back to the float base for in-binary A/B.  Cached: env read once.
+#[cfg(feature = "cuda")]
+fn ffn_llama_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("AETHER_FFN_LLAMA").map(|v| v != "0").unwrap_or(true)
     })
 }
 
@@ -780,6 +797,10 @@ struct ActivationGpu {
     attn_out: i64, proj: i64,
     gate: i64, down: i64,
     logits: i64,
+    // FFN-section perf — Q8_1 scratch for the faithful llama-MMVQ gate/up path
+    // (AETHER_FFN_LLAMA).  Quantize x_norm once per layer, feed both gate+up.
+    // q8_aq u8[d_model], q8_ad/q8_as f32[d_model/32].
+    q8_aq: i64, q8_ad: i64, q8_as: i64,
     // FR-17-extra-mla-absorbed-persist — persistent workspace buffers for
     // `mla_attention_forward_absorbed`.  Allocated once at session
     // construction (only if `cfg.is_mla_absorbed()`); reused across every
@@ -1242,7 +1263,13 @@ unsafe fn block_forward_devarg(
     if bw.w_router != 0 {
         moe_ffn_forward(bw, act, cfg, layer_idx);
     } else {
-        if bw.dt_gate == 12 && bw.dt_up == 12 {
+        if bw.dt_gate == 12 && bw.dt_up == 12 && ffn_llama_enabled() {
+            // Faithful llama-MMVQ port (Q8_1 activation + K-split + SwiGLU).
+            let n_blocks = (bw.nb_gate_up / cfg.d_ff) as c_int;  // d_model/256
+            aether_op_quantize_q8_1_llama_cuda(act.x_norm, act.q8_aq, act.q8_ad, act.q8_as, d_model);
+            aether_op_mmvq_q4k_q8_1_swiglu_cuda(
+                bw.w_gate, bw.w_up, act.q8_aq, act.q8_ad, act.gate, d_ff, n_blocks);
+        } else if bw.dt_gate == 12 && bw.dt_up == 12 {
             aether_op_fused_q4k_ffn_gate_up_silu_mul_cuda(
                 act.x_norm, bw.w_gate, bw.w_up, act.gate,
                 d_ff, (bw.nb_gate_up / cfg.d_ff) as c_int);
@@ -2773,6 +2800,9 @@ impl QwenSession {
                 gate: aether_dev_alloc_f32(cfg.d_ff as c_int),
                 down: aether_dev_alloc_f32(cfg.d_model as c_int),
                 logits: aether_dev_alloc_f32(cfg.vocab as c_int),
+                q8_aq: aether_dev_alloc_u8(cfg.d_model as c_int),
+                q8_ad: aether_dev_alloc_f32((cfg.d_model / 32) as c_int),
+                q8_as: aether_dev_alloc_f32((cfg.d_model / 32) as c_int),
                 mla_abs_kv_a, mla_abs_c_kv, mla_abs_c_kv_n, mla_abs_k_pe,
                 mla_abs_q_a, mla_abs_q_a_n, mla_abs_q_proj, mla_abs_q_full,
                 mla_abs_k_row, mla_abs_v_row, mla_abs_attn_v_out,
@@ -3261,6 +3291,9 @@ impl Drop for QwenSession {
             let _ = aether_dev_free_f32(self.act.gate);
             let _ = aether_dev_free_f32(self.act.down);
             let _ = aether_dev_free_f32(self.act.logits);
+            let _ = aether_dev_free_u8(self.act.q8_aq);
+            let _ = aether_dev_free_f32(self.act.q8_ad);
+            let _ = aether_dev_free_f32(self.act.q8_as);
             // Persistent MLA-absorbed workspace buffers (0 if not allocated).
             for h in [self.act.mla_abs_kv_a, self.act.mla_abs_c_kv,
                       self.act.mla_abs_c_kv_n, self.act.mla_abs_k_pe,

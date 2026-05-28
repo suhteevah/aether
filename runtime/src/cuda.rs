@@ -75,6 +75,8 @@ struct CudaCtx {
     fused_q4k_membw_probe: CudaFunction,
     fused_q4k_matmul_seq1_v6: CudaFunction,
     fused_q4k_ffn_gate_up_silu_mul_v2: CudaFunction,
+    aether_quantize_q8_1: CudaFunction,
+    aether_mmvq_q4k_q8_1_swiglu: CudaFunction,
     rope_apply_devarg: CudaFunction,
     append_kv_devarg: CudaFunction,
     attention_seq1_devarg: CudaFunction,
@@ -4267,6 +4269,202 @@ extern "C" __global__ void fused_q4k_ffn_gate_up_silu_mul_v2(
     }
 }
 
+// FFN-section perf — FAITHFUL llama-MMVQ port for Q4_K decode (Phase 1 of 2:
+// gate/up with SWIGLU fusion).  After 4 measured-negative single-aspect
+// rewrites (ALU-factor, int8 alone, multi-warp K-split alone, no-sync stream)
+// we port llama's whole integrated MMVQ design as ONE unit:
+//   - Activation pre-quantized to Q8_1 (per-32 int8 + f32 scale + f32 sum).
+//   - K-split: 4 warps cooperate per output row (block = (32, 4)).
+//   - vdr = 2: each thread reads 2 ints (8 bytes / 16 nibbles) of Q4_K qs per
+//     super-block-step.  Outer loop kbx += 8 (= nwarps*warp_size/qi_over_vdr).
+//   - Inner dot via dp4a-style 4-int8 MACs.  P100 (sm_60) lacks the dp4a
+//     instruction → use scalar_dp4a fallback (4 scalar int8 MACs); llama's own
+//     ggml_cuda_dp4a uses the same fallback on P100 and still hits ~170 GB/s.
+//   - SWIGLU built in: compute both gate (tmp_g) and up (tmp_u) partials, then
+//     out = up * silu(gate).
+//   - Cross-warp reduce via shared mem + final warp-reduce → 1 scalar per row.
+//
+// Spec faithfully from llama-src ggml/src/ggml-cuda/{mmvq.cu, vecdotq.cuh}:
+// vec_dot_q4_K_q8_1_impl_vmmq (lines 470-492) + the mmvq launch logic.
+
+extern "C" __device__ int aether_scalar_dp4a(unsigned int a, unsigned int b, int c) {
+    // P100 sm_60 lacks __dp4a; llama's fallback (common.cuh:697-700) is exactly
+    // this scalar form: c + sum of signed int8 products of corresponding bytes.
+    const signed char* a8 = (const signed char*)&a;
+    const signed char* b8 = (const signed char*)&b;
+    return c + (int)a8[0]*(int)b8[0] + (int)a8[1]*(int)b8[1]
+             + (int)a8[2]*(int)b8[2] + (int)a8[3]*(int)b8[3];
+}
+
+// Port of llama's aux unpacking (vecdotq.cuh:805-816): extract one PAIR of
+// (sc, m) bytes for the two sub-blocks at q4 sub-index j ∈ {0,1,2,3}, each
+// pair covering 32+32 = 64 elements (one bq8_offset's worth of QR4_K=2 inner
+// iterations).  Q4_K's 6-bit scale + 6-bit min packed across the 12-byte
+// scales[] array; this matches llama's exact bit layout.
+extern "C" __device__ void aether_q4k_aux_sc_m(
+    int j, const unsigned char* scales,
+    unsigned int* sc_out, unsigned int* m_out)
+{
+    const unsigned short* s16 = (const unsigned short*)scales;
+    unsigned short aux0, aux1;
+    if (j < 2) {
+        aux0 = s16[j+0] & 0x3f3f;
+        aux1 = s16[j+2] & 0x3f3f;
+    } else {
+        aux0 = ((s16[j+2] >> 0) & 0x0f0f) | ((s16[j-2] & 0xc0c0) >> 2);
+        aux1 = ((s16[j+2] >> 4) & 0x0f0f) | ((s16[j-0] & 0xc0c0) >> 2);
+    }
+    // Per llama vecdotq.cuh:815-816: sc = (uint8_t*)aux, m = sc + 2.
+    // aux[0] packs (scale[2j], scale[2j+1]); aux[1] packs (min[2j], min[2j+1]).
+    // So sc[i] is the LOW/HIGH byte of aux[0]; m[i] is the LOW/HIGH byte of aux[1].
+    // (Earlier impl swapped sc[1]<->m[0] — synthetic test masked it by fixing
+    //  scale==min; real Q4_K weights have distinct scale/min → garbage tokens.)
+    sc_out[0] = aux0 & 0xff;        // scale[2j]
+    sc_out[1] = (aux0 >> 8) & 0xff; // scale[2j+1]
+    m_out[0]  = aux1 & 0xff;        // min[2j]
+    m_out[1]  = (aux1 >> 8) & 0xff; // min[2j+1]
+}
+
+// Port of vec_dot_q4_K_q8_1_impl_vmmq (vecdotq.cuh:470).  Returns this
+// thread's partial contribution to the dot of ONE Q4_K super-block (kbx),
+// given the Q8_1 activation indexed via q8_blk_base = kbx * (QK_K/QK8_1) = kbx*8.
+// iqs ∈ {0,2,...,30} = 2*(tid%16) — selects which 8 of the 128 weight bytes
+// (and which subset of Q8_1 ints) this thread handles.
+extern "C" __device__ float aether_vec_dot_q4k_q8_1_p100(
+    const unsigned char* __restrict__ w_block,    // 144-byte Q4_K super-block
+    const signed char*   __restrict__ aq,         // global int8 quants
+    const float*         __restrict__ ad,         // global per-Q8_1-block scale
+    int q8_blk_base, int iqs)
+{
+    // Q4_K layout: half d [0,1], half dmin [2,3], scales[12] @ [4..15], qs[128] @ [16..143]
+    unsigned short d_bits    = ((unsigned short)w_block[1] << 8) | (unsigned short)w_block[0];
+    unsigned short dmin_bits = ((unsigned short)w_block[3] << 8) | (unsigned short)w_block[2];
+    float d    = aether_f16_to_f32_dev(d_bits);
+    float dmin = aether_f16_to_f32_dev(dmin_bits);
+
+    // bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2)) = 2 * ((iqs/2) / 4)
+    int half_iqs = iqs >> 1;             // ∈ 0..15
+    int bq8_offset = 2 * (half_iqs / 4); // ∈ {0,2,4,6}
+
+    // v: 2 ints of qs, addresses per llama's q4 = bq4_K->qs + 16*bq8_offset + 4*((iqs/2)%4)
+    const unsigned int* q4 = (const unsigned int*)(
+        w_block + 16 + 16*bq8_offset + 4*(half_iqs & 3));
+    unsigned int v0 = q4[0];
+    unsigned int v1 = q4[4];
+
+    // (sc, m) pair via the aux unpacking
+    unsigned int sc[2], m[2];
+    aether_q4k_aux_sc_m(bq8_offset >> 1, w_block + 4, sc, m);
+
+    float sumf_d = 0.0f, sumf_m = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 2 /*QR4_K*/; i++) {
+        int q8blk = q8_blk_base + bq8_offset + i;
+        float d8  = ad[q8blk];
+        // u: 2 ints of Q8_1 quants at offset (iqs/2)%4 within the 8-int block.
+        const unsigned int* q8 = (const unsigned int*)(aq + q8blk * 32) + (half_iqs & 3);
+        unsigned int u0 = q8[0];
+        unsigned int u1 = q8[4];
+
+        unsigned int v0i = (v0 >> (4*i)) & 0x0F0F0F0Fu;
+        unsigned int v1i = (v1 >> (4*i)) & 0x0F0F0F0Fu;
+
+        int dot1 = aether_scalar_dp4a(v1i, u1, aether_scalar_dp4a(v0i, u0, 0));
+        int dot2 = aether_scalar_dp4a(0x01010101u, u1,
+                       aether_scalar_dp4a(0x01010101u, u0, 0));
+
+        sumf_d += d8 * ((float)dot1 * (float)sc[i]);
+        sumf_m += d8 * ((float)dot2 * (float)m[i]);
+    }
+    return d * sumf_d - dmin * sumf_m;
+}
+
+// Activation Q8_1 quantize: float x[n_in] → int8 aq[n_in] + f32 ad[n_in/32] +
+// f32 as_sum[n_in/32].  One warp per 32-elem block.  ad = amax/127, qs = round(x/ad),
+// as_sum = Σx (more accurate than ad*Σqs; the min term in mmvq uses the exact sum).
+extern "C" __global__ void aether_quantize_q8_1(
+    const float* __restrict__ x,
+    signed char* __restrict__ aq,
+    float*       __restrict__ ad,
+    float*       __restrict__ as_sum,
+    int n_blocks32)
+{
+    int blk  = blockIdx.x;
+    int lane = threadIdx.x;
+    if (blk >= n_blocks32) return;
+    float v = x[blk * 32 + lane];
+    float amax = fabsf(v);
+    float sum  = v;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+        sum  += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+    }
+    float d   = amax / 127.0f;
+    float inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
+    int q = __float2int_rn(v * inv);
+    q = max(-127, min(127, q));
+    aq[blk * 32 + lane] = (signed char)q;
+    if (lane == 0) { ad[blk] = d; as_sum[blk] = sum; }
+}
+
+// Faithful llama-MMVQ fused gate/up + SwiGLU for Q4_K decode.
+// Block = (32, 4, 1) = 128 threads = 4 warps.  Grid = (n_out, 1, 1) (one row).
+// blocks_per_row = n_in / 256.
+extern "C" __global__ void aether_mmvq_q4k_q8_1_swiglu(
+    const unsigned char* __restrict__ w_gate,
+    const unsigned char* __restrict__ w_up,
+    const signed char*   __restrict__ aq,
+    const float*         __restrict__ ad,
+    float*               __restrict__ out,
+    int n_out, int blocks_per_row)
+{
+    int row = blockIdx.x;
+    if (row >= n_out) return;
+    int lane = threadIdx.x;
+    int warp = threadIdx.y;
+    int tid  = warp * 32 + lane;       // 0..127
+
+    const int qi_over_vdr  = 16;       // QI4_K / VDR_Q4_K_Q8_1_MMVQ = 32/2
+    const int blocks_per_iter = 8;     // = VDR*nwarps*warp_size / qi = 2*4*32/32
+
+    int kbx_start = tid / qi_over_vdr; // ∈ 0..7
+    int iqs       = 2 * (tid % qi_over_vdr); // ∈ {0,2,...,30}
+
+    const unsigned char* row_g = w_gate + (size_t)row * blocks_per_row * 144;
+    const unsigned char* row_u = w_up   + (size_t)row * blocks_per_row * 144;
+
+    float tmp_g = 0.0f, tmp_u = 0.0f;
+
+    for (int kbx = kbx_start; kbx < blocks_per_row; kbx += blocks_per_iter) {
+        int q8_blk_base = kbx * 8;     // 8 Q8_1 blocks per Q4_K super-block (256/32)
+        tmp_g += aether_vec_dot_q4k_q8_1_p100(row_g + (size_t)kbx*144, aq, ad, q8_blk_base, iqs);
+        tmp_u += aether_vec_dot_q4k_q8_1_p100(row_u + (size_t)kbx*144, aq, ad, q8_blk_base, iqs);
+    }
+
+    // Cross-warp reduction via shared mem (preserves per-lane partials),
+    // then final warp-reduce → 1 scalar per row.  Mirrors mmvq.cu:266-319.
+    __shared__ float sh_g[128];        // 4 warps × 32 lanes
+    __shared__ float sh_u[128];
+    sh_g[tid] = tmp_g;
+    sh_u[tid] = tmp_u;
+    __syncthreads();
+
+    if (warp == 0) {
+        float g = sh_g[lane] + sh_g[lane+32] + sh_g[lane+64] + sh_g[lane+96];
+        float u = sh_u[lane] + sh_u[lane+32] + sh_u[lane+64] + sh_u[lane+96];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            g += __shfl_down_sync(0xFFFFFFFFu, g, off);
+            u += __shfl_down_sync(0xFFFFFFFFu, u, off);
+        }
+        if (lane == 0) {
+            float silu_g = g / (1.0f + expf(-g));
+            out[row] = silu_g * u;
+        }
+    }
+}
+
 // matt-voice / FR-17.13-extra — append new K/V step to the on-device
 // KV cache at position `pos`. Simple memcpy-shaped kernel.
 extern "C" __global__ void append_kv(
@@ -6033,6 +6231,8 @@ fn ctx() -> &'static CudaCtx {
               "fused_q4k_matmul_seq1_v5", "fused_q4k_membw_probe",
               "fused_q4k_matmul_seq1_v6",
               "fused_q4k_ffn_gate_up_silu_mul_v2",
+              "aether_quantize_q8_1",
+              "aether_mmvq_q4k_q8_1_swiglu",
               "rope_apply_devarg", "append_kv_devarg", "attention_seq1_devarg",
               "append_kv", "attention_seq1",
               "fused_f16_matmul_seq1",
@@ -6086,6 +6286,8 @@ fn ctx() -> &'static CudaCtx {
         let fused_q4k_membw_probe = device.get_func("aether_kernels", "fused_q4k_membw_probe").unwrap();
         let fused_q4k_matmul_seq1_v6 = device.get_func("aether_kernels", "fused_q4k_matmul_seq1_v6").unwrap();
         let fused_q4k_ffn_gate_up_silu_mul_v2 = device.get_func("aether_kernels", "fused_q4k_ffn_gate_up_silu_mul_v2").unwrap();
+        let aether_quantize_q8_1 = device.get_func("aether_kernels", "aether_quantize_q8_1").unwrap();
+        let aether_mmvq_q4k_q8_1_swiglu = device.get_func("aether_kernels", "aether_mmvq_q4k_q8_1_swiglu").unwrap();
         let rope_apply_devarg = device.get_func("aether_kernels", "rope_apply_devarg").unwrap();
         let append_kv_devarg = device.get_func("aether_kernels", "append_kv_devarg").unwrap();
         let attention_seq1_devarg = device.get_func("aether_kernels", "attention_seq1_devarg").unwrap();
@@ -6131,6 +6333,7 @@ fn ctx() -> &'static CudaCtx {
                   fused_q4k_membw_probe,
                   fused_q4k_matmul_seq1_v6,
                   fused_q4k_ffn_gate_up_silu_mul_v2,
+                  aether_quantize_q8_1, aether_mmvq_q4k_q8_1_swiglu,
                   rope_apply_devarg, append_kv_devarg, attention_seq1_devarg,
                   append_kv, attention_seq1, fused_f16_matmul_seq1,
                   fused_f32_matmul_seq1,
@@ -9513,6 +9716,74 @@ fn attn_warps() -> u32 {
         ctx().fused_q4k_ffn_gate_up_silu_mul.clone()
             .launch(cfg, (av, wgv, wuv, ov, n, n_blocks))
             .expect("launch fused_q4k_ffn_gate_up_silu_mul");
+    }
+    0
+}
+
+/// FFN-section perf — Q8_1 quantize wrapper.  x[n_in] f32 → aq[n_in] u8 (i8
+/// reinterpreted) + ad[n_in/32] f32 + as_sum[n_in/32] f32.  n_in must be %32.
+#[no_mangle] pub extern "C" fn aether_op_quantize_q8_1_llama_cuda(
+    x_dev_f32: i64, aq_dev_u8: i64, ad_dev_f32: i64, as_dev_f32: i64, n_in: c_int,
+) -> c_int {
+    let Some(i_x)  = handle_to_idx(x_dev_f32) else { return -1; };
+    let Some(i_aq) = handle_to_u8_idx(aq_dev_u8) else { return -1; };
+    let Some(i_ad) = handle_to_idx(ad_dev_f32) else { return -1; };
+    let Some(i_as) = handle_to_idx(as_dev_f32) else { return -1; };
+    if n_in <= 0 || (n_in % 32) != 0 { return -1; }
+    let n_blocks32 = n_in / 32;
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let x_p  = bs[i_x].as_ref().unwrap() as *const CudaSlice<f32>;
+    let aq_p = bs_u8[i_aq].as_mut().unwrap() as *mut CudaSlice<u8>;
+    let ad_p = bs[i_ad].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let as_p = bs[i_as].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_blocks32 as u32, 1, 1),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let xv = &*x_p; let aqv = &mut *aq_p; let adv = &mut *ad_p; let asv = &mut *as_p;
+        ctx().aether_quantize_q8_1.clone()
+            .launch(cfg, (xv, aqv, adv, asv, n_blocks32))
+            .expect("launch aether_quantize_q8_1");
+    }
+    0
+}
+
+/// FFN-section perf — FAITHFUL llama-MMVQ Q4_K gate/up + SwiGLU fusion in one
+/// kernel.  Block (32, 4) = 4 warps cooperate per output row (K-split + shared
+/// reduce).  out[n_out] = silu(gate·x_q8_1) * (up·x_q8_1).
+#[no_mangle] pub extern "C" fn aether_op_mmvq_q4k_q8_1_swiglu_cuda(
+    w_gate_dev_u8: i64, w_up_dev_u8: i64,
+    aq_dev_u8: i64, ad_dev_f32: i64,
+    out_dev_f32: i64,
+    n_out: c_int, blocks_per_row: c_int,
+) -> c_int {
+    let Some(i_wg) = handle_to_u8_idx(w_gate_dev_u8) else { return -1; };
+    let Some(i_wu) = handle_to_u8_idx(w_up_dev_u8) else { return -1; };
+    let Some(i_aq) = handle_to_u8_idx(aq_dev_u8) else { return -1; };
+    let Some(i_ad) = handle_to_idx(ad_dev_f32) else { return -1; };
+    let Some(i_o)  = handle_to_idx(out_dev_f32) else { return -1; };
+    if n_out <= 0 || blocks_per_row <= 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let wg_p = bs_u8[i_wg].as_ref().unwrap() as *const CudaSlice<u8>;
+    let wu_p = bs_u8[i_wu].as_ref().unwrap() as *const CudaSlice<u8>;
+    let aq_p = bs_u8[i_aq].as_ref().unwrap() as *const CudaSlice<u8>;
+    let ad_p = bs[i_ad].as_ref().unwrap() as *const CudaSlice<f32>;
+    let o_p  = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig {
+        grid_dim:  (n_out as u32, 1, 1),
+        block_dim: (32, 4, 1),          // 128 threads, 4 warps cooperate per row
+        shared_mem_bytes: 0,            // shared declared static in the kernel
+    };
+    unsafe {
+        let wgv = &*wg_p; let wuv = &*wu_p; let aqv = &*aq_p; let adv = &*ad_p;
+        let ov = &mut *o_p;
+        ctx().aether_mmvq_q4k_q8_1_swiglu.clone()
+            .launch(cfg, (wgv, wuv, aqv, adv, ov, n_out, blocks_per_row))
+            .expect("launch aether_mmvq_q4k_q8_1_swiglu");
     }
     0
 }

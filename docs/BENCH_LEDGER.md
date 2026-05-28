@@ -335,6 +335,38 @@ step is updating a 4-int step_args device buffer.
 
 Pending — fires once DataLoader lands. Today the closest proxy is `examples/aether_lm.aether` itself (100 steps in 122 ms = ~820 steps/sec on synthetic data with 16-token batch, single block).
 
+## bench/renlys_reference_models — multi-model serving smoke (planned, *need to smoke*)
+
+Notated 2026-05-27. Seven reference inference targets discovered on jitk's
+renlys CT fleet (proxmox-renlys; CTs 100/103/104/105/108/111/120/121 each run
+`llama-server` against a local GGUF on CPU). Each row fires once aether can
+load + serve the corresponding model and produces (a) coherence vs
+`llama-server` at temp 0, (b) e2e tok/s on the harness from
+`serving e2e — aether-serve vs llama.cpp` (4-prompt × 3-rep, max_tokens=128).
+Full inventory + locations + blockers live in
+`NEXT-UP.md` → `## *Need to smoke* — renlys CT fleet reference inference targets`.
+
+| # | model                       | quant   | aether prereq                                  | row state |
+|---|-----------------------------|---------|------------------------------------------------|-----------|
+| 1 | Qwen2.5-32B-Instruct        | Q4_K_M  | existing kernels reuse; scale-up smoke         | planned   |
+| 2 | Qwen2.5-14B-Instruct        | Q4_K_M  | existing kernels reuse                         | planned   |
+| 3 | Qwen2.5-7B-Instruct         | Q4_K_M  | confirm renlys gguf == kokonoe reference       | reference (already aether's primary; existing rows above) |
+| 4 | Hermes-3-Llama-3.1-70B      | Q4_K_M  | Llama-3.1 arch smoke (attn / rope-theta)       | planned (arch-gated) |
+| 5 | Hermes-3-Llama-3.1-8B       | Q5_K_M  | **Q5_K dequant + fused matmul-seq1 kernel pair** | BLOCKED on Q5_K kernels |
+| 6 | Foundation-Sec-8B           | Q5_K_M  | **Q5_K kernel pair** (same as #5)              | BLOCKED on Q5_K kernels |
+| 7 | Lily-7B-Instruct-v0.2       | Q5_K_M  | **Q5_K kernel pair** + rope yarn ×2 path       | BLOCKED on Q5_K kernels |
+
+Q5_K_M super-block layout (176 B / 256 weights, 5.5 bpw): `d[2] + dmin[2] +
+scales[12] + qh[32] + qs[128]` — same K-quant scales/mins indexing scheme as
+Q4_K and Q6_K, 4-bit low nibble in `qs` + 1-bit high bit in `qh` (vs Q4_K's
+4 bpw single-byte and Q6_K's 6 bpw `ql/qh` split). Kernel pair follows the
+shipped Q4_K v2/v6 + Q6_K v2 pattern (BENCH_LEDGER 2026-05-20).
+
+Append-rule note: rows 1, 2, 4 can land before any new code if a `--features
+cuda` run loads each GGUF through the existing dispatch (the per-block dtype
+fix from `q4_km_mixed_precision_per_block_dtype.md` already handles
+Q4_K/Q6_K mixed-precision). Q5_K models stay BLOCKED on the kernel pair.
+
 ## Append rule
 
 Any commit that touches `runtime/src/cuda.rs`, `runtime/src/lib.rs`, `compiler/src/codegen/asm/`, or `compiler/src/mir/fuse.rs` MUST run `bench/<applicable>/run_all.ps1` and append a row here. Regressions get an explicit verdict + a remediation issue ID. Audit's `--bench` flag (planned) will check the commit-touched-files-vs-bench-row policy automatically.
@@ -692,3 +724,46 @@ pursued on Ampere (3070 Ti, where aether already beats ollama 1.6× via CUDA-gra
 decode). Recommendation: stop per-kernel P100 gate/up work; the frontier is a
 co-designed int8 pipeline or the Ampere path. attention v2 (+4.9%, adbd4f0)
 remains this arc's shipped win.
+
+---
+
+## 2026-05-27 — FAITHFUL llama-MMVQ Q4_K gate/up port → +11.1% P100 decode (SHIPPED)
+
+After 4 measured-negative single-aspect rewrites (ALU-factor, int8 alone,
+multi-warp K-split alone, no-sync stream) and a clean re-derivation of where
+llama wins (llama-bench tg128 = 39.07, ~170 GB/s effective via 4-warp-per-row
+K-split with shared-mem reduce), ported llama's whole integrated MMVQ design as
+ONE unit instead of one knob at a time.
+
+Faithful from llama-src ggml/src/ggml-cuda/{mmvq.cu, vecdotq.cuh}:
+- Q8_1 activation quantize (per-32 int8 + f32 scale + f32 sum).
+- Block (32, 4) = 4 warps cooperate per output row (1 row/block).
+- vdr=2: each thread reads 2 ints of Q4_K qs per super-block-step. Outer loop
+  kbx += 8 (= vdr*nwarps*warp_size/qi).
+- Inner dot via 4-int8 MAC; P100 (sm_60) has no dp4a so use llama's own scalar
+  fallback (4 scalar i8 MACs, mirrors common.cuh:697-700) — llama proves this
+  fallback can hit ~170 GB/s on P100.
+- SwiGLU fused in: compute both tmp_g and tmp_u partials per thread, then
+  out = up * silu(gate). 1 kernel for the whole gate/up section.
+
+Caught a real bug along the way (the 4 negatives were a feature: the synthetic
+parity passed because all scale bytes were 0x22 = scale==min, masking a swap of
+sc[1]↔m[0] in aux unpacking; real Q4_K weights have distinct scale/min →
+real-model coherence smoke caught it, fixed in the same patch).
+
+cnc P100 GPU1 (Qwen2.5-Math-7B Q4_K_M, --paged, attn v2 in both):
+
+| config | e2e tok/s | vs base | FFN gate/up µs |
+|--------|----------:|--------:|---------------:|
+| float base | 15.79 | 1.000× | 23578 |
+| llama-MMVQ port (default-on) | **17.54** | **+11.1×%** | **18059 (−23%)** |
+| llama-bench tg128 (ref) | 39.07 | 2.36× | — |
+
+Coherent: qwen25_paged_parity token-identical (`[358,2776,264,220,17,20,4666,
+6284]`); chat → "The capital of France is Paris." Default ON;
+`AETHER_FFN_LLAMA=0` falls back to float base.
+
+**Now 0.45× of llama (was 0.40×).** Generalizing the same mmvq pattern to the
+v6 matmul (q/k/v/o/down — currently 1-warp-per-row Q4_K matmul) is the next
+lever and should compound: those kernels share the same MLP bottleneck this fix
+just addressed for gate/up. Phase 2 follow-on.
