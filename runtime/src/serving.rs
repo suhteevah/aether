@@ -364,6 +364,18 @@ fn ffn_llama_enabled() -> bool {
     })
 }
 
+/// Disable CUDA-graph decode capture, running the per-step forward imperatively.
+/// On the P100 (sm_60, Linux) decode is COMPUTE-bound, so CPU launch overhead is
+/// already hidden behind GPU work — graph capture/replay then adds net overhead
+/// (measured: graphs 33.7 vs imperative 36.4 tok/s on Qwen2.5-7B Q4_K_M).  On
+/// launch-bound platforms (3070 Ti / Windows WDDM) graphs win +37%, so this stays
+/// OFF by default and is opt-in per deployment.  `AETHER_NO_GRAPH=1` to enable.
+fn no_graph_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("AETHER_NO_GRAPH").is_ok())
+}
+
 /// AETHER_DECODE_TIMING per-section profiler (env-gated, off by default → zero
 /// cost in production). Accumulates GPU-synced wall time for the attention vs
 /// FFN sections of every block_forward, to localize the decode bottleneck.
@@ -376,6 +388,18 @@ mod block_timing {
     // FFN sub-section split (dense path): gate/up fused kernel vs down-proj.
     pub static GATEUP_NS: AtomicU64 = AtomicU64::new(0);
     pub static DOWN_NS: AtomicU64 = AtomicU64::new(0);
+    // Attention sub-section split (standard path): q/k/v matmul vs
+    // rope+bias+append small ops vs the paged-attention kernel.  (o-proj +
+    // attn-input rmsnorm are the remainder of ATTN_NS not covered here.)
+    pub static QKV_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ATTNSMALL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PAGED_NS: AtomicU64 = AtomicU64::new(0);
+    // Per-step host/transfer split (step_logits): embed-dequant+h2d | GPU forward |
+    // logits d2h.  Confirms the non-GPU-compute per-token serving overhead.
+    pub static STEP_PREP_NS: AtomicU64 = AtomicU64::new(0); // CPU: ensure_block + dequant_embd_row (no sync)
+    pub static STEP_H2D_NS: AtomicU64 = AtomicU64::new(0);  // 2 h2d copies + sync
+    pub static STEP_FWD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static STEP_D2H_NS: AtomicU64 = AtomicU64::new(0);
     pub fn enabled() -> bool {
         static E: OnceLock<bool> = OnceLock::new();
         *E.get_or_init(|| std::env::var("AETHER_DECODE_TIMING").is_ok())
@@ -384,8 +408,22 @@ mod block_timing {
     pub fn add_ffn(ns: u64) { FFN_NS.fetch_add(ns, Ordering::Relaxed); N.fetch_add(1, Ordering::Relaxed); }
     pub fn add_gateup(ns: u64) { GATEUP_NS.fetch_add(ns, Ordering::Relaxed); }
     pub fn add_down(ns: u64) { DOWN_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_qkv(ns: u64) { QKV_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_attnsmall(ns: u64) { ATTNSMALL_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_paged(ns: u64) { PAGED_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_step_prep(ns: u64) { STEP_PREP_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_step_h2d(ns: u64) { STEP_H2D_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_step_fwd(ns: u64) { STEP_FWD_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn add_step_d2h(ns: u64) { STEP_D2H_NS.fetch_add(ns, Ordering::Relaxed); }
+    pub fn snapshot_step() -> (u64, u64, u64, u64) {
+        (STEP_PREP_NS.load(Ordering::Relaxed), STEP_H2D_NS.load(Ordering::Relaxed),
+         STEP_FWD_NS.load(Ordering::Relaxed), STEP_D2H_NS.load(Ordering::Relaxed))
+    }
     pub fn snapshot() -> (u64, u64, u64) {
         (ATTN_NS.load(Ordering::Relaxed), FFN_NS.load(Ordering::Relaxed), N.load(Ordering::Relaxed))
+    }
+    pub fn snapshot_attn() -> (u64, u64, u64) {
+        (QKV_NS.load(Ordering::Relaxed), ATTNSMALL_NS.load(Ordering::Relaxed), PAGED_NS.load(Ordering::Relaxed))
     }
     pub fn snapshot_ffn() -> (u64, u64) {
         (GATEUP_NS.load(Ordering::Relaxed), DOWN_NS.load(Ordering::Relaxed))
@@ -1448,6 +1486,10 @@ unsafe fn standard_attention_forward(
     // Q projection output = n_q_heads * head_dim (= d_model for Qwen/Llama,
     // but 4096 != 5120 for Mistral Small 24B where head_dim is explicit).
     let q_dim = n_q_heads * head_dim;
+    // Attention sub-split timing (q/k/v matmul | rope+bias+append | paged-attn).
+    let bt = block_timing::enabled();
+    let mut ts = std::time::Instant::now();
+    if bt { aether_dev_sync(); ts = std::time::Instant::now(); }
     // Phase 2b+2c: q/k/v all read x_norm.  If FFN_LLAMA on AND any matmul can
     // use MMVQ (Q4_K or Q6_K), quantize x_norm ONCE to Q8_1; each matmul then
     // tries mmvq_single_if_supported and falls back to dispatch_matmul otherwise.
@@ -1468,6 +1510,7 @@ unsafe fn standard_attention_forward(
         dispatch_matmul(act.x_norm, bw.w_v, bw.dt_v, act.v_step, d_kv, d_model);
     }
     if bw.b_v != 0 { aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv); }
+    if bt { aether_dev_sync(); block_timing::add_qkv(ts.elapsed().as_nanos() as u64); ts = std::time::Instant::now(); }
     if bw.attn_q_norm_g != 0 {
         aether_op_rms_norm_f32_cuda(act.q, bw.attn_q_norm_g, act.q,
             norm_eps, n_q_heads, head_dim);
@@ -1488,6 +1531,7 @@ unsafe fn standard_attention_forward(
         aether_op_paged_append_kv_devarg_f32_cuda(
             act.k_step, act.v_step, kv.k_cache, kv.v_cache, page_table_dev,
             d_kv, block_size, step_args);
+        if bt { aether_dev_sync(); block_timing::add_attnsmall(ts.elapsed().as_nanos() as u64); ts = std::time::Instant::now(); }
         if needs_flex {
             aether_op_paged_attention_flex_devarg_f32_cuda(
                 act.q, kv.k_cache, kv.v_cache, page_table_dev, act.attn_out,
@@ -1518,6 +1562,7 @@ unsafe fn standard_attention_forward(
                 n_q_heads, n_kv_heads, head_dim,
                 block_size, scale, max_seq as c_int, step_args);
         }
+        if bt { aether_dev_sync(); block_timing::add_paged(ts.elapsed().as_nanos() as u64); }
     } else {
         if needs_flex {
             panic!("FR-17-extra-gemma-fwd: arches needing flex attention \
@@ -3300,10 +3345,11 @@ impl QwenSession {
             let step_host = [pos, cur_seq, 0i32, 0i32];
             aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
 
-            if self.cfg.n_experts > 0 {
+            if self.cfg.n_experts > 0 || no_graph_enabled() {
                 // FR-17-extra-moe-fwd: MoE forward involves host-side top-k
                 // routing per layer, which can't be captured into a CUDA
                 // graph.  Run the forward imperatively each step.
+                // AETHER_NO_GRAPH=1 also forces this (P100 compute-bound win).
                 self.run_forward_imperative();
             } else {
                 if !self.graph_captured {
@@ -4120,19 +4166,27 @@ impl QwenSession {
     /// cfg.vocab).  Same forward path as `decode_step`.
     pub fn step_logits(&mut self, last_id: usize) -> Vec<f32> {
         unsafe {
+            let bt = block_timing::enabled();
+            let mut ts = std::time::Instant::now();
             let pos = self.next_pos;
             if let Err(e) = self.ensure_block_for_position(pos) {
                 panic!("[step_logits] pool allocation failed at pos {}: {}", pos, e);
             }
             let emb = self.dequant_embd_row(last_id);
+            // CPU-only prep (ensure_block + dequant), measured with NO sync so it
+            // reflects real prod cost (the h2d below is a separate bucket).
+            if bt { block_timing::add_step_prep(ts.elapsed().as_nanos() as u64); ts = std::time::Instant::now(); }
             aether_dev_h2d_f32(emb.as_ptr() as i64, self.act.x, self.cfg.d_model as c_int);
             let cur_seq = pos + 1;
             let step_host = [pos, cur_seq, 0i32, 0i32];
             aether_dev_h2d_i32(step_host.as_ptr() as i64, self.step_args, 4);
+            if bt { aether_dev_sync(); block_timing::add_step_h2d(ts.elapsed().as_nanos() as u64); ts = std::time::Instant::now(); }
 
             // block_timing forces the imperative path: its per-section
             // aether_dev_sync() calls are illegal inside CUDA graph capture.
-            if self.cfg.n_experts > 0 || block_timing::enabled() {
+            // AETHER_NO_GRAPH also forces imperative (P100 decode is compute-
+            // bound → graphs are net-negative there; see no_graph_enabled()).
+            if self.cfg.n_experts > 0 || block_timing::enabled() || no_graph_enabled() {
                 self.run_forward_imperative();
             } else {
                 if !self.graph_captured {
@@ -4143,9 +4197,11 @@ impl QwenSession {
                 assert_eq!(rc, 0, "aether_dev_graph_launch failed: {}", rc);
             }
             aether_dev_sync();
+            if bt { block_timing::add_step_fwd(ts.elapsed().as_nanos() as u64); ts = std::time::Instant::now(); }
 
             let mut logits = vec![0.0f32; self.cfg.vocab];
             aether_dev_d2h_f32(self.act.logits, logits.as_mut_ptr() as i64, self.cfg.vocab as c_int);
+            if bt { block_timing::add_step_d2h(ts.elapsed().as_nanos() as u64); }
             self.next_pos += 1;
             logits
         }
@@ -4271,6 +4327,25 @@ impl QwenSession {
                     let dn_blk = down_ns as f64 / nblk as f64 / 1000.0;
                     eprintln!("[DECODE TIMING] FFN sub-split: norm+gate/up {:.1}us  down-proj {:.1}us  (per-token x{} layers: gate/up {:.0}us down {:.0}us)",
                         gu_blk, dn_blk, self.cfg.n_layers, gu_blk*nl, dn_blk*nl);
+                }
+                let (qkv_ns, small_ns, paged_ns) = block_timing::snapshot_attn();
+                if qkv_ns > 0 || small_ns > 0 || paged_ns > 0 {
+                    let qkv_blk = qkv_ns as f64 / nblk as f64 / 1000.0;
+                    let sm_blk = small_ns as f64 / nblk as f64 / 1000.0;
+                    let pg_blk = paged_ns as f64 / nblk as f64 / 1000.0;
+                    let rest = attn_blk - qkv_blk - sm_blk - pg_blk; // o-proj + attn rmsnorm + residual
+                    eprintln!("[DECODE TIMING] ATTN sub-split: q/k/v {:.1}us  rope+bias+append {:.1}us  paged-attn {:.1}us  o-proj+norm+res {:.1}us  (per-token x{} layers: qkv {:.0}us small {:.0}us paged {:.0}us rest {:.0}us)",
+                        qkv_blk, sm_blk, pg_blk, rest, self.cfg.n_layers, qkv_blk*nl, sm_blk*nl, pg_blk*nl, rest*nl);
+                }
+                let (prep_ns, h2d_ns, fwd_ns, d2h_ns) = block_timing::snapshot_step();
+                if nsteps > 0 && (prep_ns > 0 || d2h_ns > 0) {
+                    let pr = prep_ns as f64 / nsteps as f64 / 1000.0;
+                    let h2 = h2d_ns as f64 / nsteps as f64 / 1000.0;
+                    let fw = fwd_ns as f64 / nsteps as f64 / 1000.0;
+                    let dh = d2h_ns as f64 / nsteps as f64 / 1000.0;
+                    let overhead = pr + h2 + dh;
+                    eprintln!("[DECODE TIMING] STEP host/transfer split (per-token): cpu-prep(dequant) {:.1}us  h2d {:.1}us  GPU-forward {:.1}us  logits-d2h {:.1}us  (non-GPU-compute = prep+h2d+d2h = {:.1}us = {:.1}%)",
+                        pr, h2, fw, dh, overhead, overhead / (overhead + fw) * 100.0);
                 }
             }
         }
