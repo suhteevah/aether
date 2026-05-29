@@ -52,6 +52,7 @@ use crate::cuda::{
     aether_dev_alloc_i32, aether_dev_free_i32, aether_dev_h2d_i32,
     aether_op_rms_norm_f32_cuda,
     aether_op_rope_apply_devarg_f32_cuda,
+    aether_op_qkv_bias_rope_devarg_f32_cuda,
     aether_op_append_kv_devarg_f32_cuda,
     aether_op_attention_seq1_devarg_f32_cuda,
     aether_op_paged_append_kv_devarg_f32_cuda,
@@ -374,6 +375,17 @@ fn no_graph_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("AETHER_NO_GRAPH").is_ok())
+}
+
+/// whole-layer-fusion (Slice A) — fuse the seq1 decode q/k/v bias_add + q/k rope
+/// into one kernel (was 5 launches/layer).  Default ON; `AETHER_FUSE_QKV=0`
+/// disables (falls back to the per-op bias_add×3 + rope×2 path).  Only used when
+/// all three qkv biases exist and there is no Qwen3 per-head q/k RMSNorm
+/// (see the `fuse_qkv` gate in standard_attention_forward).
+fn fuse_qkv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("AETHER_FUSE_QKV").map(|v| v != "0").unwrap_or(true))
 }
 
 /// AETHER_DECODE_TIMING per-section profiler (env-gated, off by default → zero
@@ -1486,6 +1498,13 @@ unsafe fn standard_attention_forward(
     // Q projection output = n_q_heads * head_dim (= d_model for Qwen/Llama,
     // but 4096 != 5120 for Mistral Small 24B where head_dim is explicit).
     let q_dim = n_q_heads * head_dim;
+    // whole-layer-fusion (Slice A): when all 3 qkv biases exist and there is no
+    // Qwen3 per-head q/k RMSNorm between bias and rope, fuse bias×3 + rope×2 into
+    // one kernel.  Qwen2.5 qualifies (has qkv bias, no qk-norm).  Falls back to
+    // the per-op path otherwise (Llama: no bias; Qwen3: qk-norm).
+    let fuse_qkv = fuse_qkv_enabled()
+        && bw.b_q != 0 && bw.b_k != 0 && bw.b_v != 0
+        && bw.attn_q_norm_g == 0 && bw.attn_k_norm_g == 0;
     // Attention sub-split timing (q/k/v matmul | rope+bias+append | paged-attn).
     let bt = block_timing::enabled();
     let mut ts = std::time::Instant::now();
@@ -1501,28 +1520,35 @@ unsafe fn standard_attention_forward(
     if !mmvq_single_if_supported(bw.w_q, bw.dt_q, act.q, act.q8_aq, act.q8_ad, q_dim, d_model) {
         dispatch_matmul(act.x_norm, bw.w_q, bw.dt_q, act.q, q_dim, d_model);
     }
-    if bw.b_q != 0 { aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, q_dim); }
+    if bw.b_q != 0 && !fuse_qkv { aether_op_bias_add_f32_cuda(act.q, bw.b_q, 1, q_dim); }
     if !mmvq_single_if_supported(bw.w_k, bw.dt_k, act.k_step, act.q8_aq, act.q8_ad, d_kv, d_model) {
         dispatch_matmul(act.x_norm, bw.w_k, bw.dt_k, act.k_step, d_kv, d_model);
     }
-    if bw.b_k != 0 { aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv); }
+    if bw.b_k != 0 && !fuse_qkv { aether_op_bias_add_f32_cuda(act.k_step, bw.b_k, 1, d_kv); }
     if !mmvq_single_if_supported(bw.w_v, bw.dt_v, act.v_step, act.q8_aq, act.q8_ad, d_kv, d_model) {
         dispatch_matmul(act.x_norm, bw.w_v, bw.dt_v, act.v_step, d_kv, d_model);
     }
-    if bw.b_v != 0 { aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv); }
+    if bw.b_v != 0 && !fuse_qkv { aether_op_bias_add_f32_cuda(act.v_step, bw.b_v, 1, d_kv); }
     if bt { aether_dev_sync(); block_timing::add_qkv(ts.elapsed().as_nanos() as u64); ts = std::time::Instant::now(); }
-    if bw.attn_q_norm_g != 0 {
-        aether_op_rms_norm_f32_cuda(act.q, bw.attn_q_norm_g, act.q,
-            norm_eps, n_q_heads, head_dim);
+    if fuse_qkv {
+        // Fused bias×3 + rope×2 in one launch (byte-identical to the per-op path).
+        aether_op_qkv_bias_rope_devarg_f32_cuda(
+            act.q, act.k_step, act.v_step, bw.b_q, bw.b_k, bw.b_v,
+            n_q_heads, n_kv_heads, head_dim, rope_base, step_args);
+    } else {
+        if bw.attn_q_norm_g != 0 {
+            aether_op_rms_norm_f32_cuda(act.q, bw.attn_q_norm_g, act.q,
+                norm_eps, n_q_heads, head_dim);
+        }
+        if bw.attn_k_norm_g != 0 {
+            aether_op_rms_norm_f32_cuda(act.k_step, bw.attn_k_norm_g, act.k_step,
+                norm_eps, n_kv_heads, head_dim);
+        }
+        aether_op_rope_apply_devarg_f32_cuda(act.q,
+            1, n_q_heads, head_dim, rope_base, step_args);
+        aether_op_rope_apply_devarg_f32_cuda(act.k_step,
+            1, n_kv_heads, head_dim, rope_base, step_args);
     }
-    if bw.attn_k_norm_g != 0 {
-        aether_op_rms_norm_f32_cuda(act.k_step, bw.attn_k_norm_g, act.k_step,
-            norm_eps, n_kv_heads, head_dim);
-    }
-    aether_op_rope_apply_devarg_f32_cuda(act.q,
-        1, n_q_heads, head_dim, rope_base, step_args);
-    aether_op_rope_apply_devarg_f32_cuda(act.k_step,
-        1, n_kv_heads, head_dim, rope_base, step_args);
     let scale: f32 = 1.0 / (cfg.head_dim as f32).sqrt();
     // gemma3 global layers force eff_sliding_window=0 (full attention) even
     // though cfg.sliding_window > 0; local layers keep it.

@@ -54,6 +54,7 @@ struct CudaCtx {
     mul_inplace:       CudaFunction,
     add_inplace:       CudaFunction,
     bias_add:          CudaFunction,
+    qkv_bias_rope:     CudaFunction,
     dequant_q4_k_m_gpu:CudaFunction,
     dequant_q6_k_gpu:  CudaFunction,
     dequant_iq3_xxs_gpu: CudaFunction,
@@ -2955,6 +2956,60 @@ extern "C" __global__ void bias_add(
     if (idx >= total) return;
     int c = idx % cols;
     x[idx] += bias[c];
+}
+
+// whole-layer-fusion (Slice A) — fuse the seq1 decode attention pre-process:
+// bias_add(q) + bias_add(k) + bias_add(v) + rope(q) + rope(k) collapse into ONE
+// launch (was 5 kernels).  Valid only when q/k bias are present AND there is no
+// Qwen3-style per-head q/k RMSNorm between bias and rope (caller gates on that).
+// Math is byte-identical to the sequence bias_add → rope_apply_devarg:
+//   x' = x + bias;  then NEOX-pair rotate (i, i+hd/2) by theta = pos*base^(-2i/hd).
+// One thread per q rope-pair, then per k rope-pair, then per v element.
+extern "C" __global__ void qkv_bias_rope(
+    float*       __restrict__ q,    // [n_q_heads  * head_dim]
+    float*       __restrict__ k,    // [n_kv_heads * head_dim]
+    float*       __restrict__ v,    // [n_kv_heads * head_dim]
+    const float* __restrict__ bq,   // [n_q_heads  * head_dim]
+    const float* __restrict__ bk,   // [n_kv_heads * head_dim]
+    const float* __restrict__ bv,   // [n_kv_heads * head_dim]
+    int n_q_heads, int n_kv_heads, int head_dim,
+    float base, const int* __restrict__ step_args)
+{
+    int pos = step_args[0];
+    int hd_half = head_dim / 2;
+    int q_pairs = n_q_heads  * hd_half;
+    int k_pairs = n_kv_heads * hd_half;
+    int v_elems = n_kv_heads * head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= q_pairs + k_pairs + v_elems) return;
+
+    if (idx < q_pairs) {
+        int h = idx / hd_half;
+        int i = idx - h * hd_half;
+        int b0 = h * head_dim;
+        int i0 = b0 + i, i1 = b0 + i + hd_half;
+        float x0 = q[i0] + bq[i0];
+        float x1 = q[i1] + bq[i1];
+        float theta = (float)pos * powf(base, -2.0f * (float)i / (float)head_dim);
+        float c = cosf(theta), s = sinf(theta);
+        q[i0] = x0 * c - x1 * s;
+        q[i1] = x0 * s + x1 * c;
+    } else if (idx < q_pairs + k_pairs) {
+        int j = idx - q_pairs;
+        int h = j / hd_half;
+        int i = j - h * hd_half;
+        int b0 = h * head_dim;
+        int i0 = b0 + i, i1 = b0 + i + hd_half;
+        float x0 = k[i0] + bk[i0];
+        float x1 = k[i1] + bk[i1];
+        float theta = (float)pos * powf(base, -2.0f * (float)i / (float)head_dim);
+        float c = cosf(theta), s = sinf(theta);
+        k[i0] = x0 * c - x1 * s;
+        k[i1] = x0 * s + x1 * c;
+    } else {
+        int j = idx - q_pairs - k_pairs;
+        v[j] += bv[j];
+    }
 }
 
 // matt-voice / FR-17.14-extra-deepest — Q4_K_M dequant on GPU.
@@ -6820,7 +6875,7 @@ fn ctx() -> &'static CudaCtx {
               "gelu_inplace", "add_layer_norm_fwd",
               // matt-voice deploy kernels
               "rms_norm_fwd", "fused_add_rmsnorm", "rope_apply", "gqa_repeat_kv", "gqa_reduce_kv_grad",
-              "silu_inplace", "mul_inplace", "add_inplace", "bias_add",
+              "silu_inplace", "mul_inplace", "add_inplace", "bias_add", "qkv_bias_rope",
               "dequant_q4_k_m", "dequant_q6_k", "dequant_iq3_xxs", "fused_q4k_matmul_seq1",
               "fused_q4_0_matmul_seq1",
               "fused_q5_0_matmul_seq1",
@@ -6873,6 +6928,7 @@ fn ctx() -> &'static CudaCtx {
         let mul_inplace           = device.get_func("aether_kernels", "mul_inplace").unwrap();
         let add_inplace           = device.get_func("aether_kernels", "add_inplace").unwrap();
         let bias_add              = device.get_func("aether_kernels", "bias_add").unwrap();
+        let qkv_bias_rope         = device.get_func("aether_kernels", "qkv_bias_rope").unwrap();
         let dequant_q4_k_m_gpu    = device.get_func("aether_kernels", "dequant_q4_k_m").unwrap();
         let dequant_q6_k_gpu      = device.get_func("aether_kernels", "dequant_q6_k").unwrap();
         let dequant_iq3_xxs_gpu   = device.get_func("aether_kernels", "dequant_iq3_xxs").unwrap();
@@ -6926,7 +6982,7 @@ fn ctx() -> &'static CudaCtx {
                   add_layer_norm_fwd,
                   rms_norm_fwd, fused_add_rmsnorm,
                   rope_apply, gqa_repeat_kv, gqa_reduce_kv_grad,
-                  silu_inplace, mul_inplace, add_inplace, bias_add,
+                  silu_inplace, mul_inplace, add_inplace, bias_add, qkv_bias_rope,
                   dequant_q4_k_m_gpu, dequant_q6_k_gpu, dequant_iq3_xxs_gpu,
                   fused_q4k_matmul_seq1, fused_q4_0_matmul_seq1,
                   fused_q5_0_matmul_seq1, fused_q8_0_matmul_seq1,
@@ -8237,6 +8293,48 @@ unsafe fn graph_state() -> &'static mut GraphHandles { &mut *GRAPH_STATE.0.get()
         ctx().rope_apply_devarg.clone()
             .launch(cfg, (xv, seq, n_heads, head_dim, base, sv))
             .expect("launch rope_apply_devarg");
+    }
+    0
+}
+
+/// whole-layer-fusion (Slice A) — fused seq1 decode attention pre-process:
+/// bias_add(q)+bias_add(k)+bias_add(v)+rope(q)+rope(k) in ONE launch (was 5).
+/// Byte-identical to the sequence of those 5 kernels.  Caller must ensure all
+/// three bias tensors exist and there is no per-head q/k RMSNorm (Qwen3) in
+/// between — see standard_attention_forward's `fuse_qkv` gate.
+#[no_mangle] pub extern "C" fn aether_op_qkv_bias_rope_devarg_f32_cuda(
+    q: i64, k: i64, v: i64, bq: i64, bk: i64, bv: i64,
+    n_q_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
+    base: f32, step_args_i32: i64,
+) -> c_int {
+    let Some(iq)  = handle_to_idx(q)  else { return -1; };
+    let Some(ik)  = handle_to_idx(k)  else { return -1; };
+    let Some(iv)  = handle_to_idx(v)  else { return -1; };
+    let Some(ibq) = handle_to_idx(bq) else { return -1; };
+    let Some(ibk) = handle_to_idx(bk) else { return -1; };
+    let Some(ibv) = handle_to_idx(bv) else { return -1; };
+    let Some(is)  = handle_to_i32_idx(step_args_i32) else { return -1; };
+    if n_q_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 || (head_dim % 2) != 0 { return -1; }
+    let bs = unsafe { bufs() };
+    let ibs = unsafe { i32_bufs() };
+    let q_p  = bs[iq].as_mut().unwrap()  as *mut CudaSlice<f32>;
+    let k_p  = bs[ik].as_mut().unwrap()  as *mut CudaSlice<f32>;
+    let v_p  = bs[iv].as_mut().unwrap()  as *mut CudaSlice<f32>;
+    let bq_p = bs[ibq].as_ref().unwrap() as *const CudaSlice<f32>;
+    let bk_p = bs[ibk].as_ref().unwrap() as *const CudaSlice<f32>;
+    let bv_p = bs[ibv].as_ref().unwrap() as *const CudaSlice<f32>;
+    let s_p  = ibs[is].as_ref().unwrap() as *const CudaSlice<i32>;
+    let hd_half = head_dim / 2;
+    let total = (n_q_heads * hd_half + n_kv_heads * hd_half + n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let qv = &mut *q_p; let kv = &mut *k_p; let vv = &mut *v_p;
+        let bqv = &*bq_p; let bkv = &*bk_p; let bvv = &*bv_p;
+        let sv = &*s_p;
+        ctx().qkv_bias_rope.clone()
+            .launch(cfg, (qv, kv, vv, bqv, bkv, bvv,
+                          n_q_heads, n_kv_heads, head_dim, base, sv))
+            .expect("launch qkv_bias_rope");
     }
     0
 }
