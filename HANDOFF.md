@@ -1,6 +1,92 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-28 (🟢 P100 decode 15.05 → 20.95 tok/s = +39.2%, 0.40× → 0.54× of llama; flash-attn v3 measured wash, default-off)
+## Last Updated — 2026-05-28 (🟢 P100 decode 15.05 → 33.58 tok/s = +123%, 0.40× → 0.86× of llama — ALMOST PARITY)
+
+## Project Status
+🟢 **Session closed with near-parity.** Final cnc P100 decode: **33.58 tok/s
+vs llama-bench 39.07 = 86%, only 1.16× behind** (was 2.5× at session start).
+The unsung hero: PARALLEL `rms_norm_fwd` — the existing kernel was 1-thread-per-
+row, burning ~25 ms/token in serial reduce on a 63ms/token budget. Fixing it
+gave +40% on bare base + a compounding +60% on top of all the prior MMVQ wins.
+
+| commit | what | cnc P100 tok/s |
+|--------|------|---------------:|
+| (start, fe6bbfd)          | prior HEAD | 15.05 |
+| adbd4f0 | attn v2 (multi-warp paged seq1)         | 15.78 |
+| (3 negatives doc'd)       | dcf6cd4, 0c9e022, 2cb2898 | — |
+| 48f0445 | **MMVQ Phase 1** gate/up + SwiGLU       | 17.54 |
+| 7748bd4 | **Phase 2a** down-proj                   | 18.39 |
+| 2881564 | **Phase 2b** q/k/v/o                     | 19.49 |
+| 4f94d76+4a2eb0c | **Phase 2c** lm_head + Q6_K MMVQ   | 20.95 |
+| bcb175e | flash-attn v3 (wash, default-off, kept)  | 21.04 |
+| 9efca86 | flash-attn v4 SPLIT-KV (wash, default-off, kept) | 21.10 |
+| **f4b53ed** | **PARALLEL rms_norm_fwd** (the unsung hero) | **33.58** |
+| llama-bench tg128 (ref) | — | 39.07 |
+
+**From the pre-perf-sprint baseline (13.85): +142%, 2.42×, 0.37× → 0.86× of llama.**
+
+## What Was Done This Session
+- attn v2 (multi-warp paged seq1) shipped + 5 MMVQ phases (gate/up, down, q/k/v/o,
+  lm_head, Q6_K variant) shipped. All default-on, all coherent.
+- Built faithful llama-MMVQ port (Q4_K + Q6_K) as INTEGRATED units after 4
+  single-aspect rewrites failed (ALU-factor, int8 alone, multi-warp K-split,
+  no-sync stream — all documented as measured negatives).
+- Built flash-attn v3 (online softmax + fused K+V) and v4 (split-KV, 56 SMs) —
+  both measured WASH on Qwen2.5-7B / P100 / short context. Kept registered +
+  env-toggleable for long-context paths.
+- Set out to fuse post-attn residual+rmsnorm — discovered the SERIAL 1-thread-
+  per-row rms_norm_fwd was the hidden bottleneck. Rewrote it as parallel
+  (grid=rows, block=256, shared-mem reduce) → **+40% on bare base alone**.
+
+## Current State
+All commits pushed, cnc synced to f4b53ed, workhorse + scout active.
+
+### Default-on (shipped wins)
+- `AETHER_ATTN_V2=1` — multi-warp paged seq1 attention.
+- `AETHER_FFN_LLAMA=1` — faithful llama-MMVQ for gate/up + down + q/k/v/o +
+  lm_head, dispatched Q4_K vs Q6_K by dt via `mmvq_single_if_supported`.
+- Parallel `rms_norm_fwd` (transparent — no toggle, just better kernel).
+
+### Default-off (env-only, kept as building blocks)
+- `AETHER_ATTN_V3=1` flash-attn v3 (online softmax + fused K+V pass).
+- `AETHER_ATTN_V4=1` flash-attn v4 split-KV (with `AETHER_ATTN_V4_SPLITS`,
+  default 4 = best observed). Wash on current workload; useful for long context.
+- `AETHER_FUSE_OPS=1` fused add+rmsnorm. Wash once rmsnorm is parallel.
+- Sub-toggle knobs: `AETHER_ATTN_WARPS`, `AETHER_FFN_MW_WARPS`.
+
+## Blocking Issues
+None. Workspace clean, fleet restored.
+
+## What's Next
+1. **Audit every "tiny" elementwise kernel for the 1-thread-per-row trap.** The
+   serial rmsnorm cost +40% e2e all by itself. Likely victims: `bias_add`,
+   `rope_apply`, `append_kv`, `add_inplace`, `silu_inplace`, `mul_inplace`.
+   Each may be a single-kernel parallelism fix in the same pattern. Reading
+   their kernel bodies in cuda.rs is the first step.
+2. **Re-test v3/v4 attention now** — the freed ~22ms/token may shift the
+   bottleneck; previously-wash attention optimizations might newly move e2e.
+3. **Whole-block FFN fusion** (norm + gate/up + down in one launch) — would
+   compound with parallel rmsnorm.
+4. **MMVQ variants for Q5_K / Q3_K / IQ3_S / etc.** — extends the proven
+   structure to other models / quants.
+
+## Notes for Next Session
+- **The lesson of this session**: micro-optimizing matmul kernels for ~20% lifts
+  was leaving a 40% single-kernel parallelism fix on the table. Profile each
+  kernel for its own parallelism, even the "tiny" elementwise ones. The
+  matmul-dominated picture HID the serial rmsnorm cost completely.
+- `qwen25_paged_parity` is the coherence gate — token-identical decode of
+  `[358,2776,264,220,17,20,4666,6284]` on Qwen2.5-7B "Hello, world!" prompt.
+  Run with various env toggles to verify (e.g. `AETHER_FFN_LLAMA=0` for the
+  float baseline, `AETHER_ATTN_V4=1` to test v4, etc.).
+- AETHER_DECODE_TIMING needs `--warmup 0` to avoid graph-capture deadlock.
+- cnc P100 standing access in force; evict workhorse, restore on EXIT (trap).
+- Bench scripts in scratch/ (gitignored): final_3way_bench, v4_bench, etc.
+  All trap-restore the workhorse.
+
+---
+
+## (prior) Last Updated — 2026-05-28 (🟢 P100 decode 15.05 → 20.95 tok/s = +39.2%, 0.40× → 0.54× of llama; flash-attn v3 measured wash, default-off)
 
 ## Project Status
 🟢 Session compounded further: shipped Phase 2c (lm_head + Q6_K MMVQ, +7.5% on
