@@ -953,3 +953,35 @@ What's left to reach llama parity (1.16× gap):
    ~22ms freed-up budget may shift the picture; previously-wash attention
    optimizations might now move e2e.
 3. **Whole-block FFN fusion** (norm + gate/up in one launch).
+
+---
+
+## 2026-05-28 — v3/v4 attention re-test vs parallel-rmsnorm baseline (item #2)
+
+cnc P100 GPU1, Qwen2.5-Math-7B Q4_K_M, aether-serve HEAD f4b53ed (parallel
+rmsnorm default-on), bench_client.py (3 reps × 4 open-ended prompts, 128 tok,
+warmup discarded). Workhorse evicted + restored (trap).
+
+| config (env on top of v2+FFN_LLAMA defaults) | e2e tok/s | Δ vs BASE | coherent |
+|---|---:|---:|---|
+| BASE (v2 + llama-MMVQ + parallel-rms) | 33.42 | — | ✅ "Paris." |
+| + AETHER_ATTN_V3=1 (flash v3) | 33.66 | +0.7% | ✅ |
+| + AETHER_ATTN_V4=1 SPLITS=2 | 33.82 | +1.2% | ✅ |
+| + AETHER_ATTN_V4=1 SPLITS=4 | 33.91 | +1.5% | ✅ |
+| + AETHER_ATTN_V4=1 SPLITS=8 | 33.82 | +1.2% | ✅ |
+
+**Verdict: v3/v4 still a wash (+1.5% best = run-to-run noise). Hypothesis
+DISPROVEN.** Parallel rmsnorm did NOT shift the bottleneck to attention — it
+shifted it to FFN. Per-section timing (AETHER_DECODE_TIMING, --warmup 0):
+
+| section | per-block µs | per-token µs (×28) | ratio |
+|---|---:|---:|---|
+| attn-section | 532.5 | 14911 | 0.45 |
+| ffn-section | 650.3 | 18207 | **0.55** |
+
+FFN is now the LARGER section. v3/v4 only touch the paged-attention *kernel*,
+which is a small slice of the 14.9ms attn-section (q/k/v/o matmuls + rope + bias
++ norms + append are the rest). V4_4 shaved attn-section 532.5→527.5µs/block
+(−140µs/token) — below noise. **The next lever is the FFN section (item #3:
+whole-block FFN fusion), not attention.** v3/v4 stay default-off, kept for
+long-context paths where per-token KV bandwidth dominates.

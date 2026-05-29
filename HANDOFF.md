@@ -1,6 +1,78 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-28 (🟢 P100 decode 15.05 → 33.58 tok/s = +123%, 0.40× → 0.86× of llama — ALMOST PARITY)
+## Last Updated — 2026-05-28 (🟢 elementwise-trap audit complete + v3/v4 re-test = FFN is now the bottleneck, not attention)
+
+## Project Status
+🟢 Picked up the prior session's "what's next" items #1 + #2. Both resolved with
+clean results. **The decode bottleneck has flipped: after parallel rmsnorm, FFN
+(0.55) is now larger than attention (0.45)** — so attention optimizations (v3/v4)
+are confirmed-wash and the next lever is FFN fusion (#3). Qwen2.5 decode stays at
+~33.4 tok/s (0.86× of llama). Workspace: 2 files changed + 1 new test, all
+validated on the local 3070 Ti; cnc fleet restored.
+
+## What Was Done This Session
+- **Item #1 — elementwise 1-thread-per-row trap audit (COMPLETE).** Swept every
+  candidate kernel in `runtime/src/cuda.rs`:
+  - The handoff's *suspected* victims (`bias_add`, `rope_apply`, `append_kv`,
+    `add_inplace`, `silu_inplace`, `mul_inplace`, `gqa_repeat_kv`, `scale_f32`)
+    are **all already element-parallel** (grid-strided over total elements). No trap.
+  - The actual remaining trap kernels were three: `layer_norm_fwd`,
+    `add_layer_norm_fwd`, `softmax_f32`. **Fixed all three** with the same
+    cooperative-reduce pattern that fixed rms_norm (grid=rows, block=256,
+    shared-mem tree-reduce). Launch wrappers updated grid=rows/block=256/shared.
+  - Validated: `bert_session_parity` (9/9, layer_norm max_diff 4.77e-7),
+    `cuda_bert_parity` (3/3), new `runtime/tests/cuda_softmax_parity.rs` (6/6 —
+    trap case B=1/D=152064 = 2.4e-9; odd/non-pow2 D all correct).
+  - **Honest caveat: none of the three are on the Qwen2.5 *decode* hot path**
+    (Qwen = RMSNorm + multi-warp paged attn + HOST-side sampling softmax). Wins
+    land on LayerNorm models (bert/BGE) + the non-paged forward + the `.softmax()`
+    language method. Remaining trap kernels (`*_bwd_dx`, `softmax_bwd*`,
+    `sdpa_causal_*`) are training/prefill-only + batched → low priority.
+- **Item #2 — v3/v4 attention re-test (COMPLETE, clean negative).** Ran the full
+  e2e bench on cnc P100 vs the parallel-rmsnorm baseline. All coherent. v3 +0.7%,
+  v4_2 +1.2%, v4_4 +1.5%, v4_8 +1.2% — **still a wash (noise).** Hypothesis
+  ("freed rmsnorm budget shifts bottleneck to attention") **DISPROVEN**: per-section
+  timing shows attn 14911µs : ffn 18207µs (0.45:0.55) — **FFN is now the larger
+  section.** v3/v4 only touch the paged-attn kernel (a small slice of the
+  attn-section). BENCH_LEDGER row appended.
+
+## Current State
+- `runtime/src/cuda.rs` — `layer_norm_fwd` / `add_layer_norm_fwd` / `softmax_f32`
+  now parallel cooperative-reduce + 3 launch wrappers updated. Builds clean
+  (bare + `--features cuda`). All parity tests green on 3070 Ti.
+- `runtime/tests/cuda_softmax_parity.rs` — NEW, 2 tests / 6 shapes, tagged
+  `// roadmap: P7`.
+- `docs/BENCH_LEDGER.md` — v3/v4 re-test row appended.
+- cnc-server at f4b53ed, workhorse + scout active (eviction trap-restored).
+
+## Blocking Issues
+None.
+
+## What's Next
+1. **#3 — whole-block FFN fusion** (THE lever now — FFN is 0.55 of decode).
+   Fuse rmsnorm + gate/up + SwiGLU + down into fewer launches, compounding with
+   parallel rmsnorm. Meatier build but it's where the remaining 1.16× llama gap
+   lives. FFN section = 18.2ms/token.
+2. **#4 — MMVQ variants for Q5_K / Q3_K / IQ3_S** — same proven structure as
+   Q6_K, extends to other models/quants.
+3. (low) parallelize the training/prefill trap kernels (`*_bwd_dx`,
+   `softmax_bwd*`, `sdpa_causal_*`) if a training run becomes norm-bound.
+
+## Notes for Next Session
+- The lesson from #1+#2 together: **profile sections before assuming where the
+  bottleneck is.** The handoff assumed attention; the data says FFN. Always run
+  AETHER_DECODE_TIMING (`--warmup 0`) before picking the next kernel to attack.
+- Bench harness: `scratch/v3v4_retest.sh` (on cnc as `/tmp/v3v4_retest.sh`) —
+  coherence + throughput + section-timing in one run, trap-restores workhorse.
+  Reuse it; swap the env strings for the next experiment.
+- The #1 cuda changes do NOT affect Qwen decode numbers (different code path), so
+  no cnc re-bench was needed for them — local 3070 Ti parity tests suffice.
+- cnc connection: `ssh cnc-server` (192.168.168.100). Model:
+  `/opt/openclaw-inference/models/Qwen2.5-Math-7B-Instruct-Q4_K_M.gguf`.
+
+---
+
+## (prior) Last Updated — 2026-05-28 (🟢 P100 decode 15.05 → 33.58 tok/s = +123%, 0.40× → 0.86× of llama — ALMOST PARITY)
 
 ## Project Status
 🟢 **Session closed with near-parity.** Final cnc P100 decode: **33.58 tok/s

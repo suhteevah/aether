@@ -2460,21 +2460,50 @@ extern "C" __global__ void mla_absorb_v_iq4_nl(
 /// into the context. Kept tiny — the heavy lifting is in cuBLAS sgemm.
 const KERNEL_SRC: &str = r#"
 // Row-wise softmax across last dim D. y[i,j] = exp(x[i,j] - max_i) / sum_i.
+// Parallel layout (matches rms_norm_fwd): grid=B (one block per row), block=N
+// threads cooperating per row, shared-mem reduce. The old 1-thread-per-row
+// form serialized the max + sum reductions on a single thread — for a wide D
+// (e.g. attention scores or a vocab-width row) at B=1 that left one thread
+// doing the whole O(D) softmax. Launch: grid=(B,1,1), block=(N,1,1),
+// shared=N floats.
 extern "C" __global__ void softmax_f32(
     const float* __restrict__ x,
     float*       __restrict__ y,
     int B, int D)
 {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     if (row >= B) return;
-    const float* xr = x + row * D;
-    float* yr = y + row * D;
-    float mx = xr[0];
-    for (int j = 1; j < D; j++) if (xr[j] > mx) mx = xr[j];
-    float sum = 0.0f;
-    for (int j = 0; j < D; j++) { float e = expf(xr[j] - mx); yr[j] = e; sum += e; }
-    float inv = 1.0f / sum;
-    for (int j = 0; j < D; j++) yr[j] *= inv;
+    int tid = threadIdx.x;
+    int n   = blockDim.x;
+    const float* xr = x + (size_t)row * D;
+    float*       yr = y + (size_t)row * D;
+    extern __shared__ float sh[];
+
+    // Pass 1: row max.
+    float pm = -3.402823466e38f;   // -FLT_MAX
+    for (int j = tid; j < D; j += n) { float v = xr[j]; if (v > pm) pm = v; }
+    sh[tid] = pm;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) { float o = sh[tid + s]; if (o > sh[tid]) sh[tid] = o; }
+        __syncthreads();
+    }
+    float mx = sh[0];
+    __syncthreads();
+
+    // Pass 2: exp + sum.
+    float ps = 0.0f;
+    for (int j = tid; j < D; j += n) { float e = expf(xr[j] - mx); yr[j] = e; ps += e; }
+    sh[tid] = ps;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float inv = 1.0f / sh[0];
+
+    // Pass 3: normalize.
+    for (int j = tid; j < D; j += n) yr[j] *= inv;
 }
 
 // Elementwise scale-in-place: x[i] *= s.
@@ -2534,6 +2563,12 @@ extern "C" __global__ void gelu_fwd(
 //   mean = sum(x)/D ; var = sum((x-mean)^2)/D
 //   y = (x - mean) / sqrt(var + eps) * gamma + beta
 // Caches per-row mean & rstd for the backward pass.
+// Parallel layout (matches rms_norm_fwd): grid=B (one block per row),
+// block=blockDim.x threads cooperating per row, shared-mem reduce. The old
+// 1-thread-per-row form serialized the two D-element reductions on a single
+// thread — at decode (B=1) that left one thread doing the whole O(D) norm
+// (the same trap that cost +40% e2e on the rms path).
+// Launch: grid=(B,1,1), block=(N,1,1), shared=N floats.
 extern "C" __global__ void layer_norm_fwd(
     const float* __restrict__ x,
     const float* __restrict__ gamma,
@@ -2543,20 +2578,40 @@ extern "C" __global__ void layer_norm_fwd(
     float*       __restrict__ rstd_out,
     int B, int D, float eps)
 {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     if (row >= B) return;
-    const float* xr = x + row * D;
-    float* yr = y + row * D;
-    float m = 0.0f;
-    for (int j = 0; j < D; j++) m += xr[j];
-    m /= (float)D;
-    float v = 0.0f;
-    for (int j = 0; j < D; j++) { float d = xr[j] - m; v += d * d; }
-    v /= (float)D;
-    float rstd = rsqrtf(v + eps);
-    for (int j = 0; j < D; j++) yr[j] = (xr[j] - m) * rstd * gamma[j] + beta[j];
-    mean_out[row] = m;
-    rstd_out[row] = rstd;
+    int tid = threadIdx.x;
+    int n   = blockDim.x;
+    const float* xr = x + (size_t)row * D;
+    float*       yr = y + (size_t)row * D;
+    extern __shared__ float sh[];
+
+    // Pass 1: mean.
+    float ps = 0.0f;
+    for (int j = tid; j < D; j += n) ps += xr[j];
+    sh[tid] = ps;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float m = sh[0] / (float)D;
+    __syncthreads();
+
+    // Pass 2: variance.
+    float pv = 0.0f;
+    for (int j = tid; j < D; j += n) { float dd = xr[j] - m; pv += dd * dd; }
+    sh[tid] = pv;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float rstd = rsqrtf(sh[0] / (float)D + eps);
+
+    // Pass 3: normalize + affine.
+    for (int j = tid; j < D; j += n) yr[j] = (xr[j] - m) * rstd * gamma[j] + beta[j];
+    if (tid == 0) { mean_out[row] = m; rstd_out[row] = rstd; }
 }
 
 // LayerNorm backward to dx (gamma/beta grads not produced — sufficient for
@@ -2568,6 +2623,9 @@ extern "C" __global__ void layer_norm_fwd(
 // needed and the residual passes through L1 only once. Pattern shows up
 // once per transformer sublayer (post-attention residual+norm and post-MLP
 // residual+norm), so this is one of the highest-frequency fusions.
+// Parallel layout (matches rms_norm_fwd / layer_norm_fwd): grid=B, block=N
+// threads cooperating per row, shared-mem reduce. Replaces the serial
+// 1-thread-per-row form. Launch: grid=(B,1,1), block=(N,1,1), shared=N floats.
 extern "C" __global__ void add_layer_norm_fwd(
     const float* __restrict__ a,
     const float* __restrict__ b,
@@ -2578,21 +2636,41 @@ extern "C" __global__ void add_layer_norm_fwd(
     float*       __restrict__ rstd_out,
     int B, int D, float eps)
 {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x;
     if (row >= B) return;
-    const float* ar = a + row * D;
-    const float* br = b + row * D;
-    float* yr = y + row * D;
-    float m = 0.0f;
-    for (int j = 0; j < D; j++) m += ar[j] + br[j];
-    m /= (float)D;
-    float v = 0.0f;
-    for (int j = 0; j < D; j++) { float d = (ar[j] + br[j]) - m; v += d * d; }
-    v /= (float)D;
-    float rstd = rsqrtf(v + eps);
-    for (int j = 0; j < D; j++) yr[j] = ((ar[j] + br[j]) - m) * rstd * gamma[j] + beta[j];
-    mean_out[row] = m;
-    rstd_out[row] = rstd;
+    int tid = threadIdx.x;
+    int n   = blockDim.x;
+    const float* ar = a + (size_t)row * D;
+    const float* br = b + (size_t)row * D;
+    float*       yr = y + (size_t)row * D;
+    extern __shared__ float sh[];
+
+    // Pass 1: mean of (a + b).
+    float ps = 0.0f;
+    for (int j = tid; j < D; j += n) ps += ar[j] + br[j];
+    sh[tid] = ps;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float m = sh[0] / (float)D;
+    __syncthreads();
+
+    // Pass 2: variance of (a + b).
+    float pv = 0.0f;
+    for (int j = tid; j < D; j += n) { float dd = (ar[j] + br[j]) - m; pv += dd * dd; }
+    sh[tid] = pv;
+    __syncthreads();
+    for (int s = n >> 1; s > 0; s >>= 1) {
+        if (tid < s) sh[tid] += sh[tid + s];
+        __syncthreads();
+    }
+    float rstd = rsqrtf(sh[0] / (float)D + eps);
+
+    // Pass 3: normalize + affine.
+    for (int j = tid; j < D; j += n) yr[j] = ((ar[j] + br[j]) - m) * rstd * gamma[j] + beta[j];
+    if (tid == 0) { mean_out[row] = m; rstd_out[row] = rstd; }
 }
 
 // LayerNorm parameter backward: per-feature reductions across the batch.
@@ -7574,7 +7652,13 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let y_p     = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
     let mean_p  = bs[im].as_mut().unwrap() as *mut CudaSlice<f32>;
     let rstd_p  = bs[ir].as_mut().unwrap() as *mut CudaSlice<f32>;
-    let cfg = LaunchConfig::for_num_elems(b as u32);
+    // Parallel layer-norm: grid=rows, block=256 threads cooperate per row.
+    let nthreads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim:  (b as u32, 1, 1),
+        block_dim: (nthreads, 1, 1),
+        shared_mem_bytes: nthreads * 4,
+    };
     unsafe {
         let xv = &*x_p; let gv = &*g_p; let bv = &*beta_p;
         let yv = &mut *y_p; let mv = &mut *mean_p; let rv = &mut *rstd_p;
@@ -7718,7 +7802,13 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let y_p     = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
     let mean_p  = bs[im].as_mut().unwrap() as *mut CudaSlice<f32>;
     let rstd_p  = bs[ir].as_mut().unwrap() as *mut CudaSlice<f32>;
-    let cfg = LaunchConfig::for_num_elems(bsz as u32);
+    // Parallel add+layer-norm: grid=rows, block=256 threads cooperate per row.
+    let nthreads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim:  (bsz as u32, 1, 1),
+        block_dim: (nthreads, 1, 1),
+        shared_mem_bytes: nthreads * 4,
+    };
     unsafe {
         let av = &*a_p; let bv = &*b_p; let gv = &*g_p; let betav = &*beta_p;
         let yv = &mut *y_p; let mv = &mut *mean_p; let rv = &mut *rstd_p;
@@ -7737,7 +7827,13 @@ fn handle_to_idx(h: i64) -> Option<usize> {
     let bs = unsafe { bufs() };
     let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
     let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
-    let cfg = LaunchConfig::for_num_elems(b as u32);
+    // Parallel softmax: grid=rows, block=256 threads cooperate per row.
+    let nthreads: u32 = 256;
+    let cfg = LaunchConfig {
+        grid_dim:  (b as u32, 1, 1),
+        block_dim: (nthreads, 1, 1),
+        shared_mem_bytes: nthreads * 4,
+    };
     unsafe {
         let xv = &*x_p; let yv = &mut *y_p;
         ctx().softmax_f32.clone().launch(cfg, (xv, yv, b, d)).expect("launch softmax");
