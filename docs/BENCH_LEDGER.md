@@ -985,3 +985,130 @@ which is a small slice of the 14.9ms attn-section (q/k/v/o matmuls + rope + bias
 (−140µs/token) — below noise. **The next lever is the FFN section (item #3:
 whole-block FFN fusion), not attention.** v3/v4 stay default-off, kept for
 long-context paths where per-token KV bandwidth dominates.
+
+---
+
+## 2026-05-29 — batched continuous-decode N-scaling (current slow float-seq1 scheduler)
+
+cnc P100 GPU1-via-`CUDA_VISIBLE_DEVICES=1` (FASTEST_FIRST → nvidia-smi GPU0,
+P100-12GB; same env as all prior benches → apples-to-apples), Qwen2.5-Math-7B
+Q4_K_M, shipped binary = `d1c21cc` Slice A (verified byte-identical to
+origin/main; NO rebuild). `aether-serve --paged --max-concurrent N
+--blocks-per-slot 48 --warmup 6`, 96 tok/stream. Workhorse evicted + restored
+(trap + watchdog). Harness: `scratch/batched_throughput2.sh` (hardened — the v1
+hang was a bare `wait` blocking on the never-exiting server child, not the curl;
+fixed by waiting only the explicit curl pids + `--max-time` on every curl).
+
+| N | path | aggregate tok/s | per-stream tok/s | status |
+|---:|---|---:|---:|---|
+| 1 | `[serve]` (non-sched) | 20.27 | 20.27 | ✅ coherent |
+| 2 | `[serve/sched]` | 11.80 | 5.90 | ✅ coherent, **NEGATIVE scaling** |
+| 4 | `[serve/sched]` | — (crash) | — | ❌ `CUDA_ERROR_ILLEGAL_ADDRESS`, 0 output |
+| 8 | `[serve/sched]` | ~20 (7/8 streams) | 2.89–2.99 | ⚠️ 7 streams done then core-dumped, 1 lost |
+
+**Verdict: the current batched scheduler is NOT usable for concurrent serving.**
+1. **No break-even / negative scaling**: N=2 aggregate (11.80) is *below* N=1
+   (20.27). Per-stream collapses ~1/N (serialized): 20.3 → 5.9 (N=2) →
+   2.9 (N=8). per_stream×N ≈ 20 at every N → the scheduler serializes all
+   streams onto the slow float-seq1 path with zero parallelism gain + overhead.
+   It is strictly worse than queuing requests through `--max-concurrent 1`
+   (20 tok/s) or the true single-session MMVQ path (~34 tok/s).
+2. **Memory-unsafe at N≥4**: panic `d2h: CUDA_ERROR_ILLEGAL_ADDRESS` at
+   `runtime/src/cuda.rs:7160` (`aether_dev_d2h_f32`). CUDA errors are sticky/
+   async → the OOB is in an *earlier* batched kernel (float `matmul_batched` or
+   a hetero attn/append with a batch-index bug); the d2h is just the first sync
+   that catches it. Re-run with `CUDA_LAUNCH_BLOCKING=1` to pin the kernel.
+
+**Implication for the roadmap:** confirms HANDOFF #1 (batched-MMVQ + Q6_K-seqB
+kernel build) is REQUIRED — the slow path can't be turned on as-is — AND adds a
+concrete prerequisite bug to fix: the N≥4 illegal-address in the batched path.
+Until then, deploy single-user with `--max-concurrent 1`.
+
+---
+
+## 2026-05-29 — N≥4 batched crash localized + FIXED (page-table-mirror); clean N-sweep
+
+Follow-up to the N-scaling row above. The N≥4 `CUDA_ERROR_ILLEGAL_ADDRESS` was
+**root-caused and fixed**. It was NOT a kernel index bug: a deterministic fixed-b
+sweep (`cuda_batched_crash_repro::batched_decode_crash_sweep`, b=2..8 × 24 steps,
+heterogeneous positions) ran CLEAN. The crash needed the SERVER's path-mixing:
+the scheduler runs single-slot `step_logits_for_slot`→`step_logits` (active<2) and
+batched `step_logits_for_batch` (≥2) over one shared KV pool. `step_logits` ensures
+blocks on `self.page_table_host` (single-session table), but the batched path
+advances a slot's position WITHOUT updating that table → when the slot next decodes
+single-slot, the skipped logical blocks are still `-1`; `ensure_block_for_position`
+re-h2d's the holed table and the paged-attn kernel reads `phys_blk == -1` →
+`row == -block_size` → illegal address. Explains N=2 (always batched → no
+single-slot → fine) vs N=4 (staggered arrival → single-slot↔batched mixing → crash).
+
+**Fix** (`runtime/src/serving.rs::step_logits_for_slot`): mirror the slot's complete
+page table into `self.page_table_host` before `step_logits`, so the shared
+`ensure_block_for_position` never sees a hole (1 line + comment).
+
+**Witness:** `runtime/tests/cuda_batched_crash_repro.rs::batched_graph_churn_repro`
+(warmup→single-slot→batched-b4→retire, looped) — CRASH → PASS (24 rounds, both
+graph ON and AETHER_NO_GRAPH). Regression-clean: `batched_decode_crash_sweep`
+(b=2..8) PASS, `cuda_batched_decode_parity` (b=2, token-identical) PASS.
+
+**Post-fix server N-sweep** (cnc P100, Qwen2.5-Math-7B Q4_K_M, rebuilt aether-serve,
+96 tok/stream, all responses real — no crash at any N):
+
+| N | aggregate tok/s | per-stream tok/s | status |
+|---:|---:|---:|---|
+| 1 | 20.25 | 20.25 | ✅ |
+| 2 | 11.94 | 5.97 | ✅ |
+| 4 | 17.50 | 4.38 | ✅ (was CRASH) |
+| 8 | 23.14 | 2.89 | ✅ (was 7/8 + core-dump) |
+
+Scheduler is now STABLE at all N. Aggregate grows N=2→4→8 (11.9→17.5→23.1) but
+per-stream collapses (20→6→4.4→2.9) and N=8 agg barely beats N=1 — confirming the
+batched-MMVQ + Q6_K-seqB build is still the throughput lever; the crash was the
+SAFETY blocker, now cleared.
+
+**Debug-process note:** the crash vanished under CUDA_LAUNCH_BLOCKING=1 in the
+SERVER, which *looks* like a race signature — but it was a timing/grouping confound
+(the ~3× slower server never formed b=4). A fixed-b deterministic harness was
+required to separate "kernel OOB" (ruled out) from "scheduler path-mixing" (the bug).
+
+---
+
+## 2026-05-29 — batched-MMVQ Q6_K seqB weight-reuse kernel (+47% N=8)
+
+The batched path's dominant cost was the **Q6_K per-row fallback** in
+`matmul_batched`: `ffn_down` + `attn_v` are Q6_K in Qwen2.5-7B, and the fallback
+re-read each 210-byte super-block `b` separate times (b seq1 launches). The Q4_K
+path already had a weight-reuse seqB kernel; Q6_K didn't.
+
+**Built** `fused_q6k_matmul_seqB_v3` (cuda.rs, PAGED_KERNEL_SRC): the seqB analogue
+of `fused_q6k_matmul_seq1_v2` — reads each Q6_K super-block ONCE into registers,
+dequants per quant, accumulates into all `b` activation rows held in shared mem.
+Dequant + FMA order per (b, ni) is byte-identical to seq1_v2 → exact parity with
+the per-row path. Wired into `matmul_batched` for `dt == 14`.
+
+**Correctness:** `cuda_batched_decode_parity` (b=2) still **token-identical**
+(ffn_down/attn_v Q6_K → exercises the new kernel); `batched_decode_crash_sweep`
+(b=2..8) PASS; `batched_graph_churn_repro` PASS; N=8 server output coherent.
+
+**Server N-sweep** (cnc P100, Qwen2.5-Math-7B Q4_K_M, rebuilt aether-serve, 96
+tok/stream), vs the crash-fix baseline (per-row Q6_K):
+
+| N | per-row Q6_K | Q6_K seqB | Δ |
+|---:|---:|---:|---:|
+| 1 | 20.25 | 20.32 | — (single-slot path, no batched matmul) |
+| 2 | 11.94 | 12.41 | +3.9% |
+| 4 | 17.50 | 21.28 | +21.6% |
+| 8 | 23.14 | **34.08** | **+47.3%** |
+
+N=8 aggregate (34.08) is now **1.68× the scheduler single-stream (20.32)** and ≈
+the single-session MMVQ rate (~34) — continuous batching is finally a net win. The
+gain scales with batch (the per-row penalty was b×): negligible at N=1/2, +22% at
+N=4, +47% at N=8. Per-stream at N=8: 2.89 → 4.26. Remaining batched headroom: the
+attention section + per-b elementwise ops still scale with b; Q8_1-activation MMVQ
+is the next axis but marginal on P100 (sm_60, no dp4a) — weight-reuse was the lever.
+
+**Dedicated witness** `runtime/tests/cuda_q6k_matmul_seqB_parity.rs` (`// roadmap:
+P19.5`): `seqB_matches_b_sequential_seq1` asserts BIT-EXACT (max_abs_diff = 0.0)
+vs `batch` sequential `seq1_v2` calls for every b=1..8 — PASS. `seqB_throughput_bench`
+(#[ignore]) at the `ffn_down` shape (n=3584, 74 super-blocks, B=8): serial 8×seq1_v2
+6504 µs/step vs batched 1×seqB 1256 µs/step = **5.18× isolated** — the kernel-level
+source of the +47% e2e (diluted by the rest of the forward).

@@ -1,6 +1,194 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-29 (🟢 P100 perf RE-MAPPED: decode is LATENCY-bound not bandwidth-bound; whole-layer fusion Slice A shipped +1.2%; real lever = batched-MMVQ)
+## Last Updated — 2026-05-29 PM3 (🟢 batched-MMVQ Q6_K seqB SHIPPED — N=8 batched throughput 23.1 → 34.1 tok/s (+47%); continuous batching is now a NET WIN, 1.68× single-stream)
+
+## Project Status
+🟢 Built the batched-MMVQ lever (the prior entry's #2). The batched path's
+dominant cost was the **Q6_K per-row fallback** in `matmul_batched` (ffn_down +
+attn_v are Q6_K → re-read each super-block b× as b separate seq1 launches). Built
+`fused_q6k_matmul_seqB_v3` — the Q6_K weight-reuse analogue of the existing Q4_K
+seqB kernel (read each super-block once, dot all b rows). **N=8 batched aggregate
+23.14 → 34.08 tok/s (+47%)** — now 1.68× the scheduler single-stream and ≈ the
+single-session MMVQ rate, so continuous batching is finally a real throughput win.
+Token-identical parity preserved; output coherent; crash-fix regressions clean.
+cnc fleet restored. **Uncommitted** — local tree has the full session's changes.
+
+## What Was Done This Session (cont. 2 — batched-MMVQ)
+- **`fused_q6k_matmul_seqB_v3`** (`runtime/src/cuda.rs`, in `PAGED_KERNEL_SRC`):
+  seqB analogue of `fused_q6k_matmul_seq1_v2`; reads each 210-byte Q6_K super-block
+  ONCE, dequants per quant, accumulates into all `b` activation rows in shared mem.
+  Dequant + FMA order per (b, ni) byte-identical to seq1_v2 → exact parity with the
+  per-row path. Registered in PagedCtx (struct field + load_ptx name + get_func) +
+  launch wrapper `aether_op_fused_q6k_matmul_seqB_v3_cuda`. Wired into
+  `matmul_batched` for `dt == 14`.
+- **Verified:** `cuda_batched_decode_parity` (b=2) still token-identical (Q6_K
+  ffn_down/attn_v exercise the kernel); sweep b=2..8 + churn PASS; N=8 server output
+  coherent ("To explain in detail how a transformer...").
+- **Dedicated audit witness** `runtime/tests/cuda_q6k_matmul_seqB_parity.rs`
+  (`// roadmap: P19.5`, mirrors the Q4_K seqB test): `seqB_matches_b_sequential_seq1`
+  BIT-EXACT (max_abs_diff 0.0) vs per-row `seq1_v2` for every b=1..8 — PASS;
+  `seqB_throughput_bench` (#[ignore]) at ffn_down shape = **5.18× isolated**
+  (8×seq1_v2 6504µs vs 1×seqB 1256µs/step). `#![cfg(feature="cuda")]` so the bare
+  `cargo test --workspace` audit run skips it like the other cuda tests.
+- **Server N-sweep** (rebuilt aether-serve) vs per-row baseline: N=1 20.32 (—) /
+  N=2 12.41 (+4%) / N=4 21.28 (+22%) / N=8 34.08 (+47%). Gain scales with batch
+  (per-row penalty was b×). BENCH_LEDGER row appended; memory updated.
+
+## What's Next (updated)
+1. **Commit the session** (when Matt asks): the crash fix (serving.rs) + the new
+   witness test + the Q6_K seqB kernel (cuda.rs + matmul_batched). Optionally
+   redeploy aether-serve to live :18913.
+2. **Further batched headroom** (smaller levers now): the hetero attention section +
+   per-b elementwise ops (rms_norm, bias, silu, add) still scale with b — a batched
+   forward profile (AETHER_DECODE_TIMING-equivalent for the batch path) would show
+   the next bottleneck now that the matmuls reuse weights. Q8_1-activation MMVQ is
+   the textbook next axis but MARGINAL on P100 (sm_60, no dp4a) — weight-reuse was
+   the real lever, and it's done for both Q4_K (pre-existing) and Q6_K (this session).
+3. Deployment: continuous batching is now BOTH safe AND a throughput win at N≥4;
+   for single-user latency still prefer `--max-concurrent 1`.
+
+## Notes for Next Session (cont. 2)
+- The full batched fix+build is in the LOCAL J:\aether tree (canonical): crash fix in
+  serving.rs::step_logits_for_slot, Q6_K seqB in cuda.rs, dt==14 wire +
+  q6k import in serving.rs, witness runtime/tests/cuda_batched_crash_repro.rs.
+  cnc `/tmp/{cuda,serving}_sliceA.rs` were updated to match (the build scripts cp them).
+- Q6_K seqB launch shape = Q4_K seqB (256 threads, 8 outputs/CTA, batch≤8). Parity
+  is structural (same dequant/FMA order as seq1_v2), so it holds for any Q6_K weight.
+
+---
+
+## (prior) Last Updated — 2026-05-29 PM2 (🟢 N≥4 batched crash LOCALIZED + FIXED — dual-page-table divergence in step_logits_for_slot; scheduler now stable N=1..8, witness test added, server N-sweep clean)
+
+## Project Status
+🟢 Localized AND fixed the N≥4 `CUDA_ERROR_ILLEGAL_ADDRESS` (the prerequisite bug
+the prior entry surfaced). Root cause: a **dual-page-table divergence**, NOT a
+kernel index bug. Fixed with a 1-line mirror in `step_logits_for_slot`; added a
+deterministic witness test (`batched_graph_churn_repro`, CRASH→PASS); verified
+regression-clean (sweep b=2..8 + parity b=2 token-identical) and on the real
+rebuilt server (full N=1/2/4/8 sweep, all responses real, zero crashes). cnc fleet
+restored (workhorse active). **Uncommitted** — local tree has the serving.rs fix +
+new test; Matt commits only when asked.
+
+## What Was Done This Session (cont.)
+- **Root cause (systematic-debugging).** The scheduler runs TWO decode paths over
+  one shared KV pool: single-slot `step_logits_for_slot`→`step_logits` (when
+  `active.len()<2`) and batched `step_logits_for_batch` (≥2). `step_logits` runs
+  `ensure_block_for_position` on `self.page_table_host` (the SINGLE-session table),
+  but the batched path advances a slot's position WITHOUT touching that table. So
+  when a slot later decodes single-slot, the jumped-over logical blocks are still
+  `-1`; `ensure_block_for_position` re-h2d's the holed table into `page_table_dev`
+  and the paged-attn kernel reads `phys_blk == -1` → `row == -block_size` → illegal
+  address. Explains N=2 (always batched → no single-slot → fine) vs N=4 (staggered
+  arrival → single-slot↔batched mixing → crash).
+- **Localization method.** A fixed-b deterministic sweep (b=2..8 × 24 steps) ran
+  CLEAN → ruled out the kernels + `step_logits_for_batch`. A second harness that
+  mimics the server lifecycle (warmup→single-slot decode→batched→retire, looped)
+  reproduced it at "round 1" deterministically. KEY LESSON: the crash vanished under
+  `CUDA_LAUNCH_BLOCKING=1` in the SERVER — looked like a race, but was a
+  timing/grouping confound (slower server never formed b=4); only a fixed-b harness
+  separated "kernel OOB" from "scheduler path-mixing".
+- **Fix:** `runtime/src/serving.rs::step_logits_for_slot` mirrors the slot's complete
+  page table into `self.page_table_host` before `step_logits` (1 line + comment).
+- **Witness + regression:** new `runtime/tests/cuda_batched_crash_repro.rs`
+  (`batched_graph_churn_repro` + `batched_decode_crash_sweep`, `// roadmap: P19.5`).
+  All green; `cuda_batched_decode_parity` still token-identical.
+- **Post-fix server N-sweep** (rebuilt aether-serve, no crash at any N):
+  N=1 20.25 / N=2 11.94 / N=4 17.50 / N=8 23.14 tok/s agg (per-stream 20→6→4.4→2.9).
+- BENCH_LEDGER row appended; memory [[batched_decode_primitives]] updated.
+
+## What's Next (updated)
+1. **Commit the fix** (when Matt asks): serving.rs mirror + the new witness test.
+   Optionally redeploy aether-serve so the fix reaches the live :18913 service.
+2. **Batched-MMVQ build** — now truly unblocked (crash cleared). The scheduler is
+   STABLE but slow: per-stream collapses 20→6→4.4→2.9, N=8 agg (23.1) barely beats
+   N=1 (20.3). Q8_1-quantize the N activations + batched MMVQ (read each Q4_K weight
+   once, dot all N) + a Q6_K-seqB kernel converts the idle ~70% HBM2 into real
+   multi-stream throughput.
+3. Deployment: scheduler is now SAFE to enable; for best single-user latency still
+   prefer `--max-concurrent 1`.
+
+## Notes for Next Session (cont.)
+- Repro harnesses (gitignored scratch): `batched_throughput2.sh` (hardened N-sweep),
+  `batched_crash_repro.sh` (minimal server N=4), `run_graph_churn.sh` /
+  `run_graph_churn_blocking.sh` (deterministic lifecycle repro + bisect),
+  `run_fix_verify.sh` (4-test regression gate), `run_server_bench_fixed.sh`
+  (rebuild + server N-sweep). All trap-restore the workhorse + bound curls.
+- cnc `/opt/aether` build host: the run scripts `cp /tmp/{cuda,serving}_sliceA.rs`
+  over the tree to match the shipped binary; `/tmp/serving_sliceA.rs` now contains
+  the FIX (scp'd from local). cnc's git history is divergent from origin/main
+  (auto-uploader "Initial commit" squash) — treat the LOCAL J:\aether tree as
+  canonical for the fix.
+
+---
+
+## (prior) Last Updated — 2026-05-29 PM (🟢 cheap N=4/8 batched throughput rerun DONE — current scheduler has NEGATIVE scaling AND crashes at N≥4; batched-MMVQ build confirmed required + a prerequisite bug surfaced)
+
+## Project Status
+🟢 Picked up the prior handoff's cheap item #2 (hardened batched throughput
+rerun). Result is a clean, decisive NEGATIVE: the current slow-path
+BatchScheduler (float-seq1, no MMVQ) is **not usable for concurrent serving** —
+it has **negative aggregate scaling** (N=2 < N=1) and **crashes with
+`CUDA_ERROR_ILLEGAL_ADDRESS` at N≥4**. This converts the prior "~36%/stream
+penalty" estimate into a hard answer (no break-even, strictly worse than
+serializing) and surfaces a concrete prerequisite bug for the batched-MMVQ
+build. cnc fleet restored (workhorse active), tree clean except gitignored
+scratch + the new ledger row.
+
+## What Was Done This Session
+- **Hardened the bench harness** → `scratch/batched_throughput2.sh`. Found the
+  v1 hang's real cause: a bare `wait` that blocked on the never-exiting server
+  child `SRV`, not the curl. Fix = `wait` only the explicit curl pids +
+  `--max-time` on every curl + an independent background watchdog. No rebuild:
+  verified `/tmp/{serving,cuda}_sliceA.rs` are byte-identical (modulo CRLF) to
+  shipped `origin/main` d1c21cc, so the existing 07:25 binary IS the shipped
+  Slice A binary. [[cnc_bench_curls_must_have_timeout]]
+- **N-scaling measured** (cnc P100-12GB via `CUDA_VISIBLE_DEVICES=1`, same env
+  as all prior benches; Qwen2.5-Math-7B Q4_K_M, 96 tok/stream):
+
+  | N | path | aggregate tok/s | per-stream | status |
+  |---:|---|---:|---:|---|
+  | 1 | `[serve]` | 20.27 | 20.27 | ✅ coherent |
+  | 2 | `[serve/sched]` | 11.80 | 5.90 | ✅ NEGATIVE scaling |
+  | 4 | `[serve/sched]` | crash | — | ❌ illegal-address, 0 output |
+  | 8 | `[serve/sched]` | ~20 (7/8) | 2.89–2.99 | ⚠️ 7 done then core-dumped |
+
+  per_stream×N ≈ 20 at every N → the scheduler serializes all streams onto the
+  slow float path with zero parallelism gain. BENCH_LEDGER row appended.
+- **Crash root-caused**: panic `d2h: CUDA_ERROR_ILLEGAL_ADDRESS` at
+  `runtime/src/cuda.rs:7160` (`aether_dev_d2h_f32`). CUDA errors are sticky/async
+  → the OOB is in an *earlier* batched kernel (float `matmul_batched` or a
+  hetero attn/append with a batch-index bug); the d2h is the first sync that
+  catches it. Re-run with `CUDA_LAUNCH_BLOCKING=1` to pin the faulting kernel.
+
+## What's Next (updated)
+1. **Batched-MMVQ build** (still THE P100 serving lever) — now with a concrete
+   prerequisite: **first fix the N≥4 `CUDA_ERROR_ILLEGAL_ADDRESS`** in the
+   batched path (`CUDA_LAUNCH_BLOCKING=1` to localize). Then Q8_1-quantize the N
+   activations + batched MMVQ (read each Q4_K weight once, dot against all N) +
+   a Q6_K-seqB kernel (ffn_down + attn_v are half Q6_K → currently per-row).
+2. **Deployment guidance is now firm**: serve single-user with
+   `--max-concurrent 1`; do NOT enable continuous batching until #1 lands — the
+   current path is strictly worse than queuing (and crashes at N≥4).
+3. (unchanged) single-stream P100 micro-opt is near the structural ceiling
+   (~24% HBM2 peak, latency-bound); deprioritized.
+
+## Notes for Next Session
+- Hardened harness `scratch/batched_throughput2.sh` is the template for any
+  fleet-evicting bench: `wait <explicit pids>` (never bare `wait` when a server
+  child is backgrounded) + `--max-time` on every curl + a watchdog. Reuse it.
+- The "76.14 tok/s" a v1-style script prints at N=4 is a GARBAGE artifact (it
+  divides assumed N×TOKENS by wall time; curls return instantly on a crashed
+  server with 0-byte responses). Always check resp file size / coherence head,
+  not just the computed tok/s.
+- cnc `CUDA_VISIBLE_DEVICES=1` maps to nvidia-smi **GPU0** (12GB P100) under CUDA
+  FASTEST_FIRST ordering — consistent across all prior benches, so relative
+  numbers hold, but the "732 GB/s HBM2 peak" framing assumed the 16GB card; the
+  bench card is the 12GB P100 (549 GB/s peak). Doesn't change the N-scaling
+  conclusion (same card across all N).
+
+---
+
+## (prior) Last Updated — 2026-05-29 (🟢 P100 perf RE-MAPPED: decode is LATENCY-bound not bandwidth-bound; whole-layer fusion Slice A shipped +1.2%; real lever = batched-MMVQ)
 
 ## Project Status
 🟢 Shipped Slice A (`qkv_bias_rope` fusion, +1.2% P100 decode, commit `d1c21cc`).

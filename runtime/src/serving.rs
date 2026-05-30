@@ -118,6 +118,7 @@ use crate::cuda::{
     aether_op_fused_iq3_xxs_expert_matmul_seq1_cuda,
     aether_op_matmul_f32_cuda,
     aether_op_fused_q4k_matmul_seqB_v3_cuda,
+    aether_op_fused_q6k_matmul_seqB_v3_cuda,
     aether_op_batched_rope_apply_devarg_f32_cuda,
     aether_op_batched_paged_append_kv_hetero_devarg_f32_cuda,
     aether_op_batched_paged_attention_hetero_devarg_f32_cuda,
@@ -1620,6 +1621,12 @@ unsafe fn matmul_batched(
     if dt == 12 {
         let rc = aether_op_fused_q4k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b);
         assert_eq!(rc, 0, "fused_q4k_matmul_seqB_v3 failed (rc={}, b={})", rc, b);
+    } else if dt == 14 {
+        // Batched-MMVQ Phase — Q6_K weight-reuse seqB (ffn_down + attn_v are
+        // Q6_K in Qwen2.5-7B).  Replaces the per-row fallback that re-read each
+        // 210-byte super-block `b` times — the dominant batched-decode cost.
+        let rc = aether_op_fused_q6k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b);
+        assert_eq!(rc, 0, "fused_q6k_matmul_seqB_v3 failed (rc={}, b={})", rc, b);
     } else {
         for row in 0..b {
             aether_dev_d2d_f32_offset(x, row * n_in, scratch_in, 0, n_in);
@@ -4596,6 +4603,20 @@ impl QwenSession {
             }
             // 2. Bind position state.
             self.next_pos = *next_pos;
+            // 2b. Mirror the slot's COMPLETE page table into the session's
+            //     internal `page_table_host`.  step_logits() →
+            //     ensure_block_for_position() operates on self.page_table_host,
+            //     NOT this slot's external table.  When the BATCHED path has
+            //     advanced this slot past the positions the single-slot path
+            //     last saw, self.page_table_host has -1 holes at the skipped
+            //     logical blocks; ensure_block_for_position then re-h2d's that
+            //     holed table into page_table_dev (clobbering the step-1 copy),
+            //     and the paged-attention kernel reads phys_blk == -1 →
+            //     row == -block_size → CUDA_ERROR_ILLEGAL_ADDRESS.  Mirroring
+            //     the slot's hole-free table keeps the forward reading this
+            //     slot's real K/V blocks.  (witness:
+            //     cuda_batched_crash_repro::batched_graph_churn_repro)
+            self.page_table_host = page_table_host.to_vec();
             // 3. Run the standard forward (graph or imperative).
             let logits = self.step_logits(last_id);
             // 4. Read advanced position back to the caller's slot.

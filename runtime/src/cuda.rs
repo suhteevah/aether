@@ -120,6 +120,7 @@ struct PagedCtx {
     batched_paged_attention_hetero_devarg: CudaFunction,
     batched_paged_append_kv_hetero_devarg: CudaFunction,
     fused_q4k_matmul_seqB_v3: CudaFunction,
+    fused_q6k_matmul_seqB_v3: CudaFunction,
     batched_rope_apply_devarg: CudaFunction,
     d2d_copy_f32_offset: CudaFunction,
     paged_attention_flex_devarg: CudaFunction,
@@ -165,6 +166,7 @@ fn paged_ctx() -> &'static PagedCtx {
               "batched_paged_attention_hetero_devarg",
               "batched_paged_append_kv_hetero_devarg",
               "fused_q4k_matmul_seqB_v3",
+              "fused_q6k_matmul_seqB_v3",
               "batched_rope_apply_devarg",
               "d2d_copy_f32_offset",
               "paged_attention_flex_devarg",
@@ -214,6 +216,8 @@ fn paged_ctx() -> &'static PagedCtx {
                 device.get_func("aether_paged_kernels", "batched_paged_append_kv_hetero_devarg").unwrap(),
             fused_q4k_matmul_seqB_v3:
                 device.get_func("aether_paged_kernels", "fused_q4k_matmul_seqB_v3").unwrap(),
+            fused_q6k_matmul_seqB_v3:
+                device.get_func("aether_paged_kernels", "fused_q6k_matmul_seqB_v3").unwrap(),
             batched_rope_apply_devarg:
                 device.get_func("aether_paged_kernels", "batched_rope_apply_devarg").unwrap(),
             d2d_copy_f32_offset:
@@ -878,6 +882,109 @@ extern "C" __global__ void fused_q4k_matmul_seqB_v3(
             }
             if (lane == 0 && ni < n) {
                 out[(size_t)b * n + ni] = acc;
+            }
+        }
+    }
+}
+
+// Batched-MMVQ Phase — WEIGHT-REUSE batched Q6_K matmul (the seqB analogue of
+// fused_q6k_matmul_seq1_v2).  The per-row fallback in matmul_batched re-reads
+// each 210-byte Q6_K super-block `batch` times (ffn_down + attn_v are Q6_K in
+// Qwen2.5-7B → the dominant batched-decode cost).  This reads each super-block
+// ONCE and applies it to all `batch` activation rows held in shared memory.
+// Dequant + accumulation order per (b, ni) is byte-for-byte identical to
+// fused_q6k_matmul_seq1_v2 → exact parity with the per-row path.
+//   a   : [batch * n_blocks*256]   (row-major; row b at b*n_blocks*256)
+//   w   : [n * n_blocks * 210]     (same Q6_K layout as seq1_v2)
+//   out : [batch * n]              (row-major; row b at b*n)
+extern "C" __global__ void fused_q6k_matmul_seqB_v3(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks, int batch)   // batch in [1, 8]
+{
+    __shared__ float a_tile[8 * 256];   // up to batch=8 rows × 256-elem K-tile
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc[8];
+    #pragma unroll
+    for (int b = 0; b < 8; b++) acc[b] = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // CTA-wide cooperative load of `batch` activation tiles.
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            if (b < batch) {
+                a_tile[b * 256 + threadIdx.x] =
+                    a[(size_t)b * n_blocks * 256 + bi * 256 + threadIdx.x];
+            }
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)ni * n_blocks * 210 + (size_t)bi * 210;
+            const unsigned char* ql = base;
+            const unsigned char* qh = base + 128;
+            const signed char*   sc = (const signed char*)(base + 192);
+            unsigned short d_bits = ((unsigned short)base[209] << 8) | (unsigned short)base[208];
+            float d = aether_f16_to_f32_dev(d_bits);
+
+            // 2 n_outer halves × 4 sub_pos = 8 quants/lane — identical layout to
+            // fused_q6k_matmul_seq1_v2.  Weight dequant computed ONCE per quant,
+            // reused across all `batch` activation rows.
+            #pragma unroll
+            for (int n_outer = 0; n_outer < 2; n_outer++) {
+                int ql_off = n_outer * 64;
+                int qh_off = n_outer * 32;
+                int sc_off = n_outer * 8;
+                #pragma unroll
+                for (int sub_pos = 0; sub_pos < 4; sub_pos++) {
+                    int l_iter = lane;
+                    int scale_idx = sc_off + (l_iter >> 4) + 2 * sub_pos;
+                    float sc_val = (float)sc[scale_idx];
+                    int q;
+                    if (sub_pos == 0) {
+                        unsigned char ql_byte = ql[ql_off + l_iter];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)((ql_byte & 0xFu) | ((qh_byte & 3u) << 4)) - 32;
+                    } else if (sub_pos == 1) {
+                        unsigned char ql_byte = ql[ql_off + l_iter + 32];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)((ql_byte & 0xFu) | (((qh_byte >> 2) & 3u) << 4)) - 32;
+                    } else if (sub_pos == 2) {
+                        unsigned char ql_byte = ql[ql_off + l_iter];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)(((ql_byte >> 4) & 0xFu) | (((qh_byte >> 4) & 3u) << 4)) - 32;
+                    } else {
+                        unsigned char ql_byte = ql[ql_off + l_iter + 32];
+                        unsigned char qh_byte = qh[qh_off + l_iter];
+                        q = (int)(((ql_byte >> 4) & 0xFu) | (((qh_byte >> 6) & 3u) << 4)) - 32;
+                    }
+                    float w_val = d * sc_val * (float)q;
+                    int a_idx = (n_outer * 128) + (sub_pos * 32) + l_iter;
+                    #pragma unroll
+                    for (int b = 0; b < 8; b++) {
+                        if (b < batch) acc[b] += a_tile[b * 256 + a_idx] * w_val;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        if (b < batch) {
+            float ac = acc[b];
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                ac += __shfl_down_sync(0xFFFFFFFFu, ac, offset);
+            }
+            if (lane == 0 && ni < n) {
+                out[(size_t)b * n + ni] = ac;
             }
         }
     }
@@ -10942,6 +11049,40 @@ fn attn_warps() -> u32 {
         paged_ctx().fused_q4k_matmul_seqB_v3.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks, batch))
             .expect("launch fused_q4k_matmul_seqB_v3");
+    }
+    0
+}
+
+/// Batched-MMVQ Phase — weight-reuse batched Q6_K matmul (seqB analogue of
+/// `aether_op_fused_q6k_matmul_seq1_v2_cuda`).  Reads each 210-byte Q6_K
+/// super-block ONCE, applies it to all `batch` activation rows.  Same launch
+/// shape as the Q4_K seqB wrapper (256 threads, 8 outputs/CTA).
+#[no_mangle] pub extern "C" fn aether_op_fused_q6k_matmul_seqB_v3_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int, batch: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 || batch <= 0 || batch > 8 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cta_threads = 256u32;
+    let outputs_per_cta = 8u32;
+    let grid_x = ((n as u32) + outputs_per_cta - 1) / outputs_per_cta;
+    let cfg = LaunchConfig {
+        grid_dim:  (grid_x, 1, 1),
+        block_dim: (cta_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        paged_ctx().fused_q6k_matmul_seqB_v3.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks, batch))
+            .expect("launch fused_q6k_matmul_seqB_v3");
     }
     0
 }
