@@ -130,6 +130,12 @@ pub enum Ty {
     /// N consecutive slots reserved on the local frame; `buf[i]` indexes
     /// via `(base + i*8)` addressing.
     Array { elem: Box<Ty>, n: usize },
+    /// Native slice `&[T]` / `&mut [T]` — a (ptr, len) fat pointer. Lowered
+    /// in the asm backend to TWO synthetic slots (`name.ptr`, `name.len`),
+    /// reusing the struct-field machinery. `s.len()` reads `name.len`;
+    /// `s[i]` loads `*(name.ptr + i*elem_size)`; `&s[a..b]` builds a fresh
+    /// fat pointer `(name.ptr + a*elem_size, b - a)`. P16.19.
+    Slice { mutable: bool, elem: Box<Ty> },
     /// Tuple type `(T1, T2, ...)`. Zero-cost — lowered to N synthetic field
     /// slots `<name>.0`, `<name>.1`, etc., and accessed via `.0`/`.1` field
     /// syntax. Reuses the struct machinery wholesale.

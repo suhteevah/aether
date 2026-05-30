@@ -3982,6 +3982,22 @@ unsafe fn vec_i64_free_buf(ptr: *mut i64, cap: usize) {
     match tbl[h].as_ref() { Some(v) => v.len as i64, None => 0 }
 }
 
+/// Backing-buffer pointer for the Vec, as an i64. Foundation for native
+/// `&[i64]` fat pointers (P16.19): a slice over a Vec is `(as_ptr, len)`.
+/// Returns -1 on invalid/empty handle. NOTE: the pointer is invalidated by
+/// any subsequent push that triggers a realloc — slices must be taken after
+/// the Vec stops growing, exactly like Rust's borrow rules enforce.
+#[no_mangle] pub unsafe extern "C" fn aether_vec_i64_as_ptr(handle: i64) -> i64 {
+    if handle < 0 { return -1; }
+    let tbl = vec_i64_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_ref() {
+        Some(v) if !v.ptr.is_null() => v.ptr as i64,
+        _ => -1,
+    }
+}
+
 /// Free the buffer + release the handle slot. Idempotent.
 #[no_mangle] pub unsafe extern "C" fn aether_vec_i64_free(handle: i64) -> i32 {
     if handle < 0 { return -1; }

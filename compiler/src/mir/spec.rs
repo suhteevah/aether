@@ -89,6 +89,8 @@ fn render_ty(t: &Ty) -> String {
         }
         Ty::Shape(_) => "<shape>".into(),
         Ty::Array { elem, n } => format!("[{}; {}]", render_ty(elem), n),
+        Ty::Slice { mutable, elem } =>
+            format!("&{}[{}]", if *mutable { "mut " } else { "" }, render_ty(elem)),
         Ty::Tuple(ts) => {
             let s: Vec<String> = ts.iter().map(render_ty).collect();
             format!("({})", s.join(", "))

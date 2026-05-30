@@ -1,0 +1,43 @@
+// roadmap: P16.19
+// expect: exit=42
+//
+// Native `&[i64]` slices — a (ptr, len) fat pointer over a heap Vec.
+// Exercises the full surface of P16.19:
+//   * full-slice construction over a Vec's backing buffer
+//   * `.len()` method
+//   * indexing `s[i]`
+//   * sub-slicing `&s[a..b]` and `.len()` / indexing on the sub-slice
+//
+// `slice_from_raw(ptr, len)` is a compiler builtin that packs a raw backing
+// pointer + element count into a fat pointer; the witness feeds it
+// `aether_vec_i64_as_ptr(v)` + `aether_vec_i64_len(v)`. (A `&v[..]` full-range
+// sugar would lower to exactly this; the explicit builtin keeps the parser
+// change minimal — see the P16.19 report.)
+//
+//   v = [10, 20, 30]
+//   s  = &v[..]   → len 3, s[0]=10, s[2]=30
+//   s2 = &s[1..3] → len 2, s2[0]=20
+//   result = s[0] + s[2] + s2.len() = 10 + 30 + 2 = 42
+use runtime;
+
+fn main() -> i32 {
+    let v: i64 = aether_vec_i64_new();
+    let mut i: i64 = 1;
+    while i <= 3 {
+        aether_vec_i64_push(v, i * 10);
+        i = i + 1;
+    }
+
+    let s: &[i64] = slice_from_raw(aether_vec_i64_as_ptr(v), aether_vec_i64_len(v));
+    if s.len() != 3 { return 1; }
+    if s[0] != 10 { return 2; }
+    if s[2] != 30 { return 3; }
+
+    let s2: &[i64] = &s[1..3];
+    if s2.len() != 2 { return 4; }
+    if s2[0] != 20 { return 5; }
+
+    let result: i64 = s[0] + s[2] + s2.len();
+    aether_vec_i64_free(v);
+    return result as i32;
+}

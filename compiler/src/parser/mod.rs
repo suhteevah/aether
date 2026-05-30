@@ -468,6 +468,23 @@ impl Parser {
             // diagnostics, not in the Ty AST.
             if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
             let mutable = if matches!(self.peek(0), Tok::Mut) { self.bump(); true } else { false };
+            // P16.19 — native slice `&[T]` / `&mut [T]`. The `[T]` here is an
+            // unsized slice element list, NOT a tensor `Shape` (which never
+            // appears behind a `&`). Parse `[ T ]` directly so we don't fall
+            // into the `Tok::LBracket` tensor-shape branch in the recursive
+            // `parse_ty`. `&str` is sugar for `&[u8]`.
+            if matches!(self.peek(0), Tok::LBracket) {
+                self.bump(); // [
+                let elem = self.parse_ty()?;
+                self.expect(Tok::RBracket)?;
+                return Ok(Ty::Slice { mutable, elem: Box::new(elem) });
+            }
+            // `&str` → `&[u8]` slice (bytes). Distinguishing string-ness is not
+            // needed for the i64 witness; we model it as a u8 slice.
+            if matches!(self.peek(0), Tok::Ident(ref n) if n == "str") {
+                self.bump();
+                return Ok(Ty::Slice { mutable, elem: Box::new(Ty::Named("u8".into())) });
+            }
             return Ok(Ty::Ref { mutable, inner: Box::new(self.parse_ty()?) });
         }
         if matches!(self.peek(0), Tok::LParen) {

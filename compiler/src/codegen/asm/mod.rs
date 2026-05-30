@@ -916,6 +916,13 @@ struct Locals {
     /// `-8*base_slot(%rbp) - 8*k`. Per-element kind only int/handle for
     /// now (8-byte slots) — float arrays would need a 4-byte stride.
     arrays: HashMap<String, (usize, usize, TyKind)>,
+    /// Native slices (P16.19): name → (elem_kind, elem_size_bytes). The
+    /// (ptr, len) pair lives in the synthetic `<name>.ptr` / `<name>.len`
+    /// slots (both i64); this sidecar just records what the elements are so
+    /// `s[i]` can scale the index and pick the right load width. Only i64
+    /// elements (8-byte) are exercised today; the size is carried explicitly
+    /// so widening to f32/u8 slices is a one-line change.
+    slices: HashMap<String, (TyKind, usize)>,
     /// Const-generic specialization state, shared across all fns in the program.
     /// At each call site we check `templates` for the callee; if hit, we infer
     /// concrete dim bindings from the caller's tensor_shapes, mangle, queue.
@@ -1346,6 +1353,13 @@ fn count_locals(b: &Block, locals: &mut Locals) {
                     }
                     continue;
                 }
+                // Native slice `let s: &[T] = …;` — a (ptr, len) fat pointer.
+                // Two slots, `<name>.ptr` and `<name>.len`, both i64. P16.19.
+                if let Some(Ty::Slice { .. }) = ty {
+                    locals.alloc(&format!("{}.ptr", name));
+                    locals.alloc(&format!("{}.len", name));
+                    continue;
+                }
                 locals.alloc(name);
             }
             Stmt::LetTuple { names, value } => {
@@ -1363,6 +1377,119 @@ fn count_locals(b: &Block, locals: &mut Locals) {
 /// If `t` is a Named type pointing to a registered struct, return its name.
 fn struct_name_of(t: &Ty) -> Option<String> {
     if let Ty::Named(n) = t { Some(n.clone()) } else { None }
+}
+
+/// For a `Ty::Slice`, return `(element TyKind, element size in bytes)`.
+/// Only 8-byte int/handle elements are wired up today (i64/u64/i32-as-i64
+/// and Tensor handles); float-element slices would need a 4-byte stride in
+/// the index codegen, so they're rejected here rather than mis-loaded.
+fn slice_elem_info(t: &Ty) -> Option<(TyKind, usize)> {
+    if let Ty::Slice { elem, .. } = t {
+        // Map the element type to a kind. Default unknown small ints to Int.
+        let kind = TyKind::from_ty(elem).unwrap_or(TyKind::Int);
+        match kind {
+            TyKind::Int | TyKind::TensorDev(_) | TyKind::TensorDevI32(_) => Some((TyKind::Int, 8)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Scale `%rax` by a power-of-two `factor` using repeated self-adds. Used
+/// for slice/array element-offset math where the only available multiply in
+/// the asm assembler is the 2-operand register `imulq`. `factor` MUST be a
+/// power of two (asserted at the slice-construct site via elem_size).
+fn emit_scale_pow2(out: &mut String, factor: usize) {
+    let mut f = factor;
+    while f > 1 {
+        out.push_str("    addq %rax, %rax\n");
+        f >>= 1;
+    }
+}
+
+/// Emit code that writes a slice's (ptr, len) into the given stack slots.
+/// `value` is the construction expression on the rhs of `let s: &[T] = …`.
+/// Recognised forms (P16.19):
+///   * `slice_from_raw(ptr_expr, len_expr)` — evaluate both args; ptr→.ptr,
+///     len→.len. The general "make a fat pointer from a raw base + count".
+///   * `&s[lo..hi]` — sub-slice of an existing slice local `s`. New ptr is
+///     `s.ptr + lo*elem_size`; new len is `hi - lo`.
+fn emit_slice_construct(
+    value: &Expr,
+    ptr_slot: usize,
+    len_slot: usize,
+    elem_size: usize,
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    // Form 1 — `slice_from_raw(ptr, len)`.
+    if let Expr::Call { callee, args } = value {
+        if let Expr::Ident(n) = callee.as_ref() {
+            if n == "slice_from_raw" {
+                if args.len() != 2 {
+                    return Err(AsmError::UnsupportedExpr("slice_from_raw takes (ptr, len)"));
+                }
+                // ptr → .ptr
+                let pk = emit_expr_value(&args[0], out, data, locals)?;
+                if !matches!(pk, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("slice_from_raw ptr must be i64"));
+                }
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", ptr_slot * 8));
+                // len → .len
+                let lk = emit_expr_value(&args[1], out, data, locals)?;
+                if !matches!(lk, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("slice_from_raw len must be i64"));
+                }
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", len_slot * 8));
+                return Ok(());
+            }
+        }
+    }
+    // Form 2 — `&s[lo..hi]` sub-slice.
+    if let Expr::Ref { expr, .. } = value {
+        if let Expr::Index { recv, idx } = expr.as_ref() {
+            if let (Expr::Ident(src), Expr::Range { lo, hi, .. }) = (recv.as_ref(), idx.as_ref()) {
+                if !locals.slices.contains_key(src) {
+                    return Err(AsmError::UnsupportedExpr(
+                        "sub-slice receiver must be a slice local"));
+                }
+                let src_ptr = locals.get(&format!("{}.ptr", src))
+                    .ok_or_else(|| AsmError::UnknownIdent(format!("{}.ptr", src)))?;
+                // new ptr = src.ptr + lo*elem_size
+                let lo_kind = emit_expr_value(lo, out, data, locals)?;
+                if !matches!(lo_kind, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("sub-slice lo bound must be int"));
+                }
+                // rax *= elem_size. elem_size is a power of two (8 today) so
+                // scale via repeated `addq %rax,%rax` doublings — the asm
+                // assembler only encodes the 2-operand register `imulq`, so
+                // we avoid the immediate form entirely.
+                emit_scale_pow2(out, elem_size);
+                out.push_str(&format!("    movq -{}(%rbp), %r10\n", src_ptr * 8));
+                out.push_str("    addq %r10, %rax\n");
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", ptr_slot * 8));
+                // new len = hi - lo. Evaluate hi → rax, push; eval lo → r10; sub.
+                let hi_kind = emit_expr_value(hi, out, data, locals)?;
+                if !matches!(hi_kind, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("sub-slice hi bound must be int"));
+                }
+                out.push_str("    pushq %rax\n");
+                let lo2 = emit_expr_value(lo, out, data, locals)?;
+                if !matches!(lo2, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("sub-slice lo bound must be int"));
+                }
+                out.push_str("    movq %rax, %r10\n");
+                out.push_str("    popq %rax\n");      // rax = hi
+                out.push_str("    subq %r10, %rax\n"); // rax = hi - lo
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", len_slot * 8));
+                return Ok(());
+            }
+        }
+    }
+    Err(AsmError::UnsupportedExpr(
+        "slice construction must be `slice_from_raw(ptr, len)` or `&s[lo..hi]`"))
 }
 
 /// Extract the integer shape vector from a `Ty::Shape([Const(d0), Const(d1), …])`.
@@ -1701,6 +1828,29 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                 out.push_str(&format!("    movq %rax, -{}(%rbp)\n", tag_slot * 8));
                 out.push_str(&format!("    movq %rdx, -{}(%rbp)\n", val_slot * 8));
                 let _ = ty;
+                return Ok(());
+            }
+            // Native slice `let s: &[T] = <slice-expr>;` (P16.19). Builds a
+            // (ptr, len) fat pointer into the synthetic `<name>.ptr` /
+            // `<name>.len` slots (allocated by count_locals). Two construction
+            // forms are recognised:
+            //   * `slice_from_raw(ptr_i64, len_i64)` — a builtin that takes a
+            //     raw backing pointer + element count (the witness feeds it
+            //     `aether_vec_i64_as_ptr(v)` + `aether_vec_i64_len(v)`).
+            //   * `&s[a..b]` — sub-slice of an existing slice local: the new
+            //     ptr is `s.ptr + a*elem_size`, the new len is `b - a`.
+            if let Some(slice_ty) = ty.as_ref().filter(|t| matches!(t, Ty::Slice { .. })) {
+                let (elem_kind, elem_size) = slice_elem_info(slice_ty)
+                    .ok_or(AsmError::UnsupportedExpr(
+                        "slice element type unsupported (only 8-byte int/handle slices today)"))?;
+                let ptr_key = format!("{}.ptr", name);
+                let len_key = format!("{}.len", name);
+                let ptr_slot = locals.alloc(&ptr_key);
+                let len_slot = locals.alloc(&len_key);
+                locals.types.insert(ptr_key, TyKind::Int);
+                locals.types.insert(len_key, TyKind::Int);
+                locals.slices.insert(name.clone(), (elem_kind, elem_size));
+                emit_slice_construct(value, ptr_slot, len_slot, elem_size, out, data, locals)?;
                 return Ok(());
             }
             // Struct literal as let rhs — desugars to "uninit struct let,
@@ -2565,6 +2715,25 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 Expr::Ident(n) => n.clone(),
                 _ => return Err(AsmError::UnsupportedExpr("array index read: receiver must be an ident")),
             };
+            // P16.19 — slice index `s[i]`: load `*(s.ptr + i*elem_size)`.
+            // Slices store their base as a heap pointer in `<name>.ptr` and
+            // grow upward (unlike stack arrays, which grow toward lower
+            // addresses), so the addressing is `ptr + i*size`, no negation.
+            if let Some((elem_kind, elem_size)) = locals.slices.get(&arr_name).copied() {
+                let ptr_slot = locals.get(&format!("{}.ptr", arr_name))
+                    .ok_or_else(|| AsmError::UnknownIdent(format!("{}.ptr", arr_name)))?;
+                let idx_kind = emit_expr_value(idx, out, data, locals)?;
+                if !matches!(idx_kind, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("slice index must be int"));
+                }
+                // rax = i; scale to byte offset, then add the base pointer.
+                emit_scale_pow2(out, elem_size);
+                out.push_str(&format!("    movq -{}(%rbp), %r10\n", ptr_slot * 8));
+                out.push_str("    addq %r10, %rax\n");
+                out.push_str("    movq %rax, %rdi\n");
+                out.push_str("    movq 0(%rdi), %rax\n");
+                return Ok(elem_kind);
+            }
             let (base_slot, _, elem_kind) = locals.arrays.get(&arr_name).copied()
                 .ok_or(AsmError::UnsupportedExpr("array index read: receiver is not a stack array"))?;
             let idx_kind = emit_expr_value(idx, out, data, locals)?;
@@ -2730,6 +2899,28 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 Expr::Ident(n) => n.clone(),
                 _ => return Err(AsmError::UnsupportedExpr("method receiver must be a bare local")),
             };
+            // P16.19 — slice methods. `s.len()` reads the `<name>.len` slot;
+            // `s.is_empty()` is `len == 0`. Checked before struct/Tensor
+            // dispatch since a slice local carries neither a struct_locals nor
+            // a tensor_shapes entry.
+            if locals.slices.contains_key(&recv_name) {
+                let len_slot = locals.get(&format!("{}.len", recv_name))
+                    .ok_or_else(|| AsmError::UnknownIdent(format!("{}.len", recv_name)))?;
+                match method.as_str() {
+                    "len" => {
+                        out.push_str(&format!("    movq -{}(%rbp), %rax\n", len_slot * 8));
+                        return Ok(TyKind::Int);
+                    }
+                    "is_empty" => {
+                        out.push_str(&format!("    movq -{}(%rbp), %rax\n", len_slot * 8));
+                        out.push_str("    testq %rax, %rax\n");
+                        emit_setcc_int(out, "sete");
+                        return Ok(TyKind::Int);
+                    }
+                    other => return Err(AsmError::UnsupportedExpr(
+                        string_to_static(format!("unsupported slice method `.{}()`", other)))),
+                }
+            }
             // Fast path: receiver is a struct local with a corresponding
             // `Foo__method` mangled fn. UFCS lowering — `obj.bar(x)` →
             // `Foo__bar(obj, x)`. Receiver passes by-value via existing

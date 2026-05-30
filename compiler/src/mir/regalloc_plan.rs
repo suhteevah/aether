@@ -300,7 +300,7 @@ fn recurse_ineligible_expr(e: &Expr, out: &mut HashSet<String>) {
 
 fn ty_is_composite(t: &Ty) -> bool {
     match t {
-        Ty::Array { .. } | Ty::Tuple(_) | Ty::Shape(_) => true,
+        Ty::Array { .. } | Ty::Tuple(_) | Ty::Shape(_) | Ty::Slice { .. } => true,
         Ty::Ref { inner, .. } => ty_is_composite(inner),
         Ty::Generic { name, .. } => matches!(name.as_str(), "Tensor"),
         Ty::Named(n) => matches!(n.as_str(),
