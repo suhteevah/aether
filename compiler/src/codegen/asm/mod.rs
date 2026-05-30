@@ -1723,7 +1723,15 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             } else {
                 emit_expr_value(e, out, data, locals)?;
             }
-            let frame = locals.frame_bytes();
+            // Use the cached FINAL frame size, not the live mid-emission
+            // `frame_bytes()`. An early `return` inside an `if` is emitted
+            // before later `let`s have bumped `next_slot`, so `frame_bytes()`
+            // here under-counts slots and the `addq` would restore `%rsp`
+            // short of the prologue's `subq` — corrupting the saved %rbp /
+            // return address (manifested as a SIGSEGV in non-tail tree
+            // recursion). `frame_bytes_cache` is computed by the count_locals
+            // pre-pass and matches the prologue exactly.
+            let frame = locals.frame_bytes_cache;
             out.push_str(&format!("    addq ${}, %rsp\n", frame));
             // P15.2 — Stmt::Return is an early-exit; it must run the same
             // pop sequence the natural epilogue does, or the caller's
@@ -1737,7 +1745,8 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
         }
         Stmt::Return(None) => {
             out.push_str("    xorl %eax, %eax\n");
-            let frame = locals.frame_bytes();
+            // Cached final frame size — see the Return(Some) note above.
+            let frame = locals.frame_bytes_cache;
             out.push_str(&format!("    addq ${}, %rsp\n", frame));
             for &r in locals.saved_regs.clone().iter().rev() {
                 out.push_str(&format!("    popq %r{}\n", r));

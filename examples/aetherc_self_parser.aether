@@ -1,6 +1,9 @@
-// expect: exit=42
-// roadmap: P20.2
-// expect: stdout contains AST: (- (* (+ 5 y) 2) 4)
+// Self-hosting bootstrap Deposit 11 — SELF-HOSTED PARSER in Aether.
+//
+// Companion showcase to examples/aetherc_self_interp.aether (Deposit 6).
+// The required deliverable for roadmap P20.2 is the runtime witness at
+// tests/runtime/selfhost_parser_witness.aether; this is the same code
+// kept as an example so the parser stands alongside the interp.
 //
 // SELF-HOSTED PARSER (P20.2) — written in Aether, builds a REAL AST.
 //
