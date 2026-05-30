@@ -30,16 +30,31 @@ audit `errors: 0`, golden clean, all witnesses green. Tree clean.
   → NODE_LT/GT/EQ/NE/LE/GE + NODE_IF(cond,arms)→NODE_IFARMS(then,else); new parse_cmp
   level; eval branches on the computed cond → 42 (no source-42).
 - `examples/aetherc_self_parser.aether` — Deposit 11 showcase.
-- **Self-hosted parser grammar now covers**: multi-fn programs, params, function calls
-  (fresh-frame scoped eval), blocks, `let` statements, arithmetic (+/-/* + parens),
-  6 comparison ops, `if`/`else`. All build a real AST node buffer (parse→build→re-emit
-  S-expr→separate eval-walk). 4 P20.2 witnesses, all exit 42, audit clean. No compiler
-  changes (only the earlier early-return frame fix). **Pushed to origin/main, HEAD 1432be5.**
+- **Deposit 15** (`2fcc026`): `/` `%` + unary `-`/`!` (parse_unary; NODE_DIV/MOD/NEG/NOT).
+- **Deposit 16** (`94b33cc`): `while` + assignment + `return` — env mutation (env_update)
+  + early-return propagation (a ret_p flag buffer threaded through eval; per-call return
+  frames). `sum_to(8)` runs 8 real mutating iterations → 36.
+- **Deposit 17** (`bff783d`): parse source **from a FILE on disk** (`aether_read_file`)
+  — `tests/runtime/selfhost_parser_file.aether` reads `examples/_parser_input.miniaether`,
+  parses + evals it → 42. Proven file-driven (exit tracks the file's contents).
 
-## Self-host parser — what's next (FR-20.2 continuing track)
-Next deposits toward parsing real `.aether`: `/` `%` + unary `-`/`!`; `while` loops +
-`return` statements; struct/field access; the roadmap witness (parse + re-emit a real
-`.aether` file matching the Rust-aetherc AST dump — the formal P20.2 completion).
+**Self-hosted parser now = a real file-driven parser for a complete imperative
+mini-language**: multi-fn programs, params, function calls (fresh-frame scoped eval),
+blocks, `let`, assignment, `while`, `return`, `if`/`else`, 6 comparison ops, arithmetic
+(`+ - * / %` + parens), unary `-`/`!`. Every deposit builds a real AST node buffer
+(parse→build→re-emit S-expr→separate eval-walk). **7 P20.2 witnesses** (deposits 11–17),
+all exit 42, audit clean. No compiler changes since the early-return frame fix.
+**Pushed to origin/main, HEAD bff783d.**
+
+## Self-host parser — what's next (the bigger FR-20.2 milestone)
+The imperative core + file-read are done. The remaining gap to FORMAL P20.2 ("parse +
+re-emit a REAL `.aether` file matching the Rust-aetherc AST dump") is bigger, multi-deposit:
+1. Grammar the real language needs: `struct` decls + field access (`x.field`), richer
+   types (`Tensor<T,[..]>`, `&T`), `use`/`const`/attributes (`#[..]`), `for`/match.
+2. Then re-emit in a format that matches Rust-aetherc's AST text dump byte-for-byte
+   (the roadmap's actual witness) — point it at `aether_lm.aether` or a translated
+   `compiler/src/main.rs.aether`.
+This is the named P20.2 completion vs the incremental mini-language deposits above.
 - **Compiler bug fixed** (`compiler/src/codegen/asm/mod.rs`): `Stmt::Return`'s
   early-exit epilogue used the LIVE `frame_bytes()` (mid-emission) — an early
   `return` inside an `if` emits before later `let`s bump `next_slot`, so the `addq`
