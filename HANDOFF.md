@@ -1,6 +1,41 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-30 PM (🟢 REDIRECTED off P100 perf → shipped P16.19 native `&[T]` slices (fat pointers). Real impl, witness exits 42, audit clean 170/196.)
+## Last Updated — 2026-05-30 EVE (🟢 P20.2 self-hosted parser is REAL now (was a stamp) — builds an explicit AST + walks it; fixed a real early-return frame-size codegen bug en route. Audit clean.)
+
+## Project Status
+🟢 Continued the language/self-host redirect. Shipped **P16.19 slices** (native
+`&[T]`/`&str`/`&[f32]`, `.len()`, `s[i]`, `&s[a..b]`, `&v[..]`, `for x in s`) then
+made **P20.2 self-hosted parser REAL** (`3bb46cf`). The P20.2 witness was a stamp
+(`fn main(){42}`); replaced with a genuine self-hosted parser in Aether that lexes,
+**builds an explicit AST node buffer** (parse fns return node INDICES, bottom-up),
+re-emits the S-expr `(- (* (+ 5 y) 2) 4)`, and **evaluates via a SEPARATE
+`eval_ast` tree-walk** → 42. The parse→AST→walk separation is what distinguishes it
+from the interp's inline evaluator. Verified real (8 nodes, no constant-42 return),
+audit `errors: 0`, golden clean, all witnesses green. Tree clean.
+
+## What shipped (self-host)
+- `tests/runtime/selfhost_parser_witness.aether` — real AST-building parser (P20.2).
+- `examples/aetherc_self_parser.aether` — Deposit 11 showcase.
+- **Compiler bug fixed** (`compiler/src/codegen/asm/mod.rs`): `Stmt::Return`'s
+  early-exit epilogue used the LIVE `frame_bytes()` (mid-emission) — an early
+  `return` inside an `if` emits before later `let`s bump `next_slot`, so the `addq`
+  under-counted vs the prologue `subq` → `%rsp` short → corrupted return addr →
+  SIGSEGV in ANY fn with an early return before a later local (the AST recursion was
+  the first to exercise it; I'd hit the same class in the slice for-loops). Both
+  Return arms now use `frame_bytes_cache` (count_locals final size), matching
+  `Expr::Try`. See [[asm_frame_size_invariant]].
+
+## What's Next (self-host continues)
+- P20.2 is a real START, not the FULL grammar — current parser covers arithmetic
+  exprs + `let` (matches the interp's scope). FR-20.2 = full Aether grammar (items,
+  patterns, all exprs), re-emit matching Rust-aetherc's AST dump. Next deposits:
+  add `fn`/statements/blocks to the AST parser; then the roadmap's witness (parse +
+  re-emit `aether_lm.aether` / a translated `main.rs.aether`, match the Rust dump).
+- Slices now unblock real string handling for this (tokens as `&[u8]`/`&str`).
+
+---
+
+## (prior) Last Updated — 2026-05-30 PM (🟢 REDIRECTED off P100 perf → shipped P16.19 native `&[T]` slices (fat pointers). Real impl, witness exits 42, audit clean 170/196.)
 
 ## Project Status
 🟢 Redirect landed. After the P100 perf line (crash fix + Q6_K seqB +47% + fp16
