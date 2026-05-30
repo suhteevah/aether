@@ -21,8 +21,25 @@ audit `errors: 0`, golden clean, all witnesses green. Tree clean.
   → NODE_FN/BLOCK/STMT(linked-list)/LETSTMT → re-emits
   `(fn f (block (let y 18) (- (* (+ 5 y) 2) 4)))` → separate eval_ast walk → 42.
   Lexer gained `fn`/`->`/`{`/`}`.
+- `tests/runtime/selfhost_parser_fn2.aether` — **Deposit 13** (`807fea5`): params +
+  function CALLS + multi-fn. `fn dbl(n){n*2} fn main(){let y=18; dbl(5+y)-4}` →
+  fn table + NODE_PARAM/CALL/ARG; eval_ast NODE_CALL resolves via fn_lookup, binds
+  args in a FRESH env frame (callee sees only its params; recursion-correct) → 42.
+- `tests/runtime/selfhost_parser_if.aether` — **Deposit 14** (`1432be5`): if/else +
+  6 comparison ops. `fn pick(a){if a<100 {a*2+6} else {0}} fn main(){let x=18; pick(x)}`
+  → NODE_LT/GT/EQ/NE/LE/GE + NODE_IF(cond,arms)→NODE_IFARMS(then,else); new parse_cmp
+  level; eval branches on the computed cond → 42 (no source-42).
 - `examples/aetherc_self_parser.aether` — Deposit 11 showcase.
-- **All session commits pushed to origin/main** (github.com/suhteevah/aether), HEAD c6902dc.
+- **Self-hosted parser grammar now covers**: multi-fn programs, params, function calls
+  (fresh-frame scoped eval), blocks, `let` statements, arithmetic (+/-/* + parens),
+  6 comparison ops, `if`/`else`. All build a real AST node buffer (parse→build→re-emit
+  S-expr→separate eval-walk). 4 P20.2 witnesses, all exit 42, audit clean. No compiler
+  changes (only the earlier early-return frame fix). **Pushed to origin/main, HEAD 1432be5.**
+
+## Self-host parser — what's next (FR-20.2 continuing track)
+Next deposits toward parsing real `.aether`: `/` `%` + unary `-`/`!`; `while` loops +
+`return` statements; struct/field access; the roadmap witness (parse + re-emit a real
+`.aether` file matching the Rust-aetherc AST dump — the formal P20.2 completion).
 - **Compiler bug fixed** (`compiler/src/codegen/asm/mod.rs`): `Stmt::Return`'s
   early-exit epilogue used the LIVE `frame_bytes()` (mid-emission) — an early
   `return` inside an `if` emits before later `let`s bump `next_slot`, so the `addq`
