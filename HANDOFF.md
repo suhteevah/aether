@@ -1,5 +1,106 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-05-29 (🟢 P100 perf RE-MAPPED: decode is LATENCY-bound not bandwidth-bound; whole-layer fusion Slice A shipped +1.2%; real lever = batched-MMVQ)
+
+## Project Status
+🟢 Shipped Slice A (`qkv_bias_rope` fusion, +1.2% P100 decode, commit `d1c21cc`).
+Bigger outcome: a **data-backed re-map of the P100 ceiling** that corrects two
+long-standing assumptions. **Decode is NOT bandwidth-bound** — it runs at ~24% of
+the P100-16GB HBM2 peak (732 GB/s), so it's latency/occupancy-bound; ECC-off +
+clock-lock gave **exactly 0%**. FFN matmuls already MATCH/BEAT llama bandwidth.
+The remaining single-stream gap to llama (0.87×) is diffuse + structural. The real
+P100 serving lever is **batched/continuous decode** — but the existing scheduler
+uses the slow float seq1 path (no MMVQ) so it's ~36% slower per-stream; it needs a
+**batched-MMVQ + Q6_K-seqB kernel build** to be worth turning on. cnc fleet healthy,
+ECC reverted to on, clocks locked, no zombies.
+
+## What Was Done This Session
+- **Profiled FFN** (cnc P100): gate/up **205 GB/s**, down **172 GB/s** — both ≥ llama
+  (~170). **FFN is bandwidth-saturated → the prior handoff's "FFN fusion is THE
+  lever" premise is REFUTED.** (new bench: `runtime/tests/cuda_mmvq_attn_bench.rs`)
+- **Attn matmul isolation**: q/o 160, **k/v 112 (occupancy-bound, 512 rows)**, down
+  191/173, gate/up 215, lm_head 179/173. Bandwidth scales with grid size for bpr=14.
+- **Decode-timing diagnostics added** (env-gated, free in prod, committed): ATTN
+  sub-split (q/k/v | rope+bias+append | paged-attn | o-proj) + STEP host/transfer
+  split (cpu-prep | h2d | GPU-forward | logits-d2h). Plus **`AETHER_NO_GRAPH`** flag.
+- **graphs vs imperative = WASH on P100** (33.7 vs 33.6, same prompt). The earlier
+  "graphs hurt" read was a cross-prompt artifact.
+- **Host/serving overhead confirmed small (~1.9%)**: logits-d2h 260µs (0.9%) is the
+  biggest real piece; the "565µs prep" was MY instrumentation's sync artifact (real
+  CPU prep = 97µs).
+- **Whole-layer fusion — built + measured both ways:**
+  - **Slice A `qkv_bias_rope`** (bias×3+rope×2 → 1 launch): parity 2.4e-7, cnc P100
+    **33.70 → 34.12 = +1.2%**, coherent. **SHIPPED `d1c21cc`** (default on,
+    `AETHER_FUSE_QKV=0` disables). Test: `cuda_qkv_bias_rope_parity.rs`.
+  - **Slice B `add_rmsnorm_quantize`** (add+rmsnorm+quantize → 1): parity BIT-EXACT
+    but **REGRESSED −1.1%** (collapsed the 112-block quantize into 1 block → lost
+    parallelism on the compute-bound P100). **ABANDONED + reverted.**
+  - **Fusion rule (measured): helps only if it KEEPS THE GRID LARGE (Slice A); a
+    reduction-shaped fusion regresses (Slice B). A whole-layer megakernel = maximal
+    parallelism collapse → wrong for P100.**
+- **ECC investigation (Matt-authorized driver change):** P100s shipped ECC-on.
+  Disabled on GPU1 + locked clocks → **34.12 → 34.12 = ZERO change** → because
+  decode is at ~24% of HBM2 peak (not bandwidth-saturated). **Reverted ECC to on**
+  (both cards, per Matt). Clocks left locked (harmless).
+- **nsys obtained but PARKED:** downloaded 2025.5.2 + 2026.1.3 (CUDA-13 CUPTI to
+  match the 580/CUDA-13 driver) to `/tmp/nsysx*` on cnc; BOTH capture zero CUDA data
+  (even cuda_api_sum empty → injection not loading, not a perms gate). Not worth more
+  rabbit-holing given the structural finding.
+- **Batched-decode mapped** (Explore agent): the `BatchScheduler` (750-line
+  `runtime/src/batched_serving.rs`) IS wired to HTTP via `--max-concurrent`, hetero
+  rope/attn/append kernels parity-tested. BUT `matmul_batched` uses **float seq1
+  `dispatch_matmul` (no MMVQ)** + **per-row fallback for Q6_K** (ffn_down, attn_v).
+  Measured N=1 = **21.83 tok/s** (vs 34 single-session MMVQ) = ~36% per-stream
+  penalty. (Throughput sweep hung at N=1 — bench bug, see Notes — N=4/8 not captured.)
+
+## Current State
+- `d1c21cc` (Slice A + diagnostics + NO_GRAPH) committed; local tree clean except
+  untracked `scratch/ffn_fusion_findings.md` (gitignored, full data map).
+- cnc: WH/SC/RPC all active, ECC Enabled both, clocks locked 1328/715, no zombies.
+- nsys 2026.1.3 extracted at `/tmp/nsysx26/...` on cnc (parked).
+- Single-stream P100 decode: 34.12 tok/s = 0.87× of llama-bench 39.07 (near ceiling).
+
+## Blocking Issues
+None. (nsys CUDA injection won't load — parked, not blocking.)
+
+## What's Next
+1. **Batched-MMVQ build** (THE real P100 serving lever, for the smaller-model fleet +
+   concurrent load): Q8_1-quantize the N activations, batched MMVQ that reads each
+   Q4_K weight ONCE and dots against all N → uses the idle ~70% HBM2 bandwidth. Plus
+   a **Q6_K seqB kernel** (ffn_down + attn_v are half Q6_K → currently per-row). This
+   converts the latency-bound single-stream into bandwidth-saturated multi-stream.
+   Multi-day build; the high-value direction.
+2. **(optional, cheap) hardened batched throughput rerun** — get the N=4/8 aggregate
+   to quantify the current (slow-path) scheduler's break-even. Use curl `--max-time`.
+   (Hardened harness: `scratch/batched_throughput2.sh`.)
+3. **Deprioritize single-stream P100 micro-opt** — it's near the structural ceiling
+   (~24% HBM2 peak, latency-bound). k/v occupancy fusion (~2%) is the only sliver.
+4. Deployment note: for single-user 70B-swap-in use `--max-concurrent 1`
+   (single-session MMVQ, 34 tok/s); the scheduler path costs ~36%/stream until #1.
+
+## Notes for Next Session
+- **Bench scripts that `systemctl stop` the workhorse MUST bound every curl with
+  `--max-time` AND have a watchdog** — the trap restores the fleet only on clean
+  exit, so a hung curl holds the PROD fleet down for minutes. This bit me this
+  session (`scratch/batched_throughput.sh` hung at N=1). [[cnc_bench_curls_must_have_timeout]]
+- **`pkill -f <pattern>` over ssh matches your OWN remote shell** (pattern is in its
+  command line) → kills your session (exit 255). Use `pkill -9 -f '[b]atched_throughput'`.
+  [[pkill_f_self_matches_ssh_shell]]
+- **cnc driver is the proprietary NVIDIA 580.126.09 `.run`, kernel module compiled
+  from source** (source `/usr/src/nvidia-580.126.09/`, editable per Matt). Driver/
+  runtime = **CUDA 13.0**; toolkit = CUDA 12.8 (a split). Matt authorized any driver
+  change to make the P100s better. Docs:
+  `J:\claudeai\scratch\audit-all-repos\clones\microos-kernel-drivers\nvidia\README.md`
+  + wiki `projects/p100-build.md`. [[cnc_nvidia_driver_from_source]]
+- **Decode-section ratios this session were imperative** (AETHER_DECODE_TIMING forces
+  imperative + adds syncs); always cross-check absolute numbers vs a graphs-prod
+  wall-clock run (warmup 6, no timing).
+- cnc P100-16GB HBM2 peak = 732 GB/s; aether decode ~150-215 GB/s = ~24-29% of peak.
+  Headroom is real but only batching can use it. [[p100_decode_latency_bound_not_bandwidth]]
+- Full data map: `scratch/ffn_fusion_findings.md`.
+
+---
+
 ## Last Updated — 2026-05-28 (🟢 elementwise-trap audit complete + v3/v4 re-test = FFN is now the bottleneck, not attention)
 
 ## Project Status
