@@ -119,6 +119,8 @@ use crate::cuda::{
     aether_op_matmul_f32_cuda,
     aether_op_fused_q4k_matmul_seqB_v3_cuda,
     aether_op_fused_q6k_matmul_seqB_v3_cuda,
+    aether_op_fused_q4k_matmul_seqB_fp16_cuda,
+    aether_op_fused_q6k_matmul_seqB_fp16_cuda,
     aether_op_batched_rope_apply_devarg_f32_cuda,
     aether_op_batched_paged_append_kv_hetero_devarg_f32_cuda,
     aether_op_batched_paged_attention_hetero_devarg_f32_cuda,
@@ -1605,6 +1607,15 @@ unsafe fn standard_attention_forward(
     }
 }
 
+/// Batched seqB matmuls use the fp16 half2 kernels (P100 2:1 FP16 lever,
+/// CLAUDEAI_FR.md FR-CLW-1) when `AETHER_SEQB_FP16=1`.  Default OFF (fp32 seqB,
+/// bit-exact) — gate for the e2e A/B.  fp16 accumulates per-super-block then
+/// flushes to fp32, so accuracy holds (microbench rel ~5e-4).
+fn seqb_fp16_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("AETHER_SEQB_FP16").is_ok())
+}
+
 /// FR-19.5-extra-deep Phase 2b-2b — batched matmul over `b` rows.
 ///
 /// `x` is `[b * n_in]`, `y` is `[b * n_out]`.  For Q4_K weights (dt==12) the
@@ -1618,15 +1629,24 @@ unsafe fn matmul_batched(
     n_out: c_int, n_in: c_int, b: c_int,
     scratch_in: i64, scratch_out: i64,
 ) {
+    let fp16 = seqb_fp16_enabled();
     if dt == 12 {
-        let rc = aether_op_fused_q4k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b);
-        assert_eq!(rc, 0, "fused_q4k_matmul_seqB_v3 failed (rc={}, b={})", rc, b);
+        let rc = if fp16 {
+            aether_op_fused_q4k_matmul_seqB_fp16_cuda(x, w, y, n_out, n_in / 256, b)
+        } else {
+            aether_op_fused_q4k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b)
+        };
+        assert_eq!(rc, 0, "fused_q4k_matmul_seqB failed (rc={}, b={}, fp16={})", rc, b, fp16);
     } else if dt == 14 {
         // Batched-MMVQ Phase — Q6_K weight-reuse seqB (ffn_down + attn_v are
         // Q6_K in Qwen2.5-7B).  Replaces the per-row fallback that re-read each
         // 210-byte super-block `b` times — the dominant batched-decode cost.
-        let rc = aether_op_fused_q6k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b);
-        assert_eq!(rc, 0, "fused_q6k_matmul_seqB_v3 failed (rc={}, b={})", rc, b);
+        let rc = if fp16 {
+            aether_op_fused_q6k_matmul_seqB_fp16_cuda(x, w, y, n_out, n_in / 256, b)
+        } else {
+            aether_op_fused_q6k_matmul_seqB_v3_cuda(x, w, y, n_out, n_in / 256, b)
+        };
+        assert_eq!(rc, 0, "fused_q6k_matmul_seqB failed (rc={}, b={}, fp16={})", rc, b, fp16);
     } else {
         for row in 0..b {
             aether_dev_d2d_f32_offset(x, row * n_in, scratch_in, 0, n_in);

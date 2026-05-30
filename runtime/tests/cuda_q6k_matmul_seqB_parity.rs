@@ -28,6 +28,7 @@ use aether_rt::cuda::{
     aether_dev_alloc_u8, aether_dev_free_u8, aether_dev_h2d_u8,
     aether_op_fused_q6k_matmul_seq1_v2_cuda,
     aether_op_fused_q6k_matmul_seqB_v3_cuda,
+    aether_op_fused_q6k_matmul_seqB_fp16_cuda,
 };
 
 /// Random Q6_K weight bytes (210/super-block) with a fixed small f16 `d` per
@@ -115,6 +116,82 @@ fn seqB_matches_b_sequential_seq1() {
         aether_dev_free_u8(d_w);
         aether_dev_free_f32(d_a1);
         aether_dev_free_f32(d_o1);
+    }
+}
+
+/// fp16 half2 variant (P100 lever): accuracy vs the fp32 seqB (NOT bit-exact —
+/// fp16 multiply + per-super-block fp16 partials introduce small error, but the
+/// long-K + warp reductions are fp32, so it must stay within a tight tolerance)
+/// + isolated speed at the ffn_down shape (B=8).  Decides whether fp16 is worth
+/// integrating before touching the e2e serving path.
+#[test]
+fn seqB_fp16_accuracy_and_speed() {
+    unsafe {
+        assert_eq!(0, aether_dev_init(), "CUDA init");
+        // ffn_down shape: n_out = d_model = 3584, n_in = d_ff = 18944 = 74 blocks.
+        const N: usize = 3584;
+        const N_BLOCKS: c_int = 74;
+        const K: usize = (N_BLOCKS as usize) * 256;
+        const BATCH: usize = 8;
+
+        let w_host = random_q6k_bytes(N, N_BLOCKS as usize, 0xF00D_5EEDu64);
+        let a_batch: Vec<f32> = (0..(BATCH * K))
+            .map(|i| ((i as f32) * 0.00025 - 0.12).sin() * 0.5).collect();
+        let d_w = aether_dev_alloc_u8(w_host.len() as c_int);
+        let d_ab = aether_dev_alloc_f32((BATCH * K) as c_int);
+        let d_o32 = aether_dev_alloc_f32((BATCH * N) as c_int);
+        let d_o16 = aether_dev_alloc_f32((BATCH * N) as c_int);
+        aether_dev_h2d_u8(w_host.as_ptr() as i64, d_w, w_host.len() as c_int);
+        aether_dev_h2d_f32(a_batch.as_ptr() as i64, d_ab, (BATCH * K) as c_int);
+
+        // --- accuracy: fp16 seqB vs fp32 seqB (the fp32 path is bit-exact to per-row) ---
+        assert_eq!(0, aether_op_fused_q6k_matmul_seqB_v3_cuda(d_ab, d_w, d_o32, N as c_int, N_BLOCKS, BATCH as c_int));
+        assert_eq!(0, aether_op_fused_q6k_matmul_seqB_fp16_cuda(d_ab, d_w, d_o16, N as c_int, N_BLOCKS, BATCH as c_int));
+        aether_dev_sync();
+        let mut o32 = vec![0.0f32; BATCH * N];
+        let mut o16 = vec![0.0f32; BATCH * N];
+        aether_dev_d2h_f32(d_o32, o32.as_mut_ptr() as i64, (BATCH * N) as c_int);
+        aether_dev_d2h_f32(d_o16, o16.as_mut_ptr() as i64, (BATCH * N) as c_int);
+        let mut max_abs = 0.0f32;
+        let mut max_mag = 0.0f32;
+        for i in 0..BATCH * N {
+            let d = (o32[i] - o16[i]).abs();
+            if d > max_abs { max_abs = d; }
+            if o32[i].abs() > max_mag { max_mag = o32[i].abs(); }
+        }
+        let rel = if max_mag > 0.0 { max_abs / max_mag } else { 0.0 };
+        println!("[q6k fp16] accuracy vs fp32 seqB: max_abs={:.3e} max_mag={:.3e} rel={:.3e}",
+            max_abs, max_mag, rel);
+        assert!(rel < 0.05,
+            "fp16 drifted too far from fp32 (rel={:.3e} >= 0.05) — fp32-accumulator design may be wrong", rel);
+
+        // --- speed: fp16 vs fp32 seqB at B=8 ---
+        const ITERS: usize = 200;
+        for _ in 0..40 {
+            aether_op_fused_q6k_matmul_seqB_fp16_cuda(d_ab, d_w, d_o16, N as c_int, N_BLOCKS, BATCH as c_int);
+            aether_op_fused_q6k_matmul_seqB_v3_cuda(d_ab, d_w, d_o32, N as c_int, N_BLOCKS, BATCH as c_int);
+        }
+        aether_dev_sync();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            aether_op_fused_q6k_matmul_seqB_v3_cuda(d_ab, d_w, d_o32, N as c_int, N_BLOCKS, BATCH as c_int);
+        }
+        aether_dev_sync();
+        let fp32_us = t0.elapsed().as_secs_f64() / ITERS as f64 * 1e6;
+        let t1 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            aether_op_fused_q6k_matmul_seqB_fp16_cuda(d_ab, d_w, d_o16, N as c_int, N_BLOCKS, BATCH as c_int);
+        }
+        aether_dev_sync();
+        let fp16_us = t1.elapsed().as_secs_f64() / ITERS as f64 * 1e6;
+        println!("[q6k fp16 bench] n={} n_blocks={} batch={} iters={}", N, N_BLOCKS, BATCH, ITERS);
+        println!("  fp32 seqB_v3: {:.2} µs/step", fp32_us);
+        println!("  fp16 seqB:    {:.2} µs/step", fp16_us);
+        println!("  fp16 speedup vs fp32: {:.2}× ({})", fp32_us / fp16_us,
+            if fp16_us < fp32_us { "WIN" } else { "no win — fp32 stays" });
+
+        aether_dev_free_u8(d_w);
+        aether_dev_free_f32(d_ab); aether_dev_free_f32(d_o32); aether_dev_free_f32(d_o16);
     }
 }
 

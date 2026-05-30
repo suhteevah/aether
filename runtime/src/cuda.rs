@@ -31,7 +31,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::cublas::sys::cublasOperation_t;
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx, compile_ptx_with_opts, CompileOptions};
 
 struct CudaCtx {
     device: Arc<CudaDevice>,
@@ -11083,6 +11083,333 @@ fn attn_warps() -> u32 {
         paged_ctx().fused_q6k_matmul_seqB_v3.clone()
             .launch(cfg, (av, wv, ov, n, n_blocks, batch))
             .expect("launch fused_q6k_matmul_seqB_v3");
+    }
+    0
+}
+
+// ── batched-seqB fp16 (P100 lever, CLAUDEAI_FR.md FR-CLW-1) ──────────────────
+// P100 (sm_60) has no __dp4a but native 2:1 FP16.  fp16 half2 MAC variant of the
+// Q6_K seqB matmul: activations cast fp32→fp16 (interleaved [k*8 + b] so a single
+// row-pair is one contiguous half2), weight dequant cast to fp16, `__hfma2`
+// accumulates 2 rows per instruction.  ACCUMULATION SAFETY: fp16 accumulates only
+// the ~8 quants/lane WITHIN one super-block, then flushes to a per-lane fp32
+// accumulator; the long-K reduction (74 super-blocks) + the 32-lane warp reduce
+// are all fp32 — so drift is bounded (the NaN/vocab-1 trap the FR warns about
+// comes from long pure-fp16 accumulation, which this avoids).
+//
+// Compiled in a SEPARATE nvrtc module at compute_60 (half2 arithmetic intrinsics
+// are __CUDA_ARCH__>=530-gated; the default paged module's arch is left alone so
+// existing kernels' codegen is untouched).
+const FP16_KERNEL_SRC: &str = r#"
+#include <cuda_fp16.h>
+
+// Q4_K scale/min unpack (duplicated from PAGED_KERNEL_SRC — separate module).
+extern "C" __device__ unsigned int q4k_get_scale_fp16(int sub, const unsigned char* sc) {
+    if (sub < 4) return sc[sub] & 63u;
+    return (sc[sub + 4] & 0xFu) | (((unsigned int)(sc[sub - 4] >> 6)) << 4);
+}
+extern "C" __device__ unsigned int q4k_get_min_fp16(int sub, const unsigned char* sc) {
+    if (sub < 4) return sc[sub + 4] & 63u;
+    return (sc[sub + 4] >> 4) | (((unsigned int)(sc[sub] >> 6)) << 4);
+}
+
+extern "C" __global__ void fused_q6k_matmul_seqB_fp16(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks, int batch)
+{
+    // Interleaved fp16 activations: a_tile[k*8 + b] = act(row b, K-element k).
+    __shared__ __half a_tile[256 * 8];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc[8];
+    #pragma unroll
+    for (int b = 0; b < 8; b++) acc[b] = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        // Cooperative load: thread tid (= K-element) writes all 8 rows; padding
+        // rows (b>=batch) get 0 so the unconditional __hfma2 over 8 rows is safe.
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            __half v = (b < batch)
+                ? __float2half(a[(size_t)b * n_blocks * 256 + bi * 256 + threadIdx.x])
+                : __float2half(0.0f);
+            a_tile[threadIdx.x * 8 + b] = v;
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)ni * n_blocks * 210 + (size_t)bi * 210;
+            const unsigned char* ql = base;
+            const unsigned char* qh = base + 128;
+            const signed char*   sc = (const signed char*)(base + 192);
+            unsigned short d_bits = ((unsigned short)base[209] << 8) | (unsigned short)base[208];
+            float d = __half2float(__ushort_as_half(d_bits));
+
+            // fp16 partials for this super-block: 4 half2 = 8 rows.
+            half2 acc16[4];
+            #pragma unroll
+            for (int p = 0; p < 4; p++) acc16[p] = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int n_outer = 0; n_outer < 2; n_outer++) {
+                int ql_off = n_outer * 64;
+                int qh_off = n_outer * 32;
+                int sc_off = n_outer * 8;
+                #pragma unroll
+                for (int sub_pos = 0; sub_pos < 4; sub_pos++) {
+                    int l_iter = lane;
+                    int scale_idx = sc_off + (l_iter >> 4) + 2 * sub_pos;
+                    float sc_val = (float)sc[scale_idx];
+                    int q;
+                    if (sub_pos == 0) {
+                        unsigned char a0 = ql[ql_off + l_iter];
+                        unsigned char b0 = qh[qh_off + l_iter];
+                        q = (int)((a0 & 0xFu) | ((b0 & 3u) << 4)) - 32;
+                    } else if (sub_pos == 1) {
+                        unsigned char a0 = ql[ql_off + l_iter + 32];
+                        unsigned char b0 = qh[qh_off + l_iter];
+                        q = (int)((a0 & 0xFu) | (((b0 >> 2) & 3u) << 4)) - 32;
+                    } else if (sub_pos == 2) {
+                        unsigned char a0 = ql[ql_off + l_iter];
+                        unsigned char b0 = qh[qh_off + l_iter];
+                        q = (int)(((a0 >> 4) & 0xFu) | (((b0 >> 4) & 3u) << 4)) - 32;
+                    } else {
+                        unsigned char a0 = ql[ql_off + l_iter + 32];
+                        unsigned char b0 = qh[qh_off + l_iter];
+                        q = (int)(((a0 >> 4) & 0xFu) | (((b0 >> 6) & 3u) << 4)) - 32;
+                    }
+                    __half w_h = __float2half(d * sc_val * (float)q);
+                    half2 w2 = __half2half2(w_h);
+                    int a_idx = (n_outer * 128) + (sub_pos * 32) + l_iter;
+                    const half2* arow = (const half2*)&a_tile[a_idx * 8];  // rows 0..7
+                    #pragma unroll
+                    for (int p = 0; p < 4; p++) {
+                        acc16[p] = __hfma2(arow[p], w2, acc16[p]);          // rows 2p, 2p+1
+                    }
+                }
+            }
+            // Flush fp16 super-block partials into the fp32 accumulators.
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                float2 f = __half22float2(acc16[p]);
+                acc[2 * p]     += f.x;
+                acc[2 * p + 1] += f.y;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        if (b < batch) {
+            float ac = acc[b];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                ac += __shfl_down_sync(0xFFFFFFFFu, ac, off);
+            }
+            if (lane == 0 && ni < n) out[(size_t)b * n + ni] = ac;
+        }
+    }
+}
+
+// fp16 half2 variant of fused_q4k_matmul_seqB_v3.  Same interleaved-fp16 a_tile +
+// per-super-block fp16 partials → fp32 flush.  Each Q4_K byte yields a lo and hi
+// nibble (two weights at two K positions); both __hfma2 into the same partials.
+extern "C" __global__ void fused_q4k_matmul_seqB_fp16(
+    const float*         __restrict__ a,
+    const unsigned char* __restrict__ w,
+    float*               __restrict__ out,
+    int n, int n_blocks, int batch)
+{
+    __shared__ __half a_tile[256 * 8];   // interleaved [k*8 + b]
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int ni = blockIdx.x * 8 + warp;
+
+    float acc[8];
+    #pragma unroll
+    for (int b = 0; b < 8; b++) acc[b] = 0.0f;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        #pragma unroll
+        for (int b = 0; b < 8; b++) {
+            __half v = (b < batch)
+                ? __float2half(a[(size_t)b * n_blocks * 256 + bi * 256 + threadIdx.x])
+                : __float2half(0.0f);
+            a_tile[threadIdx.x * 8 + b] = v;
+        }
+        __syncthreads();
+
+        if (ni < n) {
+            const unsigned char* base = w + (size_t)ni * n_blocks * 144 + (size_t)bi * 144;
+            float d    = __half2float(__ushort_as_half(((unsigned short)base[1] << 8) | (unsigned short)base[0]));
+            float dmin = __half2float(__ushort_as_half(((unsigned short)base[3] << 8) | (unsigned short)base[2]));
+            const unsigned char* scales = base + 4;
+            const unsigned char* qs     = base + 16;
+
+            float d_eff[8], m_eff[8];
+            #pragma unroll
+            for (int s = 0; s < 8; s++) {
+                d_eff[s] = d    * (float)q4k_get_scale_fp16(s, scales);
+                m_eff[s] = dmin * (float)q4k_get_min_fp16(s, scales);
+            }
+
+            half2 acc16[4];
+            #pragma unroll
+            for (int p = 0; p < 4; p++) acc16[p] = __float2half2_rn(0.0f);
+
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int sub_lo = i * 2;
+                int sub_hi = i * 2 + 1;
+                unsigned char byte = qs[i * 32 + lane];
+                float w_lo = d_eff[sub_lo] * (float)(byte & 0xFu)        - m_eff[sub_lo];
+                float w_hi = d_eff[sub_hi] * (float)((byte >> 4) & 0xFu) - m_eff[sub_hi];
+                half2 wlo2 = __half2half2(__float2half(w_lo));
+                half2 whi2 = __half2half2(__float2half(w_hi));
+                int k_lo = sub_lo * 32 + lane;
+                int k_hi = sub_hi * 32 + lane;
+                const half2* arow_lo = (const half2*)&a_tile[k_lo * 8];
+                const half2* arow_hi = (const half2*)&a_tile[k_hi * 8];
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    acc16[p] = __hfma2(arow_lo[p], wlo2, acc16[p]);
+                    acc16[p] = __hfma2(arow_hi[p], whi2, acc16[p]);
+                }
+            }
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                float2 f = __half22float2(acc16[p]);
+                acc[2 * p]     += f.x;
+                acc[2 * p + 1] += f.y;
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int b = 0; b < 8; b++) {
+        if (b < batch) {
+            float ac = acc[b];
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                ac += __shfl_down_sync(0xFFFFFFFFu, ac, off);
+            }
+            if (lane == 0 && ni < n) out[(size_t)b * n + ni] = ac;
+        }
+    }
+}
+"#;
+
+struct Fp16Ctx {
+    fused_q6k_matmul_seqB_fp16: CudaFunction,
+    fused_q4k_matmul_seqB_fp16: CudaFunction,
+}
+static FP16_CTX: OnceLock<Fp16Ctx> = OnceLock::new();
+
+/// nvrtc here (the pip cuda_nvrtc wheel) does NOT bundle `cuda_fp16.h` as a
+/// builtin header, so `#include <cuda_fp16.h>` needs an explicit search dir.
+/// Probe env (CUDA_HOME/CUDA_PATH) + the common toolkit locations and keep only
+/// dirs that actually contain the header (portable across cnc/kokonoe).
+fn fp16_include_dirs() -> Vec<String> {
+    let mut cands: Vec<String> = Vec::new();
+    for var in ["CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"] {
+        if let Ok(base) = std::env::var(var) {
+            cands.push(format!("{}/include", base));
+            cands.push(format!("{}/targets/x86_64-linux/include", base));
+        }
+    }
+    cands.push("/usr/local/cuda/include".into());
+    cands.push("/usr/local/cuda/targets/x86_64-linux/include".into());
+    cands.push("/usr/local/cuda-12.8/targets/x86_64-linux/include".into());
+    cands.push("/usr/local/cuda-12.8/include".into());
+    cands.into_iter()
+        .filter(|d| std::path::Path::new(&format!("{}/cuda_fp16.h", d)).exists())
+        .collect()
+}
+
+fn fp16_ctx() -> &'static Fp16Ctx {
+    FP16_CTX.get_or_init(|| {
+        let device = &ctx().device;
+        let incs = fp16_include_dirs();
+        assert!(!incs.is_empty(),
+            "cuda_fp16.h not found in any candidate dir; set CUDA_HOME (need <dir>/cuda_fp16.h)");
+        let ptx = compile_ptx_with_opts(FP16_KERNEL_SRC, CompileOptions {
+            arch: Some("compute_60"),
+            include_paths: incs,
+            ..Default::default()
+        }).expect("compile_ptx fp16 (compute_60)");
+        device.load_ptx(ptx, "aether_fp16_kernels",
+            &["fused_q6k_matmul_seqB_fp16", "fused_q4k_matmul_seqB_fp16"])
+            .expect("load_ptx fp16");
+        Fp16Ctx {
+            fused_q6k_matmul_seqB_fp16:
+                device.get_func("aether_fp16_kernels", "fused_q6k_matmul_seqB_fp16").unwrap(),
+            fused_q4k_matmul_seqB_fp16:
+                device.get_func("aether_fp16_kernels", "fused_q4k_matmul_seqB_fp16").unwrap(),
+        }
+    })
+}
+
+/// fp16 half2 variant of `aether_op_fused_q6k_matmul_seqB_v3_cuda` (P100 lever).
+/// Same args + launch shape; accumulates in fp32 (per-super-block fp16 partials).
+#[no_mangle] pub extern "C" fn aether_op_fused_q6k_matmul_seqB_fp16_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int, batch: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 || batch <= 0 || batch > 8 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig {
+        grid_dim:  (((n as u32) + 7) / 8, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        fp16_ctx().fused_q6k_matmul_seqB_fp16.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks, batch))
+            .expect("launch fused_q6k_matmul_seqB_fp16");
+    }
+    0
+}
+
+/// fp16 half2 variant of `aether_op_fused_q4k_matmul_seqB_v3_cuda` (P100 lever).
+#[no_mangle] pub extern "C" fn aether_op_fused_q4k_matmul_seqB_fp16_cuda(
+    a_dev_f32: i64, w_dev_u8: i64, out_dev_f32: i64,
+    n: c_int, n_blocks: c_int, batch: c_int,
+) -> c_int {
+    let Some(i_a) = handle_to_idx(a_dev_f32) else { return -1; };
+    let Some(i_w) = handle_to_u8_idx(w_dev_u8) else { return -1; };
+    let Some(i_o) = handle_to_idx(out_dev_f32) else { return -1; };
+    if n <= 0 || n_blocks <= 0 || batch <= 0 || batch > 8 { return -1; }
+    let bs = unsafe { bufs() };
+    let bs_u8 = unsafe { u8_bufs() };
+    let a_p = bs[i_a].as_ref().unwrap() as *const CudaSlice<f32>;
+    let w_p = bs_u8[i_w].as_ref().unwrap() as *const CudaSlice<u8>;
+    let o_p = bs[i_o].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig {
+        grid_dim:  (((n as u32) + 7) / 8, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        let av = &*a_p; let wv = &*w_p; let ov = &mut *o_p;
+        fp16_ctx().fused_q4k_matmul_seqB_fp16.clone()
+            .launch(cfg, (av, wv, ov, n, n_blocks, batch))
+            .expect("launch fused_q4k_matmul_seqB_fp16");
     }
     0
 }

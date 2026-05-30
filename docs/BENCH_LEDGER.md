@@ -1112,3 +1112,37 @@ vs `batch` sequential `seq1_v2` calls for every b=1..8 — PASS. `seqB_throughpu
 (#[ignore]) at the `ffn_down` shape (n=3584, 74 super-blocks, B=8): serial 8×seq1_v2
 6504 µs/step vs batched 1×seqB 1256 µs/step = **5.18× isolated** — the kernel-level
 source of the +47% e2e (diluted by the rest of the forward).
+
+---
+
+## 2026-05-30 — batched seqB fp16 half2 (P100 fp16 lever, FR-CLW-1) — CORRECT but e2e-MARGINAL, flag-gated
+
+Per CLAUDEAI_FR.md FR-CLW-1 (P100 sm_60 has no dp4a; lever is fp16 half2 → fp32
+accumulator). Built fp16 variants of BOTH batched seqB matmuls,
+`fused_q4k_matmul_seqB_fp16` + `fused_q6k_matmul_seqB_fp16` (cuda.rs, a SEPARATE
+nvrtc module compiled at compute_60 with an explicit cuda_fp16.h include-path probe
+— the pip cuda_nvrtc wheel doesn't bundle the header; the paged module's codegen is
+left untouched). Design: activations cast fp32→fp16 (interleaved [k*8+b] so a
+row-pair is one contiguous half2), weight dequant→fp16, `__hfma2` accumulates 2 rows
+/instruction into per-super-block fp16 partials, FLUSHED to a per-lane fp32
+accumulator; the 74-block + 32-lane reductions stay fp32. Wired into `matmul_batched`
+behind `AETHER_SEQB_FP16` (default OFF). Witness: `cuda_q6k_matmul_seqB_parity.rs::
+seqB_fp16_accuracy_and_speed`.
+
+**Kernel-level (Q6_K seqB, ffn_down shape, B=8):** accuracy rel **5.47e-4** vs fp32
+(fp32-accumulator design holds — no drift); speed **1.15×** isolated (1256→1090 µs).
+
+**e2e A/B** (rebuilt aether-serve, SAME binary, env-flag toggle = clean attribution,
+single rep, output coherent + token-identical):
+
+| N | fp32 seqB | fp16 seqB | Δ |
+|---:|---:|---:|---:|
+| 4 | 21.24 | 20.81 | −2.0% |
+| 8 | 32.13 | 33.44 | +4.1% |
+
+**Verdict: correct but e2e-MARGINAL** (+4% best at N=8, ~noise-level single-rep;
+slightly negative at N=4). Consistent with the 1.15× isolated: these kernels are
+DEQUANT/occupancy-bound, not FMA-bound (1256µs vs ~117µs raw-FMA floor), so half2 on
+the multiply alone barely moves e2e. The real fp16 win needs fp16 dequant + better
+tiling (a whole-kernel rewrite), not just half2 on the FMA. Kept flag-gated
+default-off as a proven building block + the reusable cuda_fp16 nvrtc infra.
