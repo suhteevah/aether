@@ -87,6 +87,19 @@ pub enum Instr {
     /// `movq %src, disp(%base)` for a non-rbp/rsp 64-bit base register.
     /// Used by stack-array index writes.
     MovBaseDispFromReg { src: Reg, base: Reg, disp: i32 },
+    /// `movzbl disp(%base), %eax-class` — zero-extend a single byte from
+    /// memory into a 32-bit dst (which clears the upper 32 bits of the full
+    /// 64-bit reg). `0F B6 /r`. Used by `&[u8]`/`&str` slice index loads so a
+    /// 1-byte element is read EXACTLY one byte wide — no 8-byte over-read past
+    /// the heap allocation. P16.19.
+    MovzblBaseDispToReg { dst: Reg, base: Reg, disp: i32 },
+    /// `movzwl disp(%base), %eax-class` — zero-extend a 16-bit word from
+    /// memory. `0F B7 /r`. Used by `&[u16]`/`&[i16]` slice index loads.
+    MovzwlBaseDispToReg { dst: Reg, base: Reg, disp: i32 },
+    /// `movl disp(%base), %eax-class` — load a 32-bit dword (upper 32 bits of
+    /// the dst reg cleared by the hardware). `8B /r`, no REX.W. Used by
+    /// `&[u32]`/`&[i32]`/`&[f32]`-as-int slice index loads. P16.19.
+    MovlBaseDispToReg { dst: Reg, base: Reg, disp: i32 },
     /// `mov [rbp + disp32], r64` — store to stack slot.
     MovRbpDispFromReg { src: Reg, disp: i32 },
     /// `movq $imm32, disp32(%rbp)` — store sign-extended imm32 directly to a
@@ -149,6 +162,11 @@ pub enum Instr {
     MovssRspToXmm { dst: XmmReg },
     /// `movss %xmm, (%rsp)` — store to top of stack.
     MovssXmmToRsp { src: XmmReg },
+    /// `movss disp(%base), %xmm` for a non-rbp/rsp 64-bit base register.
+    /// `F3 0F 10 /r`. Used by `&[f32]` slice index loads — the element
+    /// address has been computed into a GPR (`%rdi`); this loads the f32 from
+    /// it without round-tripping through a stack slot. P16.19.
+    MovssBaseDispToXmm { dst: XmmReg, base: Reg, disp: i32 },
 
     // -------- SSE2 double-precision float (f64) -----------------------------
     // Same op shapes as the ss family but with the `F2` SSE prefix instead of
@@ -165,6 +183,9 @@ pub enum Instr {
     UcomisdXmmXmm { dst: XmmReg, src: XmmReg },
     MovsdRspToXmm { dst: XmmReg },
     MovsdXmmToRsp { src: XmmReg },
+    /// `movsd disp(%base), %xmm` for a non-rbp/rsp 64-bit base register.
+    /// `F2 0F 10 /r`. Used by `&[f64]` slice index loads. P16.19.
+    MovsdBaseDispToXmm { dst: XmmReg, base: Reg, disp: i32 },
 
     // -------- int ↔ float conversions -------------------------------------
     /// `cvtsi2ss %src(r64), %dst(xmm)` — `F3 REX.W 0F 2A /r`.
@@ -483,6 +504,43 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
             b.extend_from_slice(&disp.to_le_bytes());
             Encoded { bytes: b, reloc: None }
         }
+        MovzblBaseDispToReg { dst, base, disp } => {
+            // [REX] 0F B6 /r. Mod=10 disp32. dst in reg field, base in r/m.
+            // No REX.W — the 32-bit dst write zero-extends to the full 64-bit
+            // reg, and the byte source needs no width override. REX is emitted
+            // only when an extension bit (r8..r15) is in play.
+            assert!(!matches!(base, Reg::Rsp), "MovzblBaseDispToReg with rsp base needs SIB");
+            let mut b = Vec::with_capacity(8);
+            let rex = 0x40 | (dst.extension() << 2) | base.extension();
+            if rex != 0x40 { b.push(rex); }
+            b.extend_from_slice(&[0x0F, 0xB6]);
+            b.push(0b10_000_000 | (dst.lo3() << 3) | base.lo3());
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        MovzwlBaseDispToReg { dst, base, disp } => {
+            // [REX] 0F B7 /r. Mod=10 disp32. Zero-extend 16-bit → 32-bit dst.
+            assert!(!matches!(base, Reg::Rsp), "MovzwlBaseDispToReg with rsp base needs SIB");
+            let mut b = Vec::with_capacity(8);
+            let rex = 0x40 | (dst.extension() << 2) | base.extension();
+            if rex != 0x40 { b.push(rex); }
+            b.extend_from_slice(&[0x0F, 0xB7]);
+            b.push(0b10_000_000 | (dst.lo3() << 3) | base.lo3());
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
+        MovlBaseDispToReg { dst, base, disp } => {
+            // [REX] 8B /r. Mod=10 disp32. 32-bit load — upper 32 bits of the
+            // 64-bit dst are cleared by the hardware. No REX.W.
+            assert!(!matches!(base, Reg::Rsp), "MovlBaseDispToReg with rsp base needs SIB");
+            let mut b = Vec::with_capacity(7);
+            let rex = 0x40 | (dst.extension() << 2) | base.extension();
+            if rex != 0x40 { b.push(rex); }
+            b.push(0x8B);
+            b.push(0b10_000_000 | (dst.lo3() << 3) | base.lo3());
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
         XchgRegRegQ { dst, src } => {
             // REX.W + 87 /r   (xchg r/m64, r64)
             let rex = 0x48 | (src.extension() << 2) | dst.extension();
@@ -571,6 +629,18 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
             let modrm = 0b00_000_100 | (src.lo3() << 3);
             Encoded { bytes: vec![0xF3, 0x0F, 0x11, modrm, 0x24], reloc: None }
         }
+        MovssBaseDispToXmm { dst, base, disp } => {
+            // F3 [REX] 0F 10 /r. Mod=10 disp32. xmm dst in reg field, base in
+            // r/m. REX only when base is r8..r15. P16.19 — `&[f32]` load.
+            assert!(!matches!(base, Reg::Rsp), "MovssBaseDispToXmm with rsp base needs SIB");
+            let mut b = Vec::with_capacity(9);
+            b.push(0xF3);
+            if base.extension() != 0 { b.push(0x41); }
+            b.extend_from_slice(&[0x0F, 0x10]);
+            b.push(0b10_000_000 | (dst.lo3() << 3) | base.lo3());
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
+        }
 
         // ------------------ SSE2 f64 -------------------------------------
         MovsdRbpDispToXmm { dst, disp } => {
@@ -629,6 +699,17 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
         MovsdXmmToRsp { src } => {
             let modrm = 0b00_000_100 | (src.lo3() << 3);
             Encoded { bytes: vec![0xF2, 0x0F, 0x11, modrm, 0x24], reloc: None }
+        }
+        MovsdBaseDispToXmm { dst, base, disp } => {
+            // F2 [REX] 0F 10 /r. Mod=10 disp32. P16.19 — `&[f64]` load.
+            assert!(!matches!(base, Reg::Rsp), "MovsdBaseDispToXmm with rsp base needs SIB");
+            let mut b = Vec::with_capacity(9);
+            b.push(0xF2);
+            if base.extension() != 0 { b.push(0x41); }
+            b.extend_from_slice(&[0x0F, 0x10]);
+            b.push(0b10_000_000 | (dst.lo3() << 3) | base.lo3());
+            b.extend_from_slice(&disp.to_le_bytes());
+            Encoded { bytes: b, reloc: None }
         }
 
         // ------------------ int ↔ float conversions ----------------------
@@ -909,6 +990,37 @@ mod tests {
         assert_eq!(enc(Instr::SetccAl { cc: CondCode::Ne }), vec![0x0F, 0x95, 0xC0]);
         // `movzbl %al, %eax` -> 0F B6 C0
         assert_eq!(enc(Instr::MovzblAlEax), vec![0x0F, 0xB6, 0xC0]);
+    }
+
+    #[test]
+    fn sized_slice_element_loads() {
+        // P16.19 — per-element-width loads from a base register (the slice
+        // element address computed into %rdi). Verified against Intel SDM.
+        //
+        // `movzbl 0(%rdi), %eax` -> 0F B6 87 00 00 00 00  (no REX; dst/base low)
+        assert_eq!(
+            enc(Instr::MovzblBaseDispToReg { dst: Reg::Rax, base: Reg::Rdi, disp: 0 }),
+            vec![0x0F, 0xB6, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        // `movzwl 0(%rdi), %eax` -> 0F B7 87 00 00 00 00
+        assert_eq!(
+            enc(Instr::MovzwlBaseDispToReg { dst: Reg::Rax, base: Reg::Rdi, disp: 0 }),
+            vec![0x0F, 0xB7, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        // `movl 0(%rdi), %eax` -> 8B 87 00 00 00 00  (32-bit, clears upper rax)
+        assert_eq!(
+            enc(Instr::MovlBaseDispToReg { dst: Reg::Rax, base: Reg::Rdi, disp: 0 }),
+            vec![0x8B, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        // `movss 0(%rdi), %xmm0` -> F3 0F 10 87 00 00 00 00
+        assert_eq!(
+            enc(Instr::MovssBaseDispToXmm { dst: XmmReg::Xmm0, base: Reg::Rdi, disp: 0 }),
+            vec![0xF3, 0x0F, 0x10, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        // `movsd 0(%rdi), %xmm0` -> F2 0F 10 87 00 00 00 00
+        assert_eq!(
+            enc(Instr::MovsdBaseDispToXmm { dst: XmmReg::Xmm0, base: Reg::Rdi, disp: 0 }),
+            vec![0xF2, 0x0F, 0x10, 0x87, 0x00, 0x00, 0x00, 0x00]);
+        // r8-base variant gets a REX prefix: `movzbl 0(%r8), %eax` -> 41 0F B6 80 …
+        assert_eq!(
+            enc(Instr::MovzblBaseDispToReg { dst: Reg::Rax, base: Reg::R8, disp: 0 }),
+            vec![0x41, 0x0F, 0xB6, 0x80, 0x00, 0x00, 0x00, 0x00]);
     }
 
     #[test]

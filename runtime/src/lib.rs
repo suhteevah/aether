@@ -4013,6 +4013,111 @@ unsafe fn vec_i64_free_buf(ptr: *mut i64, cap: usize) {
     0
 }
 
+// ---- Vec<f32> handle table ------------------------------------------------
+// Mirrors the Vec<i64> table exactly, but stores f32 elements. Backs native
+// `&[f32]` slices (P16.19): `slice_from_raw(aether_vec_f32_as_ptr(v),
+// aether_vec_f32_len(v))`. Push takes the f32 bit-pattern in the low 32 bits
+// of an i64 so it crosses the C ABI without a float register (the asm backend
+// passes/returns scalars in GPRs for FFI); the runtime reinterprets it.
+
+struct VecF32 {
+    ptr: *mut f32,
+    len: usize,
+    cap: usize,
+}
+
+struct VecF32Cell(UnsafeCell<Vec<Option<Box<VecF32>>>>);
+unsafe impl Sync for VecF32Cell {}
+static VEC_F32_TABLE: VecF32Cell = VecF32Cell(UnsafeCell::new(Vec::new()));
+
+unsafe fn vec_f32_table() -> &'static mut Vec<Option<Box<VecF32>>> {
+    &mut *VEC_F32_TABLE.0.get()
+}
+
+unsafe fn vec_f32_alloc_buf(cap: usize) -> *mut f32 {
+    if cap == 0 { return std::ptr::null_mut(); }
+    let bytes = cap.checked_mul(std::mem::size_of::<f32>()).expect("vec f32 cap overflow");
+    aether_alloc_bytes(bytes as i64) as *mut f32
+}
+
+unsafe fn vec_f32_free_buf(ptr: *mut f32, cap: usize) {
+    if ptr.is_null() || cap == 0 { return; }
+    let bytes = cap * std::mem::size_of::<f32>();
+    aether_free_bytes(ptr as i64, bytes as i64);
+}
+
+/// Allocate a fresh empty `Vec<f32>`. Returns a non-negative handle.
+#[no_mangle] pub unsafe extern "C" fn aether_vec_f32_new() -> i64 {
+    let v = Box::new(VecF32 { ptr: std::ptr::null_mut(), len: 0, cap: 0 });
+    let tbl = vec_f32_table();
+    for (i, slot) in tbl.iter_mut().enumerate() {
+        if slot.is_none() { *slot = Some(v); return i as i64; }
+    }
+    tbl.push(Some(v));
+    (tbl.len() - 1) as i64
+}
+
+/// Push an f32 (passed as its little-endian bit-pattern in the low 32 bits of
+/// `bits`) onto the Vec. Capacity-doubling growth. 0 ok / -1 bad handle / -2 OOM.
+#[no_mangle] pub unsafe extern "C" fn aether_vec_f32_push(handle: i64, bits: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = vec_f32_table();
+    let idx = handle as usize;
+    if idx >= tbl.len() { return -1; }
+    let v = match tbl[idx].as_mut() { Some(v) => v, None => return -1 };
+    if v.len == v.cap {
+        let new_cap = if v.cap == 0 { 4 } else { v.cap * 2 };
+        let new_ptr = vec_f32_alloc_buf(new_cap);
+        if new_ptr.is_null() { return -2; }
+        if v.len > 0 {
+            std::ptr::copy_nonoverlapping(v.ptr, new_ptr, v.len);
+        }
+        vec_f32_free_buf(v.ptr, v.cap);
+        v.ptr = new_ptr;
+        v.cap = new_cap;
+    }
+    *v.ptr.add(v.len) = f32::from_bits((bits & 0xFFFF_FFFF) as u32);
+    v.len += 1;
+    0
+}
+
+/// Number of elements currently in the Vec<f32>.
+#[no_mangle] pub unsafe extern "C" fn aether_vec_f32_len(handle: i64) -> i64 {
+    if handle < 0 { return 0; }
+    let tbl = vec_f32_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return 0; }
+    match tbl[h].as_ref() { Some(v) => v.len as i64, None => 0 }
+}
+
+/// Backing-buffer pointer for the Vec<f32>, as an i64. Returns -1 on
+/// invalid/empty handle. Foundation for native `&[f32]` fat pointers (P16.19).
+#[no_mangle] pub unsafe extern "C" fn aether_vec_f32_as_ptr(handle: i64) -> i64 {
+    if handle < 0 { return -1; }
+    let tbl = vec_f32_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_ref() {
+        Some(v) if !v.ptr.is_null() => v.ptr as i64,
+        _ => -1,
+    }
+}
+
+/// Free the buffer + release the handle slot. Idempotent.
+#[no_mangle] pub unsafe extern "C" fn aether_vec_f32_free(handle: i64) -> i32 {
+    if handle < 0 { return -1; }
+    let tbl = vec_f32_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    if let Some(mut v) = tbl[h].take() {
+        vec_f32_free_buf(v.ptr, v.cap);
+        v.ptr = std::ptr::null_mut();
+        v.cap = 0;
+        v.len = 0;
+    }
+    0
+}
+
 // ---- String (UTF-8 owned, == Vec<u8>) ------------------------------------
 
 struct AeString {
@@ -4072,6 +4177,21 @@ unsafe fn string_table() -> &'static mut Vec<Option<Box<AeString>>> {
     let h = handle as usize;
     if h >= tbl.len() { return 0; }
     match tbl[h].as_ref() { Some(s) => s.len as i64, None => 0 }
+}
+
+/// Backing UTF-8 buffer pointer for the string, as an i64. Foundation for
+/// native `&str` / `&[u8]` fat pointers (P16.19): a byte slice over a String
+/// is `(as_ptr, len)`. Returns -1 on invalid/empty handle. Like the Vec
+/// version, the pointer is invalidated by any subsequent push that reallocs.
+#[no_mangle] pub unsafe extern "C" fn aether_string_as_ptr(handle: i64) -> i64 {
+    if handle < 0 { return -1; }
+    let tbl = string_table();
+    let h = handle as usize;
+    if h >= tbl.len() { return -1; }
+    match tbl[h].as_ref() {
+        Some(s) if !s.ptr.is_null() => s.ptr as i64,
+        _ => -1,
+    }
 }
 
 /// Read byte at `idx` (returned as 0..=255 in i64). -1 on out-of-range.

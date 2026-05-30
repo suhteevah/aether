@@ -221,6 +221,14 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
 
         Instr::MovRegFromBaseDisp { .. } => 7, // REX + 8B + ModRM + disp32
         Instr::MovBaseDispFromReg { .. } => 7, // REX + 89 + ModRM + disp32
+        // Sized slice-element loads (P16.19). REX byte present only when an
+        // r8..r15 dst or base is in play; size mirrors that exactly.
+        Instr::MovzblBaseDispToReg { dst, base, disp: _ } => // [REX] 0F B6 ModRM disp32
+            if dst.extension() != 0 || base.extension() != 0 { 8 } else { 7 },
+        Instr::MovzwlBaseDispToReg { dst, base, disp: _ } => // [REX] 0F B7 ModRM disp32
+            if dst.extension() != 0 || base.extension() != 0 { 8 } else { 7 },
+        Instr::MovlBaseDispToReg { dst, base, disp: _ } => // [REX] 8B ModRM disp32
+            if dst.extension() != 0 || base.extension() != 0 { 7 } else { 6 },
         Instr::AddRegImm8 { .. } | Instr::SubRegImm8 { .. } => 4,
         Instr::AddRegImm32 { .. } | Instr::SubRegImm32 { .. } => 7,
         Instr::AddRegRegQ { .. } | Instr::SubRegRegQ { .. } => 3,
@@ -249,6 +257,9 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
             | Instr::MulssXmmXmm { .. } | Instr::DivssXmmXmm { .. } => 4,
         Instr::UcomissXmmXmm { .. } => 3,
         Instr::MovssRspToXmm { .. } | Instr::MovssXmmToRsp { .. } => 5,
+        // F3 [REX] 0F 10 ModRM disp32 (P16.19 `&[f32]` load). REX only for r8+.
+        Instr::MovssBaseDispToXmm { base, .. } =>
+            if base.extension() != 0 { 9 } else { 8 },
         Instr::MovsdRbpDispToXmm { .. } | Instr::MovsdXmmToRbpDisp { .. } => 8,
         Instr::MovsdRipSymToXmm { .. } => 8,
         Instr::MovsdXmmXmm { .. } => 4,
@@ -256,6 +267,9 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
             | Instr::MulsdXmmXmm { .. } | Instr::DivsdXmmXmm { .. } => 4,
         Instr::UcomisdXmmXmm { .. } => 4,
         Instr::MovsdRspToXmm { .. } | Instr::MovsdXmmToRsp { .. } => 5,
+        // F2 [REX] 0F 10 ModRM disp32 (P16.19 `&[f64]` load). REX only for r8+.
+        Instr::MovsdBaseDispToXmm { base, .. } =>
+            if base.extension() != 0 { 9 } else { 8 },
         Instr::Cvtsi2ssRegToXmm { .. } | Instr::Cvtss2siXmmToReg { .. } => 5,
         Instr::Cvtsi2sdRegToXmm { .. } | Instr::Cvtsd2siXmmToReg { .. } => 5,
         Instr::Cvtss2sdXmmXmm { .. } | Instr::Cvtsd2ssXmmXmm { .. } => 4,
@@ -487,6 +501,9 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
                 Instr::MovssXmmToRspDisp { src: parse_xmm(a, lineno)?, disp }
             } else if let Some(disp) = parse_rsp_mem(a) {
                 Instr::MovssRspDispToXmm { dst: parse_xmm(b, lineno)?, disp }
+            } else if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                // `movss disp(%base), %xmm` — P16.19 `&[f32]` element load.
+                Instr::MovssBaseDispToXmm { dst: parse_xmm(b, lineno)?, base, disp }
             } else {
                 Instr::MovssXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
             }
@@ -527,6 +544,9 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
                 Instr::MovsdXmmToRspDisp { src: parse_xmm(a, lineno)?, disp }
             } else if let Some(disp) = parse_rsp_mem(a) {
                 Instr::MovsdRspDispToXmm { dst: parse_xmm(b, lineno)?, disp }
+            } else if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                // `movsd disp(%base), %xmm` — P16.19 `&[f64]` element load.
+                Instr::MovsdBaseDispToXmm { dst: parse_xmm(b, lineno)?, base, disp }
             } else {
                 Instr::MovsdXmmXmm { dst: parse_xmm(b, lineno)?, src: parse_xmm(a, lineno)? }
             }
@@ -649,12 +669,24 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "setle" => Instr::SetccAl { cc: CondCode::Le },
         "setge" => Instr::SetccAl { cc: CondCode::Ge },
         "movzbl" => {
-            // Only the form we emit: `movzbl %al, %eax`. Anything else fails.
             let (a, b) = split_comma(rest);
-            if a.trim() != "%al" || b.trim() != "%eax" {
-                return Err(syn(lineno, format!("only `movzbl %al, %eax` supported, got {a}, {b}")));
+            // Memory form: `movzbl disp(%base), %dst` — P16.19 `&[u8]` load.
+            if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                Instr::MovzblBaseDispToReg { dst: parse_reg(b, lineno)?, base, disp }
+            } else if a.trim() == "%al" && b.trim() == "%eax" {
+                Instr::MovzblAlEax
+            } else {
+                return Err(syn(lineno, format!("movzbl: only `%al, %eax` or `disp(%base), %reg`, got {a}, {b}")));
             }
-            Instr::MovzblAlEax
+        }
+        "movzwl" => {
+            // Memory form only: `movzwl disp(%base), %dst` — P16.19 `&[u16]`.
+            let (a, b) = split_comma(rest);
+            if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                Instr::MovzwlBaseDispToReg { dst: parse_reg(b, lineno)?, base, disp }
+            } else {
+                return Err(syn(lineno, format!("movzwl: only `disp(%base), %reg`, got {a}, {b}")));
+            }
         }
         "je"  | "jeq" => Instr::JccRel32 { cc: CondCode::E,  sym: rest.to_string() },
         "jne"        => Instr::JccRel32 { cc: CondCode::Ne, sym: rest.to_string() },
@@ -671,6 +703,16 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
         "movl"  if rest.starts_with('$') => {
             let (imm, reg) = split_comma(rest);
             Instr::MovRegImm32 { dst: parse_reg(reg, lineno)?, imm: parse_imm(imm, lineno)? as i32 }
+        }
+        // `movl disp(%base), %dst` — 32-bit load (P16.19 `&[u32]`/`&[i32]`).
+        // Zero-extends into the full 64-bit dst.
+        "movl" => {
+            let (a, b) = split_comma(rest);
+            if let Some((disp, base)) = parse_base_mem(a, lineno) {
+                Instr::MovlBaseDispToReg { dst: parse_reg(b, lineno)?, base, disp }
+            } else {
+                return Err(syn(lineno, format!("movl: only `$imm, %reg` or `disp(%base), %reg`, got {a}, {b}")));
+            }
         }
 
         // ── AVX2 (FR-15.3) ──────────────────────────────────────────────────

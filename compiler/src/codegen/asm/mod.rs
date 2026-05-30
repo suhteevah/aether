@@ -1379,20 +1379,36 @@ fn struct_name_of(t: &Ty) -> Option<String> {
     if let Ty::Named(n) = t { Some(n.clone()) } else { None }
 }
 
-/// For a `Ty::Slice`, return `(element TyKind, element size in bytes)`.
-/// Only 8-byte int/handle elements are wired up today (i64/u64/i32-as-i64
-/// and Tensor handles); float-element slices would need a 4-byte stride in
-/// the index codegen, so they're rejected here rather than mis-loaded.
+/// For a `Ty::Slice`, return `(loaded-value TyKind, element size in bytes)`.
+/// P16.19 — the element size drives the index-load width and the sub-slice
+/// stride; the kind is what `s[i]` evaluates to (Int for all int widths,
+/// F32/F64 for float slices). Mapping is by the element type *name* so a
+/// `&[u8]`/`&str` reads exactly one byte, `&[f32]` reads 4 via `movss`, etc.
+///   * u8 / i8           → (Int, 1)
+///   * u16 / i16         → (Int, 2)
+///   * u32 / i32         → (Int, 4)
+///   * f32               → (F32, 4)
+///   * i64 / u64 / isize → (Int, 8)   (handles too — Tensor<…> handle slices)
+///   * f64               → (F64, 8)
+/// Returns None only for genuinely unsupported element types.
 fn slice_elem_info(t: &Ty) -> Option<(TyKind, usize)> {
-    if let Ty::Slice { elem, .. } = t {
-        // Map the element type to a kind. Default unknown small ints to Int.
-        let kind = TyKind::from_ty(elem).unwrap_or(TyKind::Int);
-        match kind {
-            TyKind::Int | TyKind::TensorDev(_) | TyKind::TensorDevI32(_) => Some((TyKind::Int, 8)),
+    let elem = if let Ty::Slice { elem, .. } = t { elem.as_ref() } else { return None; };
+    // A `&str` parses to a slice whose element is the synthetic `u8` name.
+    if let Ty::Named(name) = elem {
+        return match name.as_str() {
+            "u8" | "i8"            => Some((TyKind::Int, 1)),
+            "u16" | "i16"          => Some((TyKind::Int, 2)),
+            "u32" | "i32"          => Some((TyKind::Int, 4)),
+            "f32"                  => Some((TyKind::F32, 4)),
+            "i64" | "u64" | "isize" | "usize" => Some((TyKind::Int, 8)),
+            "f64"                  => Some((TyKind::F64, 8)),
             _ => None,
-        }
-    } else {
-        None
+        };
+    }
+    // Tensor<…> handle element (8-byte i64 handle).
+    match TyKind::from_ty(elem) {
+        Some(TyKind::TensorDev(_)) | Some(TyKind::TensorDevI32(_)) => Some((TyKind::Int, 8)),
+        _ => None,
     }
 }
 
@@ -1842,7 +1858,7 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             if let Some(slice_ty) = ty.as_ref().filter(|t| matches!(t, Ty::Slice { .. })) {
                 let (elem_kind, elem_size) = slice_elem_info(slice_ty)
                     .ok_or(AsmError::UnsupportedExpr(
-                        "slice element type unsupported (only 8-byte int/handle slices today)"))?;
+                        "slice element type unsupported (u8/i8/u16/i16/u32/i32/i64/u64/f32/f64 + Tensor handles)"))?;
                 let ptr_key = format!("{}.ptr", name);
                 let len_key = format!("{}.len", name);
                 let ptr_slot = locals.alloc(&ptr_key);
@@ -2726,12 +2742,27 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 if !matches!(idx_kind, TyKind::Int) {
                     return Err(AsmError::UnsupportedExpr("slice index must be int"));
                 }
-                // rax = i; scale to byte offset, then add the base pointer.
+                // rax = i; scale to byte offset, then add the base pointer so
+                // %rdi holds the EXACT element address.
                 emit_scale_pow2(out, elem_size);
                 out.push_str(&format!("    movq -{}(%rbp), %r10\n", ptr_slot * 8));
                 out.push_str("    addq %r10, %rax\n");
                 out.push_str("    movq %rax, %rdi\n");
-                out.push_str("    movq 0(%rdi), %rax\n");
+                // P16.19 — width-correct load. Each element is read at EXACTLY
+                // its own size so a 1-byte `&[u8]` element never over-reads the
+                // 8 bytes the old i64-only path assumed (which could fault at
+                // the tail of a heap allocation).
+                match (elem_kind, elem_size) {
+                    (TyKind::Int, 1) => out.push_str("    movzbl 0(%rdi), %eax\n"),
+                    (TyKind::Int, 2) => out.push_str("    movzwl 0(%rdi), %eax\n"),
+                    (TyKind::Int, 4) => out.push_str("    movl 0(%rdi), %eax\n"),
+                    (TyKind::Int, _) => out.push_str("    movq 0(%rdi), %rax\n"),
+                    (TyKind::F32, _) => out.push_str("    movss 0(%rdi), %xmm0\n"),
+                    (TyKind::F64, _) => out.push_str("    movsd 0(%rdi), %xmm0\n"),
+                    // Handle-typed (Tensor) elements behave like 8-byte ints.
+                    (TyKind::TensorDev(_), _) | (TyKind::TensorDevI32(_), _) =>
+                        out.push_str("    movq 0(%rdi), %rax\n"),
+                }
                 return Ok(elem_kind);
             }
             let (base_slot, _, elem_kind) = locals.arrays.get(&arr_name).copied()

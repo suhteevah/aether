@@ -1,0 +1,28 @@
+// roadmap: P16.19
+// expect: exit=42
+//
+// `&[f32]` slices — width-correct 4-byte float loads via `movss` (NOT movq).
+// f32 values are pushed as their IEEE-754 bit patterns (the runtime
+// aether_vec_f32_push takes the bits in the low 32 of an i64):
+//   1.0f32  = 0x3F800000 = 1065353216
+//   20.0f32 = 0x41A00000 = 1101004800
+//   21.0f32 = 0x41A80000 = 1101529088
+//
+//   buf = [1.0, 20.0, 21.0]
+//   f   = &[f32] → len 3
+//   sum = f[0] + f[1] + f[2] = 42.0  → as i32 = 42
+use runtime;
+
+fn main() -> i32 {
+    let v: i64 = aether_vec_f32_new();
+    aether_vec_f32_push(v, 1065353216);   // 1.0
+    aether_vec_f32_push(v, 1101004800);   // 20.0
+    aether_vec_f32_push(v, 1101529088);   // 21.0
+
+    let f: &[f32] = slice_from_raw(aether_vec_f32_as_ptr(v), aether_vec_f32_len(v));
+    if f.len() != 3 { return 1; }
+
+    let total: f32 = f[0] + f[1] + f[2];   // 1.0 + 20.0 + 21.0 = 42.0
+    aether_vec_f32_free(v);
+    return total as i32;                    // 42
+}
