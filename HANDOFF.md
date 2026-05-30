@@ -28,9 +28,19 @@ real diff = +191 asm + AST/parser/runtime).
   `&[u8]`) + `aether_vec_f32_*`. Witnesses (real, exit 42 via movzbl/movss, 0
   constant shortcuts): `slice_u8.aether` (&str over a String), `slice_f32.aether`;
   `slice_str.aether` (i64) unregressed.
-- **Still deferred (honest, NOT stubs)**: `&v[..]` full-range sugar (the worker
-  rate-limited before wiring it; `slice_from_raw(as_ptr(v), len(v))` is the explicit
-  form it lowers to) + `.iter()`/`.iter_mut()`.
+- **Gaps CLOSED `8f474ff`**: `&v[..]` full-range sugar (parses; emit_slice_construct
+  Form 3 maps a container handle → its as_ptr/len by element size: 8→Vec<i64>,
+  4→Vec<f32>, 1→String/&str) + slice iteration `for x in s` / `s.iter()` (walks
+  0..s.len() binding `x = s[i]` with a width-correct load). Witness `slice_iter.aether`
+  exits 42 via `&v[..]` over a Vec + `for x in s`, AND `&st[..]` over a String +
+  `for b in bytes` (the tokenizer unlock). Gotcha fixed: range and slice for-loop
+  paths must alloc the SAME slot count (2) or the prologue frame and return
+  epilogues desync → segfault in multi-loop fns.
+- **P16.19 surface is now COMPLETE** for i64/u8/f32 slices: construction
+  (`slice_from_raw` + `&v[..]`), `.len()`/`.is_empty()`, indexing `s[i]`, sub-slicing
+  `&s[a..b]`, iteration `for x in s`. Witnesses: slice_str/u8/f32/iter (all exit 42).
+  `&str` byte-iteration works (parser/tokenizer unlock). `.iter_mut()` parses but
+  mutation-through-slice isn't exercised (real follow-up).
 
 ## What's Next (continue the language/self-host redirect)
 - Finish P16.19 surface: `&v[..]` sugar, f32/u8-stride slices, `&str` slicing + iter.
