@@ -1,0 +1,967 @@
+// expect: exit=42
+// roadmap: P20.2
+// expect: stdout contains AST: (fn (params) (block (let a 90) (let b (neg 3)) (- (- (- (/ a 2) (% 10 7)) b) 3)))
+//
+// SELF-HOSTED PARSER (P20.2) — Deposit 15: DIVISION `/`, MODULO `%`, and
+// UNARY `-` / `!`. Builds on Deposit 14 (selfhost_parser_if.aether), which
+// added comparison operators + `if`/`else` EXPRESSIONS. This witness parses
+// a SINGLE function whose body exercises ALL THREE new operators:
+//
+//     fn main() -> i64 { let a = 90; let b = -3; (a / 2) - (10 % 7) - b - 3 }
+//
+// into the SAME flat (kind,a,b) node buffer, registers it in the FN TABLE
+// keyed by name span, re-emits it as an S-expression, and then EVALUATES it
+// with the tree-walk. The exit code comes from eval'ing the built AST — NOT
+// a constant, and (deliberately) NOT from any literal `42` in the source.
+//   (90 / 2) - (10 % 7) - (-3) - 3 = 45 - 3 - (-3) - 3 = 45 - 3 + 3 - 3 = 42.
+//
+// New over Deposit 14:
+//   - tokens: `/` (TOK_SLASH) and `%` (TOK_PERCENT); a BARE `!` (TOK_BANG)
+//             — the `!=` two-char punct is still recognised first (peek the
+//             next byte), so `!` only becomes TOK_BANG when NOT followed by
+//             `=` (the same peek-next-byte pattern as `->`/`==`/`<=`/`>=`).
+//   - nodes:  NODE_DIV / NODE_MOD (binary, SAME precedence as `*`), and
+//             NODE_NEG / NODE_NOT (UNARY: a = operand index, b unused).
+//   - parser: parse_term's `*` loop now also accepts `/` (->NODE_DIV) and
+//             `%` (->NODE_MOD) at the same precedence. A NEW parse_unary
+//             level sits BETWEEN term and factor:
+//                 unary := ('-' | '!') unary | factor
+//             `-x` -> NODE_NEG, `!x` -> NODE_NOT. parse_term now calls
+//             parse_unary instead of parse_factor directly. So the full
+//             precedence ladder is: cmp > addsub > term(*,/,%) > unary > factor.
+//   - emit + eval extended for the div/mod/neg/not nodes. eval's NODE_DIV
+//             computes lv/rv; NODE_MOD lv%rv; NODE_NEG 0-v (Aether HAS unary
+//             `-` but `0 - v` is equally correct and reads explicitly);
+//             NODE_NOT returns 1 when v==0 else 0.
+use runtime;
+
+// --- Token kinds -----------------------------------------------------
+const TOK_NUM:     i64 = 1;
+const TOK_IDENT:   i64 = 2;
+const TOK_LET:     i64 = 3;
+const TOK_EQ:      i64 = 4;
+const TOK_SEMI:    i64 = 5;
+const TOK_PLUS:    i64 = 6;
+const TOK_MINUS:   i64 = 7;
+const TOK_STAR:    i64 = 8;
+const TOK_LPAREN:  i64 = 9;
+const TOK_RPAREN:  i64 = 10;
+const TOK_FN:      i64 = 11;   // `fn` keyword
+const TOK_ARROW:   i64 = 12;   // `->` two-char punct
+const TOK_LBRACE:  i64 = 13;   // `{`
+const TOK_RBRACE:  i64 = 14;   // `}`
+const TOK_COMMA:   i64 = 15;   // `,`
+const TOK_IF:      i64 = 16;   // `if` keyword
+const TOK_ELSE:    i64 = 17;   // `else` keyword
+const TOK_LT:      i64 = 18;   // `<`
+const TOK_GT:      i64 = 19;   // `>`
+const TOK_EQEQ:    i64 = 20;   // `==` two-char punct
+const TOK_NE:      i64 = 21;   // `!=` two-char punct
+const TOK_LE:      i64 = 22;   // `<=` two-char punct
+const TOK_GE:      i64 = 23;   // `>=` two-char punct
+const TOK_SLASH:   i64 = 24;   // `/`  (division)
+const TOK_PERCENT: i64 = 25;   // `%`  (modulo)
+const TOK_BANG:    i64 = 26;   // `!`  (bare logical-not; `!=` handled above)
+const TOK_EOF:     i64 = 0;
+
+// --- AST node kinds --------------------------------------------------
+// Each node = 3 i64s (kind, a, b) packed into the node buffer. Binary
+// nodes store CHILD INDICES in a/b; UNARY nodes store the operand index in
+// a and leave b unused (0).
+const NODE_NUM:     i64 = 1;   // (NODE_NUM,     value,           0)
+const NODE_IDENT:   i64 = 2;   // (NODE_IDENT,   name_start,      name_len)
+const NODE_ADD:     i64 = 3;   // (NODE_ADD,     lhs_index,       rhs_index)
+const NODE_SUB:     i64 = 4;   // (NODE_SUB,     lhs_index,       rhs_index)
+const NODE_MUL:     i64 = 5;   // (NODE_MUL,     lhs_index,       rhs_index)
+const NODE_FN:      i64 = 6;   // (NODE_FN,      params_head_idx, body_block_idx)  params=-1 if ()
+const NODE_BLOCK:   i64 = 7;   // (NODE_BLOCK,   head_stmt_idx,   0)   head=-1 if empty
+const NODE_STMT:    i64 = 8;   // (NODE_STMT,    stmt_node_idx,   next_stmt_idx)   next=-1 ends
+const NODE_LETSTMT: i64 = 9;   // (NODE_LETSTMT, name_ident_idx,  value_expr_idx)
+const NODE_PARAM:   i64 = 10;  // (NODE_PARAM,   name_ident_idx,  next_param_idx)  next=-1 ends
+const NODE_CALL:    i64 = 11;  // (NODE_CALL,    callee_ident_idx,args_head_idx)   args=-1 if none
+const NODE_ARG:     i64 = 12;  // (NODE_ARG,     arg_expr_idx,    next_arg_idx)    next=-1 ends
+// Comparison nodes: binary, (kind, lhs_index, rhs_index). eval -> 1 or 0.
+const NODE_LT:      i64 = 13;  // (NODE_LT, lhs, rhs)   a <  b
+const NODE_GT:      i64 = 14;  // (NODE_GT, lhs, rhs)   a >  b
+const NODE_EQ:      i64 = 15;  // (NODE_EQ, lhs, rhs)   a == b
+const NODE_NE:      i64 = 16;  // (NODE_NE, lhs, rhs)   a != b
+const NODE_LE:      i64 = 17;  // (NODE_LE, lhs, rhs)   a <= b
+const NODE_GE:      i64 = 18;  // (NODE_GE, lhs, rhs)   a >= b
+// if / arms encoding: NODE_IF holds (cond_idx, arms_idx); the arms node
+// holds (then_block_idx, else_block_idx | -1).
+const NODE_IF:      i64 = 19;  // (NODE_IF,     cond_idx,        arms_idx)
+const NODE_IFARMS:  i64 = 20;  // (NODE_IFARMS, then_block_idx,  else_block_idx | -1)
+// Division / modulo: binary, SAME precedence as NODE_MUL.
+const NODE_DIV:     i64 = 21;  // (NODE_DIV, lhs, rhs)   a / b
+const NODE_MOD:     i64 = 22;  // (NODE_MOD, lhs, rhs)   a % b
+// Unary nodes: a = operand index, b unused (0).
+const NODE_NEG:     i64 = 23;  // (NODE_NEG, operand, 0)   -x  -> 0 - x
+const NODE_NOT:     i64 = 24;  // (NODE_NOT, operand, 0)   !x  -> (x == 0) ? 1 : 0
+
+const MAX_TOKENS: i64 = 256;
+const MAX_NODES:  i64 = 256;
+const ENV_CAP:    i64 = 64;
+const FN_CAP:     i64 = 32;
+
+// --- Generic 3-i64 packed-record buffer (tokens AND ast nodes) -------
+// rec[idx] = (f0, f1, f2), 24 bytes per record, little-endian i64 each.
+fn write_rec(buf: i64, idx: i64, f0: i64, f1: i64, f2: i64) {
+    let base = idx * 24;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(buf, base + k,      (f0 >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 8  + k, (f1 >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 16 + k, (f2 >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+fn read_rec_field(buf: i64, idx: i64, field: i64) -> i64 {
+    let base = idx * 24 + field * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(buf, base + k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+
+// --- Lexer -----------------------------------------------------------
+fn is_digit(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+fn is_alpha(b: i64) -> i64 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 { return 1; }
+    return 0;
+}
+
+fn lex(src: i64, n: i64, toks: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut tn: i64 = 0;
+    while i < n {
+        let b = aether_byte_at(src, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if is_digit(b) == 1 {
+            let start = i;
+            i += 1;
+            while i < n && is_digit(aether_byte_at(src, i)) == 1 { i += 1; }
+            write_rec(toks, tn, TOK_NUM, start, i - start);
+            tn += 1;
+            continue;
+        }
+        if is_alpha(b) == 1 {
+            let start = i;
+            i += 1;
+            while i < n && (is_alpha(aether_byte_at(src, i)) == 1 || is_digit(aether_byte_at(src, i)) == 1) {
+                i += 1;
+            }
+            if (i - start) == 3 && aether_bytes_eq(src + start, "let", 3) == 1 {
+                write_rec(toks, tn, TOK_LET, start, 3);
+            } else if (i - start) == 2 && aether_bytes_eq(src + start, "fn", 2) == 1 {
+                write_rec(toks, tn, TOK_FN, start, 2);
+            } else if (i - start) == 2 && aether_bytes_eq(src + start, "if", 2) == 1 {
+                write_rec(toks, tn, TOK_IF, start, 2);
+            } else if (i - start) == 4 && aether_bytes_eq(src + start, "else", 4) == 1 {
+                write_rec(toks, tn, TOK_ELSE, start, 4);
+            } else {
+                // Plain identifier (also covers a type name like `i64`,
+                // which the parser simply skips after `->`).
+                write_rec(toks, tn, TOK_IDENT, start, i - start);
+            }
+            tn += 1;
+            continue;
+        }
+        // Two-char punct: `->`. Peek the next byte before falling through
+        // to the single-char table.
+        if b == 45 && (i + 1) < n && aether_byte_at(src, i + 1) == 62 {
+            write_rec(toks, tn, TOK_ARROW, i, 2);
+            tn += 1;
+            i += 2;
+            continue;
+        }
+        // Two-char punct: `==`. `=` is byte 61; a SECOND `=` makes it EQEQ,
+        // otherwise it's a plain assignment TOK_EQ (handled in the table).
+        if b == 61 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_EQEQ, i, 2);
+            tn += 1;
+            i += 2;
+            continue;
+        }
+        // Two-char punct: `!=`. `!` is byte 33; paired with `=` it's NE.
+        // Checked BEFORE the bare-`!` table entry so `!=` always wins.
+        if b == 33 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_NE, i, 2);
+            tn += 1;
+            i += 2;
+            continue;
+        }
+        // Two-char punct: `<=`. `<` is byte 60; bare `<` falls to the table.
+        if b == 60 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_LE, i, 2);
+            tn += 1;
+            i += 2;
+            continue;
+        }
+        // Two-char punct: `>=`. `>` is byte 62; bare `>` falls to the table.
+        if b == 62 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_GE, i, 2);
+            tn += 1;
+            i += 2;
+            continue;
+        }
+        let kind = if b == 61 { TOK_EQ }
+                   else if b == 59 { TOK_SEMI }
+                   else if b == 43 { TOK_PLUS }
+                   else if b == 45 { TOK_MINUS }
+                   else if b == 42 { TOK_STAR }
+                   else if b == 47 { TOK_SLASH }
+                   else if b == 37 { TOK_PERCENT }
+                   else if b == 33 { TOK_BANG }
+                   else if b == 40 { TOK_LPAREN }
+                   else if b == 41 { TOK_RPAREN }
+                   else if b == 123 { TOK_LBRACE }
+                   else if b == 125 { TOK_RBRACE }
+                   else if b == 44 { TOK_COMMA }
+                   else if b == 60 { TOK_LT }
+                   else if b == 62 { TOK_GT }
+                   else { 0 };
+        if kind == 0 {
+            aether_print_kv_i64("LEX skip byte", b);
+            i += 1;
+            continue;
+        }
+        write_rec(toks, tn, kind, i, 1);
+        tn += 1;
+        i += 1;
+    }
+    write_rec(toks, tn, TOK_EOF, 0, 0);
+    return tn;
+}
+
+// --- Env (for ident eval) --------------------------------------------
+// Two parallel buffers: names (start,len) x2 i64, vals (value) x1 i64.
+// count lives in slot 0 of a 1-record buffer.
+fn env_set(names: i64, vals: i64, count_p: i64,
+           name_start: i64, name_len: i64, value: i64) {
+    let count = read_rec_field(count_p, 0, 0);
+    let nbase = count * 16;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(names, nbase + k,     (name_start >> (k * 8)) & 255);
+        aether_byte_set(names, nbase + 8 + k, (name_len   >> (k * 8)) & 255);
+        k += 1;
+    }
+    let vbase = count * 8;
+    let mut k2 = 0;
+    while k2 < 8 {
+        aether_byte_set(vals, vbase + k2, (value >> (k2 * 8)) & 255);
+        k2 += 1;
+    }
+    write_rec(count_p, 0, count + 1, 0, 0);
+}
+
+fn env_get(names: i64, vals: i64, count_p: i64, src: i64,
+           name_start: i64, name_len: i64) -> i64 {
+    let count = read_rec_field(count_p, 0, 0);
+    let mut i = 0;
+    while i < count {
+        let nbase = i * 16;
+        let mut s: i64 = 0;
+        let mut l: i64 = 0;
+        let mut k = 0;
+        while k < 8 {
+            s = s | (aether_byte_at(names, nbase + k)     << (k * 8));
+            l = l | (aether_byte_at(names, nbase + 8 + k) << (k * 8));
+            k += 1;
+        }
+        if l == name_len && aether_bytes_eq(src + s, src + name_start, name_len) == 1 {
+            let vbase = i * 8;
+            let mut acc: i64 = 0;
+            let mut k2 = 0;
+            while k2 < 8 {
+                acc = acc | (aether_byte_at(vals, vbase + k2) << (k2 * 8));
+                k2 += 1;
+            }
+            return acc;
+        }
+        i += 1;
+    }
+    aether_print_kv_i64("ENV miss len", name_len);
+    return 0;
+}
+
+// --- Fn table --------------------------------------------------------
+// Parallel buffers, keyed by the function NAME SPAN (start,len into src):
+//   fn_names: (start,len) x2 i64 = 16 bytes/entry
+//   fn_nodes: (NODE_FN index)  x1 i64 = 8  bytes/entry
+//   fc_p slot 0 = live fn count.
+fn fn_register(fn_names: i64, fn_nodes: i64, fc_p: i64,
+               name_start: i64, name_len: i64, fn_node_idx: i64) {
+    let count = read_rec_field(fc_p, 0, 0);
+    let nbase = count * 16;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(fn_names, nbase + k,     (name_start >> (k * 8)) & 255);
+        aether_byte_set(fn_names, nbase + 8 + k, (name_len   >> (k * 8)) & 255);
+        k += 1;
+    }
+    let vbase = count * 8;
+    let mut k2 = 0;
+    while k2 < 8 {
+        aether_byte_set(fn_nodes, vbase + k2, (fn_node_idx >> (k2 * 8)) & 255);
+        k2 += 1;
+    }
+    write_rec(fc_p, 0, count + 1, 0, 0);
+}
+
+// Returns the NODE_FN index whose registered name span matches src[name_start..+len],
+// or -1 if no function by that name was registered.
+fn fn_lookup(fn_names: i64, fn_nodes: i64, fc_p: i64, src: i64,
+             name_start: i64, name_len: i64) -> i64 {
+    let count = read_rec_field(fc_p, 0, 0);
+    let mut i = 0;
+    while i < count {
+        let nbase = i * 16;
+        let mut s: i64 = 0;
+        let mut l: i64 = 0;
+        let mut k = 0;
+        while k < 8 {
+            s = s | (aether_byte_at(fn_names, nbase + k)     << (k * 8));
+            l = l | (aether_byte_at(fn_names, nbase + 8 + k) << (k * 8));
+            k += 1;
+        }
+        if l == name_len && aether_bytes_eq(src + s, src + name_start, name_len) == 1 {
+            let vbase = i * 8;
+            let mut acc: i64 = 0;
+            let mut k2 = 0;
+            while k2 < 8 {
+                acc = acc | (aether_byte_at(fn_nodes, vbase + k2) << (k2 * 8));
+                k2 += 1;
+            }
+            return acc;
+        }
+        i += 1;
+    }
+    aether_print_kv_i64("FN miss len", name_len);
+    return -1;
+}
+
+// --- AST node allocator ----------------------------------------------
+fn node_alloc(nodes: i64, nc_p: i64, kind: i64, a: i64, b: i64) -> i64 {
+    let idx = read_rec_field(nc_p, 0, 0);
+    write_rec(nodes, idx, kind, a, b);
+    write_rec(nc_p, 0, idx + 1, 0, 0);
+    return idx;
+}
+
+// --- Parser (RETURNS node indices, does NOT evaluate) ----------------
+fn pos_get(p: i64) -> i64 { return read_rec_field(p, 0, 0); }
+fn pos_set(p: i64, v: i64) { write_rec(p, 0, v, 0, 0); }
+fn peek_kind(toks: i64, pos_p: i64) -> i64 {
+    return read_rec_field(toks, pos_get(pos_p), 0);
+}
+
+// Map a comparison-operator TOKEN kind to its comparison NODE kind, or -1
+// if the token is not a comparison operator. Keeps parse_cmp compact.
+fn cmp_node_kind(tok_kind: i64) -> i64 {
+    if tok_kind == TOK_LT   { return NODE_LT; }
+    if tok_kind == TOK_GT   { return NODE_GT; }
+    if tok_kind == TOK_EQEQ { return NODE_EQ; }
+    if tok_kind == TOK_NE   { return NODE_NE; }
+    if tok_kind == TOK_LE   { return NODE_LE; }
+    if tok_kind == TOK_GE   { return NODE_GE; }
+    return -1;
+}
+
+// factor := NUMBER | IDENT | CALL | IF-EXPR | '(' expr ')'
+// CALL    := IDENT '(' (expr (',' expr)*)? ')'   (IDENT immediately followed by '(')
+// IF-EXPR := 'if' expr block ('else' block)?     (an if as a PRIMARY)
+// Returns a NODE INDEX. Parens just return the inner node's index.
+fn parse_factor(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let p = pos_get(pos_p);
+    let k = read_rec_field(toks, p, 0);
+    let s = read_rec_field(toks, p, 1);
+    let l = read_rec_field(toks, p, 2);
+    if k == TOK_LPAREN {
+        pos_set(pos_p, p + 1);                       // consume '('
+        let inner = parse_expr(toks, pos_p, src, nodes, nc_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);          // consume ')'
+        return inner;
+    }
+    if k == TOK_IF {
+        // if-EXPRESSION as a primary: `if` <cond expr> <then block> ('else' <else block>)?
+        pos_set(pos_p, p + 1);                        // consume 'if'
+        let cond = parse_expr(toks, pos_p, src, nodes, nc_p);   // condition (a full expr)
+        let then_block = parse_block(toks, pos_p, src, nodes, nc_p);
+        let mut else_block: i64 = -1;                 // -1 => no else arm
+        if peek_kind(toks, pos_p) == TOK_ELSE {
+            pos_set(pos_p, pos_get(pos_p) + 1);       // consume 'else'
+            else_block = parse_block(toks, pos_p, src, nodes, nc_p);
+        }
+        let arms = node_alloc(nodes, nc_p, NODE_IFARMS, then_block, else_block);
+        return node_alloc(nodes, nc_p, NODE_IF, cond, arms);
+    }
+    if k == TOK_NUM {
+        pos_set(pos_p, p + 1);
+        // Decode decimal literal from src[s..s+l] and store the VALUE.
+        let mut acc: i64 = 0;
+        let mut i = 0;
+        while i < l {
+            acc = acc * 10 + (aether_byte_at(src, s + i) - 48);
+            i += 1;
+        }
+        return node_alloc(nodes, nc_p, NODE_NUM, acc, 0);
+    }
+    if k == TOK_IDENT {
+        pos_set(pos_p, p + 1);                        // consume the IDENT
+        // CALL form: an IDENT immediately followed by '('.
+        if peek_kind(toks, pos_p) == TOK_LPAREN {
+            let callee = node_alloc(nodes, nc_p, NODE_IDENT, s, l);
+            pos_set(pos_p, pos_get(pos_p) + 1);       // consume '('
+            let mut head: i64 = -1;
+            let mut prev: i64 = -1;
+            while peek_kind(toks, pos_p) != TOK_RPAREN && peek_kind(toks, pos_p) != TOK_EOF {
+                let arg_expr = parse_expr(toks, pos_p, src, nodes, nc_p);
+                let cell = node_alloc(nodes, nc_p, NODE_ARG, arg_expr, -1);
+                if head == -1 {
+                    head = cell;                      // first argument
+                } else {
+                    let pk = read_rec_field(nodes, prev, 0);
+                    let pa = read_rec_field(nodes, prev, 1);
+                    write_rec(nodes, prev, pk, pa, cell);
+                }
+                prev = cell;
+                if peek_kind(toks, pos_p) == TOK_COMMA {
+                    pos_set(pos_p, pos_get(pos_p) + 1);   // consume ',' and continue
+                }
+            }
+            if peek_kind(toks, pos_p) == TOK_RPAREN {
+                pos_set(pos_p, pos_get(pos_p) + 1);   // consume ')'
+            }
+            return node_alloc(nodes, nc_p, NODE_CALL, callee, head);
+        }
+        // Plain variable reference. Store the NAME SPAN; resolution in eval.
+        return node_alloc(nodes, nc_p, NODE_IDENT, s, l);
+    }
+    pos_set(pos_p, p + 1);
+    aether_print_kv_i64("PARSE bad factor kind", k);
+    return node_alloc(nodes, nc_p, NODE_NUM, 0, 0);
+}
+
+// unary := ('-' | '!') unary | factor
+// A new precedence level BETWEEN term and factor. A leading `-` builds a
+// NODE_NEG over the rest of the unary; a leading `!` builds a NODE_NOT.
+// Right-recursive so `--x` / `!!x` chain naturally. Anything else delegates
+// straight to parse_factor.
+fn parse_unary(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let k = peek_kind(toks, pos_p);
+    if k == TOK_MINUS {
+        pos_set(pos_p, pos_get(pos_p) + 1);            // consume '-'
+        let operand = parse_unary(toks, pos_p, src, nodes, nc_p);
+        return node_alloc(nodes, nc_p, NODE_NEG, operand, 0);
+    }
+    if k == TOK_BANG {
+        pos_set(pos_p, pos_get(pos_p) + 1);            // consume '!'
+        let operand = parse_unary(toks, pos_p, src, nodes, nc_p);
+        return node_alloc(nodes, nc_p, NODE_NOT, operand, 0);
+    }
+    return parse_factor(toks, pos_p, src, nodes, nc_p);
+}
+
+// term := unary (('*' | '/' | '%') unary)*  -> NODE_MUL / NODE_DIV / NODE_MOD
+// `/` and `%` join `*` at the SAME precedence level. parse_term now calls
+// parse_unary (the new level below it) rather than parse_factor directly.
+fn parse_term(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let mut lhs = parse_unary(toks, pos_p, src, nodes, nc_p);
+    while peek_kind(toks, pos_p) == TOK_STAR
+       || peek_kind(toks, pos_p) == TOK_SLASH
+       || peek_kind(toks, pos_p) == TOK_PERCENT {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let rhs = parse_unary(toks, pos_p, src, nodes, nc_p);
+        if op == TOK_STAR {
+            lhs = node_alloc(nodes, nc_p, NODE_MUL, lhs, rhs);
+        } else if op == TOK_SLASH {
+            lhs = node_alloc(nodes, nc_p, NODE_DIV, lhs, rhs);
+        } else {
+            lhs = node_alloc(nodes, nc_p, NODE_MOD, lhs, rhs);
+        }
+    }
+    return lhs;
+}
+
+// addsub := term (('+' | '-') term)*  -> builds NODE_ADD / NODE_SUB nodes
+fn parse_addsub(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let mut lhs = parse_term(toks, pos_p, src, nodes, nc_p);
+    while peek_kind(toks, pos_p) == TOK_PLUS || peek_kind(toks, pos_p) == TOK_MINUS {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let rhs = parse_term(toks, pos_p, src, nodes, nc_p);
+        if op == TOK_PLUS {
+            lhs = node_alloc(nodes, nc_p, NODE_ADD, lhs, rhs);
+        } else {
+            lhs = node_alloc(nodes, nc_p, NODE_SUB, lhs, rhs);
+        }
+    }
+    return lhs;
+}
+
+// cmp := addsub (CMPOP addsub)?   -> builds ONE NODE_LT/GT/EQ/NE/LE/GE node
+fn parse_cmp(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let lhs = parse_addsub(toks, pos_p, src, nodes, nc_p);
+    let nk = cmp_node_kind(peek_kind(toks, pos_p));
+    if nk == -1 {
+        return lhs;                                   // no comparison operator
+    }
+    pos_set(pos_p, pos_get(pos_p) + 1);               // consume the cmp op
+    let rhs = parse_addsub(toks, pos_p, src, nodes, nc_p);
+    return node_alloc(nodes, nc_p, nk, lhs, rhs);
+}
+
+// expr := cmp   -> comparison is the lowest-precedence expression level.
+fn parse_expr(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    return parse_cmp(toks, pos_p, src, nodes, nc_p);
+}
+
+// stmt := 'let' IDENT '=' expr ';'   -> NODE_LETSTMT(name_ident, value_expr)
+//       | expr                       -> the expr node itself (tail/result)
+fn parse_stmt(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    if peek_kind(toks, pos_p) == TOK_LET {
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume 'let'
+        let lp = pos_get(pos_p);
+        let name_s = read_rec_field(toks, lp, 1);
+        let name_l = read_rec_field(toks, lp, 2);
+        let name_idx = node_alloc(nodes, nc_p, NODE_IDENT, name_s, name_l);
+        pos_set(pos_p, lp + 1);                          // consume IDENT
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume '='
+        let val_idx = parse_expr(toks, pos_p, src, nodes, nc_p);
+        if peek_kind(toks, pos_p) == TOK_SEMI {
+            pos_set(pos_p, pos_get(pos_p) + 1);          // consume ';'
+        }
+        return node_alloc(nodes, nc_p, NODE_LETSTMT, name_idx, val_idx);
+    }
+    let e = parse_expr(toks, pos_p, src, nodes, nc_p);
+    if peek_kind(toks, pos_p) == TOK_SEMI {
+        pos_set(pos_p, pos_get(pos_p) + 1);              // optional ';'
+    }
+    return e;
+}
+
+// block := '{' stmt* '}'  -> NODE_BLOCK(head_stmt_idx, 0)
+fn parse_block(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    pos_set(pos_p, pos_get(pos_p) + 1);                  // consume '{'
+    let mut head: i64 = -1;
+    let mut prev: i64 = -1;
+    while peek_kind(toks, pos_p) != TOK_RBRACE && peek_kind(toks, pos_p) != TOK_EOF {
+        let stmt_node = parse_stmt(toks, pos_p, src, nodes, nc_p);
+        let cell = node_alloc(nodes, nc_p, NODE_STMT, stmt_node, -1);
+        if head == -1 {
+            head = cell;                                 // first statement
+        } else {
+            let pk = read_rec_field(nodes, prev, 0);
+            let pa = read_rec_field(nodes, prev, 1);
+            write_rec(nodes, prev, pk, pa, cell);
+        }
+        prev = cell;
+    }
+    if peek_kind(toks, pos_p) == TOK_RBRACE {
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume '}'
+    }
+    return node_alloc(nodes, nc_p, NODE_BLOCK, head, 0);
+}
+
+// params := '(' (IDENT (',' IDENT)*)? ')'  -> NODE_PARAM linked list head (-1 if empty)
+fn parse_params(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    if peek_kind(toks, pos_p) == TOK_LPAREN {
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume '('
+    }
+    let mut head: i64 = -1;
+    let mut prev: i64 = -1;
+    while peek_kind(toks, pos_p) != TOK_RPAREN && peek_kind(toks, pos_p) != TOK_EOF {
+        let pp = pos_get(pos_p);
+        let name_s = read_rec_field(toks, pp, 1);
+        let name_l = read_rec_field(toks, pp, 2);
+        let name_idx = node_alloc(nodes, nc_p, NODE_IDENT, name_s, name_l);
+        pos_set(pos_p, pp + 1);                          // consume the param IDENT
+        let cell = node_alloc(nodes, nc_p, NODE_PARAM, name_idx, -1);
+        if head == -1 {
+            head = cell;                                 // first parameter
+        } else {
+            let pk = read_rec_field(nodes, prev, 0);
+            let pa = read_rec_field(nodes, prev, 1);
+            write_rec(nodes, prev, pk, pa, cell);
+        }
+        prev = cell;
+        if peek_kind(toks, pos_p) == TOK_COMMA {
+            pos_set(pos_p, pos_get(pos_p) + 1);          // consume ',' and continue
+        }
+    }
+    if peek_kind(toks, pos_p) == TOK_RPAREN {
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume ')'
+    }
+    return head;
+}
+
+// fn_decl := 'fn' IDENT params ('->' TYPE)? block  -> NODE_FN(params_head, body_block)
+fn parse_fn(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64,
+            fn_names: i64, fn_nodes: i64, fc_p: i64) -> i64 {
+    pos_set(pos_p, pos_get(pos_p) + 1);                  // consume 'fn'
+    let np = pos_get(pos_p);
+    let name_s = read_rec_field(toks, np, 1);
+    let name_l = read_rec_field(toks, np, 2);
+    pos_set(pos_p, np + 1);                              // consume name IDENT
+    let params = parse_params(toks, pos_p, src, nodes, nc_p);
+    if peek_kind(toks, pos_p) == TOK_ARROW {
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume '->'
+        if peek_kind(toks, pos_p) == TOK_IDENT {
+            pos_set(pos_p, pos_get(pos_p) + 1);          // skip the type name
+        }
+    }
+    let body = parse_block(toks, pos_p, src, nodes, nc_p);
+    let fn_node = node_alloc(nodes, nc_p, NODE_FN, params, body);
+    fn_register(fn_names, fn_nodes, fc_p, name_s, name_l, fn_node);
+    return fn_node;
+}
+
+// program := fn_decl*  (loop until EOF).
+fn parse_program(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64,
+                 fn_names: i64, fn_nodes: i64, fc_p: i64) -> i64 {
+    let mut count = 0;
+    while peek_kind(toks, pos_p) == TOK_FN {
+        parse_fn(toks, pos_p, src, nodes, nc_p, fn_names, fn_nodes, fc_p);
+        count += 1;
+    }
+    return count;
+}
+
+// --- Print helpers ---------------------------------------------------
+fn print_int(scratch: i64, v: i64) {
+    if v == 0 {
+        aether_byte_set(scratch, 0, 48);
+        aether_print_bytes(scratch, 1);
+        return;
+    }
+    let mut x = v;
+    let mut nd = 0;
+    while x > 0 {
+        aether_byte_set(scratch, nd, 48 + (x % 10));
+        x = x / 10;
+        nd += 1;
+    }
+    let mut a = 0;
+    let mut b = nd - 1;
+    while a < b {
+        let ta = aether_byte_at(scratch, a);
+        let tb = aether_byte_at(scratch, b);
+        aether_byte_set(scratch, a, tb);
+        aether_byte_set(scratch, b, ta);
+        a += 1;
+        b -= 1;
+    }
+    aether_print_bytes(scratch, nd);
+}
+
+fn print_cstr(s: i64) {
+    aether_print_bytes(s, aether_str_len(s));
+}
+
+// --- AST re-emit: recursive S-expression walk from a root index ------
+fn emit_sexpr(nodes: i64, src: i64, scratch: i64, idx: i64) {
+    let k = read_rec_field(nodes, idx, 0);
+    let a = read_rec_field(nodes, idx, 1);
+    let b = read_rec_field(nodes, idx, 2);
+    if k == NODE_NUM {
+        print_int(scratch, a);
+        return;
+    }
+    if k == NODE_IDENT {
+        // a=name_start, b=name_len — print the source span.
+        aether_print_bytes(src + a, b);
+        return;
+    }
+    if k == NODE_FN {
+        // (fn (params <name> ...) <block>)
+        print_cstr("(fn (params");
+        let mut pcell = a;                    // head NODE_PARAM index (-1 if none)
+        while pcell != -1 {
+            print_cstr(" ");
+            let name_node = read_rec_field(nodes, pcell, 1);
+            emit_sexpr(nodes, src, scratch, name_node);
+            pcell = read_rec_field(nodes, pcell, 2);   // next param
+        }
+        print_cstr(") ");
+        emit_sexpr(nodes, src, scratch, b);   // body NODE_BLOCK
+        print_cstr(")");
+        return;
+    }
+    if k == NODE_BLOCK {
+        // (block <stmt> <stmt> ...) — walk the NODE_STMT linked list.
+        print_cstr("(block");
+        let mut cell = a;                     // head NODE_STMT index (-1 if empty)
+        while cell != -1 {
+            print_cstr(" ");
+            let stmt_node = read_rec_field(nodes, cell, 1);
+            emit_sexpr(nodes, src, scratch, stmt_node);
+            cell = read_rec_field(nodes, cell, 2);   // next
+        }
+        print_cstr(")");
+        return;
+    }
+    if k == NODE_LETSTMT {
+        // (let <name> <value>)
+        print_cstr("(let ");
+        emit_sexpr(nodes, src, scratch, a);   // name NODE_IDENT
+        print_cstr(" ");
+        emit_sexpr(nodes, src, scratch, b);   // value expr
+        print_cstr(")");
+        return;
+    }
+    if k == NODE_CALL {
+        // (call <name> <arg> <arg> ...) — walk the NODE_ARG linked list.
+        print_cstr("(call ");
+        emit_sexpr(nodes, src, scratch, a);   // callee NODE_IDENT
+        let mut acell = b;                    // head NODE_ARG index (-1 if none)
+        while acell != -1 {
+            print_cstr(" ");
+            let arg_node = read_rec_field(nodes, acell, 1);
+            emit_sexpr(nodes, src, scratch, arg_node);
+            acell = read_rec_field(nodes, acell, 2);   // next arg
+        }
+        print_cstr(")");
+        return;
+    }
+    if k == NODE_IF {
+        // (if <cond> <then-block> <else-block>) — else-block omitted if -1.
+        print_cstr("(if ");
+        emit_sexpr(nodes, src, scratch, a);          // condition
+        let then_block = read_rec_field(nodes, b, 1);
+        let else_block = read_rec_field(nodes, b, 2);
+        print_cstr(" ");
+        emit_sexpr(nodes, src, scratch, then_block); // then NODE_BLOCK
+        if else_block != -1 {
+            print_cstr(" ");
+            emit_sexpr(nodes, src, scratch, else_block);   // else NODE_BLOCK
+        }
+        print_cstr(")");
+        return;
+    }
+    // Unary nodes: (neg x) / (not x). a = operand, b unused.
+    if k == NODE_NEG {
+        print_cstr("(neg ");
+        emit_sexpr(nodes, src, scratch, a);
+        print_cstr(")");
+        return;
+    }
+    if k == NODE_NOT {
+        print_cstr("(not ");
+        emit_sexpr(nodes, src, scratch, a);
+        print_cstr(")");
+        return;
+    }
+    // Comparison nodes: (< l r) (> l r) (== l r) (!= l r) (<= l r) (>= l r)
+    if k == NODE_LT || k == NODE_GT || k == NODE_EQ
+       || k == NODE_NE || k == NODE_LE || k == NODE_GE {
+        print_cstr("(");
+        if k == NODE_LT { print_cstr("< "); }
+        else if k == NODE_GT { print_cstr("> "); }
+        else if k == NODE_EQ { print_cstr("== "); }
+        else if k == NODE_NE { print_cstr("!= "); }
+        else if k == NODE_LE { print_cstr("<= "); }
+        else { print_cstr(">= "); }
+        emit_sexpr(nodes, src, scratch, a);   // lhs
+        print_cstr(" ");
+        emit_sexpr(nodes, src, scratch, b);   // rhs
+        print_cstr(")");
+        return;
+    }
+    // Binary arithmetic: (op lhs rhs) — +, -, *, /, %.
+    print_cstr("(");
+    if k == NODE_ADD { print_cstr("+ "); }
+    else if k == NODE_SUB { print_cstr("- "); }
+    else if k == NODE_DIV { print_cstr("/ "); }
+    else if k == NODE_MOD { print_cstr("% "); }
+    else { print_cstr("* "); }
+    emit_sexpr(nodes, src, scratch, a);   // recurse into lhs child
+    print_cstr(" ");
+    emit_sexpr(nodes, src, scratch, b);   // recurse into rhs child
+    print_cstr(")");
+}
+
+// --- SEPARATE AST tree-walk evaluator --------------------------------
+// Recurses over child INDICES stored in the node buffer. The fn table is
+// threaded through so NODE_CALL can resolve + invoke callees.
+fn eval_ast(nodes: i64, idx: i64, names: i64, vals: i64, ec_p: i64, src: i64,
+            fn_names: i64, fn_nodes: i64, fc_p: i64) -> i64 {
+    let k = read_rec_field(nodes, idx, 0);
+    let a = read_rec_field(nodes, idx, 1);
+    let b = read_rec_field(nodes, idx, 2);
+    if k == NODE_NUM   { return a; }
+    if k == NODE_IDENT { return env_get(names, vals, ec_p, src, a, b); }
+    if k == NODE_FN    {
+        return eval_ast(nodes, b, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+    }
+    if k == NODE_BLOCK {
+        let mut cell = a;                     // head NODE_STMT index (-1 if empty)
+        let mut last: i64 = 0;
+        while cell != -1 {
+            let stmt_node = read_rec_field(nodes, cell, 1);
+            last = eval_ast(nodes, stmt_node, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+            cell = read_rec_field(nodes, cell, 2);   // next
+        }
+        return last;
+    }
+    if k == NODE_LETSTMT {
+        let name_s = read_rec_field(nodes, a, 1);
+        let name_l = read_rec_field(nodes, a, 2);
+        let v = eval_ast(nodes, b, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        env_set(names, vals, ec_p, name_s, name_l, v);
+        return v;
+    }
+    if k == NODE_CALL {
+        let callee_s = read_rec_field(nodes, a, 1);
+        let callee_l = read_rec_field(nodes, a, 2);
+        let fn_node = fn_lookup(fn_names, fn_nodes, fc_p, src, callee_s, callee_l);
+        let params_head = read_rec_field(nodes, fn_node, 1);   // NODE_FN field a
+        let body_block  = read_rec_field(nodes, fn_node, 2);   // NODE_FN field b
+        let cnames = aether_alloc_bytes(ENV_CAP * 16);
+        let cvals  = aether_alloc_bytes(ENV_CAP * 8);
+        let cc_p   = aether_alloc_bytes(24);
+        write_rec(cc_p, 0, 0, 0, 0);
+        let mut pcell = params_head;          // NODE_PARAM head (-1 if none)
+        let mut acell = b;                    // NODE_ARG head    (-1 if none)
+        while pcell != -1 && acell != -1 {
+            let pname_node = read_rec_field(nodes, pcell, 1);   // NODE_PARAM -> NODE_IDENT
+            let pname_s = read_rec_field(nodes, pname_node, 1);
+            let pname_l = read_rec_field(nodes, pname_node, 2);
+            let arg_expr = read_rec_field(nodes, acell, 1);     // NODE_ARG -> expr idx
+            let av = eval_ast(nodes, arg_expr, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+            env_set(cnames, cvals, cc_p, pname_s, pname_l, av);
+            pcell = read_rec_field(nodes, pcell, 2);   // next param
+            acell = read_rec_field(nodes, acell, 2);   // next arg
+        }
+        let r = eval_ast(nodes, body_block, cnames, cvals, cc_p, src, fn_names, fn_nodes, fc_p);
+        aether_free_bytes(cnames, ENV_CAP * 16);
+        aether_free_bytes(cvals,  ENV_CAP * 8);
+        aether_free_bytes(cc_p,   24);
+        return r;
+    }
+    if k == NODE_IF {
+        let cond = eval_ast(nodes, a, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        let then_block = read_rec_field(nodes, b, 1);
+        let else_block = read_rec_field(nodes, b, 2);
+        if cond != 0 {
+            return eval_ast(nodes, then_block, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        }
+        if else_block != -1 {
+            return eval_ast(nodes, else_block, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        }
+        return 0;                              // `if` with no else, cond false
+    }
+    // Unary nodes. a = operand index, b unused.
+    if k == NODE_NEG {
+        // -x == 0 - x. Aether HAS a unary `-`, but `0 - v` is identical and
+        // reads explicitly (no reliance on the unary lowering path).
+        let v = eval_ast(nodes, a, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        return 0 - v;
+    }
+    if k == NODE_NOT {
+        // !x == (x == 0) ? 1 : 0  (logical not). No ternary — branch.
+        let v = eval_ast(nodes, a, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        if v == 0 { return 1; }
+        return 0;
+    }
+    // Comparison nodes: evaluate both sides, return 1 or 0.
+    if k == NODE_LT || k == NODE_GT || k == NODE_EQ
+       || k == NODE_NE || k == NODE_LE || k == NODE_GE {
+        let lv = eval_ast(nodes, a, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        let rv = eval_ast(nodes, b, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+        if k == NODE_LT { if lv <  rv { return 1; } return 0; }
+        if k == NODE_GT { if lv >  rv { return 1; } return 0; }
+        if k == NODE_EQ { if lv == rv { return 1; } return 0; }
+        if k == NODE_NE { if lv != rv { return 1; } return 0; }
+        if k == NODE_LE { if lv <= rv { return 1; } return 0; }
+        if lv >= rv { return 1; } return 0;    // NODE_GE
+    }
+    // Binary arithmetic: +, -, *, /, %.
+    let lv = eval_ast(nodes, a, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+    let rv = eval_ast(nodes, b, names, vals, ec_p, src, fn_names, fn_nodes, fc_p);
+    if k == NODE_ADD { return lv + rv; }
+    if k == NODE_SUB { return lv - rv; }
+    if k == NODE_DIV { return lv / rv; }
+    if k == NODE_MOD { return lv % rv; }
+    return lv * rv;   // NODE_MUL
+}
+
+// --- main ------------------------------------------------------------
+fn main() -> i32 {
+    // A single function whose body exercises DIVISION, MODULO, and a UNARY
+    // minus. Deliberately NO literal `42` in the source — the 42 is COMPUTED
+    // by walking the built AST:
+    //   (90 / 2) - (10 % 7) - (-3) - 3 = 45 - 3 + 3 - 3 = 42.
+    let src = "fn main() -> i64 { let a = 90; let b = -3; (a / 2) - (10 % 7) - b - 3 }";
+    let n = aether_str_len(src);
+    aether_print_kv_i64("source bytes", n);
+
+    // 1. LEX.
+    let toks = aether_alloc_bytes(MAX_TOKENS * 24);
+    let tn = lex(src, n, toks);
+    aether_print_kv_i64("token count", tn);
+
+    // AST node buffer + live node count.
+    let nodes = aether_alloc_bytes(MAX_NODES * 24);
+    let nc_p  = aether_alloc_bytes(24);
+    write_rec(nc_p, 0, 0, 0, 0);
+
+    // Env for ident resolution during eval of the TOP-LEVEL (main) frame.
+    let names = aether_alloc_bytes(ENV_CAP * 16);
+    let vals  = aether_alloc_bytes(ENV_CAP * 8);
+    let ec_p  = aether_alloc_bytes(24);
+    write_rec(ec_p, 0, 0, 0, 0);
+
+    // Fn table (name span -> NODE_FN index).
+    let fn_names = aether_alloc_bytes(FN_CAP * 16);
+    let fn_nodes = aether_alloc_bytes(FN_CAP * 8);
+    let fc_p     = aether_alloc_bytes(24);
+    write_rec(fc_p, 0, 0, 0, 0);
+
+    // Token cursor.
+    let pos_p = aether_alloc_bytes(24);
+    pos_set(pos_p, 0);
+
+    // 2. PARSE the whole program into the AST + fn table.
+    let nfns = parse_program(toks, pos_p, src, nodes, nc_p, fn_names, fn_nodes, fc_p);
+    aether_print_kv_i64("functions parsed", nfns);
+    aether_print_kv_i64("ast nodes built", read_rec_field(nc_p, 0, 0));
+
+    // 3. RE-EMIT `main` as an S-expression (proves the div/mod/neg nodes
+    //    are real structure in the node buffer).
+    let scratch = aether_alloc_bytes(32);
+    // "main" is at src[3..7] (after "fn ").
+    let main_node = fn_lookup(fn_names, fn_nodes, fc_p, src, 3, 4);
+    aether_print_kv_i64("main NODE_FN index", main_node);
+    print_cstr("AST: ");
+    emit_sexpr(nodes, src, scratch, main_node);
+    print_cstr("\n");
+
+    // 4. EVALUATE `main` via the SEPARATE tree-walk. The exit code comes
+    //    from walking main's AST — computing the div, mod, and unary-neg —
+    //    NOT from a constant, and NOT from any literal 42 in the source.
+    let result = eval_ast(nodes, main_node, names, vals, ec_p, src,
+                          fn_names, fn_nodes, fc_p);
+    aether_print_kv_i64("eval_ast(main)", result);
+
+    aether_free_bytes(toks,    MAX_TOKENS * 24);
+    aether_free_bytes(nodes,   MAX_NODES * 24);
+    aether_free_bytes(nc_p,    24);
+    aether_free_bytes(names,   ENV_CAP * 16);
+    aether_free_bytes(vals,    ENV_CAP * 8);
+    aether_free_bytes(ec_p,    24);
+    aether_free_bytes(fn_names, FN_CAP * 16);
+    aether_free_bytes(fn_nodes, FN_CAP * 8);
+    aether_free_bytes(fc_p,    24);
+    aether_free_bytes(pos_p,   24);
+    aether_free_bytes(scratch, 32);
+
+    result as i32
+}
