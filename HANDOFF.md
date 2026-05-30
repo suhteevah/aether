@@ -1,6 +1,42 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-29 PM3 (🟢 batched-MMVQ Q6_K seqB SHIPPED — N=8 batched throughput 23.1 → 34.1 tok/s (+47%); continuous batching is now a NET WIN, 1.68× single-stream)
+## Last Updated — 2026-05-30 (🟢 fp16 batched-seqB explored + CLOSED — correct but e2e-marginal (latency-bound, not FMA-bound); banked flag-gated + cuda_fp16 infra. P100 per-kernel fp16 line is a closed dead-end. Redirecting.)
+
+## Project Status
+🟢 Big session, all committed. Arc: cheap N-sweep → found+FIXED the N≥4 batched
+crash (dual page-table divergence) → shipped Q6_K seqB weight-reuse (**N=8 batched
+23.1 → 34.1 tok/s, +47%, continuous batching now a NET WIN**) → explored fp16
+(FR-CLW-1) and **closed it**: fp16 half2 is correct (rel ~1e-3) but e2e-MARGINAL
+(+4% ≈ noise; (3a) tuning +2%) because these quant kernels are **latency-bound at
+~7% of peak, not FMA-bound** — independently reproduces the documented "P100 gap is
+systemic" finding. cnc fleet restored, workhorse active.
+
+## Commits this session
+- `563bcb9` crash fix (step_logits_for_slot page-table mirror) + Q6_K seqB +47% + 2 witness tests
+- `9cea77d` track CLAUDEAI_FR.md (workbench findings inbox)
+- `7b2f8a6` batched seqB fp16 kernels (flag-gated `AETHER_SEQB_FP16`, e2e-marginal)
+- `4d1e8ce` (3a) fp16 tuning (+2%) → P100 fp16 line closed
+
+## Key conclusions (don't re-litigate)
+- **Batched continuous decode is now safe + a net win** (crash fixed; seqB weight-reuse
+  for Q4_K *and* Q6_K). Deploy: still prefer `--max-concurrent 1` for single-user
+  latency; concurrency is a throughput win at N≥4.
+- **P100 per-kernel fp16/tiling is a CLOSED dead-end** ([[p100_quant_matmul_lever_is_fp16]]).
+  fp16 helps the FMA, but the kernels are latency/dependency-bound (52 GB/s, ~7% peak),
+  so it can't move e2e. fp16 kernels kept flag-gated as building blocks + the cuda_fp16
+  nvrtc infra (compute_60 + include-path probe) is reusable.
+
+## What's Next (REDIRECT — perf line well-characterized, pick the next area)
+- Batched headroom is now mostly STRUCTURAL (per-b attention + elementwise scale with
+  b for independent requests; the matmuls already reuse weights). A batched-forward
+  profile would confirm, but the per-kernel latency wall suggests diminishing returns.
+- Candidate redirects (see roadmap-tracker output / docs/ROADMAP_V2.md): prefix-sharing
+  for batched (shared-prompt throughput), or a different roadmap mega-phase (enums+? ,
+  heap stdlib + SafeTensors, SSA + reg alloc, bf16 + strided views, etc.).
+
+---
+
+## (prior) Last Updated — 2026-05-29 PM3 (🟢 batched-MMVQ Q6_K seqB SHIPPED — N=8 batched throughput 23.1 → 34.1 tok/s (+47%); continuous batching is now a NET WIN, 1.68× single-stream)
 
 ## Project Status
 🟢 Built the batched-MMVQ lever (the prior entry's #2). The batched path's
@@ -38,12 +74,17 @@ cnc fleet restored. **Uncommitted** — local tree has the full session's change
 1. **Commit the session** (when Matt asks): the crash fix (serving.rs) + the new
    witness test + the Q6_K seqB kernel (cuda.rs + matmul_batched). Optionally
    redeploy aether-serve to live :18913.
-2. **Further batched headroom** (smaller levers now): the hetero attention section +
-   per-b elementwise ops (rms_norm, bias, silu, add) still scale with b — a batched
-   forward profile (AETHER_DECODE_TIMING-equivalent for the batch path) would show
-   the next bottleneck now that the matmuls reuse weights. Q8_1-activation MMVQ is
-   the textbook next axis but MARGINAL on P100 (sm_60, no dp4a) — weight-reuse was
-   the real lever, and it's done for both Q4_K (pre-existing) and Q6_K (this session).
+2. **fp16 half2 MAC in the quant matmuls — THE P100 lever** (per `CLAUDEAI_FR.md`
+   FR-CLW-1, Matt-confirmed; see memory [[p100_quant_matmul_lever_is_fp16]]). P100 is
+   sm_60 → NO `__dp4a` (so Q8_1/int8 is a dead end, correctly dismissed). The real
+   edge is native 2:1 FP16: dequant weight → fp16, `half2` multiply, **fp32
+   accumulator** (mandatory — pure-fp16 long-K sums drift to NaN/vocab-1). Two scopes:
+   (a) the batched `seqB` kernels I just shipped — they go COMPUTE-bound at high b
+   (weight reused b×), so fp16's 2× FMA helps MOST there; (b) the single-stream
+   `seq1` quant matmuls — the bigger prize: the ~2.7× P100 serving gap vs llama /
+   the fleet-cutover gate. Risk: fp16 drift; gate every change on qwen25_paged_parity
+   (token-identical) + finite logits.
+   (Lesser batched headroom: hetero attention + per-b elementwise still scale with b.)
 3. Deployment: continuous batching is now BOTH safe AND a throughput win at N≥4;
    for single-user latency still prefer `--max-concurrent 1`.
 
