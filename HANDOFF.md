@@ -20,13 +20,17 @@ real diff = +191 asm + AST/parser/runtime).
 - **Asm backend** (~+191 lines): `let s:&[T]` → 2 slots (`s.ptr`/`s.len`);
   `slice_from_raw(ptr,len)` builtin + `&s[lo..hi]` sub-slice construction;
   `.len()`/`.is_empty()`; `s[i]` → `*(ptr+i*size)`.
-- **Honest deviations / v1 scope** (NOT overclaiming): construction uses
-  `slice_from_raw(as_ptr(v), len(v))` not the `&v[..]` sugar (the spec offered this
-  fallback; `&v[..]` lowers to exactly this — wiring `..` full-range was more
-  invasive). **i64 (8-byte) element slices only** — `slice_elem_info` rejects
-  float-elem slices rather than mis-load; f32/u8 stride is a localized follow-up
-  (elem_size already threaded). `&str` parses to `&[u8]` but no string slicing is
-  exercised yet. These are real follow-ups, not stubs.
+- **Surface widened `38d4578`**: now **u8/`&str` + f32 + i64** element slices.
+  `slice_elem_info` maps u8/i8→1, u16/i16→2, u32/i32→4, f32→4, i64/u64→8, f64→8;
+  slice index `s[i]` emits a WIDTH-CORRECT load by (kind,size) — `movzbl`/`movzwl`/
+  `movl`/`movq`/`movss` (no more 8-byte over-read on byte slices); aether_asm gained
+  those encodings (34/34 asm tests pass). Runtime: `aether_string_as_ptr` (→`&str`/
+  `&[u8]`) + `aether_vec_f32_*`. Witnesses (real, exit 42 via movzbl/movss, 0
+  constant shortcuts): `slice_u8.aether` (&str over a String), `slice_f32.aether`;
+  `slice_str.aether` (i64) unregressed.
+- **Still deferred (honest, NOT stubs)**: `&v[..]` full-range sugar (the worker
+  rate-limited before wiring it; `slice_from_raw(as_ptr(v), len(v))` is the explicit
+  form it lowers to) + `.iter()`/`.iter_mut()`.
 
 ## What's Next (continue the language/self-host redirect)
 - Finish P16.19 surface: `&v[..]` sugar, f32/u8-stride slices, `&str` slicing + iter.
