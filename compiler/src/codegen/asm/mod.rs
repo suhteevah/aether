@@ -1463,6 +1463,40 @@ fn emit_slice_construct(
             }
         }
     }
+    // Form 3 — `&v[..]` full slice over a CONTAINER handle (Vec/String).
+    // Disambiguator vs Form 2: the receiver is NOT a slice local — it's an i64
+    // container handle. The accessor FFI is chosen by element size:
+    //   8 → Vec<i64>, 4 → Vec<f32>, 1 → String/&str. This is exactly what
+    //   `slice_from_raw(<container>_as_ptr(v), <container>_len(v))` lowers to;
+    //   the calls are synthesized so the call ABI is handled by the Call path.
+    if let Expr::Ref { expr, .. } = value {
+        if let Expr::Index { recv, idx } = expr.as_ref() {
+            if let (Expr::Ident(src), Expr::Range { .. }) = (recv.as_ref(), idx.as_ref()) {
+                if !locals.slices.contains_key(src) {
+                    let (as_ptr_fn, len_fn) = match elem_size {
+                        8 => ("aether_vec_i64_as_ptr", "aether_vec_i64_len"),
+                        4 => ("aether_vec_f32_as_ptr", "aether_vec_f32_len"),
+                        1 => ("aether_string_as_ptr", "aether_string_len"),
+                        _ => return Err(AsmError::UnsupportedExpr(
+                            "&container[..] supports &[i64] / &[f32] / &str only")),
+                    };
+                    let ptr_call = Expr::Call {
+                        callee: Box::new(Expr::Ident(as_ptr_fn.to_string())),
+                        args: vec![Expr::Ident(src.clone())],
+                    };
+                    emit_expr_value(&ptr_call, out, data, locals)?;
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", ptr_slot * 8));
+                    let len_call = Expr::Call {
+                        callee: Box::new(Expr::Ident(len_fn.to_string())),
+                        args: vec![Expr::Ident(src.clone())],
+                    };
+                    emit_expr_value(&len_call, out, data, locals)?;
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", len_slot * 8));
+                    return Ok(());
+                }
+            }
+        }
+    }
     // Form 2 — `&s[lo..hi]` sub-slice.
     if let Expr::Ref { expr, .. } = value {
         if let Expr::Index { recv, idx } = expr.as_ref() {
@@ -1569,7 +1603,10 @@ fn count_locals_in_expr(e: &Expr, locals: &mut Locals) {
         }
         Expr::For { var, iter, body, .. } => {
             // The iteration variable lives in a slot; the upper bound also
-            // gets a slot so we don't re-evaluate it each loop.
+            // gets a slot so we don't re-evaluate it each loop.  Both the range
+            // path (var + _for_end_) and the P16.19 slice-iter path (_for_sidx_
+            // + var) allocate exactly two slots in emit, so two here keeps the
+            // prologue frame and the return epilogues in lock-step.
             count_locals_in_expr(iter, locals);
             locals.alloc(var);
             locals.alloc("_for_end_");
@@ -2392,6 +2429,87 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             Ok(TyKind::Int)
         }
         Expr::For { var, iter, body, .. } => {
+            // P16.19 — slice iteration `for x in s` / `for x in s.iter()`:
+            // walk `0..s.len()` binding `x = s[i]` (width-correct load) each
+            // step. Recognised when the iterable is a slice local, or `.iter()`
+            // / `.iter_mut()` on one.
+            let slice_src = match iter.as_ref() {
+                Expr::Ident(n) if locals.slices.contains_key(n) => Some(n.clone()),
+                Expr::MethodCall { recv, name, .. }
+                    if name == "iter" || name == "iter_mut" => match recv.as_ref() {
+                        Expr::Ident(n) if locals.slices.contains_key(n) => Some(n.clone()),
+                        _ => None,
+                    },
+                _ => None,
+            };
+            if let Some(s) = slice_src {
+                let (elem_kind, elem_size) = locals.slices.get(&s).copied().unwrap();
+                let ptr_slot = locals.get(&format!("{}.ptr", s))
+                    .ok_or_else(|| AsmError::UnknownIdent(format!("{}.ptr", s)))?;
+                let len_slot = locals.get(&format!("{}.len", s))
+                    .ok_or_else(|| AsmError::UnknownIdent(format!("{}.len", s)))?;
+                // counter i = 0
+                let idx_slot = locals.alloc("_for_sidx_");
+                out.push_str(&format!("    movq $0, -{}(%rbp)\n", idx_slot * 8));
+                // element binding `var` (its own slot + elem type)
+                let x_slot = locals.alloc(var);
+                locals.types.insert(var.clone(), elem_kind);
+
+                let top = locals.fresh_label("foriter_top");
+                let cont = locals.fresh_label("foriter_cont");
+                let end = locals.fresh_label("foriter_end");
+                out.push_str(&format!("{}:\n", top));
+                // if i >= len goto end
+                out.push_str(&format!("    movq -{}(%rbp), %rax\n", idx_slot * 8));
+                out.push_str(&format!("    movq -{}(%rbp), %r10\n", len_slot * 8));
+                out.push_str("    cmpq %r10, %rax\n");
+                out.push_str(&format!("    jge {}\n", end));
+                // addr = s.ptr + i*elem_size  →  %rdi
+                out.push_str(&format!("    movq -{}(%rbp), %rax\n", idx_slot * 8));
+                emit_scale_pow2(out, elem_size);
+                out.push_str(&format!("    movq -{}(%rbp), %r10\n", ptr_slot * 8));
+                out.push_str("    addq %r10, %rax\n");
+                out.push_str("    movq %rax, %rdi\n");
+                // x = *(addr) — width-correct load + store to x's slot
+                match (elem_kind, elem_size) {
+                    (TyKind::Int, 1) => {
+                        out.push_str("    movzbl 0(%rdi), %eax\n");
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", x_slot * 8));
+                    }
+                    (TyKind::Int, 2) => {
+                        out.push_str("    movzwl 0(%rdi), %eax\n");
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", x_slot * 8));
+                    }
+                    (TyKind::Int, 4) => {
+                        out.push_str("    movl 0(%rdi), %eax\n");
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", x_slot * 8));
+                    }
+                    (TyKind::F32, _) => {
+                        out.push_str("    movss 0(%rdi), %xmm0\n");
+                        out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", x_slot * 8));
+                    }
+                    (TyKind::F64, _) => {
+                        out.push_str("    movsd 0(%rdi), %xmm0\n");
+                        out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", x_slot * 8));
+                    }
+                    _ => {
+                        out.push_str("    movq 0(%rdi), %rax\n");
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", x_slot * 8));
+                    }
+                }
+                locals.loop_labels.push((cont.clone(), end.clone()));
+                emit_block(body, out, data, locals)?;
+                locals.loop_labels.pop();
+                out.push_str(&format!("{}:\n", cont));
+                // i++
+                out.push_str(&format!("    movq -{}(%rbp), %rax\n", idx_slot * 8));
+                out.push_str("    addq $1, %rax\n");
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", idx_slot * 8));
+                out.push_str(&format!("    jmp {}\n", top));
+                out.push_str(&format!("{}:\n", end));
+                out.push_str("    xorl %eax, %eax\n");
+                return Ok(TyKind::Int);
+            }
             // Only `lo..hi` is supported in the asm backend today.
             let (lo, hi) = match iter.as_ref() {
                 Expr::Range { lo, hi, .. } => (lo.as_ref(), hi.as_ref()),

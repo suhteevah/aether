@@ -915,7 +915,20 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.bump();
-                    let idx = self.parse_expr()?;
+                    // P16.19 — `v[..]` full-range slice sugar. The bounds are
+                    // placeholders (the container full-slice in emit_slice_construct
+                    // ignores them, using the container's len). `v[i]` and
+                    // `v[lo..hi]` still parse through parse_expr/parse_range.
+                    let idx = if matches!(self.peek(0), Tok::DotDot) {
+                        self.bump();
+                        Expr::Range {
+                            lo: Box::new(Expr::IntLit(0)),
+                            hi: Box::new(Expr::IntLit(0)),
+                            step: None,
+                        }
+                    } else {
+                        self.parse_expr()?
+                    };
                     self.expect(Tok::RBracket)?;
                     e = Expr::Index { recv: Box::new(e), idx: Box::new(idx) };
                 }

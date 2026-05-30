@@ -1,0 +1,42 @@
+// roadmap: P16.19
+// expect: exit=42
+//
+// Closes the last two P16.19 gaps:
+//   * `&v[..]` full-range slice sugar over a container (Vec<i64> and String)
+//   * slice iteration `for x in s` (the self-hosted tokenizer/parser unlock —
+//     iterate bytes without an explicit index loop)
+//
+//   &v[..]  over Vec[5,7,9]  → for x in s   sum  = 5+7+9 = 21
+//   &st[..] over "\7\7\7"    → for b in bytes bsum = 7+7+7 = 21
+//   result = 21 + 21 = 42
+use runtime;
+
+fn main() -> i32 {
+    // &[i64]: `&v[..]` full-range + `for x in s`
+    let v: i64 = aether_vec_i64_new();
+    aether_vec_i64_push(v, 5);
+    aether_vec_i64_push(v, 7);
+    aether_vec_i64_push(v, 9);
+    let s: &[i64] = &v[..];
+    if s.len() != 3 { return 1; }
+    let mut sum: i64 = 0;
+    for x in s {
+        sum = sum + x;          // 5 + 7 + 9 = 21
+    }
+    aether_vec_i64_free(v);
+
+    // &str / &[u8]: `&st[..]` full-range over a String + `for b in bytes`
+    let st: i64 = aether_string_new();
+    aether_string_push_byte(st, 7);
+    aether_string_push_byte(st, 7);
+    aether_string_push_byte(st, 7);
+    let bytes: &[u8] = &st[..];
+    if bytes.len() != 3 { return 2; }
+    let mut bsum: i64 = 0;
+    for b in bytes {
+        bsum = bsum + b;        // 7 + 7 + 7 = 21 (movzbl byte loads)
+    }
+    aether_string_free(st);
+
+    return (sum + bsum) as i32; // 21 + 21 = 42
+}
