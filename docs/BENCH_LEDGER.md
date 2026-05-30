@@ -1146,3 +1146,30 @@ DEQUANT/occupancy-bound, not FMA-bound (1256µs vs ~117µs raw-FMA floor), so ha
 the multiply alone barely moves e2e. The real fp16 win needs fp16 dequant + better
 tiling (a whole-kernel rewrite), not just half2 on the FMA. Kept flag-gated
 default-off as a proven building block + the reusable cuda_fp16 nvrtc infra.
+
+---
+
+## 2026-05-30 — (3a) fp16 kernel tuning + (3b) analysis → per-kernel P100 fp16 line CLOSED
+
+(3a) Tuned `fused_q6k_matmul_seqB_fp16`: vectorized int4 (128-bit) shared loads +
+flush fp16 partials to fp32 every 8 super-blocks (instead of every block). Result:
+1.15× → **1.17×** isolated (+2%, accuracy rel 1.3e-3). Essentially nothing — the
+flush/load overhead was NOT the bottleneck.
+
+**Root cause (the decisive finding):** the kernel achieves only **52 GB/s = ~7% of
+peak**. It is LATENCY/dependency-bound, NOT FMA-throughput-bound: the per-quant chain
+(weight-byte load → integer bit-extract → cast → fma) at 1-warp-per-output-row has
+too little ILP to hide latency. fp16 can't reach its ~1.8× FMA-dominance ceiling
+because FMA throughput was never the limit.
+
+(3b) The latency-bound lever is multi-warp K-split — but it BREAKS seqB's block-level
+8-row activation reuse and is a documented −4.7% loss on P100 (b=1,
+ffn_gateup_alu_factoring_dead_end). Not pursued.
+
+**Conclusion — independently reproduces the prior "gap is systemic" finding.** fp16 on
+P100 quant decode is a real but MODEST lever: it helps the FMA, but these kernels are
+latency-bound, so per-kernel fp16/tiling can't move e2e meaningfully (fp16 e2e was +4%
+≈ noise; tuning +2%). The per-kernel P100 fp16 line is CLOSED. Banked: the flag-gated
+fp16 kernels (correct, rel ~1e-3) + the reusable cuda_fp16 nvrtc infra (compute_60 +
+include-path probe) stay as building blocks. Single-stream is at the latency ceiling
+(0.86× llama via int8-MMVQ); batched is a net win via seqB weight-reuse (+47% N=8).

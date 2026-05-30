@@ -11127,8 +11127,13 @@ extern "C" __global__ void fused_q6k_matmul_seqB_fp16(
     int ni = blockIdx.x * 8 + warp;
 
     float acc[8];
+    half2 acc16[4];   // (3a) fp16 partials persist across up to 8 super-blocks
+                      // then flush to fp32 — cuts half22float2 overhead ~8x while
+                      // keeping fp16 accumulation bounded (~64 terms, drift-safe).
     #pragma unroll
     for (int b = 0; b < 8; b++) acc[b] = 0.0f;
+    #pragma unroll
+    for (int p = 0; p < 4; p++) acc16[p] = __float2half2_rn(0.0f);
 
     for (int bi = 0; bi < n_blocks; bi++) {
         // Cooperative load: thread tid (= K-element) writes all 8 rows; padding
@@ -11149,11 +11154,6 @@ extern "C" __global__ void fused_q6k_matmul_seqB_fp16(
             const signed char*   sc = (const signed char*)(base + 192);
             unsigned short d_bits = ((unsigned short)base[209] << 8) | (unsigned short)base[208];
             float d = __half2float(__ushort_as_half(d_bits));
-
-            // fp16 partials for this super-block: 4 half2 = 8 rows.
-            half2 acc16[4];
-            #pragma unroll
-            for (int p = 0; p < 4; p++) acc16[p] = __float2half2_rn(0.0f);
 
             #pragma unroll
             for (int n_outer = 0; n_outer < 2; n_outer++) {
@@ -11183,22 +11183,26 @@ extern "C" __global__ void fused_q6k_matmul_seqB_fp16(
                         unsigned char b0 = qh[qh_off + l_iter];
                         q = (int)(((a0 >> 4) & 0xFu) | (((b0 >> 6) & 3u) << 4)) - 32;
                     }
-                    __half w_h = __float2half(d * sc_val * (float)q);
-                    half2 w2 = __half2half2(w_h);
+                    half2 w2 = __half2half2(__float2half(d * sc_val * (float)q));
                     int a_idx = (n_outer * 128) + (sub_pos * 32) + l_iter;
-                    const half2* arow = (const half2*)&a_tile[a_idx * 8];  // rows 0..7
+                    // (3a) one 128-bit shared load = all 8 rows' activations.
+                    int4 araw = *(const int4*)&a_tile[a_idx * 8];
+                    const half2* ah = (const half2*)&araw;
                     #pragma unroll
                     for (int p = 0; p < 4; p++) {
-                        acc16[p] = __hfma2(arow[p], w2, acc16[p]);          // rows 2p, 2p+1
+                        acc16[p] = __hfma2(ah[p], w2, acc16[p]);            // rows 2p, 2p+1
                     }
                 }
             }
-            // Flush fp16 super-block partials into the fp32 accumulators.
+        }
+        // (3a) flush fp16 partials to fp32 every 8 super-blocks (+ final tail).
+        if ((bi & 7) == 7 || bi == n_blocks - 1) {
             #pragma unroll
             for (int p = 0; p < 4; p++) {
                 float2 f = __half22float2(acc16[p]);
                 acc[2 * p]     += f.x;
                 acc[2 * p + 1] += f.y;
+                acc16[p] = __float2half2_rn(0.0f);
             }
         }
         __syncthreads();
