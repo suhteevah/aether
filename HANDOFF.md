@@ -1,6 +1,42 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-30 (🟢 fp16 batched-seqB explored + CLOSED — correct but e2e-marginal (latency-bound, not FMA-bound); banked flag-gated + cuda_fp16 infra. P100 per-kernel fp16 line is a closed dead-end. Redirecting.)
+## Last Updated — 2026-05-30 PM (🟢 REDIRECTED off P100 perf → shipped P16.19 native `&[T]` slices (fat pointers). Real impl, witness exits 42, audit clean 170/196.)
+
+## Project Status
+🟢 Redirect landed. After the P100 perf line (crash fix + Q6_K seqB +47% + fp16
+closed), redirected to language/self-host work per roadmap-tracker (P6–P10 were
+100% witnessed; gaps are V3/V4). Shipped **P16.19 native `&[T]` slices** —
+`(ptr,len)` fat pointers modeled as a 2-field struct (reusing the asm backend's
+per-field stack-slot machinery), with `.len()`, `s[i]` indexing, `&s[a..b]`
+sub-slicing, over real heap `Vec` data. Witness `tests/runtime/slice_str.aether`
+exits 42 (verified independently through the Aether-only chain); audit clean,
+`errors: 0`, count 169→170. Committed `aa8b2da` (auto-uploader's generic message;
+real diff = +191 asm + AST/parser/runtime).
+
+## P16.19 — what shipped + honest scope
+- **AST**: `Ty::Slice { mutable, elem }` (ast/mod.rs); all exhaustive `Ty` matches updated.
+- **Parser**: `&[T]` / `&mut [T]` / `&str` in `parse_ty` (parser/mod.rs).
+- **Runtime**: `aether_vec_i64_as_ptr(handle)->i64` (backing-buffer ptr; lib.rs).
+- **Asm backend** (~+191 lines): `let s:&[T]` → 2 slots (`s.ptr`/`s.len`);
+  `slice_from_raw(ptr,len)` builtin + `&s[lo..hi]` sub-slice construction;
+  `.len()`/`.is_empty()`; `s[i]` → `*(ptr+i*size)`.
+- **Honest deviations / v1 scope** (NOT overclaiming): construction uses
+  `slice_from_raw(as_ptr(v), len(v))` not the `&v[..]` sugar (the spec offered this
+  fallback; `&v[..]` lowers to exactly this — wiring `..` full-range was more
+  invasive). **i64 (8-byte) element slices only** — `slice_elem_info` rejects
+  float-elem slices rather than mis-load; f32/u8 stride is a localized follow-up
+  (elem_size already threaded). `&str` parses to `&[u8]` but no string slicing is
+  exercised yet. These are real follow-ups, not stubs.
+
+## What's Next (continue the language/self-host redirect)
+- Finish P16.19 surface: `&v[..]` sugar, f32/u8-stride slices, `&str` slicing + iter.
+- Or next roadmap-tracker picks: **16.15 Drop/RAII** (M, deps met) · **20.8 3-stage
+  bootstrap** (S, deps witnessed — proves self-host fix-point A2==A3) · 16.9 proc-macros
+  (XL, unblocks 22.8). slice work unlocks the self-hosted parser (P20) + tokenizers.
+
+---
+
+## (prior) Last Updated — 2026-05-30 (🟢 fp16 batched-seqB explored + CLOSED — correct but e2e-marginal (latency-bound, not FMA-bound); banked flag-gated + cuda_fp16 infra. P100 per-kernel fp16 line is a closed dead-end. Redirecting.)
 
 ## Project Status
 🟢 Big session, all committed. Arc: cheap N-sweep → found+FIXED the N≥4 batched
