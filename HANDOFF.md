@@ -14,8 +14,15 @@ from the interp's inline evaluator. Verified real (8 nodes, no constant-42 retur
 audit `errors: 0`, golden clean, all witnesses green. Tree clean.
 
 ## What shipped (self-host)
-- `tests/runtime/selfhost_parser_witness.aether` — real AST-building parser (P20.2).
+- `tests/runtime/selfhost_parser_witness.aether` — real AST-building parser, expr +
+  `let` (P20.2, Deposit 11).
+- `tests/runtime/selfhost_parser_fn.aether` — **Deposit 12** (`c6902dc`): `fn`
+  declarations + statement blocks. Parses `fn f() -> i64 { let y = 18; (5+y)*2-4 }`
+  → NODE_FN/BLOCK/STMT(linked-list)/LETSTMT → re-emits
+  `(fn f (block (let y 18) (- (* (+ 5 y) 2) 4)))` → separate eval_ast walk → 42.
+  Lexer gained `fn`/`->`/`{`/`}`.
 - `examples/aetherc_self_parser.aether` — Deposit 11 showcase.
+- **All session commits pushed to origin/main** (github.com/suhteevah/aether), HEAD c6902dc.
 - **Compiler bug fixed** (`compiler/src/codegen/asm/mod.rs`): `Stmt::Return`'s
   early-exit epilogue used the LIVE `frame_bytes()` (mid-emission) — an early
   `return` inside an `if` emits before later `let`s bump `next_slot`, so the `addq`
