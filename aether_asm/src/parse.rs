@@ -244,7 +244,9 @@ fn synthetic_text_size(instrs: &[Instr]) -> u32 {
         Instr::CallRegIndirect { reg } => if reg.extension() != 0 { 3 } else { 2 },
         Instr::Ret => 1,
         Instr::CmpRegRegQ { .. } | Instr::TestRegRegQ { .. } => 3,
-        Instr::SetccAl { .. } | Instr::MovzblAlEax => 3,
+        Instr::SetccAl { .. } | Instr::MovzblAlEax | Instr::MovzwlAxEax => 3,
+        Instr::MovsbqAlRax | Instr::MovswqAxRax => 4,
+        Instr::MovlEaxEax => 2,
         Instr::JccRel32 { .. } => 6,
         Instr::JmpRel32 { .. } => 5,
         Instr::NegRegQ { .. } => 3,
@@ -680,12 +682,30 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             }
         }
         "movzwl" => {
-            // Memory form only: `movzwl disp(%base), %dst` — P16.19 `&[u16]`.
             let (a, b) = split_comma(rest);
+            // Memory form: `movzwl disp(%base), %dst` — P16.19 `&[u16]`.
             if let Some((disp, base)) = parse_base_mem(a, lineno) {
                 Instr::MovzwlBaseDispToReg { dst: parse_reg(b, lineno)?, base, disp }
+            } else if a.trim() == "%ax" && b.trim() == "%eax" {
+                Instr::MovzwlAxEax
             } else {
-                return Err(syn(lineno, format!("movzwl: only `disp(%base), %reg`, got {a}, {b}")));
+                return Err(syn(lineno, format!("movzwl: only `%ax, %eax` or `disp(%base), %reg`, got {a}, {b}")));
+            }
+        }
+        "movsbq" => {
+            let (a, b) = split_comma(rest);
+            if a.trim() == "%al" && b.trim() == "%rax" {
+                Instr::MovsbqAlRax
+            } else {
+                return Err(syn(lineno, format!("movsbq: only `%al, %rax`, got {a}, {b}")));
+            }
+        }
+        "movswq" => {
+            let (a, b) = split_comma(rest);
+            if a.trim() == "%ax" && b.trim() == "%rax" {
+                Instr::MovswqAxRax
+            } else {
+                return Err(syn(lineno, format!("movswq: only `%ax, %rax`, got {a}, {b}")));
             }
         }
         "je"  | "jeq" => Instr::JccRel32 { cc: CondCode::E,  sym: rest.to_string() },
@@ -710,8 +730,11 @@ fn parse_instr(line: &str, lineno: u32) -> Result<Instr, AsmError> {
             let (a, b) = split_comma(rest);
             if let Some((disp, base)) = parse_base_mem(a, lineno) {
                 Instr::MovlBaseDispToReg { dst: parse_reg(b, lineno)?, base, disp }
+            } else if a.trim() == "%eax" && b.trim() == "%eax" {
+                // Reg form — `as u32` truncation (zeroes upper 32 bits).
+                Instr::MovlEaxEax
             } else {
-                return Err(syn(lineno, format!("movl: only `$imm, %reg` or `disp(%base), %reg`, got {a}, {b}")));
+                return Err(syn(lineno, format!("movl: only `$imm, %reg`, `disp(%base), %reg`, or `%eax, %eax`, got {a}, {b}")));
             }
         }
 

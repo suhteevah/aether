@@ -1,13 +1,19 @@
 // roadmap: P6.4
 // expect: exit=42
 //
-// Narrowing unsigned int casts (`as u8`/`u16`) — keep the low N bits, matching
-// Rust's `as` truncation. Previously "unsupported cast combination". (u32 and
-// signed i8/i16 await wider aether-asm encodings.)
+// Narrowing int casts — `as u8`/`u16`/`u32` (zero-extend) + `as i8`/`i16`
+// (sign-extend), matching Rust `as` truncation. Required new aether-asm
+// encodings (movzwl/movsbq/movswq/movl reg-forms).
 fn main() -> i32 {
-    let b: i64 = 300 as u8;          // 300 & 0xFF   = 44
-    let w: i64 = 65578 as u16;       // 65578 & 0xFFFF = 42
-    if b == 44 {
-        if w == 42 { 42 } else { 1 }
-    } else { 2 }
+    let u8v: i64  = 300 as u8;        // 300 & 0xFF      = 44
+    let u16v: i64 = 65578 as u16;     // 65578 & 0xFFFF  = 42
+    let i8v: i64  = 200 as i8;        // 0xC8 sign-ext   = -56
+    let i16v: i64 = 40000 as i16;     // 0x9C40 sign-ext = -25536
+
+    let ok: i64 =
+        (if u8v == 44 { 1 } else { 0 }) +
+        (if u16v == 42 { 1 } else { 0 }) +
+        (if i8v == 0 - 56 { 1 } else { 0 }) +
+        (if i16v == 0 - 25536 { 1 } else { 0 });
+    (ok * 10 + 2) as i32     // all four correct -> 4*10+2 = 42
 }

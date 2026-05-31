@@ -222,6 +222,15 @@ pub enum Instr {
     SetccAl { cc: CondCode },
     /// `movzbl %al, %eax` — zero-extend AL to EAX. 0F B6 C0.
     MovzblAlEax,
+    /// `movzwl %ax, %eax` — zero-extend AX to EAX. 0F B7 C0.
+    MovzwlAxEax,
+    /// `movsbq %al, %rax` — sign-extend AL to RAX. REX.W 0F BE C0.
+    MovsbqAlRax,
+    /// `movswq %ax, %rax` — sign-extend AX to RAX. REX.W 0F BF C0.
+    MovswqAxRax,
+    /// `movl %eax, %eax` — copy EAX to EAX, zeroing the upper 32 bits of RAX
+    /// (the `as u32` truncation). 89 C0.
+    MovlEaxEax,
     /// `jcc rel32` — 0F 8X cd. Resolved as a Rel32Pc relocation against `sym`.
     JccRel32 { cc: CondCode, sym: String },
     /// `jmp rel32` — E9 cd. Same relocation kind.
@@ -812,6 +821,22 @@ pub fn encode_instruction(i: &Instr) -> Encoded {
             // 0F B6 C0 — movzbl %al, %eax. Clears upper 32 bits of rax too.
             Encoded { bytes: vec![0x0F, 0xB6, 0xC0], reloc: None }
         }
+        MovzwlAxEax => {
+            // 0F B7 C0 — movzwl %ax, %eax. Zero-extend low 16 bits.
+            Encoded { bytes: vec![0x0F, 0xB7, 0xC0], reloc: None }
+        }
+        MovsbqAlRax => {
+            // REX.W 0F BE C0 — movsbq %al, %rax. Sign-extend low byte.
+            Encoded { bytes: vec![0x48, 0x0F, 0xBE, 0xC0], reloc: None }
+        }
+        MovswqAxRax => {
+            // REX.W 0F BF C0 — movswq %ax, %rax. Sign-extend low 16 bits.
+            Encoded { bytes: vec![0x48, 0x0F, 0xBF, 0xC0], reloc: None }
+        }
+        MovlEaxEax => {
+            // 89 C0 — movl %eax, %eax. Zeroes the upper 32 bits of rax.
+            Encoded { bytes: vec![0x89, 0xC0], reloc: None }
+        }
         JccRel32 { cc, sym } => {
             // 0F 8X cd — 6 bytes total. rel32 starts at offset 2.
             let opcode = 0x80 | cc.opcode_byte();
@@ -990,6 +1015,18 @@ mod tests {
         assert_eq!(enc(Instr::SetccAl { cc: CondCode::Ne }), vec![0x0F, 0x95, 0xC0]);
         // `movzbl %al, %eax` -> 0F B6 C0
         assert_eq!(enc(Instr::MovzblAlEax), vec![0x0F, 0xB6, 0xC0]);
+    }
+
+    #[test]
+    fn int_width_cast_regforms() {
+        // `movzwl %ax, %eax` -> 0F B7 C0
+        assert_eq!(enc(Instr::MovzwlAxEax), vec![0x0F, 0xB7, 0xC0]);
+        // `movsbq %al, %rax` -> 48 0F BE C0
+        assert_eq!(enc(Instr::MovsbqAlRax), vec![0x48, 0x0F, 0xBE, 0xC0]);
+        // `movswq %ax, %rax` -> 48 0F BF C0
+        assert_eq!(enc(Instr::MovswqAxRax), vec![0x48, 0x0F, 0xBF, 0xC0]);
+        // `movl %eax, %eax` -> 89 C0
+        assert_eq!(enc(Instr::MovlEaxEax), vec![0x89, 0xC0]);
     }
 
     #[test]
