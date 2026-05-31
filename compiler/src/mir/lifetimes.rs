@@ -29,15 +29,36 @@ pub struct PlaceState {
     pub moved:          bool,
 }
 
+/// A borrow-check violation carrying a stable diagnostic code. The codes
+/// are the `AE0200` family (Phase 6.3):
+///   * `AE0200` — mutable aliasing (`&mut x` while `x` is already borrowed).
+///   * `AE0201` — shared/mut conflict (`&x` while `x` is mutably borrowed).
+///   * `AE0202` — use/borrow of a moved value.
+///   * `AE0203` — move out of a value that is currently borrowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Violation {
+    pub code: &'static str,
+    pub message: String,
+}
+
 #[derive(Default)]
 pub struct Checker {
     pub places:  HashMap<String, PlaceState>,
     pub borrows: HashMap<u32, (String, BorrowKind)>,
-    pub errors:  Vec<String>,
+    pub errors:  Vec<Violation>,
 }
 
 impl Checker {
+    /// Back-compat surface: run the checker and return the violation
+    /// messages only (drops the codes). Used by the unit tests.
     pub fn run(events: &[BorrowEvent]) -> Vec<String> {
+        Self::run_coded(events).into_iter().map(|v| v.message).collect()
+    }
+
+    /// Run the checker and return each violation with its stable `AE02xx`
+    /// diagnostic code. The driver maps these straight into `Diag`s so
+    /// `--check --json-errors` reports `"code":"AE0200"` etc.
+    pub fn run_coded(events: &[BorrowEvent]) -> Vec<Violation> {
         let mut c = Checker::default();
         for ev in events { c.step(ev); }
         c.errors
@@ -50,21 +71,30 @@ impl Checker {
                     shared_borrows: 0, mut_borrows: 0, moved: false,
                 });
                 if st.moved {
-                    self.errors.push(format!("borrow of moved value `{}`", place));
+                    self.errors.push(Violation {
+                        code: "AE0202",
+                        message: format!("borrow of moved value `{}`", place),
+                    });
                     return;
                 }
                 match kind {
                     BorrowKind::Mut => {
                         if st.mut_borrows > 0 || st.shared_borrows > 0 {
-                            self.errors.push(format!(
-                                "cannot borrow `{}` as mutable: already borrowed", place));
+                            self.errors.push(Violation {
+                                code: "AE0200",
+                                message: format!(
+                                    "cannot borrow `{}` as mutable: already borrowed", place),
+                            });
                         }
                         st.mut_borrows += 1;
                     }
                     BorrowKind::Shared => {
                         if st.mut_borrows > 0 {
-                            self.errors.push(format!(
-                                "cannot borrow `{}` as shared: already mutably borrowed", place));
+                            self.errors.push(Violation {
+                                code: "AE0201",
+                                message: format!(
+                                    "cannot borrow `{}` as shared: already mutably borrowed", place),
+                            });
                         }
                         st.shared_borrows += 1;
                     }
@@ -86,15 +116,21 @@ impl Checker {
                     shared_borrows: 0, mut_borrows: 0, moved: false,
                 });
                 if st.shared_borrows + st.mut_borrows > 0 {
-                    self.errors.push(format!(
-                        "cannot move out of `{}` while it is borrowed", place));
+                    self.errors.push(Violation {
+                        code: "AE0203",
+                        message: format!(
+                            "cannot move out of `{}` while it is borrowed", place),
+                    });
                 }
                 st.moved = true;
             }
             BorrowEvent::Use { place } => {
                 if let Some(st) = self.places.get(place) {
                     if st.moved {
-                        self.errors.push(format!("use of moved value `{}`", place));
+                        self.errors.push(Violation {
+                            code: "AE0202",
+                            message: format!("use of moved value `{}`", place),
+                        });
                     }
                 }
             }

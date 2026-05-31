@@ -1,0 +1,14 @@
+// Multiple shared borrows of the same local don't conflict — must check clean.
+//
+// P6.3 — the borrow checker permits any number of overlapping `&x` shared
+// borrows; only a `&mut` overlapping another borrow is rejected. This file
+// exercises the legal side so the checker is proven not to over-reject.
+fn read(v: i64) -> i64 { v }
+
+fn main() -> i64 {
+    let x: i64 = 5;
+    let a = &x;
+    let b = &x;
+    let c = &x;
+    read(x)
+}

@@ -1,0 +1,12 @@
+// Two simultaneous &mut borrows of the same local must be rejected.
+//
+// P6.3 — the borrow checker (compiler/src/mir/lifetimes.rs) holds a
+// `let`-bound `&mut` live to end-of-fn. The second `&mut x` overlaps the
+// first, so the checker emits AE0200 "cannot borrow `x` as mutable:
+// already borrowed" and `--check` exits nonzero.
+fn main() -> i64 {
+    let mut x: i64 = 5;
+    let a = &mut x;
+    let b = &mut x;
+    0
+}

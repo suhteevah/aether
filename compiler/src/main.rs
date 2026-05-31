@@ -438,16 +438,26 @@ fn main() {
 
     let mir_prog = mir::run_autodiff_pass(&prog);
 
-    // P11.5 — drive the NLL borrow checker over each fn at `--check`. Reports
-    // the count of detected violations to stderr; the violations don't (yet)
-    // turn into AE0200 diagnostics, but the module is on the path.
+    // P6.3 — drive the NLL borrow checker over each fn at `--check` and
+    // surface every violation as an `AE0200`-family diagnostic, failing the
+    // check with a nonzero exit. The checker is a lexical over-approximation
+    // (a `let`-bound borrow stays live to end-of-fn); a clean program checks
+    // OK, an aliasing program fails with a stable code an LLM can act on.
     if args.check_only {
-        let lt_errors = mir::lifetimes_drive::drive(&prog);
+        let lt_violations = mir::lifetimes_drive::drive(&prog);
+        for v in &lt_violations {
+            sink.push(Diag::error(v.code, "borrow", v.message.clone())
+                .with_hint("a `let`-bound `&mut` borrow stays live to the end of the \
+                    function; release the prior borrow (drop the binding or pass the value \
+                    instead of `&mut`) before taking another"));
+        }
         if !args.json_errors {
-            eprintln!("[aetherc] check OK — {} fn(s); borrow check {} violation(s)",
-                      mir_prog.funcs.len(), lt_errors);
+            eprintln!("[aetherc] check {} — {} fn(s); borrow check {} violation(s)",
+                      if lt_violations.is_empty() { "OK" } else { "FAILED" },
+                      mir_prog.funcs.len(), lt_violations.len());
         }
         report(&sink, &file_str, args.json_errors);
+        if sink.has_errors() { std::process::exit(1); }
         return;
     }
 
