@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-30 LATE (🟢 FORMAL P20.2 landed — `aetherc --emit=ast` canonical AST dump + the self-hosted parser re-emits it BYTE-FOR-BYTE. Two independent parsers proven to agree on a real file's AST at runtime. Full audit clean, errors: 0.)
+## Last Updated — 2026-05-31 (🟢 FORMAL P20.2 landed — `aetherc --emit=ast` canonical AST dump + the self-hosted parser re-emits it BYTE-FOR-BYTE. Two independent parsers proven to agree on a real file's AST at runtime. Full audit clean, errors: 0. All committed + pushed, HEAD efea47e.)
 
 ## Session arc (this session) — FORMAL P20.2
 The prior 7 deposits (11–17) checked the self-hosted parser's S-expr against
