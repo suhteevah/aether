@@ -2166,6 +2166,12 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             out.push_str(&format!("    movq ${}, %rax\n", n));
             Ok(TyKind::Int)
         }
+        Expr::BoolLit(b) => {
+            // `true` / `false` lower to 1 / 0 in %rax (Int-class). Branch and
+            // arithmetic codegen treat them as ordinary integers.
+            out.push_str(&format!("    movq ${}, %rax\n", if *b { 1 } else { 0 }));
+            Ok(TyKind::Int)
+        }
         Expr::FloatLit(f) => {
             // Width selected by the surrounding annotation (set by `Stmt::Let`,
             // assignment, or float-returning fn). Defaults to F32.

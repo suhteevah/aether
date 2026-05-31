@@ -1,0 +1,13 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// `true` / `false` literals now codegen (to 1 / 0). Previously the asm backend
+// had no `Expr::BoolLit` arm, so a bare `true`/`false` was "unhandled expr".
+fn main() -> i32 {
+    let t: bool = true;
+    let f: bool = false;
+    let mut r: i64 = 0;
+    if t { r = r + 42; }      // taken
+    if f { r = r - 100; }     // skipped
+    r as i32
+}
