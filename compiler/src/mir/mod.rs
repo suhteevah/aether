@@ -29,6 +29,7 @@ pub mod lto;
 pub mod traits;
 pub mod traits_drive;
 pub mod into_desugar;
+pub mod path_call;
 pub mod infer;
 pub mod lifetimes;
 pub mod async_exec;

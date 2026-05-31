@@ -1,0 +1,19 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Associated functions (Rust's `Type::method()` constructors). `Counter::new`
+// and `Counter::with` are inherent impl methods; the Path-callee calls are
+// rewritten to the flattened `Counter__new` / `Counter__with`. `new` returns
+// the struct by value via the P6.5 struct-return ABI.
+struct Counter { n: i64 }
+
+impl Counter {
+    fn new() -> Counter { Counter { n: 40 } }
+    fn bump(self, by: i64) -> i64 { self.n + by }
+}
+
+fn main() -> i32 {
+    let c: Counter = Counter::new();   // Counter__new() -> n = 40
+    let r: i64 = Counter::bump(c, 2);  // Counter__bump(c, 2) -> 42
+    r as i32
+}

@@ -360,6 +360,16 @@ fn main() {
         }
     }
 
+    // P6 — associated-function calls. Rewrites `Type::method(args)` to the
+    // flattened `Type__method(args)` for every known impl method (constructors
+    // like `Counter::new()`, `Celsius::from(40)`). Runs after `.into()` desugar.
+    {
+        let n = mir::path_call::run(&mut prog);
+        if n > 0 && !args.json_errors {
+            eprintln!("[aetherc] resolved {} associated-fn `Type::method` call(s)", n);
+        }
+    }
+
     // P6.6 — closure-object lowering. Runs BEFORE the closure-lifting pass so
     // it can fully lower the cases that pass deliberately punts on: a CAPTURING
     // closure bound to a local and passed as a value (`apply(inc, 5)`). These
