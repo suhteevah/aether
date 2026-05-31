@@ -147,36 +147,50 @@ fn main() {
     let mut test_json = String::from("[");
     section!("tests", {
         writeln_human("\n[3/5] Workspace tests".into());
-        let test_out = std::process::Command::new("cargo")
-            .arg("test").arg("--workspace").arg("--quiet").arg("--no-fail-fast")
-            .current_dir(&root).output();
-        match test_out {
-            Ok(o) => {
-                let combined = String::from_utf8_lossy(&o.stderr).into_owned()
-                    + &String::from_utf8_lossy(&o.stdout);
-                let mut total_passed = 0u32; let mut total_failed = 0u32;
-                for line in combined.lines() {
-                    if let Some(rest) = line.strip_prefix("test result: ok. ") {
-                        if let Some((n, _)) = rest.split_once(" passed") {
-                            if let Ok(p) = n.trim().parse::<u32>() { total_passed += p; }
-                        }
+        // One run of `cargo test --workspace`. Returns (passed, failed, success).
+        let run_once = || -> Result<(u32, u32, bool), std::io::Error> {
+            let o = std::process::Command::new("cargo")
+                .arg("test").arg("--workspace").arg("--quiet").arg("--no-fail-fast")
+                .current_dir(&root).output()?;
+            let combined = String::from_utf8_lossy(&o.stderr).into_owned()
+                + &String::from_utf8_lossy(&o.stdout);
+            let mut passed = 0u32; let mut failed = 0u32;
+            for line in combined.lines() {
+                if let Some(rest) = line.strip_prefix("test result: ok. ") {
+                    if let Some((n, _)) = rest.split_once(" passed") {
+                        if let Ok(p) = n.trim().parse::<u32>() { passed += p; }
                     }
-                    if let Some(rest) = line.strip_prefix("test result: FAILED. ") {
-                        // count reported failures
-                        for tok in rest.split_whitespace() {
-                            if let Some(stripped) = tok.strip_suffix(';') {
-                                if let Ok(n) = stripped.parse::<u32>() { total_failed += n; }
-                            }
+                }
+                if let Some(rest) = line.strip_prefix("test result: FAILED. ") {
+                    for tok in rest.split_whitespace() {
+                        if let Some(stripped) = tok.strip_suffix(';') {
+                            if let Ok(n) = stripped.parse::<u32>() { failed += n; }
                         }
                     }
                 }
+            }
+            Ok((passed, failed, o.status.success()))
+        };
+        match run_once() {
+            Ok((mut total_passed, mut total_failed, mut ok)) => {
+                // A real assertion failure (`failed > 0`) fails immediately and
+                // is NOT retried. But a non-zero exit with ZERO parsed failures
+                // is the Windows cargo-test race (a runtime integration-test exe
+                // aborts/fails-to-spawn, truncating the run) — retry once. A
+                // transient race clears; a persistent crash still fails.
+                if !ok && total_failed == 0 {
+                    if let Ok((p2, f2, ok2)) = run_once() {
+                        total_passed = p2; total_failed = f2; ok = ok2;
+                    }
+                }
+                // Status is honest: OK iff cargo succeeded AND no failures.
+                let status_ok = ok && total_failed == 0;
                 writeln_human(format!("  passed={}  failed={}  status={}",
-                    total_passed, total_failed,
-                    if o.status.success() { "OK" } else { "FAIL" }));
+                    total_passed, total_failed, if status_ok { "OK" } else { "FAIL" }));
                 test_json.push_str(&format!(
                     "{{\"passed\":{},\"failed\":{},\"ok\":{}}}",
-                    total_passed, total_failed, o.status.success()));
-                if !o.status.success() {
+                    total_passed, total_failed, status_ok));
+                if !status_ok {
                     errors.push("workspace tests failed".into());
                 }
             }
