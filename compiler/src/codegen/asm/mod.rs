@@ -500,6 +500,10 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
     /// name and the linker name (`aether_<n>`) for caller-side lookup
     /// symmetry.
     let mut fn_returns_enum: HashMap<String, String> = HashMap::new();
+    // P6.5 — fns whose declared return is a small (≤2 i64-field) struct use
+    // the 2-register return ABI (field0 → %rax, field1 → %rdx). Populated after
+    // struct_decls is fully built (a fn may precede its return struct's decl).
+    let mut fn_returns_struct: HashMap<String, String> = HashMap::new();
     let mut struct_decls: HashMap<String, StructDecl> = HashMap::new();
     let mut enum_decls: HashMap<String, EnumDecl> = HashMap::new();
     let mut const_env: HashMap<String, i64> = HashMap::new();
@@ -566,6 +570,26 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
         }
     }
 
+    // P6.5 — now that struct_decls is complete, detect fns returning a small
+    // struct (1 or 2 i64/Int fields → rax:rdx). Larger structs / float fields
+    // need an sret hidden-pointer ABI (follow-up) and are intentionally left
+    // out so they still hit the clear "struct literal must appear…" error.
+    for item in &p.items {
+        if let Item::Fn(f) = item {
+            if let Some(Ty::Named(rname)) = f.ret.as_ref() {
+                if let Some(sd) = struct_decls.get(rname) {
+                    let small = (1..=2).contains(&sd.fields.len())
+                        && sd.fields.iter().all(|fld|
+                            matches!(TyKind::from_ty(&fld.ty), Some(TyKind::Int)));
+                    if small {
+                        fn_returns_struct.insert(f.name.clone(), rname.clone());
+                        fn_returns_struct.insert(format!("aether_{}", f.name), rname.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // Pre-register every template's return TyKind under both its bare name and
     // every future mangled name's bare prefix — call sites read sigs by name
     // before the spec exists, so without this the call would default to Int.
@@ -581,7 +605,7 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
                 let fn_plan = plan.get(&f.name);
                 let (floats, f64s) = emit_fn(
                     f, &mut text, &mut data, &sigs, &local_fns,
-                    &struct_decls, &enum_decls, &fn_returns_enum,
+                    &struct_decls, &enum_decls, &fn_returns_enum, &fn_returns_struct,
                     &const_env, Some(generics.clone()), fn_plan)?;
                 all_floats.extend(floats);
                 all_f64s.extend(f64s);
@@ -623,7 +647,7 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
         // stack path, which is the same conservative default as --O0.
         let (floats, f64s) = emit_fn(
             &spec, &mut text, &mut data, &sigs, &local_fns,
-            &struct_decls, &enum_decls, &fn_returns_enum,
+            &struct_decls, &enum_decls, &fn_returns_enum, &fn_returns_struct,
             &spec_env, Some(generics.clone()), None)?;
         all_floats.extend(floats);
         all_f64s.extend(f64s);
@@ -729,6 +753,55 @@ fn call_returns_enum(e: &Expr, fn_returns_enum: &HashMap<String, String>) -> Opt
         }
     }
     None
+}
+
+/// If `e` is a call to a fn that returns a small struct (registered in
+/// `fn_returns_struct`), return the struct's name. Drives the 2-register
+/// struct-return ABI on the caller side. P6.5.
+fn call_returns_struct(e: &Expr, fn_returns_struct: &HashMap<String, String>) -> Option<String> {
+    if let Expr::Call { callee, .. } = e {
+        if let Expr::Ident(n) = callee.as_ref() {
+            return fn_returns_struct.get(n).cloned();
+        }
+    }
+    None
+}
+
+/// Emit a small struct's fields into (%rax = field0, %rdx = field1) for the
+/// struct-return ABI. `fields` are the literal's (name, expr) pairs; `sd`
+/// gives the declared field order. field1 is evaluated and parked in rdx
+/// first (via a push) so evaluating field0 can't clobber it. P6.5.
+fn emit_struct_return_value(
+    lit_fields: &[(String, Expr)],
+    sd: &StructDecl,
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    let find = |fname: &str| lit_fields.iter().find(|(n, _)| n == fname).map(|(_, e)| e);
+    // field0 -> rax (saved on the stack while field1 is computed)
+    let f0 = &sd.fields[0];
+    let e0 = find(&f0.name).ok_or(AsmError::UnsupportedExpr(
+        "struct-return literal missing a declared field"))?;
+    let k0 = emit_expr_value(e0, out, data, locals)?;
+    if !matches!(k0, TyKind::Int) {
+        return Err(AsmError::UnsupportedExpr("struct-return field must be i64-shaped"));
+    }
+    out.push_str("    pushq %rax\n");
+    if sd.fields.len() >= 2 {
+        let f1 = &sd.fields[1];
+        let e1 = find(&f1.name).ok_or(AsmError::UnsupportedExpr(
+            "struct-return literal missing a declared field"))?;
+        let k1 = emit_expr_value(e1, out, data, locals)?;
+        if !matches!(k1, TyKind::Int) {
+            return Err(AsmError::UnsupportedExpr("struct-return field must be i64-shaped"));
+        }
+        out.push_str("    movq %rax, %rdx\n");
+    } else {
+        out.push_str("    xorl %edx, %edx\n");
+    }
+    out.push_str("    popq %rax\n");
+    Ok(())
 }
 
 /// Emit code that produces a payload-enum value in (%rax = tag, %rdx = val).
@@ -907,6 +980,14 @@ struct Locals {
     /// `Expr::Try` early-return: the handler runs when the inner call's tag
     /// is non-zero (Err), copying both registers to the caller as-is.
     current_fn_returns_enum: Option<String>,
+    /// Caller-side: fn name → struct-decl name for fns whose return is a
+    /// small (≤2 i64-field) struct. Drives the same 2-register return ABI
+    /// (field0 → %rax, field1 → %rdx) at call sites. P6.5 struct-return.
+    fn_returns_struct: HashMap<String, String>,
+    /// Callee-side: struct-decl name iff the *current* fn returns a small
+    /// struct. The block tail (a struct literal) is marshalled into
+    /// (%rax = field0, %rdx = field1) instead of single-rax.
+    current_fn_returns_struct: Option<String>,
     /// Cached fn-frame size in bytes — used by `Expr::Try` and `Stmt::Return`
     /// to emit `addq $frame, %rsp` epilogues without re-running the
     /// frame-sizing pass.
@@ -1029,6 +1110,7 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
            struct_decls: &HashMap<String, StructDecl>,
            enum_decls: &HashMap<String, EnumDecl>,
            fn_returns_enum: &HashMap<String, String>,
+           fn_returns_struct: &HashMap<String, String>,
            const_env: &HashMap<String, i64>,
            generics: Option<Rc<RefCell<GenericState>>>,
            fn_plan: Option<&HashMap<String, u8>>)
@@ -1048,6 +1130,8 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     // (Both the bare fn name and the linker-mangled name are registered in
     // the caller-side map; either lookup hits.)
     locals.current_fn_returns_enum = fn_returns_enum.get(&f.name).cloned();
+    locals.fn_returns_struct = fn_returns_struct.clone();
+    locals.current_fn_returns_struct = fn_returns_struct.get(&f.name).cloned();
     locals.const_env = const_env.clone();
     locals.generics = generics;
     // P15.2 — install per-fn reg plan (callee-saved r12..r15). Empty at --O0.
@@ -1223,6 +1307,23 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
             out.push_str("    xorl %eax, %eax\n");
             out.push_str("    xorl %edx, %edx\n");
         }
+    } else if locals.current_fn_returns_struct.is_some() {
+        // P6.5 — struct-returning fn: the tail must be a struct literal, which
+        // we marshal into (field0 → %rax, field1 → %rdx).
+        for s in &body.stmts {
+            emit_stmt(s, out, data, &mut locals)?;
+        }
+        match body.tail.as_deref() {
+            Some(Expr::StructLit { name: lit_name, fields }) => {
+                let sd = locals.struct_decls.get(lit_name).cloned()
+                    .ok_or(AsmError::UnsupportedExpr(
+                        "struct-return: unknown struct in tail literal"))?;
+                emit_struct_return_value(fields, &sd, out, data, &mut locals)?;
+            }
+            _ => return Err(AsmError::UnsupportedExpr(
+                "struct-returning fn must end with a struct-literal tail \
+                 (explicit `return T{..}` is a follow-up)")),
+        }
     } else {
         emit_block(body, out, data, &mut locals)?;
     }
@@ -1235,6 +1336,7 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     if body.tail.is_none()
         && !matches!(ret_kind, Some(TyKind::F32) | Some(TyKind::F64))
         && locals.current_fn_returns_enum.is_none()
+        && locals.current_fn_returns_struct.is_none()
     {
         out.push_str("    xorl %eax, %eax\n");
     }
@@ -1985,6 +2087,36 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                     }
                 }
                 return Ok(());
+            }
+            // P6.5 — `let p: T = small_struct_call();`. count_locals already
+            // reserved `p.<field>` slots (the struct-typed-let branch keys off
+            // the `: T` annotation), so here we mirror that allocation, run the
+            // call (which leaves field0 in %rax, field1 in %rdx via the
+            // struct-return ABI), and store each register into its field slot.
+            if call_returns_struct(value, &locals.fn_returns_struct).is_some() {
+                if let Some(struct_name) = ty.as_ref().and_then(struct_name_of) {
+                    if let Some(sd) = locals.struct_decls.get(&struct_name).cloned() {
+                        locals.struct_locals.insert(name.clone(), struct_name.clone());
+                        for field in &sd.fields {
+                            let key = format!("{}.{}", name, field.name);
+                            let slot = locals.alloc(&key);
+                            let kind = TyKind::from_ty(&field.ty).unwrap_or(TyKind::Int);
+                            locals.types.insert(key, kind);
+                            let _ = slot;
+                        }
+                        // Run the call: field0 → rax, field1 → rdx.
+                        let _ = emit_expr_value(value, out, data, locals)?;
+                        let s0 = locals.get(&format!("{}.{}", name, sd.fields[0].name))
+                            .ok_or(AsmError::UnsupportedExpr("struct-return: field0 slot"))?;
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", s0 * 8));
+                        if sd.fields.len() >= 2 {
+                            let s1 = locals.get(&format!("{}.{}", name, sd.fields[1].name))
+                                .ok_or(AsmError::UnsupportedExpr("struct-return: field1 slot"))?;
+                            out.push_str(&format!("    movq %rdx, -{}(%rbp)\n", s1 * 8));
+                        }
+                        return Ok(());
+                    }
+                }
             }
             // Decide the local's TyKind: explicit annotation wins, else infer
             // from the value's runtime type. If the annotation is a float type,

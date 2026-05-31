@@ -1,0 +1,16 @@
+// roadmap: P6.5
+// expect: exit=42
+//
+// Return a struct by value. `make` yields a Pt; the 2-register struct-return
+// ABI puts field 0 in rax and field 1 in rdx (mirroring the enum-payload ABI),
+// and `let p: Pt = make()` unmarshals them into p's flat field slots.
+struct Pt { x: i64, y: i64 }
+
+fn make() -> Pt {
+    Pt { x: 40, y: 2 }
+}
+
+fn main() -> i32 {
+    let p: Pt = make();
+    (p.x + p.y) as i32      // 40 + 2 = 42
+}
