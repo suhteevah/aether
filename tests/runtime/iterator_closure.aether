@@ -1,0 +1,36 @@
+// roadmap: P6.8
+// expect: exit=42
+//
+// Iterator fold driven by a REAL user closure (not a hardcoded C predicate).
+// `vec_fold` takes a `Closure` parameter and invokes it per element through
+// the P6.6 closure-object ABI; the closure captures `factor` by value, so the
+// capture survives across the per-element calls. This is 6.6 unblocking 6.8:
+// `filter`/`map`/`fold` can finally take arbitrary user closures.
+use runtime;
+
+fn vec_fold(v: i64, n: i64, init: i64, f: Closure) -> i64 {
+    let mut acc: i64 = init;
+    let mut i: i64 = 0;
+    while i < n {
+        let x: i64 = aether_vec_i64_get(v, i);
+        acc = f(acc, x);
+        i = i + 1;
+    }
+    acc
+}
+
+fn main() -> i32 {
+    let v: i64 = aether_vec_i64_new();
+    if v < 0 { return 1; }
+    let mut k: i64 = 1;
+    while k <= 6 {
+        aether_vec_i64_push(v, k);     // v = [1,2,3,4,5,6], sum = 21
+        k = k + 1;
+    }
+    let factor: i64 = 2;
+    // Closure captures `factor`; folds acc + x*factor over the vec.
+    let doubler = |acc: i64, x: i64| acc + x * factor;
+    let total: i64 = vec_fold(v, 6, 0, doubler);   // 2 * (1+2+3+4+5+6) = 42
+    aether_vec_i64_free(v);
+    total as i32
+}
