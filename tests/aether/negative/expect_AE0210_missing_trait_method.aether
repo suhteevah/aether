@@ -1,0 +1,17 @@
+// An impl that omits a REQUIRED (bodyless) trait method must be rejected.
+//
+// P6.2 — mir::traits::Resolver::check_completeness flags `area` (which the
+// trait declares with no default body) as missing from `impl Shape for Sq`,
+// so aetherc fails with AE0210 instead of silently compiling a Sq that has
+// no `area`.
+trait Shape {
+    fn area(&self) -> i32;       // required, no default body
+}
+
+struct Sq { side: i32 }
+
+impl Shape for Sq {
+    // area deliberately omitted
+}
+
+fn main() -> i32 { 0 }

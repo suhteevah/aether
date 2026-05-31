@@ -1,0 +1,31 @@
+// expect: exit=42
+// roadmap: P6.2
+//
+// Real trait semantics (not just name-mangling): a `trait` with a DEFAULT
+// method body + two impls, one inheriting the default and one overriding it.
+// The default body is synthesized into the inheriting impl by
+// mir::traits_drive, and dispatch goes through ordinary `obj.method()`
+// receiver-type resolution.
+trait Shape {
+    fn area(&self) -> i32;          // required — every impl must supply it
+    fn bonus(&self) -> i32 { 6 }    // default — impls may inherit or override
+}
+
+struct Sq { side: i32 }
+struct Rect { w: i32, h: i32 }
+
+impl Shape for Sq {
+    fn area(&self) -> i32 { self.side * self.side }
+    // bonus omitted -> inherits the default (6)
+}
+
+impl Shape for Rect {
+    fn area(&self) -> i32 { self.w * self.h }
+    fn bonus(&self) -> i32 { 0 }    // override
+}
+
+fn main() -> i32 {
+    let s: Sq = Sq { side: 3 };          // area 9, bonus 6 (default)
+    let r: Rect = Rect { w: 4, h: 5 };   // area 20, bonus 0 (override)
+    s.area() + s.bonus() + r.area() + r.bonus() + 7   // 9 + 6 + 20 + 0 + 7 = 42
+}

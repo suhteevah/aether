@@ -330,6 +330,25 @@ fn main() {
         }
     }
 
+    // P6.2 — trait resolution. Synthesizes default-method impls into each
+    // `impl Trait for Type` (so the asm flattener emits `Type__method`), then
+    // runs `mir::traits::Resolver::check_completeness` to reject impls that
+    // omit a required method (AE0210) or impl an unknown trait (AE0211).
+    // Runs before the closure / fusion passes (which walk the impl method
+    // lists) and before the `--check` early return so both paths enforce it.
+    {
+        let tr = mir::traits_drive::run(&mut prog);
+        if tr.synthesized_defaults > 0 && !args.json_errors {
+            eprintln!("[aetherc] traits: synthesized {} default-method impl(s)",
+                      tr.synthesized_defaults);
+        }
+        if !tr.diags.is_empty() {
+            for d in tr.diags { sink.push(d); }
+            report(&sink, &file_str, args.json_errors);
+            std::process::exit(1);
+        }
+    }
+
     // Closure-lifting pass. Walks every `Expr::Closure { params, body }` in
     // the program and lifts it to a synthetic `__closure_<n>` top-level fn,
     // rewriting the closure expression in-place to `Expr::Ident(<lifted_name>)`

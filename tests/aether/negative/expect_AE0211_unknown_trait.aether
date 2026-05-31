@@ -1,0 +1,11 @@
+// An impl of a trait that was never declared must be rejected.
+//
+// P6.2 — mir::traits::Resolver::check_completeness has no `Drawable` in its
+// trait table, so `impl Drawable for Sq` fails with AE0211.
+struct Sq { side: i32 }
+
+impl Drawable for Sq {
+    fn draw(&self) -> i32 { 0 }
+}
+
+fn main() -> i32 { 0 }
