@@ -1,0 +1,18 @@
+// roadmap: P6.1
+// expect: exit=42
+//
+// Type-generic functions monomorphized by argument type. `id<T>` and `pick<T>`
+// are specialized per concrete type at each call site — `id` instantiates for
+// BOTH i64 (rax) and f32 (xmm0), each with the correct storage class.
+fn id<T>(x: T) -> T { x }
+
+fn pick<T>(a: T, b: T, c: i64) -> T {
+    if c > 0 { a } else { b }
+}
+
+fn main() -> i32 {
+    let a: i64 = id(30);            // id__T_i64
+    let f: f32 = id(10.0);          // id__T_f32  (xmm0, distinct specialization)
+    let p: i64 = pick(2, 99, 1);    // pick__T_i64 -> 2
+    (a + (f as i64) + p) as i32     // 30 + 10 + 2 = 42
+}

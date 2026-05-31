@@ -48,8 +48,85 @@ use crate::ast::{BinOp, Block, Expr, FnDecl, Item, MatchPat, Program, ShapeDim, 
 #[derive(Default)]
 struct GenericState {
     templates: HashMap<String, FnDecl>,
-    pending: Vec<(String, Vec<(String, i64)>, String)>,
+    /// (template, const(shape) bindings, TYPE bindings, mangled name). Type
+    /// bindings map a type param `T` → a concrete type name ("i64"/"f32"/…)
+    /// for type-generic fns (`fn id<T>(x: T) -> T`).
+    pending: Vec<(String, Vec<(String, i64)>, Vec<(String, String)>, String)>,
     seen: HashSet<String>,
+}
+
+/// Concrete type name of a call argument, for type-generic inference.
+fn arg_concrete_type_name(arg: &Expr, locals: &Locals) -> Option<String> {
+    match arg {
+        Expr::IntLit(_) | Expr::BoolLit(_) => Some("i64".into()),
+        Expr::FloatLit(_) => Some(match locals.default_float {
+            Some(TyKind::F64) => "f64", _ => "f32" }.into()),
+        Expr::Ident(n) => locals.types.get(n).map(|k| match k {
+            TyKind::F32 => "f32".to_string(),
+            TyKind::F64 => "f64".to_string(),
+            _ => "i64".to_string(),
+        }),
+        Expr::Cast { ty, .. } => Some(ty.clone()),
+        _ => None,
+    }
+}
+
+/// Substitute a type param `param` → concrete type name throughout a fn's
+/// signature + body (let annotations + cast targets). Used to build a
+/// type-generic specialization.
+fn subst_type_param_fn(f: &mut FnDecl, param: &str, concrete: &str) {
+    for p in f.params.iter_mut() { subst_type_in_ty(&mut p.ty, param, concrete); }
+    if let Some(r) = f.ret.as_mut() { subst_type_in_ty(r, param, concrete); }
+    if let Some(b) = f.body.as_mut() { subst_type_in_block(b, param, concrete); }
+}
+fn subst_type_in_ty(ty: &mut Ty, param: &str, concrete: &str) {
+    match ty {
+        Ty::Named(n) if n == param => *n = concrete.to_string(),
+        Ty::Ref { inner, .. } => subst_type_in_ty(inner, param, concrete),
+        Ty::Slice { elem, .. } => subst_type_in_ty(elem, param, concrete),
+        Ty::Array { elem, .. } => subst_type_in_ty(elem, param, concrete),
+        Ty::Tuple(es) => for e in es { subst_type_in_ty(e, param, concrete); },
+        Ty::Generic { args, .. } => for a in args { subst_type_in_ty(a, param, concrete); },
+        _ => {}
+    }
+}
+fn subst_type_in_block(b: &mut Block, param: &str, concrete: &str) {
+    for s in b.stmts.iter_mut() {
+        match s {
+            Stmt::Let { ty, value, .. } => {
+                if let Some(t) = ty.as_mut() { subst_type_in_ty(t, param, concrete); }
+                if let Some(e) = value.as_mut() { subst_type_in_expr(e, param, concrete); }
+            }
+            Stmt::LetTuple { value, .. } => subst_type_in_expr(value, param, concrete),
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => subst_type_in_expr(e, param, concrete),
+            _ => {}
+        }
+    }
+    if let Some(t) = b.tail.as_mut() { subst_type_in_expr(t, param, concrete); }
+}
+fn subst_type_in_expr(e: &mut Expr, param: &str, concrete: &str) {
+    match e {
+        Expr::Cast { ty, expr } => {
+            if ty == param { *ty = concrete.to_string(); }
+            subst_type_in_expr(expr, param, concrete);
+        }
+        Expr::Block(b) => subst_type_in_block(b, param, concrete),
+        Expr::If { cond, then, else_ } => {
+            subst_type_in_expr(cond, param, concrete);
+            subst_type_in_block(then, param, concrete);
+            if let Some(eb) = else_ { subst_type_in_block(eb, param, concrete); }
+        }
+        Expr::For { iter, body, .. } => { subst_type_in_expr(iter, param, concrete); subst_type_in_block(body, param, concrete); }
+        Expr::While { cond, body } => { subst_type_in_expr(cond, param, concrete); subst_type_in_block(body, param, concrete); }
+        Expr::Region { body, .. } => subst_type_in_block(body, param, concrete),
+        Expr::Call { callee, args } => { subst_type_in_expr(callee, param, concrete); for a in args { subst_type_in_expr(a, param, concrete); } }
+        Expr::MethodCall { recv, args, .. } => { subst_type_in_expr(recv, param, concrete); for a in args { subst_type_in_expr(a, param, concrete); } }
+        Expr::Bin { lhs, rhs, .. } => { subst_type_in_expr(lhs, param, concrete); subst_type_in_expr(rhs, param, concrete); }
+        Expr::Unary { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => subst_type_in_expr(expr, param, concrete),
+        Expr::Field { recv, .. } => subst_type_in_expr(recv, param, concrete),
+        Expr::Index { recv, idx } => { subst_type_in_expr(recv, param, concrete); subst_type_in_expr(idx, param, concrete); }
+        _ => {}
+    }
 }
 
 /// Where the value of an expression lives after evaluation.
@@ -623,7 +700,7 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
             return Err(AsmError::UnsupportedExpr("monomorphization runaway"));
         }
         let next = generics.borrow_mut().pending.pop();
-        let Some((tname, bindings, mangled)) = next else { break; };
+        let Some((tname, bindings, type_bindings, mangled)) = next else { break; };
         let tdecl = generics.borrow().templates.get(&tname).cloned()
             .ok_or(AsmError::UnsupportedExpr("monomorphization: unknown template"))?;
         // Build the specialized FnDecl: rename, drop const_params (it's now
@@ -633,6 +710,12 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
         let mut spec = tdecl.clone();
         spec.name = mangled.clone();
         spec.const_params.clear();
+        // Type-generic substitution: replace each type param `T` → its bound
+        // concrete type throughout the spec's signature + body, so the spec
+        // codegens with concrete types (correct storage class per instantiation).
+        for (param, concrete) in &type_bindings {
+            subst_type_param_fn(&mut spec, param, concrete);
+        }
         let mut spec_env = const_env.clone();
         for (k, v) in &bindings { spec_env.insert(k.clone(), *v); }
         // Register the specialization so cascading calls resolve.
@@ -2719,11 +2802,24 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 let tdecl_opt = g.borrow().templates.get(&name).cloned();
                 if let Some(tdecl) = tdecl_opt {
                     let mut bindings: HashMap<String, i64> = HashMap::new();
+                    let mut type_bindings: HashMap<String, String> = HashMap::new();
                     for (i, tp) in tdecl.params.iter().enumerate() {
                         let p_ty = match &tp.ty {
                             Ty::Ref { inner, .. } => inner.as_ref(),
                             other => other,
                         };
+                        // TYPE-generic param: the type is a bare `Named(T)` whose
+                        // name is a generic param → infer T from the arg's type.
+                        if let Ty::Named(tn) = p_ty {
+                            if tdecl.const_params.iter().any(|cp| cp == tn) {
+                                if let Some(arg) = args.get(i) {
+                                    if let Some(concrete) = arg_concrete_type_name(arg, locals) {
+                                        type_bindings.insert(tn.clone(), concrete);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         let Some(sym_dims) = tensor_type_dims(p_ty) else { continue; };
                         // Get the caller arg's concrete shape. Args are positional
                         // 1:1 with template params (no struct expansion at template
@@ -2749,31 +2845,49 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                             }
                         }
                     }
-                    // Every const_param must have a binding.
+                    // Every generic param must be bound — by a shape (i64) or a
+                    // type binding.
                     for cp in &tdecl.const_params {
-                        if !bindings.contains_key(cp) {
+                        if !bindings.contains_key(cp) && !type_bindings.contains_key(cp) {
                             return Err(AsmError::UnsupportedExpr(string_to_static(
-                                format!("template '{}': could not infer const param '{}'", name, cp))));
+                                format!("template '{}': could not infer generic param '{}'", name, cp))));
                         }
                     }
-                    // Stable mangling: const_params order from the template.
-                    let mut sorted: Vec<(String, i64)> = tdecl.const_params.iter()
-                        .map(|cp| (cp.clone(), *bindings.get(cp).unwrap()))
-                        .collect();
-                    let suffix: String = sorted.iter()
-                        .map(|(k, v)| format!("__{}{}", k, v))
-                        .collect();
+                    // Stable mangling: const_params order from the template; each
+                    // is either a shape (i64) or a type binding.
+                    let mut sorted: Vec<(String, i64)> = Vec::new();
+                    let mut sorted_types: Vec<(String, String)> = Vec::new();
+                    let mut suffix = String::new();
+                    for cp in &tdecl.const_params {
+                        if let Some(v) = bindings.get(cp) {
+                            sorted.push((cp.clone(), *v));
+                            suffix.push_str(&format!("__{}{}", cp, v));
+                        } else if let Some(t) = type_bindings.get(cp) {
+                            sorted_types.push((cp.clone(), t.clone()));
+                            suffix.push_str(&format!("__{}_{}", cp, t));
+                        }
+                    }
                     let mangled = format!("{}{}", name, suffix);
                     {
                         let mut gm = g.borrow_mut();
                         if gm.seen.insert(mangled.clone()) {
                             sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                            gm.pending.push((name.clone(), sorted, mangled.clone()));
+                            sorted_types.sort_by(|a, b| a.0.cmp(&b.0));
+                            gm.pending.push((name.clone(), sorted, sorted_types, mangled.clone()));
                         }
                     }
-                    // Make the call resolve through the spec name.
+                    // Make the call resolve through the spec name. Register the
+                    // spec's return TyKind so the caller reads the right register:
+                    // from the template's sig if concrete, OR — for a type-generic
+                    // `-> T` return — from the bound concrete type (so an `f32`
+                    // instantiation is read from xmm0, not rax).
                     locals.local_fns.insert(mangled.clone());
-                    if let Some(rk) = locals.sigs.get(&name).copied() {
+                    let spec_ret_kind = locals.sigs.get(&name).copied().or_else(|| {
+                        if let Some(Ty::Named(tn)) = tdecl.ret.as_ref() {
+                            type_bindings.get(tn).and_then(|c| TyKind::from_ty(&Ty::Named(c.clone())))
+                        } else { None }
+                    });
+                    if let Some(rk) = spec_ret_kind {
                         locals.sigs.insert(mangled.clone(), rk);
                     }
                     name = mangled;
