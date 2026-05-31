@@ -93,6 +93,37 @@ Recommended next: tackle the **struct-return ABI** as a dedicated TDD deposit
 (it unblocks From + builders + generic struct returns), accepting it's the first
 asm-backend change of the arc — do it isolated, sweep the full runtime suite.
 
+#### Struct-return ABI — precise plan (scoped, ready to implement)
+Exact failure: `fn make() -> Pt { Pt{..} }` hits `compiler/src/codegen/asm/mod.rs:3042`
+"struct literal must appear directly as the rhs of `let x: T = T {…};`" — a
+StructLit is only materialized when it's a `let` rhs (mod.rs:1951), never in
+return position. Mirror the EXISTING enum-payload 2-register ABI (tag→rax,
+val→rdx) for structs. Scope v1 to structs with **≤2 i64/Int fields** (rax:rdx);
+clear error otherwise (>2 fields or any f32 field needs sret — follow-up).
+Sites to change, in lockstep:
+1. **Sig collection** (mod.rs:557-565, next to `fn_returns_enum`): add
+   `fn_returns_struct: HashMap<fn, struct>` for fns whose `f.ret` is a
+   ≤2-i64-field struct (check `struct_decls`).
+2. **Locals fields**: add `fn_returns_struct` + `current_fn_returns_struct`
+   (clones of the enum ones at mod.rs:903/909, set at ~1046/1050).
+3. **Return marshal** (mod.rs:1210 branch): if `current_fn_returns_struct`,
+   route the tail (a StructLit) through a new `emit_struct_return_value` that
+   evals field0→rax, field1→rdx in the struct decl's field order. Add a
+   matching guard to the `body.tail.is_none()` rax-zero at 1235.
+4. **`call_returns_struct` helper** (clone `call_returns_enum` mod.rs:725).
+5. **Caller unmarshal** (mod.rs:1877 branch, next to the enum one): a
+   `let p: T = struct_call()` allocs `p.<field>` slots, evals the call, stores
+   rax→field0, rdx→field1, registers `struct_locals[p]=T`.
+6. **count_locals** — CRITICAL ([[asm_frame_size_invariant]]): the count pass
+   must alloc the SAME `p.<field>` slots for a struct-returning-call let as the
+   enum case allocs `p.tag/p.val`. Find the enum-call branch in count_locals and
+   add the struct-call sibling, or the prologue `subq`/epilogue `addq` desync →
+   SIGSEGV. Verify count == emit slot count.
+Witness: `fn make() -> Pt { Pt{x:40,y:2} }; let p: Pt = make(); p.x+p.y` → 42,
+plus the existing struct/enum tests must stay green. Then From/.into() is a
+small follow-up (parse `impl From<S> for T` generic-trait-ref + desugar
+`e.into()` in a `let x: T = …` to `T__from(e)`).
+
 ### Audit-flake note (now mitigated)
 The audit `[3/5] Workspace tests` step used to intermittently print
 `passed=122/129 failed=0 status=FAIL` (errors: 1) — a **cargo-test race on
