@@ -21,6 +21,8 @@ change touching every arm-tuple, or the core let-parse path — wider churn).
 - **6.4 `loop { }`** (`8867e32`) — new `Tok::Loop` keyword → `while 1 { … }`.
 - **6.4 `true`/`false`** (`3ab7fe8`) — `Expr::BoolLit` had NO asm-backend arm
   (was "unhandled expr"); now lowers to 1/0. Found while building `while let`.
+- **6.4 char literals** (`c0f2266`) — `'A'`/`'\n'` lex to IntLit(byte); the lexer
+  rejected `'` before. Disambiguated from lifetimes (`'a`) by the closing quote.
 
 ### struct-construction cluster (complete)
 The struct ergonomics are Rust-complete: **struct-return ABI + From/.into() +
