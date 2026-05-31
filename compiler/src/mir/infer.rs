@@ -56,6 +56,9 @@ pub struct InferCtx {
     /// Union-find store: `subst[v]` is the binding of var `v` (another type,
     /// possibly a var) or `None` if still free.
     subst: Vec<Option<Type>>,
+    /// The declared return type of the fn currently being walked, so explicit
+    /// `return e;` statements can be checked against it. Set per fn in `run`.
+    expected_ret: Option<Type>,
 }
 
 impl InferCtx {
@@ -171,6 +174,8 @@ pub fn run(prog: &Program) -> Vec<Diag> {
                 let t = ann_to_type(&mut ctx, &p.ty);
                 env.insert(p.name.clone(), t);
             }
+            // Record the declared return type so `return e;` can be checked.
+            ctx.expected_ret = f.ret.as_ref().map(|t| ann_to_type(&mut ctx, t));
             let body_t = infer_block(&mut ctx, &sigs, &mut env, body, &mut diags);
             // P6.1 — the implicit-return (tail) expression must match the
             // declared return type. Explicit `return e;` checking is a
@@ -243,7 +248,22 @@ fn infer_stmt(
             let _ = infer_expr(ctx, sigs, env, value, diags);
             for n in names { let v = ctx.fresh(); env.insert(n.clone(), v); }
         }
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => { let _ = infer_expr(ctx, sigs, env, e, diags); }
+        Stmt::Return(Some(e)) => {
+            let rt = infer_expr(ctx, sigs, env, e, diags);
+            // Check `return e;` against the enclosing fn's declared return type.
+            if let Some(exp) = ctx.expected_ret.clone() {
+                if let Err((a, b)) = ctx.unify(&rt, &exp) {
+                    if a.is_scalar() && b.is_scalar() {
+                        diags.push(Diag::error("AE0222", "type",
+                            format!("returned value is {}, but the function returns {}",
+                                bucket_name(&a), bucket_name(&b)))
+                            .with_hint("make the returned value match the declared return type, \
+                                or insert an explicit `as` cast"));
+                    }
+                }
+            }
+        }
+        Stmt::Expr(e) => { let _ = infer_expr(ctx, sigs, env, e, diags); }
         Stmt::Return(None) => {}
     }
 }
