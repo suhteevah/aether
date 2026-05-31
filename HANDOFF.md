@@ -1,9 +1,29 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 16 features / 26 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + **struct-construction cluster: struct-return ABI + From/.into() + Type::method() + Self** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 4dfcfc6.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 20 features / ~35 commits: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 8867e32.)
 
-### LATEST (after the 18-commit summary below): struct-construction cluster complete
-The struct ergonomics are now Rust-complete: **struct-return ABI + From/.into() +
+### Honest goal status
+"Reach rust feature parity" is a multi-month arc — NOT reached this session, but
+substantially advanced: the type system, traits, closures, borrow-checking,
+struct-construction, and pattern/control-flow are genuinely real now (were
+tagged-but-fake islands). Remaining = large subsystems, each its own focused
+effort: **sret** (large struct returns), **generics + monomorphization** (the
+keystone for Box/Vec<T>/HashMap + generic traits + Iterator), **dyn Trait
+vtables**, **full NLL borrow**, **async**, **macros**, **threads**, and
+**match guards / OR-patterns / let-else** (the last three need an AST match-arm
+change touching every arm-tuple, or the core let-parse path — wider churn).
+
+### LATEST: control-flow cluster (if let / while let / loop / bool literals)
+- **6.4 `if let`** (`42336f5`) + **`while let`** (`88989d5`) — parser desugars to
+  the existing match machinery. `if let PAT = e { } else { }` → 2-arm match;
+  `while let PAT = e { }` → `while 1 { let tmp = e; match tmp { PAT => …, _ =>
+  break } }`. Both temp-bind a non-ident (call) scrutinee (match needs a local).
+- **6.4 `loop { }`** (`8867e32`) — new `Tok::Loop` keyword → `while 1 { … }`.
+- **6.4 `true`/`false`** (`3ab7fe8`) — `Expr::BoolLit` had NO asm-backend arm
+  (was "unhandled expr"); now lowers to 1/0. Found while building `while let`.
+
+### struct-construction cluster (complete)
+The struct ergonomics are Rust-complete: **struct-return ABI + From/.into() +
 associated functions (`Type::method()`) + `Self`**. `fn new() -> Self { Self { … } }`,
 `Counter::new()`, `40.into()` all work and compose.
 - **6.2 `Self` type** (`4dfcfc6`) — `mir::self_type` replaces `Self` with the
