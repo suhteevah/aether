@@ -330,6 +330,17 @@ fn main() {
         }
     }
 
+    // P6 — `Self` type resolution. Within `impl T { … }`, replaces every `Self`
+    // (types, `Self { … }` literals, `Self::method` paths) with the concrete
+    // `T`, so `fn new() -> Self { Self { … } }` works. Runs before trait/assoc-fn
+    // resolution + struct codegen so they all see the concrete type.
+    {
+        let n = mir::self_type::run(&mut prog);
+        if n > 0 && !args.json_errors {
+            eprintln!("[aetherc] resolved {} `Self` reference(s)", n);
+        }
+    }
+
     // P6.2 — trait resolution. Synthesizes default-method impls into each
     // `impl Trait for Type` (so the asm flattener emits `Type__method`), then
     // runs `mir::traits::Resolver::check_completeness` to reject impls that

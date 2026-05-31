@@ -1,0 +1,19 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// `Self` in impl blocks — the standard Rust constructor idiom. `Self` resolves
+// to the impl's concrete type (Counter), so the return type `-> Self`, the
+// `Self { … }` literal, and the `Self::base()` path all work. Composes with the
+// struct-return ABI + associated-fn resolution.
+struct Counter { n: i64 }
+
+impl Counter {
+    fn base() -> i64 { 40 }
+    fn new() -> Self { Self { n: Self::base() } }   // -> Counter { n: 40 }
+    fn plus(self, by: i64) -> i64 { self.n + by }
+}
+
+fn main() -> i32 {
+    let c: Counter = Counter::new();
+    Counter::plus(c, 2) as i32      // 40 + 2 = 42
+}

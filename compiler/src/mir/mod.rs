@@ -29,6 +29,7 @@ pub mod lto;
 pub mod traits;
 pub mod traits_drive;
 pub mod into_desugar;
+pub mod self_type;
 pub mod path_call;
 pub mod infer;
 pub mod lifetimes;

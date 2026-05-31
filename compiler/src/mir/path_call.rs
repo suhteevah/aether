@@ -83,6 +83,16 @@ fn walk_expr(e: &mut Expr, methods: &HashSet<String>, count: &mut usize) {
         Expr::For { iter, body, .. } => { walk_expr(iter, methods, count); walk_block(body, methods, count); }
         Expr::While { cond, body } => { walk_expr(cond, methods, count); walk_block(body, methods, count); }
         Expr::Region { body, .. } => walk_block(body, methods, count),
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { walk_expr(fv, methods, count); },
+        Expr::Match { scrutinee, arms } => {
+            walk_expr(scrutinee, methods, count);
+            for (_, a) in arms { walk_expr(a, methods, count); }
+        }
+        Expr::Tuple(elems) => for e in elems { walk_expr(e, methods, count); },
+        Expr::Range { lo, hi, step } => {
+            walk_expr(lo, methods, count); walk_expr(hi, methods, count);
+            if let Some(s) = step { walk_expr(s, methods, count); }
+        }
         _ => {}
     }
 }

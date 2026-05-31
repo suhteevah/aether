@@ -89,6 +89,16 @@ fn desugar_expr(e: &mut Expr, from: &HashSet<String>, count: &mut usize) {
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => desugar_expr(expr, from, count),
         Expr::Field { recv, .. } => desugar_expr(recv, from, count),
         Expr::Index { recv, idx } => { desugar_expr(recv, from, count); desugar_expr(idx, from, count); }
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { desugar_expr(fv, from, count); },
+        Expr::Match { scrutinee, arms } => {
+            desugar_expr(scrutinee, from, count);
+            for (_, a) in arms { desugar_expr(a, from, count); }
+        }
+        Expr::Tuple(elems) => for e in elems { desugar_expr(e, from, count); },
+        Expr::Range { lo, hi, step } => {
+            desugar_expr(lo, from, count); desugar_expr(hi, from, count);
+            if let Some(s) = step { desugar_expr(s, from, count); }
+        }
         _ => {}
     }
 }
