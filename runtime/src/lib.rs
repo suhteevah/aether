@@ -1372,6 +1372,34 @@ fn wall_us_now() -> i64 {
     match std::fs::create_dir_all(s) { Ok(()) => 0, Err(_) => -2 }
 }
 
+/// P6.13 — `std::env::set_var`. Set the environment variable `key` to `val`
+/// (both NUL-terminated C-strings). No-op on a null/invalid pointer.
+#[no_mangle] pub unsafe extern "C" fn aether_env_set(key: i64, val: i64) {
+    let Some(k) = cstr_to_string(key) else { return; };
+    let Some(v) = cstr_to_string(val) else { return; };
+    std::env::set_var(k, v);
+}
+
+/// P6.13 — `std::env::var` parsed as an i64. Returns the variable's value
+/// parsed as an integer, or -1 if it is unset or not a valid integer.
+#[no_mangle] pub unsafe extern "C" fn aether_env_var_i64(key: i64) -> i64 {
+    let Some(k) = cstr_to_string(key) else { return -1; };
+    match std::env::var(&k) {
+        Ok(s) => s.trim().parse::<i64>().unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
+/// Read a NUL-terminated C-string at pointer `p` into an owned `String`.
+/// Returns `None` on a null pointer or invalid UTF-8.
+unsafe fn cstr_to_string(p: i64) -> Option<String> {
+    if p == 0 { return None; }
+    let mut len = 0usize;
+    while *(p as *const u8).add(len) != 0 { len += 1; }
+    let bytes = std::slice::from_raw_parts(p as *const u8, len);
+    std::str::from_utf8(bytes).ok().map(|s| s.to_string())
+}
+
 /// P6.13 — process spawn. Run a shell command string and return its exit code
 /// (or -1 if the process could not be spawned / was signal-terminated).
 /// Cross-platform: `cmd /C <s>` on Windows, `sh -c <s>` elsewhere. This is the

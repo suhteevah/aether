@@ -1,0 +1,13 @@
+// roadmap: P6.13
+// expect: exit=42
+//
+// std::env round-trip: set an environment variable, read it back parsed as an
+// i64. aether_env_set / aether_env_var_i64 are the std::env::{set_var,var}
+// equivalents on the C-ABI surface.
+use runtime;
+
+fn main() -> i32 {
+    aether_env_set("AETHER_TEST_VAR", "42");
+    let v: i64 = aether_env_var_i64("AETHER_TEST_VAR");
+    v as i32
+}
