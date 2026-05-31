@@ -23,6 +23,11 @@ change touching every arm-tuple, or the core let-parse path — wider churn).
   (was "unhandled expr"); now lowers to 1/0. Found while building `while let`.
 - **6.4 char literals** (`c0f2266`) — `'A'`/`'\n'` lex to IntLit(byte); the lexer
   rejected `'` before. Disambiguated from lifetimes (`'a`) by the closing quote.
+- **6.4 narrowing int casts** (`9dd0eb4`) — `as u8`/`as u16` (low-N-bit truncation).
+  u32/i8/i16 left erroring — they need aether-asm encodings it lacks. NOTE:
+  further codegen wins increasingly hit **aether-asm's limited instruction
+  subset** (no movzwl/movsbq reg-forms, no movl reg-reg, shifts via %cl, movq
+  imm32) — see [[aether_asm_encoder_limits]]. Extend the encoder to unblock more.
 
 ### struct-construction cluster (complete)
 The struct ergonomics are Rust-complete: **struct-return ABI + From/.into() +
