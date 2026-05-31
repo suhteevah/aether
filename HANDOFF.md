@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 13 commits: real type inference engine + traits (default/completeness/supertraits) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + audit reliability fix. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD cf30545.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 18 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits) + borrow-reject (2 codes witnessed) + closures-as-value + iterators-with-closures + process spawn + std::env + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD b469f5e.)
 
 ### Session arc — Phase 6 (Rust language parity) made REAL
 Goal set: "reach rust feature parity" = Roadmap v2 Phase 6. roadmap-tracker
@@ -58,10 +58,40 @@ new static check runs at `--check`; negative conformance tests in
    cargo-test-on-Windows race once instead of reporting a false FAIL; real
    assertion failures still fail immediately. [[audit_cargo_test_flaky_on_windows]]
 
+10. **6.1 reassignment check** (`7caa74f`) — `x = e` vs x's scalar type →
+    **AE0224**. Completes the scalar-safety quadrant (let-init / call-arg /
+    return / reassign).
+11. **6.3 AE0201 witness + audit retry-loop** (`ae0e435`) — end-to-end negative
+    for shared-after-mut; audit retries the cargo-test race up to 3× (it hits
+    twice-in-a-row sometimes).
+12. **6.13 std::env** (`b469f5e`) — `aether_env_set` / `aether_env_var_i64`
+    (std::env::{set_var,var} equiv) + `cstr_to_string` helper. Witness `env_var`
+    (set AETHER_TEST_VAR=42, read back → 42).
+
 See [[p6_rust_parity_typesystem_push]] for the per-pass ownership + codes.
-**Diagnostic codes added this session:** AE0200-0203 (borrow), AE0210-0212
-(trait), AE0220-0222 (type). All AE02xx checks run at `--check`; negatives in
-`tests/aether/negative/expect_AE02##_*.aether`.
+**Diagnostic codes added this session:** AE0200-0203 (borrow; 0200+0201
+witnessed e2e), AE0210-0212 (trait), AE0220-0222 + AE0224 (type). All AE02xx
+checks run at `--check`; negatives in `tests/aether/negative/expect_AE02##_*.aether`.
+
+### Why this is where the safe ground ends (next steps need XL subsystems)
+The clean, single-deposit P6 wins are now exhausted. The remaining items each
+need a large/risky subsystem, NOT a quick deposit:
+- **From/.into() (6.5)** is blocked on the **struct-return ABI** — verified
+  broken: `fn make() -> Pt { Pt{..} }` fails to link. A fn returning a struct
+  by value needs rax:rdx (≤16B; the enum-payload 2-reg ABI is the seed) or sret.
+  This is asm-backend work — the one area deliberately untouched all session to
+  hold the zero-regression streak (all 18 commits were analysis-pass / AST-
+  rewrite / runtime-FFI).
+- **Generics (type params + monomorphization)** — keystone, unblocks
+  Box/Vec<T>/HashMap (6.7) + generic traits + Iterator trait. Extends the
+  const-generic worklist but hits the same storage-class/asm-backend wall.
+- **async (6.10) / macros (6.11)** — still model-only islands (wire like traits
+  was, but each is a real L/XL transform).
+- **threads (6.9)** — `aether_thread_spawn` exists; closure-objects could now
+  feed it, but join + shared-state + Windows CreateThread ABI is a real chunk.
+Recommended next: tackle the **struct-return ABI** as a dedicated TDD deposit
+(it unblocks From + builders + generic struct returns), accepting it's the first
+asm-backend change of the arc — do it isolated, sweep the full runtime suite.
 
 ### Audit-flake note (now mitigated)
 The audit `[3/5] Workspace tests` step used to intermittently print
