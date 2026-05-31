@@ -474,6 +474,13 @@ fn main() {
     // (a `let`-bound borrow stays live to end-of-fn); a clean program checks
     // OK, an aliasing program fails with a stable code an LLM can act on.
     if args.check_only {
+        // P6.1 — Hindley-Milner inference + type checking. Catches scalar
+        // mismatches (e.g. `let x: i64 = 3.5;`) the storage-class default
+        // silently accepted. Conservative: only concrete scalar conflicts.
+        let ty_diags = mir::infer::run(&prog);
+        let n_ty = ty_diags.len();
+        for d in ty_diags { sink.push(d); }
+        // P6.3 — NLL borrow checker; AE0200-family violations fail the check.
         let lt_violations = mir::lifetimes_drive::drive(&prog);
         for v in &lt_violations {
             sink.push(Diag::error(v.code, "borrow", v.message.clone())
@@ -482,9 +489,10 @@ fn main() {
                     instead of `&mut`) before taking another"));
         }
         if !args.json_errors {
-            eprintln!("[aetherc] check {} — {} fn(s); borrow check {} violation(s)",
-                      if lt_violations.is_empty() { "OK" } else { "FAILED" },
-                      mir_prog.funcs.len(), lt_violations.len());
+            let ok = n_ty == 0 && lt_violations.is_empty();
+            eprintln!("[aetherc] check {} — {} fn(s); {} type error(s), {} borrow violation(s)",
+                      if ok { "OK" } else { "FAILED" },
+                      mir_prog.funcs.len(), n_ty, lt_violations.len());
         }
         report(&sink, &file_str, args.json_errors);
         if sink.has_errors() { std::process::exit(1); }

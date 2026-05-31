@@ -1,0 +1,10 @@
+// A scalar type mismatch between annotation and value must be rejected.
+//
+// P6.1 — mir::infer infers the rhs `3.5` as a float, unifies it against the
+// `i64` annotation, and the concrete Int-vs-Float clash surfaces as AE0220.
+// Before the inference engine, the storage-class default silently accepted
+// this and compiled a wrong program.
+fn main() -> i32 {
+    let x: i64 = 3.5;
+    x as i32
+}
