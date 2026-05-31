@@ -1100,6 +1100,13 @@ impl Parser {
                 let body = self.parse_block()?;
                 Ok(Expr::For { var, iter: Box::new(iter), body, parallel: false, distributed })
             }
+            Tok::Loop => {
+                // `loop { BODY }` is `while 1 { BODY }` — an unconditional loop
+                // exited by `break`. IntLit(1) is the always-true cond.
+                self.bump();
+                let body = self.parse_block()?;
+                Ok(Expr::While { cond: Box::new(Expr::IntLit(1)), body })
+            }
             Tok::While => {
                 self.bump();
                 // `while let PAT = SCRUT { BODY }` desugars to

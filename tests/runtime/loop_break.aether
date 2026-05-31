@@ -1,0 +1,13 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// `loop { … }` — Rust's unconditional loop, desugared to `while 1 { … }` and
+// exited with `break`.
+fn main() -> i32 {
+    let mut i: i64 = 0;
+    loop {
+        i = i + 1;
+        if i >= 42 { break; }
+    }
+    i as i32
+}
