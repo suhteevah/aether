@@ -1,8 +1,16 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 15 features / 25 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + **struct-return ABI + From/.into() + Type::method() constructors** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD c64e407.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 16 features / 26 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + **struct-construction cluster: struct-return ABI + From/.into() + Type::method() + Self** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 4dfcfc6.)
 
-### LATEST (after the 18-commit summary below): struct-return ABI + From/.into() + assoc fns
+### LATEST (after the 18-commit summary below): struct-construction cluster complete
+The struct ergonomics are now Rust-complete: **struct-return ABI + From/.into() +
+associated functions (`Type::method()`) + `Self`**. `fn new() -> Self { Self { … } }`,
+`Counter::new()`, `40.into()` all work and compose.
+- **6.2 `Self` type** (`4dfcfc6`) — `mir::self_type` replaces `Self` with the
+  impl's concrete type (return/param/let types, `Self { … }` literals,
+  `Self::method` paths, `as Self`). Also fixed a recursion gap: path_call +
+  into_desugar now descend into struct-literal fields / match arms / tuples.
+  Witness `self_type` (Counter::new() → Self{n:Self::base()} → plus(c,2) = 42).
 - **6.2 associated functions** (`c64e407`) — `mir::path_call` rewrites
   `Type::method(args)` → `Type__method(args)` for known impl methods. Rust-style
   constructors: `Counter::new()`, `Celsius::from(40)`, `T::default()`. Precise
