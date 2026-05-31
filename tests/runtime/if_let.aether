@@ -1,0 +1,19 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// `if let PAT = SCRUT { … } else { … }` — desugars to a 2-arm match (PAT and
+// a wildcard). Exercises both the matching branch (payload bound) and the
+// non-matching else branch.
+enum Box { Empty, Full(i64) }
+
+fn main() -> i32 {
+    let full: Box = Box::Full(40);
+    let empty: Box = Box::Empty;
+
+    // Matches Full -> binds x = 40 -> 41.
+    let a: i64 = if let Box::Full(x) = full { x + 1 } else { 0 };
+    // Doesn't match Full -> else -> 1.
+    let b: i64 = if let Box::Full(y) = empty { y } else { 1 };
+
+    (a + b) as i32      // 41 + 1 = 42
+}

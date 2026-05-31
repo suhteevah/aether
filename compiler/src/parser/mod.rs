@@ -1027,6 +1027,36 @@ impl Parser {
             }
             Tok::If => {
                 self.bump();
+                // `if let PAT = SCRUT { THEN } else { ELSE }` desugars to
+                // `match SCRUT { PAT => { THEN }, _ => { ELSE } }`. The match
+                // codegen already handles enum-variant payload binding, so this
+                // is a pure parser desugar onto existing machinery.
+                if matches!(self.peek(0), Tok::Let) {
+                    self.bump(); // `let`
+                    let pat = self.parse_match_pat()?;
+                    self.expect(Tok::Eq)?;
+                    let scrut = self.with_struct_lit_disabled(|p| p.parse_expr())?;
+                    let then = self.parse_block()?;
+                    let else_arm = if matches!(self.peek(0), Tok::Else) {
+                        self.bump();
+                        if matches!(self.peek(0), Tok::If) {
+                            let nested = self.parse_atom()?; // `else if` chains
+                            Expr::Block(Block { stmts: Vec::new(), tail: Some(Box::new(nested)) })
+                        } else {
+                            Expr::Block(self.parse_block()?)
+                        }
+                    } else {
+                        // No `else`: the non-matching arm yields unit (empty block).
+                        Expr::Block(Block { stmts: Vec::new(), tail: None })
+                    };
+                    return Ok(Expr::Match {
+                        scrutinee: Box::new(scrut),
+                        arms: vec![
+                            (pat, Expr::Block(then)),
+                            (MatchPat::Wildcard, else_arm),
+                        ],
+                    });
+                }
                 let cond = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                 let then = self.parse_block()?;
                 let else_ = if matches!(self.peek(0), Tok::Else) {
