@@ -1,0 +1,13 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// Narrowing unsigned int casts (`as u8`/`u16`) — keep the low N bits, matching
+// Rust's `as` truncation. Previously "unsupported cast combination". (u32 and
+// signed i8/i16 await wider aether-asm encodings.)
+fn main() -> i32 {
+    let b: i64 = 300 as u8;          // 300 & 0xFF   = 44
+    let w: i64 = 65578 as u16;       // 65578 & 0xFFFF = 42
+    if b == 44 {
+        if w == 42 { 42 } else { 1 }
+    } else { 2 }
+}

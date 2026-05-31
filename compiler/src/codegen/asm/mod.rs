@@ -1081,6 +1081,18 @@ fn emit_cast(out: &mut String, inner: TyKind, to: &str) -> Result<TyKind, AsmErr
         // are both `TyKind::Int` for now, so widening/narrowing is a no-op).
         (TyKind::F32, "f32") | (TyKind::F64, "f64") => Ok(inner),
         (TyKind::Int, "i64") | (TyKind::Int, "i32") => Ok(inner),
+        (TyKind::Int, "u64") | (TyKind::Int, "usize") | (TyKind::Int, "isize") => Ok(inner),
+        // Narrowing unsigned int casts: keep the low N bits (Rust `as`
+        // truncation). Encodings limited to what aether-asm supports — u8 via
+        // movzbl, u16 via a register-held 0xFFFF mask. u32 (0xFFFFFFFF mask
+        // exceeds imm32) and signed i8/i16 (need movsbq/movswq) aren't encoded
+        // yet — they still error clearly.
+        (TyKind::Int, "u8")  => { out.push_str("    movzbl %al, %eax\n"); Ok(TyKind::Int) }
+        (TyKind::Int, "u16") => {
+            out.push_str("    movq $65535, %r10\n");
+            out.push_str("    andq %r10, %rax\n");
+            Ok(TyKind::Int)
+        }
         // f32→i32 via the same cvtss2siq we use for i64.
         (TyKind::F32, "i32") => { out.push_str("    cvtss2siq %xmm0, %rax\n"); Ok(TyKind::Int) }
         (TyKind::F64, "i32") => { out.push_str("    cvtsd2siq %xmm0, %rax\n"); Ok(TyKind::Int) }
