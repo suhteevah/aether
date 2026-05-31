@@ -9,15 +9,18 @@
 //! It implements the Algorithm-W kernel: type variables in a union-find
 //! substitution table, `unify` with an occurs check, and a bottom-up inference
 //! walk that assigns a `Type` to every binding (from the rhs, reconciled with
-//! any explicit annotation).
+//! any explicit annotation) and to every call argument (vs. the declared param
+//! type).
 //!
-//! Diagnostics are emitted conservatively — only when an explicit annotation
-//! and the inferred rhs are BOTH concrete scalars (`Int` / `Float` / `Bool`)
-//! that genuinely conflict. Aggregate / pointer / generic types are inferred as
-//! opaque vars and never flagged, so the engine adds a real check without
-//! false-positiving on the rich existing suite. Integer widths are bucketed
-//! (Aether casts freely between them), so `let x: i32 = 5i64` is fine; the
-//! catch is the cross-bucket case `Int` vs `Float`.
+//! Diagnostics are emitted conservatively — only when both sides of a clash are
+//! concrete scalars (`Int` / `Float` / `Bool`). Aggregate / pointer / generic
+//! types are inferred as opaque vars and never flagged, so the engine adds a
+//! real check without false-positiving on the rich existing suite. Integer
+//! widths are bucketed (Aether casts freely between them); the catch is the
+//! cross-bucket case `Int` vs `Float`.
+//!
+//!   * `AE0220` — a `let` annotation conflicts with the inferred value.
+//!   * `AE0221` — a call argument conflicts with the declared parameter type.
 
 use crate::ast::{BinOp, Block, Expr, Item, Program, Stmt, Ty};
 use crate::diag::Diag;
@@ -41,6 +44,13 @@ impl Type {
     }
 }
 
+/// Declared signatures: per fn-name return type + parameter types.
+#[derive(Default)]
+struct Sigs {
+    ret: HashMap<String, Type>,
+    params: HashMap<String, Vec<Type>>,
+}
+
 #[derive(Default)]
 pub struct InferCtx {
     /// Union-find store: `subst[v]` is the binding of var `v` (another type,
@@ -55,7 +65,7 @@ impl InferCtx {
         Type::Var(id)
     }
 
-    /// Follow var bindings to a representative (path-compressed conceptually).
+    /// Follow var bindings to a representative.
     fn resolve(&self, t: &Type) -> Type {
         let mut cur = t.clone();
         while let Type::Var(v) = cur {
@@ -67,18 +77,16 @@ impl InferCtx {
         cur
     }
 
-    /// Occurs check: does var `v` appear in (the resolution of) `t`? Prevents
-    /// building an infinite type when unifying `v` with something mentioning it.
+    /// Occurs check: does var `v` appear in (the resolution of) `t`?
     fn occurs(&self, v: u32, t: &Type) -> bool {
         match self.resolve(t) {
             Type::Var(w) => v == w,
-            _ => false, // our Types have no nested vars (monomorphic core)
+            _ => false, // monomorphic core has no nested vars
         }
     }
 
     /// Unify two types. Binds free vars; returns the conflicting pair on a
-    /// concrete clash. The let-checker decides whether a given clash is worth a
-    /// diagnostic (only scalar-vs-scalar today).
+    /// concrete clash. The caller decides whether a clash warrants a diagnostic.
     pub fn unify(&mut self, a: &Type, b: &Type) -> Result<(), (Type, Type)> {
         let ra = self.resolve(a);
         let rb = self.resolve(b);
@@ -134,17 +142,21 @@ fn ret_type(ctx: &mut InferCtx, ret: &Option<Ty>) -> Type {
 pub fn run(prog: &Program) -> Vec<Diag> {
     let mut ctx = InferCtx::default();
     let mut diags = Vec::new();
+    let mut sigs = Sigs::default();
 
-    // Pre-collect fn return types so call expressions infer their result.
-    let mut fn_ret: HashMap<String, Type> = HashMap::new();
+    // Pre-collect fn return + parameter types so calls can be checked.
+    let mut record = |ctx: &mut InferCtx, sigs: &mut Sigs, name: String, f: &crate::ast::FnDecl| {
+        sigs.ret.insert(name.clone(), ret_type(ctx, &f.ret));
+        let ptys: Vec<Type> = f.params.iter().map(|p| ann_to_type(ctx, &p.ty)).collect();
+        sigs.params.insert(name, ptys);
+    };
     for it in &prog.items {
         match it {
-            Item::Fn(f) => { let t = ret_type(&mut ctx, &f.ret); fn_ret.insert(f.name.clone(), t); }
+            Item::Fn(f) => record(&mut ctx, &mut sigs, f.name.clone(), f),
             Item::Impl { type_name, methods } | Item::ImplTrait { type_name, methods, .. } => {
                 for m in methods {
-                    let t = ret_type(&mut ctx, &m.ret);
-                    fn_ret.insert(format!("{}__{}", type_name, m.name), t.clone());
-                    fn_ret.insert(m.name.clone(), t);
+                    record(&mut ctx, &mut sigs, format!("{}__{}", type_name, m.name), m);
+                    record(&mut ctx, &mut sigs, m.name.clone(), m);
                 }
             }
             _ => {}
@@ -159,7 +171,7 @@ pub fn run(prog: &Program) -> Vec<Diag> {
                 let t = ann_to_type(&mut ctx, &p.ty);
                 env.insert(p.name.clone(), t);
             }
-            infer_block(&mut ctx, &fn_ret, &mut env, body, &mut diags);
+            infer_block(&mut ctx, &sigs, &mut env, body, &mut diags);
         }
     }
     diags
@@ -167,23 +179,23 @@ pub fn run(prog: &Program) -> Vec<Diag> {
 
 fn infer_block(
     ctx: &mut InferCtx,
-    fn_ret: &HashMap<String, Type>,
+    sigs: &Sigs,
     env: &mut HashMap<String, Type>,
     b: &Block,
     diags: &mut Vec<Diag>,
 ) -> Type {
     for s in &b.stmts {
-        infer_stmt(ctx, fn_ret, env, s, diags);
+        infer_stmt(ctx, sigs, env, s, diags);
     }
     match &b.tail {
-        Some(t) => infer_expr(ctx, fn_ret, env, t, diags),
+        Some(t) => infer_expr(ctx, sigs, env, t, diags),
         None => Type::Unit,
     }
 }
 
 fn infer_stmt(
     ctx: &mut InferCtx,
-    fn_ret: &HashMap<String, Type>,
+    sigs: &Sigs,
     env: &mut HashMap<String, Type>,
     s: &Stmt,
     diags: &mut Vec<Diag>,
@@ -191,14 +203,13 @@ fn infer_stmt(
     match s {
         Stmt::Let { name, ty, value, .. } => {
             let rhs_t = match value {
-                Some(v) => infer_expr(ctx, fn_ret, env, v, diags),
+                Some(v) => infer_expr(ctx, sigs, env, v, diags),
                 None => ctx.fresh(),
             };
             let bind_t = match ty {
                 Some(ann) => {
                     let ann_t = ann_to_type(ctx, ann);
                     if let Err((a, b)) = ctx.unify(&ann_t, &rhs_t) {
-                        // Only a concrete scalar-vs-scalar clash is reported.
                         if a.is_scalar() && b.is_scalar() {
                             diags.push(Diag::error("AE0220", "type",
                                 format!("type mismatch in `let {}`: annotation is {}, but the value is {}",
@@ -214,17 +225,17 @@ fn infer_stmt(
             env.insert(name.clone(), ctx.resolve(&bind_t));
         }
         Stmt::LetTuple { names, value } => {
-            let _ = infer_expr(ctx, fn_ret, env, value, diags);
+            let _ = infer_expr(ctx, sigs, env, value, diags);
             for n in names { let v = ctx.fresh(); env.insert(n.clone(), v); }
         }
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => { let _ = infer_expr(ctx, fn_ret, env, e, diags); }
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => { let _ = infer_expr(ctx, sigs, env, e, diags); }
         Stmt::Return(None) => {}
     }
 }
 
 fn infer_expr(
     ctx: &mut InferCtx,
-    fn_ret: &HashMap<String, Type>,
+    sigs: &Sigs,
     env: &mut HashMap<String, Type>,
     e: &Expr,
     diags: &mut Vec<Diag>,
@@ -236,13 +247,12 @@ fn infer_expr(
         Expr::StrLit(_) => Type::Str,
         Expr::Ident(n) => env.get(n).cloned().unwrap_or_else(|| ctx.fresh()),
         Expr::Bin { op, lhs, rhs } => {
-            let lt = infer_expr(ctx, fn_ret, env, lhs, diags);
-            let rt = infer_expr(ctx, fn_ret, env, rhs, diags);
+            let lt = infer_expr(ctx, sigs, env, lhs, diags);
+            let rt = infer_expr(ctx, sigs, env, rhs, diags);
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
                 | BinOp::And | BinOp::Or => Type::Bool,
                 BinOp::Assign => Type::Unit,
-                // Arithmetic / bitwise: result follows a concrete operand.
                 _ => {
                     let lr = ctx.resolve(&lt);
                     if lr.is_scalar() { lr } else { ctx.resolve(&rt) }
@@ -250,68 +260,82 @@ fn infer_expr(
             }
         }
         Expr::Unary { op, expr } => {
-            let t = infer_expr(ctx, fn_ret, env, expr, diags);
+            let t = infer_expr(ctx, sigs, env, expr, diags);
             match op {
                 crate::ast::UnOp::Not => Type::Bool,
                 crate::ast::UnOp::Neg => ctx.resolve(&t),
             }
         }
         Expr::Call { callee, args } => {
-            for a in args { let _ = infer_expr(ctx, fn_ret, env, a, diags); }
+            let arg_types: Vec<Type> = args.iter()
+                .map(|a| infer_expr(ctx, sigs, env, a, diags))
+                .collect();
             if let Expr::Ident(n) = callee.as_ref() {
-                fn_ret.get(n).cloned().unwrap_or_else(|| ctx.fresh())
+                // Check each arg against the declared parameter type.
+                if let Some(ptys) = sigs.params.get(n) {
+                    for (i, (at, pt)) in arg_types.iter().zip(ptys.iter()).enumerate() {
+                        if let Err((a, b)) = ctx.unify(at, pt) {
+                            if a.is_scalar() && b.is_scalar() {
+                                diags.push(Diag::error("AE0221", "type",
+                                    format!("argument {} to `{}` is {}, but the parameter is {}",
+                                        i + 1, n, bucket_name(&a), bucket_name(&b)))
+                                    .with_hint("pass a value of the parameter's type or insert an \
+                                        explicit `as` cast at the call site"));
+                            }
+                        }
+                    }
+                }
+                sigs.ret.get(n).cloned().unwrap_or_else(|| ctx.fresh())
             } else {
-                let _ = infer_expr(ctx, fn_ret, env, callee, diags);
+                let _ = infer_expr(ctx, sigs, env, callee, diags);
                 ctx.fresh()
             }
         }
         Expr::Cast { expr, ty } => {
-            let _ = infer_expr(ctx, fn_ret, env, expr, diags);
-            // The cast target dictates the result bucket.
+            let _ = infer_expr(ctx, sigs, env, expr, diags);
             ann_to_type(ctx, &Ty::Named(ty.clone()))
         }
-        Expr::Block(b) => infer_block(ctx, fn_ret, env, b, diags),
+        Expr::Block(b) => infer_block(ctx, sigs, env, b, diags),
         Expr::If { cond, then, else_ } => {
-            let _ = infer_expr(ctx, fn_ret, env, cond, diags);
-            let tt = infer_block(ctx, fn_ret, env, then, diags);
+            let _ = infer_expr(ctx, sigs, env, cond, diags);
+            let tt = infer_block(ctx, sigs, env, then, diags);
             if let Some(eb) = else_ {
-                let _ = infer_block(ctx, fn_ret, env, eb, diags);
+                let _ = infer_block(ctx, sigs, env, eb, diags);
             }
             tt
         }
         Expr::While { cond, body } => {
-            let _ = infer_expr(ctx, fn_ret, env, cond, diags);
-            let _ = infer_block(ctx, fn_ret, env, body, diags);
+            let _ = infer_expr(ctx, sigs, env, cond, diags);
+            let _ = infer_block(ctx, sigs, env, body, diags);
             Type::Unit
         }
         Expr::For { iter, body, .. } => {
-            let _ = infer_expr(ctx, fn_ret, env, iter, diags);
-            let _ = infer_block(ctx, fn_ret, env, body, diags);
+            let _ = infer_expr(ctx, sigs, env, iter, diags);
+            let _ = infer_block(ctx, sigs, env, body, diags);
             Type::Unit
         }
-        Expr::Region { body, .. } => infer_block(ctx, fn_ret, env, body, diags),
+        Expr::Region { body, .. } => infer_block(ctx, sigs, env, body, diags),
         Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => {
-            let _ = infer_expr(ctx, fn_ret, env, expr, diags);
+            let _ = infer_expr(ctx, sigs, env, expr, diags);
             ctx.fresh()
         }
         Expr::MethodCall { recv, args, .. } => {
-            let _ = infer_expr(ctx, fn_ret, env, recv, diags);
-            for a in args { let _ = infer_expr(ctx, fn_ret, env, a, diags); }
+            let _ = infer_expr(ctx, sigs, env, recv, diags);
+            for a in args { let _ = infer_expr(ctx, sigs, env, a, diags); }
             ctx.fresh()
         }
-        Expr::Field { recv, .. } => { let _ = infer_expr(ctx, fn_ret, env, recv, diags); ctx.fresh() }
+        Expr::Field { recv, .. } => { let _ = infer_expr(ctx, sigs, env, recv, diags); ctx.fresh() }
         Expr::Index { recv, idx } => {
-            let _ = infer_expr(ctx, fn_ret, env, recv, diags);
-            let _ = infer_expr(ctx, fn_ret, env, idx, diags);
+            let _ = infer_expr(ctx, sigs, env, recv, diags);
+            let _ = infer_expr(ctx, sigs, env, idx, diags);
             ctx.fresh()
         }
         Expr::Range { lo, hi, step } => {
-            let _ = infer_expr(ctx, fn_ret, env, lo, diags);
-            let _ = infer_expr(ctx, fn_ret, env, hi, diags);
-            if let Some(s) = step { let _ = infer_expr(ctx, fn_ret, env, s, diags); }
+            let _ = infer_expr(ctx, sigs, env, lo, diags);
+            let _ = infer_expr(ctx, sigs, env, hi, diags);
+            if let Some(s) = step { let _ = infer_expr(ctx, sigs, env, s, diags); }
             ctx.fresh()
         }
-        // Aggregate / control literals: opaque for now.
         _ => ctx.fresh(),
     }
 }
@@ -365,7 +389,6 @@ mod tests {
 
     #[test]
     fn mismatch_let_flagged() {
-        // fn main() { let x: i64 = 3.5; }
         use crate::ast::*;
         let prog = Program { items: vec![Item::Fn(FnDecl {
             attrs: vec![], is_pub: false, is_extern: false, name: "main".into(),
@@ -394,7 +417,6 @@ mod tests {
                 stmts: vec![
                     Stmt::Let { name: "x".into(), mutable: false,
                         ty: Some(Ty::Named("i64".into())), value: Some(Expr::IntLit(5)) },
-                    // f32 annotation + float literal: same bucket, no error.
                     Stmt::Let { name: "y".into(), mutable: false,
                         ty: Some(Ty::Named("f32".into())), value: Some(Expr::FloatLit(2.5)) },
                 ],
@@ -402,5 +424,31 @@ mod tests {
             }),
         })] };
         assert!(run(&prog).is_empty());
+    }
+
+    #[test]
+    fn arg_type_mismatch_flagged() {
+        // fn f(a: i64) -> i64 { a }  fn main() { f(3.5); }
+        use crate::ast::*;
+        let f = FnDecl {
+            attrs: vec![], is_pub: false, is_extern: false, name: "f".into(),
+            const_params: vec![], params: vec![Param { name: "a".into(), ty: Ty::Named("i64".into()) }],
+            ret: Some(Ty::Named("i64".into())),
+            body: Some(Block { stmts: vec![], tail: Some(Box::new(Expr::Ident("a".into()))) }),
+        };
+        let main = FnDecl {
+            attrs: vec![], is_pub: false, is_extern: false, name: "main".into(),
+            const_params: vec![], params: vec![], ret: None,
+            body: Some(Block {
+                stmts: vec![Stmt::Expr(Expr::Call {
+                    callee: Box::new(Expr::Ident("f".into())),
+                    args: vec![Expr::FloatLit(3.5)],
+                })],
+                tail: None,
+            }),
+        };
+        let prog = Program { items: vec![Item::Fn(f), Item::Fn(main)] };
+        let diags = run(&prog);
+        assert!(diags.iter().any(|d| d.code == "AE0221"));
     }
 }

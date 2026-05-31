@@ -1,0 +1,11 @@
+// Passing a float where an i64 parameter is declared must be rejected.
+//
+// P6.1 — mir::infer infers the call argument `2.5` as a float and unifies it
+// against `scale`'s declared `factor: i64`; the concrete Int-vs-Float clash
+// surfaces as AE0221 at the call site.
+fn scale(factor: i64, x: i64) -> i64 { factor * x }
+
+fn main() -> i32 {
+    let r = scale(2.5, 10);
+    r as i32
+}
