@@ -1032,6 +1032,7 @@ impl Parser {
                 // codegen already handles enum-variant payload binding, so this
                 // is a pure parser desugar onto existing machinery.
                 if matches!(self.peek(0), Tok::Let) {
+                    let uid = self.pos;
                     self.bump(); // `let`
                     let pat = self.parse_match_pat()?;
                     self.expect(Tok::Eq)?;
@@ -1049,12 +1050,29 @@ impl Parser {
                         // No `else`: the non-matching arm yields unit (empty block).
                         Expr::Block(Block { stmts: Vec::new(), tail: None })
                     };
-                    return Ok(Expr::Match {
-                        scrutinee: Box::new(scrut),
+                    // The match codegen needs a local scrutinee. If it's already
+                    // a bare ident, use it directly; otherwise bind it to a
+                    // fresh temp (emitted as a prelude let around the match).
+                    let (scrut_ident, prelude): (Expr, Option<Stmt>) = match scrut {
+                        s @ Expr::Ident(_) => (s, None),
+                        other => {
+                            let tmp = format!("__if_let_scrut_{}", uid);
+                            (Expr::Ident(tmp.clone()),
+                             Some(Stmt::Let { name: tmp, mutable: false, ty: None, value: Some(other) }))
+                        }
+                    };
+                    let m = Expr::Match {
+                        scrutinee: Box::new(scrut_ident),
                         arms: vec![
                             (pat, Expr::Block(then)),
                             (MatchPat::Wildcard, else_arm),
                         ],
+                    };
+                    return Ok(match prelude {
+                        None => m,
+                        Some(stmt) => Expr::Block(Block {
+                            stmts: vec![stmt], tail: Some(Box::new(m)),
+                        }),
                     });
                 }
                 let cond = self.with_struct_lit_disabled(|p| p.parse_expr())?;
@@ -1084,6 +1102,41 @@ impl Parser {
             }
             Tok::While => {
                 self.bump();
+                // `while let PAT = SCRUT { BODY }` desugars to
+                // `while true { match SCRUT { PAT => { BODY }, _ => break } }`.
+                // SCRUT is re-evaluated each iteration (e.g. `it.next()`), and
+                // the wildcard arm breaks when it stops matching.
+                if matches!(self.peek(0), Tok::Let) {
+                    let uid = self.pos;
+                    self.bump(); // `let`
+                    let pat = self.parse_match_pat()?;
+                    self.expect(Tok::Eq)?;
+                    let scrut = self.with_struct_lit_disabled(|p| p.parse_expr())?;
+                    let body = self.parse_block()?;
+                    // The match codegen needs a local scrutinee; bind the
+                    // (re-evaluated each iteration) expression to a fresh temp.
+                    let tmp = format!("__while_let_scrut_{}", uid);
+                    let match_expr = Expr::Match {
+                        scrutinee: Box::new(Expr::Ident(tmp.clone())),
+                        arms: vec![
+                            (pat, Expr::Block(body)),
+                            (MatchPat::Wildcard, Expr::Break),
+                        ],
+                    };
+                    return Ok(Expr::While {
+                        // Always-true loop; the wildcard arm's `break` exits.
+                        // `IntLit(1)` (not `BoolLit`) since the asm backend
+                        // branches on integer truthiness.
+                        cond: Box::new(Expr::IntLit(1)),
+                        body: Block {
+                            stmts: vec![
+                                Stmt::Let { name: tmp, mutable: false, ty: None, value: Some(scrut) },
+                                Stmt::Expr(match_expr),
+                            ],
+                            tail: None,
+                        },
+                    });
+                }
                 let cond = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                 let body = self.parse_block()?;
                 Ok(Expr::While { cond: Box::new(cond), body })

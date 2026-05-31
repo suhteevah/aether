@@ -1,0 +1,21 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// `while let PAT = SCRUT { BODY }` — desugars to
+// `while 1 { let tmp = SCRUT; match tmp { PAT => { BODY }, _ => break } }`.
+// SCRUT is re-evaluated each iteration; the loop ends when it stops matching.
+enum Box { Empty, Full(i64) }
+
+fn item(i: i64) -> Box {
+    if i < 7 { Box::Full(i * 2) } else { Box::Empty }
+}
+
+fn main() -> i32 {
+    let mut i: i64 = 0;
+    let mut sum: i64 = 0;
+    while let Box::Full(x) = item(i) {   // Full while i<7, x = i*2
+        sum = sum + x;
+        i = i + 1;
+    }
+    sum as i32      // 2*(0+1+2+3+4+5+6) = 42
+}
