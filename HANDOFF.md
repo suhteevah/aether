@@ -1,8 +1,13 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 22 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + **struct-return ABI + From/.into()** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD 4a88a0d.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 15 features / 25 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + **struct-return ABI + From/.into() + Type::method() constructors** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD c64e407.)
 
-### LATEST (after the 18-commit summary below): struct-return ABI + From/.into()
+### LATEST (after the 18-commit summary below): struct-return ABI + From/.into() + assoc fns
+- **6.2 associated functions** (`c64e407`) — `mir::path_call` rewrites
+  `Type::method(args)` → `Type__method(args)` for known impl methods. Rust-style
+  constructors: `Counter::new()`, `Celsius::from(40)`, `T::default()`. Precise
+  (enum ctors untouched). Witness `assoc_fn` (Counter::new() → struct-return →
+  Counter::bump(c,2) = 42).
 - **6.5 struct-return ABI** (`4404a3a`) — fns returning a small (≤2 i64-field)
   struct now use the enum-payload 2-register ABI (field0→rax, field1→rdx).
   Callee marshals the struct-literal tail; `let p: T = make()` unmarshals into
