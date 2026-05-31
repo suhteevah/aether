@@ -1,0 +1,27 @@
+; ModuleID = 'aether'
+target triple = "x86_64-pc-windows-gnu"
+
+; --- aether autodiff + distributed runtime intrinsics ---
+declare void @aether_autodiff_init(i8*)
+declare void @aether_autodiff_push(i8*, i8*)
+declare void @aether_autodiff_reverse(i8*)
+declare void @aether_autodiff_accumulate(i8*, i8*)
+declare void @aether_autodiff_partial(i8*, i32, i32, i32)
+declare void @aether_dist_all_reduce(i8*, i32, i32)
+declare i32 @puts(i8*)
+
+define i32 @sum_to() {
+entry:
+  ; aether: let s = 0
+  ; aether: let i = 1
+  ; aether: <while>
+  ; aether: return s
+  ret i32 0
+}
+
+define i32 @main() {
+entry:
+  ; aether: sum_to(8) + 6
+  ret i32 0
+}
+

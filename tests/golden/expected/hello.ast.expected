@@ -1,0 +1,1 @@
+(fn main (params) (block (call println "Hello from Aether - close to the metal") 0))

@@ -1,0 +1,12 @@
+// AETHER MIR — comments above this line do not exist in any binary
+
+fn sum_to {
+    let s = 0
+    let i = 1
+    <while>
+    return s
+}
+
+fn main {
+    sum_to(8) + 6
+}

@@ -1,6 +1,65 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-30 EOD (🟢 huge session — full arc below. Latest: self-hosted parser shipped 7 deposits (11–17), now a real file-driven mini-language parser. All committed + pushed to origin/main, HEAD 6231981, audit clean.)
+## Last Updated — 2026-05-30 LATE (🟢 FORMAL P20.2 landed — `aetherc --emit=ast` canonical AST dump + the self-hosted parser re-emits it BYTE-FOR-BYTE. Two independent parsers proven to agree on a real file's AST at runtime. Full audit clean, errors: 0.)
+
+## Session arc (this session) — FORMAL P20.2
+The prior 7 deposits (11–17) checked the self-hosted parser's S-expr against
+hardcoded `// expect:` strings. This session closed the loop with a real
+**cross-parser equality proof**: the Aether self-hosted parser and Rust-aetherc
+produce **byte-identical** AST dumps of the same `.aether` file, verified at
+runtime + golden-locked.
+
+1. **`aetherc --emit=ast`** (NEW emit mode) — `compiler/src/codegen/ast_dump.rs`
+   walks the PRISTINE parse tree (snapshotted in main.rs *before* the
+   use-resolution / closure-lifting / fusion / autodiff passes rewrite it) and
+   emits a canonical S-expr: one `(fn NAME (params …) (block …))` per line,
+   LF-terminated. `x = e` → `(assign NAME e)`; types ELIDED (`n: i64` → `n`).
+   Covers the full Stmt/Expr surface. Has a Rust unit test.
+2. **Golden-locked** — `tools/audit/src/golden.rs` now runs `--emit=ast` on
+   every `tests/golden/inputs/*.aether`; committed `.ast.expected` for hello /
+   autodiff_step / locals / p20_2 (16 golden cases total now: 4 inputs × 4
+   emits). Audit re-diffs each run, so the Rust dumper can't silently drift.
+3. **Self-hosted match** — `tests/runtime/selfhost_parser_formal.aether`
+   (Deposit 18) parses the SAME `tests/golden/inputs/p20_2.aether`, builds the
+   SAME dump into a heap buffer (`emit_buf` + `emit_fn_buf`, fn names from the fn
+   table), reads the committed `p20_2.ast.expected` off disk, and
+   `aether_bytes_eq`'s the two. **exit 42 IFF byte-identical.** No eval — the
+   exit code IS the AST comparison. The self-hosted lexer/parser gained
+   TOK_COLON handling to skip param/let type annotations (real-Aether requires
+   typed params; the mini-language didn't have them).
+
+Chain of trust: golden (committed `.ast.expected` == fresh `--emit=ast`) ∧
+runtime (self-hosted fresh parse == committed) ⇒ self-hosted AST == Rust AST,
+re-verified every audit run.
+
+## Two commits this session
+- `4388fb7` feat(P20.2): the FORMAL work — ast_dump.rs, main.rs wiring, p20_2
+  input + its .ast golden, the witness. (NOTE: this commit's message claimed
+  "audit clean" prematurely — golden.rs wasn't wired + the other goldens were
+  missing; fixed in the follow-up below.)
+- (follow-up) golden.rs `ast` case + the 6 generated `*.expected` files +
+  this HANDOFF. **NOW the full audit is genuinely clean: errors: 0.**
+
+## Project Status (end of session)
+🟢 Full audit `errors: 0`, `OK - audit clean`. cargo test `passed=194 failed=0`
+(incl. new `ast_dump` unit test). 16 golden cases OK (4×`--emit=ast` included).
+`selfhost_parser_formal OK exit=42`. **8 P20.2 witnesses now** (deposits 11–18).
+See [[selfhost_parser_deposits]].
+
+## What's next (self-host continues)
+- Enrich the canonical format toward a FULLER AST dump that still matches both
+  sides in lockstep: param types, return types, more items (struct/const/use/
+  attributes), then point `--emit=ast` + the self-hosted parser at a richer
+  shared file (a translated subset of `aether_lm.aether`). Each enrichment =
+  one deposit updating ast_dump.rs + the self-hosted `emit_buf` + the golden.
+- The big remaining P20.2/P9.1 milestone: self-hosted parser handles the FULL
+  Aether grammar (structs, types, generics, attributes, for/match) and the dump
+  matches on a real model file. The byte-for-byte harness built this session is
+  the verification mechanism for all of it.
+
+---
+
+## (prior) Last Updated — 2026-05-30 EOD (🟢 huge session — full arc below. Latest: self-hosted parser shipped 7 deposits (11–17), now a real file-driven mini-language parser. All committed + pushed to origin/main, HEAD 6231981, audit clean.)
 
 ## Session arc (newest → oldest, all committed + pushed)
 1. **P20.2 self-hosted parser — 7 deposits (11–17)** [[selfhosted_parser_deposits]]:

@@ -30,7 +30,9 @@ pub fn cases(root: &Path) -> Vec<GoldenCase> {
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("aether") {
-                for (emit, suf) in [("mir", "mir"), ("asm", "s"), ("llvm-ir", "ll")] {
+                // P20.2 — `ast` golden-locks the canonical AST dump (the
+                // format the self-hosted parser re-emits byte-for-byte).
+                for (emit, suf) in [("mir", "mir"), ("asm", "s"), ("llvm-ir", "ll"), ("ast", "ast")] {
                     out.push(GoldenCase {
                         input: p.clone(),
                         emit,

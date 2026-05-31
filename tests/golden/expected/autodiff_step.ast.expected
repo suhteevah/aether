@@ -1,0 +1,1 @@
+(fn train_step (params) (block (let logits (call forward)) (let loss (mcall logits cross_entropy labels)) (mcall loss backward)))
