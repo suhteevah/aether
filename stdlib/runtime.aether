@@ -57,6 +57,7 @@ extern fn aether_path_exists(path: i64) -> i64;
 extern fn aether_file_size(path: i64) -> i64;
 extern fn aether_is_dir(path: i64) -> i64;
 extern fn aether_create_dir_all(path: i64) -> i32;
+extern fn aether_process_run(cmd: i64) -> i64;
 extern fn aether_remove_file(path: i64) -> i32;
 extern fn aether_copy_file(src: i64, dst: i64) -> i64;
 extern fn aether_rename(src: i64, dst: i64) -> i32;

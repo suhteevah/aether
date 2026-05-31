@@ -1372,6 +1372,31 @@ fn wall_us_now() -> i64 {
     match std::fs::create_dir_all(s) { Ok(()) => 0, Err(_) => -2 }
 }
 
+/// P6.13 — process spawn. Run a shell command string and return its exit code
+/// (or -1 if the process could not be spawned / was signal-terminated).
+/// Cross-platform: `cmd /C <s>` on Windows, `sh -c <s>` elsewhere. This is the
+/// `std::process::Command` equivalent on the C-ABI surface.
+#[no_mangle] pub unsafe extern "C" fn aether_process_run(cmd: i64) -> i64 {
+    if cmd == 0 { return -1; }
+    let mut len = 0usize;
+    while *(cmd as *const u8).add(len) != 0 { len += 1; }
+    let p = std::slice::from_raw_parts(cmd as *const u8, len);
+    let Ok(s) = std::str::from_utf8(p) else { return -1; };
+    let mut c = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(s);
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(s);
+        c
+    };
+    match c.status() {
+        Ok(st) => st.code().map(|x| x as i64).unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
 /// Remove a single file. Returns 0 on success, negative on failure.
 #[no_mangle] pub unsafe extern "C" fn aether_remove_file(path: i64) -> i32 {
     if path == 0 { return -1; }

@@ -1,0 +1,13 @@
+// roadmap: P6.13
+// expect: exit=42
+//
+// Process spawn (std::process::Command equivalent): run a child shell command
+// and read its exit code back. `aether_process_run` runs the string via
+// `cmd /C` (Windows) / `sh -c` (Unix); the child here exits 42, and we
+// propagate that as this program's exit code.
+use runtime;
+
+fn main() -> i32 {
+    let code: i64 = aether_process_run("exit 42");
+    code as i32
+}
