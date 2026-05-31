@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 6 deposits: real type inference engine + traits + borrow-reject + closures-as-value. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD 52a2b3e.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 13 commits: real type inference engine + traits (default/completeness/supertraits) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + audit reliability fix. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD cf30545.)
 
 ### Session arc — Phase 6 (Rust language parity) made REAL
 Goal set: "reach rust feature parity" = Roadmap v2 Phase 6. roadmap-tracker
@@ -39,15 +39,39 @@ new static check runs at `--check`; negative conformance tests in
    `expect_AE0220/0221/0222_*`. Existing `hm_inference` (annotation-less) still
    clean. Int widths bucketed (Aether casts freely).
 
-See [[p6_rust_parity_typesystem_push]] for the per-pass ownership + codes.
+5. **6.1 explicit `return e;` checking** (`38bbb0e`) — `InferCtx.expected_ret`
+   field carries the fn's declared return type so `return 3.5;` in an i64 fn
+   also fires AE0222 (not just the tail). Type checker now covers let + args +
+   tail + explicit returns.
+6. **6.8 iterators with REAL closures** (`95cde0b`) — `vec_fold(v, n, init,
+   f: Closure)` invokes a user closure per element via the 6.6 object ABI
+   (closure captures `factor`); fold over [1..6] → 42. No new backend/runtime
+   code — pure compounding of 6.6. Was: FFI with hardcoded predicates.
+7. **6.2 supertraits** (`505257a`) — `trait Pet: Animal` parses (AST
+   `Item::Trait.supertraits`); an `impl Pet for T` now requires `impl Animal
+   for T` → **AE0212** if missing. ast_dump kept byte-identical (P20.2 golden
+   unaffected). Witness `trait_supertrait` (Dog satisfies both → 42).
+8. **6.13 process spawn** (`cf30545`) — `aether_process_run(cmd)` =
+   std::process::Command equiv (`cmd /C` / `sh -c`, returns exit code). Witness
+   `process_spawn` (child exits 42 → propagated).
+9. **audit reliability** (`9418b30`) — the tests dimension now retries the
+   cargo-test-on-Windows race once instead of reporting a false FAIL; real
+   assertion failures still fail immediately. [[audit_cargo_test_flaky_on_windows]]
 
-### Audit-flake note (do not panic on it)
-The audit `[3/5] Workspace tests` step intermittently prints
-`passed=122/129 failed=0 status=FAIL` (errors: 1). That's a **cargo-test race on
+See [[p6_rust_parity_typesystem_push]] for the per-pass ownership + codes.
+**Diagnostic codes added this session:** AE0200-0203 (borrow), AE0210-0212
+(trait), AE0220-0222 (type). All AE02xx checks run at `--check`; negatives in
+`tests/aether/negative/expect_AE02##_*.aether`.
+
+### Audit-flake note (now mitigated)
+The audit `[3/5] Workspace tests` step used to intermittently print
+`passed=122/129 failed=0 status=FAIL` (errors: 1) — a **cargo-test race on
 Windows** (a runtime integration-test exe exits non-zero without a parsed FAILED
-line), NOT a real failure — re-run `scripts/audit.ps1`, it returns
-`passed=201 failed=0 status=OK, errors: 0`. Confirm with `cargo test -p aetherc`
-(deterministic 50+ pass). See [[audit_cargo_test_flaky_on_windows]].
+line), NOT a real failure. Fixed in `9418b30`: the step now retries that exact
+signature (non-zero exit + 0 parsed failures) once. Real assertion failures
+(`failed>0`) still fail immediately and unretried. If you somehow still see it,
+re-run; confirm with `cargo test -p aetherc` (deterministic 57 pass). See
+[[audit_cargo_test_flaky_on_windows]].
 
 ### What's next on the parity path
 - 6.1 follow-ups: explicit `return e;` checking (thread expected type into the
