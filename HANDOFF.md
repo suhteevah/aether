@@ -1,6 +1,69 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 (🟢 FORMAL P20.2 landed — `aetherc --emit=ast` canonical AST dump + the self-hosted parser re-emits it BYTE-FOR-BYTE. Two independent parsers proven to agree on a real file's AST at runtime. Full audit clean, errors: 0. All committed + pushed, HEAD efea47e.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 6 deposits: real type inference engine + traits + borrow-reject + closures-as-value. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD 52a2b3e.)
+
+### Session arc — Phase 6 (Rust language parity) made REAL
+Goal set: "reach rust feature parity" = Roadmap v2 Phase 6. roadmap-tracker
+found many P6 items were TAGGED but not real (model-only islands never wired
+into the pipeline). Shipped 6 commits turning the keystone type-system + closure
+gaps into genuine, witnessed features. New diagnostic family **AE02xx**; each
+new static check runs at `--check`; negative conformance tests in
+`tests/aether/negative/expect_AE02##_*.aether`.
+
+1. **6.3 borrow checker REJECTS** (`1a62fb1`) — was wired but only COUNTED
+   violations. `mir::lifetimes` errors now carry codes (`Violation{code,msg}`),
+   `lifetimes_drive` returns them + walks nested blocks, `--check` exits 1.
+   **AE0200** mut-alias / **AE0201** shared-vs-mut / **AE0202** use-after-move /
+   **AE0203** move-while-borrowed. Witnesses: negative `expect_AE0200_mut_alias`,
+   positive `06_borrow_ok` (3 shared borrows clean). `--check`-only (lexical
+   over-approx; full compile-path needs NLL EndBorrow — documented).
+2. **6.2 traits wired** (`9d34633`) — `mir::traits_drive` puts the dead
+   `mir::traits::Resolver` on the compile path: synthesizes default-method impls
+   + completeness checks. **AE0210** missing required method / **AE0211** unknown
+   trait. EMPTY impl of undeclared trait = marker opt-in (`unsafe impl Send`),
+   allowed. Witness `trait_default_method` (Sq inherits default bonus, Rect
+   overrides → 42) + two negatives.
+3. **6.6 closures-as-value** (`c5a7fa1`) — `mir::closure_objects` (runs BEFORE
+   `mir::closures`): a CAPTURING closure passed as a value becomes a heap object
+   `[fn_ptr|caps]`; calls through a closure-object local / `Closure`-typed param
+   rewrite to `{let fp=aether_load_i64(obj,0); fp(obj,args)}` reusing the
+   EXISTING indirect-call path — ZERO asm-backend changes. New runtime
+   `aether_load_i64`/`aether_store_i64`. Witness `closure_capture_value`
+   (acc=37 survives `apply(inc,5)` → 42). By-value captures only.
+4. **6.1 type inference ENGINE** (`aaac189`, `44edbcd`, `52a2b3e`) — was MISSING.
+   `mir::infer` = real Algorithm-W kernel (TyVar union-find, `unify` + occurs
+   check, 7 unit tests). Catches scalar mismatches the storage-class default
+   silently accepted: **AE0220** let-vs-value, **AE0221** call-arg-vs-param,
+   **AE0222** return-vs-body-tail. Conservative concrete-scalar-only rule → zero
+   false positives swept across runtime+examples+stdlib. Negatives
+   `expect_AE0220/0221/0222_*`. Existing `hm_inference` (annotation-less) still
+   clean. Int widths bucketed (Aether casts freely).
+
+See [[p6_rust_parity_typesystem_push]] for the per-pass ownership + codes.
+
+### Audit-flake note (do not panic on it)
+The audit `[3/5] Workspace tests` step intermittently prints
+`passed=122/129 failed=0 status=FAIL` (errors: 1). That's a **cargo-test race on
+Windows** (a runtime integration-test exe exits non-zero without a parsed FAILED
+line), NOT a real failure — re-run `scripts/audit.ps1`, it returns
+`passed=201 failed=0 status=OK, errors: 0`. Confirm with `cargo test -p aetherc`
+(deterministic 50+ pass). See [[audit_cargo_test_flaky_on_windows]].
+
+### What's next on the parity path
+- 6.1 follow-ups: explicit `return e;` checking (thread expected type into the
+  walk); type-generic inference at call sites (extends the const-generic
+  worklist) — unblocks 6.7 Box/Vec<T>/HashMap.
+- 6.2 follow-ups: associated types, supertraits, `dyn Trait` vtables, generic
+  trait dispatch via monomorphization.
+- 6.6 follow-ups: mut-capture-as-value, inline `apply(|x| .., 5)` closures,
+  FnMut/FnOnce distinction.
+- Fresh items: 6.8 iterators taking REAL user closures (now unblocked by 6.6),
+  6.9 Mutex (atomics exist), 6.13 net/process I/O. 6.10 async + 6.11 macros are
+  still model-only islands (wire like traits was).
+
+---
+
+## (prior) Last Updated — 2026-05-31 (🟢 FORMAL P20.2 landed — `aetherc --emit=ast` canonical AST dump + the self-hosted parser re-emits it BYTE-FOR-BYTE. Two independent parsers proven to agree on a real file's AST at runtime. Full audit clean, errors: 0. All committed + pushed, HEAD efea47e.)
 
 ## Session arc (this session) — FORMAL P20.2
 The prior 7 deposits (11–17) checked the self-hosted parser's S-expr against
