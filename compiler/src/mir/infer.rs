@@ -281,13 +281,36 @@ fn infer_expr(
         Expr::BoolLit(_) => Type::Bool,
         Expr::StrLit(_) => Type::Str,
         Expr::Ident(n) => env.get(n).cloned().unwrap_or_else(|| ctx.fresh()),
+        Expr::Bin { op: BinOp::Assign, lhs, rhs } => {
+            // Reassignment: `x = e` must keep x's scalar type. Infer rhs, and
+            // if the lvalue is a known concrete-scalar local, check the rhs
+            // against it (AE0224). Conservative — same scalar rule as AE0220.
+            let rt = infer_expr(ctx, sigs, env, rhs, diags);
+            if let Expr::Ident(n) = lhs.as_ref() {
+                if let Some(lt) = env.get(n).cloned() {
+                    if let Err((a, b)) = ctx.unify(&lt, &rt) {
+                        if a.is_scalar() && b.is_scalar() {
+                            diags.push(Diag::error("AE0224", "type",
+                                format!("cannot assign {} to `{}`, which is {}",
+                                    bucket_name(&b), n, bucket_name(&a)))
+                                .with_hint("assign a value of the variable's type, or insert an \
+                                    explicit `as` cast"));
+                        }
+                    }
+                } else {
+                    let _ = infer_expr(ctx, sigs, env, lhs, diags);
+                }
+            } else {
+                let _ = infer_expr(ctx, sigs, env, lhs, diags);
+            }
+            Type::Unit
+        }
         Expr::Bin { op, lhs, rhs } => {
             let lt = infer_expr(ctx, sigs, env, lhs, diags);
             let rt = infer_expr(ctx, sigs, env, rhs, diags);
             match op {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
                 | BinOp::And | BinOp::Or => Type::Bool,
-                BinOp::Assign => Type::Unit,
                 _ => {
                     let lr = ctx.resolve(&lt);
                     if lr.is_scalar() { lr } else { ctx.resolve(&rt) }

@@ -1,0 +1,10 @@
+// Reassigning a float to an i64 variable must be rejected.
+//
+// P6.1 — mir::infer knows `x` is an integer (from its `let` annotation) and
+// infers the rhs `2.5` as a float; the reassignment's concrete scalar clash
+// surfaces as AE0224.
+fn main() -> i32 {
+    let mut x: i64 = 0;
+    x = 2.5;
+    x as i32
+}
