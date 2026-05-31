@@ -1,6 +1,20 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 18 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits) + borrow-reject (2 codes witnessed) + closures-as-value + iterators-with-closures + process spawn + std::env + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD b469f5e.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 22 commits: real type inference engine (5 scalar checks) + traits (default/completeness/supertraits) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + **struct-return ABI + From/.into()** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0. HEAD 4a88a0d.)
+
+### LATEST (after the 18-commit summary below): struct-return ABI + From/.into()
+- **6.5 struct-return ABI** (`4404a3a`) — fns returning a small (≤2 i64-field)
+  struct now use the enum-payload 2-register ABI (field0→rax, field1→rdx).
+  Callee marshals the struct-literal tail; `let p: T = make()` unmarshals into
+  p's field slots (count_locals already reserved them via the struct-typed-let
+  branch, so the dual-pass slot invariant held with NO count_locals change —
+  the first asm-backend change of the arc, zero regressions). Witness
+  `struct_return` (make() → Pt{40,2}; p.x+p.y = 42). v1: struct-literal tail
+  only; >2 fields / float fields still error (sret follow-up).
+- **6.5 From + .into()** (`4a88a0d`) — compounds traits + struct-return. Parser
+  takes `impl From<i64> for T`; `mir::into_desugar` rewrites `let x: T =
+  e.into()` → `T::from(e)`; From/Into are builtin traits exempt from AE0211.
+  Witness `from_into` (impl From<i64> for Celsius; 40.into() → deg 42).
 
 ### Session arc — Phase 6 (Rust language parity) made REAL
 Goal set: "reach rust feature parity" = Roadmap v2 Phase 6. roadmap-tracker
@@ -73,15 +87,14 @@ See [[p6_rust_parity_typesystem_push]] for the per-pass ownership + codes.
 witnessed e2e), AE0210-0212 (trait), AE0220-0222 + AE0224 (type). All AE02xx
 checks run at `--check`; negatives in `tests/aether/negative/expect_AE02##_*.aether`.
 
-### Why this is where the safe ground ends (next steps need XL subsystems)
-The clean, single-deposit P6 wins are now exhausted. The remaining items each
+### The frontier now (struct-return + From DONE; next steps need XL subsystems)
+The struct-return ABI + From/.into() are SHIPPED (4404a3a / 4a88a0d) — the first
+asm-backend changes of the arc, done with zero regressions. Remaining items each
 need a large/risky subsystem, NOT a quick deposit:
-- **From/.into() (6.5)** is blocked on the **struct-return ABI** — verified
-  broken: `fn make() -> Pt { Pt{..} }` fails to link. A fn returning a struct
-  by value needs rax:rdx (≤16B; the enum-payload 2-reg ABI is the seed) or sret.
-  This is asm-backend work — the one area deliberately untouched all session to
-  hold the zero-regression streak (all 18 commits were analysis-pass / AST-
-  rewrite / runtime-FFI).
+- **Larger struct returns** — the v1 is ≤2 i64 fields (rax:rdx). >2 fields or
+  any float field need an **sret hidden-pointer ABI** (caller passes a result
+  pointer in rcx; callee writes fields through it; args shift right). Mirror the
+  struct-return detection but route to sret when `!small`.
 - **Generics (type params + monomorphization)** — keystone, unblocks
   Box/Vec<T>/HashMap (6.7) + generic traits + Iterator trait. Extends the
   const-generic worklist but hits the same storage-class/asm-backend wall.
@@ -93,8 +106,8 @@ Recommended next: tackle the **struct-return ABI** as a dedicated TDD deposit
 (it unblocks From + builders + generic struct returns), accepting it's the first
 asm-backend change of the arc — do it isolated, sweep the full runtime suite.
 
-#### Struct-return ABI — precise plan (scoped, ready to implement)
-Exact failure: `fn make() -> Pt { Pt{..} }` hits `compiler/src/codegen/asm/mod.rs:3042`
+#### Struct-return ABI — SHIPPED (4404a3a). Original plan kept below for the sret follow-up.
+Exact failure (now fixed): `fn make() -> Pt { Pt{..} }` hit `compiler/src/codegen/asm/mod.rs:3042`
 "struct literal must appear directly as the rhs of `let x: T = T {…};`" — a
 StructLit is only materialized when it's a `let` rhs (mod.rs:1951), never in
 return position. Mirror the EXISTING enum-payload 2-register ABI (tag→rax,
