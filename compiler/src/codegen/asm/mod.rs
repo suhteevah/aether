@@ -2146,11 +2146,24 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                 let sd = locals.struct_decls.get(lit_name).cloned()
                     .ok_or(AsmError::UnsupportedExpr("struct literal: unknown type"))?;
                 locals.struct_locals.insert(name.clone(), lit_name.clone());
+                // Generic struct: map the field type params to the annotation's
+                // concrete args, so `let p: Pair<f32> = Pair { … }` gives the
+                // fields f32 storage instead of the Int default.
+                let type_subst: HashMap<String, Ty> = match ty {
+                    Some(Ty::Generic { name: ann_name, args }) if ann_name == lit_name => {
+                        sd.generics.iter().cloned().zip(args.iter().cloned()).collect()
+                    }
+                    _ => HashMap::new(),
+                };
                 // Allocate one slot per declared field under `name.field` keys.
                 for field in &sd.fields {
                     let key = format!("{}.{}", name, field.name);
                     let slot = locals.alloc(&key);
-                    let kind = TyKind::from_ty(&field.ty).unwrap_or(TyKind::Int);
+                    let resolved_ty = match &field.ty {
+                        Ty::Named(n) => type_subst.get(n).cloned().unwrap_or_else(|| field.ty.clone()),
+                        other => other.clone(),
+                    };
+                    let kind = TyKind::from_ty(&resolved_ty).unwrap_or(TyKind::Int);
                     locals.types.insert(key, kind);
                     let _ = slot;
                 }

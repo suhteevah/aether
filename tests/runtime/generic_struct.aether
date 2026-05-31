@@ -1,0 +1,15 @@
+// roadmap: P6.1
+// expect: exit=42
+//
+// Generic structs `struct Pair<T> { a: T, b: T }` instantiated at the use site.
+// The field type param `T` resolves from the `Pair<i64>` / `Pair<f32>`
+// annotation, so each instantiation lays its fields out with the correct
+// storage class (i64 slots vs f32 xmm slots).
+struct Pair<T> { a: T, b: T }
+
+fn main() -> i32 {
+    let pi: Pair<i64> = Pair { a: 40, b: 2 };       // i64 fields
+    let pf: Pair<f32> = Pair { a: 30.0, b: 10.0 };  // f32 fields
+    let s: f32 = pf.a + pf.b;                        // 40.0
+    (pi.a + pi.b + (s as i64) - 40) as i32          // 42 + 40 - 40 = 42
+}
