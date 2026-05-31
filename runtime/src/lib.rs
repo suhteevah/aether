@@ -881,6 +881,23 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     *(p as *mut u8).add(i as usize) = (v & 0xFF) as u8;
 }
 
+/// Load the i64 word at element index `i` (byte offset `i*8`) of the buffer.
+/// Used by the closure-object ABI (P6.6): a closure value is a heap block
+/// laid out as `[fn_ptr | cap0 | cap1 | ...]`, so `aether_load_i64(obj, 0)`
+/// fetches the code pointer and `aether_load_i64(obj, 1+k)` fetches capture k.
+#[no_mangle] pub unsafe extern "C" fn aether_load_i64(p: i64, i: i64) -> i64 {
+    if p == 0 || i < 0 { return 0; }
+    *(p as *const i64).add(i as usize)
+}
+
+/// Store the i64 word `v` at element index `i` (byte offset `i*8`). The
+/// closure-object constructor uses this to write the code pointer + captured
+/// values into the heap block. See `aether_load_i64`.
+#[no_mangle] pub unsafe extern "C" fn aether_store_i64(p: i64, i: i64, v: i64) {
+    if p == 0 || i < 0 { return; }
+    *(p as *mut i64).add(i as usize) = v;
+}
+
 // ─── FR-15.3 (AVX2) — witness helpers ───────────────────────────────────────
 // These three fns let an `.aether` source build two f32 arrays, call the
 // compiler's recognized `__aether_avx2_dot_f32` builtin on them, and compare

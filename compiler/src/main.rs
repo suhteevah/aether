@@ -349,6 +349,17 @@ fn main() {
         }
     }
 
+    // P6.6 — closure-object lowering. Runs BEFORE the closure-lifting pass so
+    // it can fully lower the cases that pass deliberately punts on: a CAPTURING
+    // closure bound to a local and passed as a value (`apply(inc, 5)`). These
+    // become heap `[fn_ptr | caps…]` objects + an env-prepending indirect call
+    // (through params typed `Closure`); everything it doesn't touch flows on to
+    // mir::closures unchanged.
+    let cobj = mir::closure_objects::run(&mut prog);
+    if cobj > 0 && !args.json_errors {
+        eprintln!("[aetherc] lowered {} capturing closure(s) to heap objects", cobj);
+    }
+
     // Closure-lifting pass. Walks every `Expr::Closure { params, body }` in
     // the program and lifts it to a synthetic `__closure_<n>` top-level fn,
     // rewriting the closure expression in-place to `Expr::Ident(<lifted_name>)`

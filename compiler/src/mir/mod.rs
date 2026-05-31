@@ -19,6 +19,7 @@ use crate::ast::*;
 pub mod adgraph;
 pub mod fuse;
 pub mod closures;
+pub mod closure_objects;
 pub mod spec;
 pub mod ssa;
 pub mod opt;
