@@ -1,6 +1,29 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-30 EVE (🟢 P20.2 self-hosted parser is REAL now (was a stamp) — builds an explicit AST + walks it; fixed a real early-return frame-size codegen bug en route. Audit clean.)
+## Last Updated — 2026-05-30 EOD (🟢 huge session — full arc below. Latest: self-hosted parser shipped 7 deposits (11–17), now a real file-driven mini-language parser. All committed + pushed to origin/main, HEAD 6231981, audit clean.)
+
+## Session arc (newest → oldest, all committed + pushed)
+1. **P20.2 self-hosted parser — 7 deposits (11–17)** [[selfhosted_parser_deposits]]:
+   real AST-building parser in Aether (was a stamp). Now reads a `.aether` file off
+   disk and parses fn/params/calls/blocks/let/assign/while/return/if-else/6-compares/
+   `+-*/%`/unary into a real AST → re-emits S-expr → separate eval-walk → 42. 7
+   witnesses `tests/runtime/selfhost_parser_*.aether`, all exit 42.
+2. **P16.19 native slices** — `&[i64]/&[u8]/&str/&[f32]`, `.len()`, `s[i]`, `&s[a..b]`,
+   `&v[..]`, `for x in s`. Real impl in the asm backend [[slices_are_two_field_structs]].
+3. **Compiler fix**: early-return frame-size bug (Return used live frame_bytes() not the
+   cache → SIGSEGV in any fn with an early return before a later local)
+   [[asm_frame_size_invariant]].
+4. **P100 perf** (earlier): batched-decode N≥4 crash FIXED (dual page-table divergence) +
+   Q6_K seqB weight-reuse (**N=8 batched 23.1→34.1 tok/s, +47%, continuous batching now a
+   net win**) + fp16 batched-seqB explored & CLOSED (latency-bound, not FMA-bound)
+   [[batched_decode_primitives]] [[p100_quant_matmul_lever_is_fp16]].
+
+## Project Status (end of session)
+🟢 Everything green + pushed. Audit `errors: 0`, `OK - audit clean`. No uncommitted work.
+Next: continue the self-host parser toward FORMAL P20.2 (structs/types/attributes →
+re-emit matching the Rust-aetherc AST dump on a real file) — see the parser section below.
+
+## (prior detail) Last Updated — 2026-05-30 EVE (🟢 P20.2 self-hosted parser is REAL now (was a stamp) — builds an explicit AST + walks it; fixed a real early-return frame-size codegen bug en route. Audit clean.)
 
 ## Project Status
 🟢 Continued the language/self-host redirect. Shipped **P16.19 slices** (native
