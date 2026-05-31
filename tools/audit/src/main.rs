@@ -176,12 +176,16 @@ fn main() {
                 // A real assertion failure (`failed > 0`) fails immediately and
                 // is NOT retried. But a non-zero exit with ZERO parsed failures
                 // is the Windows cargo-test race (a runtime integration-test exe
-                // aborts/fails-to-spawn, truncating the run) — retry once. A
-                // transient race clears; a persistent crash still fails.
-                if !ok && total_failed == 0 {
+                // aborts/fails-to-spawn, truncating the run) — retry up to 2 more
+                // times. A transient race clears; a persistent crash still fails
+                // after all attempts. The race occasionally hits twice in a row,
+                // so a single retry isn't enough.
+                let mut attempts = 1;
+                while !ok && total_failed == 0 && attempts < 3 {
+                    attempts += 1;
                     if let Ok((p2, f2, ok2)) = run_once() {
                         total_passed = p2; total_failed = f2; ok = ok2;
-                    }
+                    } else { break; }
                 }
                 // Status is honest: OK iff cargo succeeded AND no failures.
                 let status_ok = ok && total_failed == 0;
