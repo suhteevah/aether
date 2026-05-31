@@ -1,0 +1,24 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Supertraits: `trait Pet: Animal` requires every `impl Pet for T` to also
+// supply `impl Animal for T`. Dog implements both (Animal via the inherited
+// `legs` default, Pet via `name_id`), so dispatch through both works.
+trait Animal {
+    fn legs(&self) -> i32 { 4 }     // default
+}
+trait Pet: Animal {
+    fn name_id(&self) -> i32;       // required
+}
+
+struct Dog { id: i32 }
+
+impl Animal for Dog { }             // inherits legs() = 4
+impl Pet for Dog {
+    fn name_id(&self) -> i32 { 38 }
+}
+
+fn main() -> i32 {
+    let d: Dog = Dog { id: 1 };
+    d.legs() + d.name_id()          // 4 + 38 = 42
+}

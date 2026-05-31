@@ -1,0 +1,19 @@
+// An impl of a trait with a supertrait bound must also implement the supertrait.
+//
+// P6.2 — `trait Pet: Animal` means every `impl Pet for T` requires
+// `impl Animal for T`. `Cat` implements `Pet` but not `Animal`, so
+// mir::traits_drive rejects it with AE0212.
+trait Animal {
+    fn legs(&self) -> i32;
+}
+trait Pet: Animal {
+    fn name_id(&self) -> i32;
+}
+
+struct Cat { id: i32 }
+
+impl Pet for Cat {
+    fn name_id(&self) -> i32 { 0 }
+}
+
+fn main() -> i32 { 0 }

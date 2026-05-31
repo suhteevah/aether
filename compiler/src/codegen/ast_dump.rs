@@ -98,7 +98,7 @@ fn dump_item(item: &Item, out: &mut String) {
             }
         }
         // Trait declarations carry signatures only (no bodies); dump the shape.
-        Item::Trait { name, methods } => {
+        Item::Trait { name, methods, .. } => {
             out.push_str("(trait ");
             out.push_str(name);
             for m in methods {

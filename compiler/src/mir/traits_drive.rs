@@ -34,11 +34,21 @@ pub struct TraitReport {
 }
 
 pub fn run(prog: &mut Program) -> TraitReport {
-    // 1. Collect trait declarations (full FnDecls, so default bodies survive).
+    // 1. Collect trait declarations (full FnDecls, so default bodies survive)
+    //    + each trait's supertrait bounds.
     let mut trait_methods: HashMap<String, Vec<FnDecl>> = HashMap::new();
+    let mut supertraits: HashMap<String, Vec<String>> = HashMap::new();
     for it in &prog.items {
-        if let Item::Trait { name, methods } = it {
+        if let Item::Trait { name, methods, supertraits: st } = it {
             trait_methods.insert(name.clone(), methods.clone());
+            supertraits.insert(name.clone(), st.clone());
+        }
+    }
+    // Which (type) implements which trait — for supertrait satisfaction checks.
+    let mut impls_of: HashMap<String, HashSet<String>> = HashMap::new();
+    for it in &prog.items {
+        if let Item::ImplTrait { trait_name, type_name, .. } = it {
+            impls_of.entry(type_name.clone()).or_default().insert(trait_name.clone());
         }
     }
 
@@ -104,6 +114,25 @@ pub fn run(prog: &mut Program) -> TraitReport {
               trait method a default body so impls can inherit it")
         };
         diags.push(Diag::error(code, "trait", msg).with_hint(hint));
+    }
+
+    // Supertrait satisfaction: `impl Pet for Dog` requires `impl Animal for Dog`
+    // when `trait Pet: Animal`. Missing supertrait impl -> AE0212.
+    for it in &prog.items {
+        if let Item::ImplTrait { trait_name, type_name, .. } = it {
+            let Some(supers) = supertraits.get(trait_name) else { continue; };
+            let provided = impls_of.get(type_name);
+            for sup in supers {
+                let has = provided.map_or(false, |s| s.contains(sup));
+                if !has {
+                    diags.push(Diag::error("AE0212", "trait",
+                        format!("`{}` requires supertrait `{}`, but `{}` does not implement it",
+                            trait_name, sup, type_name))
+                        .with_hint(format!("add `impl {} for {} {{ ... }}` so the supertrait \
+                            bound on `{}` is satisfied", sup, type_name, trait_name)));
+                }
+            }
+        }
     }
 
     TraitReport { synthesized_defaults, diags }

@@ -18,11 +18,12 @@ pub enum Item {
     /// then desugars to `Foo__bar(obj, x)` when `obj` is of struct
     /// type `Foo`.
     Impl { type_name: String, methods: Vec<FnDecl> },
-    /// `trait Foo { fn bar(&self) -> i32; }` — declares a trait with a list
-    /// of method signatures. Today only used by `mir::traits::Resolver` for
-    /// completeness checks; static dispatch still goes through `Item::Impl`'s
-    /// per-type method tables.
-    Trait { name: String, methods: Vec<FnDecl> },
+    /// `trait Foo: Super1 + Super2 { fn bar(&self) -> i32; }` — declares a
+    /// trait with optional supertrait bounds + a list of method signatures.
+    /// `mir::traits` checks completeness + that an `impl Foo for T` also
+    /// supplies `impl SuperN for T`. Static dispatch still goes through
+    /// `Item::Impl`'s per-type method tables.
+    Trait { name: String, supertraits: Vec<String>, methods: Vec<FnDecl> },
     /// `impl Foo for Bar { fn bar(&self) -> i32 { ... } }`. Lowered to the
     /// same `<Bar>__bar` mangling as inherent `impl`. The `trait_name` is
     /// recorded so the trait resolver can verify completeness.

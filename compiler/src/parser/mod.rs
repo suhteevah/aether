@@ -297,6 +297,16 @@ impl Parser {
     fn parse_trait_item(&mut self) -> PResult<Item> {
         self.expect(Tok::Trait)?;
         let name = self.expect_ident()?;
+        // Optional supertrait bounds: `trait Pet: Animal + Named { ... }`.
+        let mut supertraits = Vec::new();
+        if matches!(self.peek(0), Tok::Colon) {
+            self.bump();
+            supertraits.push(self.expect_ident()?);
+            while matches!(self.peek(0), Tok::Plus) {
+                self.bump();
+                supertraits.push(self.expect_ident()?);
+            }
+        }
         self.expect(Tok::LBrace)?;
         let mut methods = Vec::new();
         while !matches!(self.peek(0), Tok::RBrace) {
@@ -306,7 +316,7 @@ impl Parser {
             methods.push(m);
         }
         self.expect(Tok::RBrace)?;
-        Ok(Item::Trait { name, methods })
+        Ok(Item::Trait { name, supertraits, methods })
     }
 
     fn parse_match_pat(&mut self) -> PResult<MatchPat> {
