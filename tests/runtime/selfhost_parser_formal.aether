@@ -1,0 +1,839 @@
+// expect: exit=42
+// roadmap: P20.2
+// expect: stdout contains MATCH: self-hosted AST == aetherc --emit=ast
+//
+// SELF-HOSTED PARSER (P20.2) — Deposit 18: FORMAL byte-for-byte AST match.
+//
+// Every prior deposit (11-17) re-emitted the parsed AST as an S-expression
+// and checked it against a hardcoded `// expect:` string. This deposit closes
+// the loop: it parses the SAME `.aether` file that Rust-aetherc parses, emits
+// the SAME canonical S-expression format that `aetherc --emit=ast` emits, and
+// then at runtime READS the committed Rust dump off disk and compares the two
+// byte-for-byte. The exit code is 42 IFF the self-hosted parser's output is
+// identical to Rust-aetherc's --emit=ast output — i.e. the two independent
+// parsers agree on the AST of a real program.
+//
+//   shared input    : tests/golden/inputs/p20_2.aether
+//   Rust dump (gold): tests/golden/expected/p20_2.ast.expected   (golden-locked
+//                     against fresh `aetherc --emit=ast` every audit run)
+//   this witness    : parses the input, builds the dump into a heap buffer,
+//                     reads the gold file, and `aether_bytes_eq`'s them.
+//
+// Chain of trust:
+//   golden dimension : committed .ast.expected == fresh `aetherc --emit=ast`
+//                      (Rust dumper stays honest)
+//   this runtime test: self-hosted fresh parse == committed .ast.expected
+//                      (self-hosted parser matches Rust, byte-for-byte)
+//   => self-hosted AST == Rust AST, transitively, re-checked every audit.
+//
+// The canonical format (see compiler/src/codegen/ast_dump.rs):
+//   (fn NAME (params NAME*) (block STMT* TAIL?))   ; one fn per line, LF-terminated
+//   stmt := (let NAME EXPR) | (assign NAME EXPR) | (return EXPR) | EXPR
+//   expr := INT | NAME | (OP EXPR EXPR) | (neg E) | (not E)
+//         | (call NAME EXPR*) | (if E BLOCK BLOCK?) | (while E BLOCK)
+//   Types are ELIDED — a param `n: i64` dumps as just `n`.
+//
+// Unlike the eval-driven deposits, this witness does NOT evaluate the program
+// — the exit code comes from the AST COMPARISON, not from running `main`.
+use runtime;
+
+// --- Token kinds -----------------------------------------------------
+const TOK_NUM:     i64 = 1;
+const TOK_IDENT:   i64 = 2;
+const TOK_LET:     i64 = 3;
+const TOK_EQ:      i64 = 4;
+const TOK_SEMI:    i64 = 5;
+const TOK_PLUS:    i64 = 6;
+const TOK_MINUS:   i64 = 7;
+const TOK_STAR:    i64 = 8;
+const TOK_LPAREN:  i64 = 9;
+const TOK_RPAREN:  i64 = 10;
+const TOK_FN:      i64 = 11;
+const TOK_ARROW:   i64 = 12;
+const TOK_LBRACE:  i64 = 13;
+const TOK_RBRACE:  i64 = 14;
+const TOK_COMMA:   i64 = 15;
+const TOK_IF:      i64 = 16;
+const TOK_ELSE:    i64 = 17;
+const TOK_LT:      i64 = 18;
+const TOK_GT:      i64 = 19;
+const TOK_EQEQ:    i64 = 20;
+const TOK_NE:      i64 = 21;
+const TOK_LE:      i64 = 22;
+const TOK_GE:      i64 = 23;
+const TOK_SLASH:   i64 = 24;
+const TOK_PERCENT: i64 = 25;
+const TOK_BANG:    i64 = 26;
+const TOK_WHILE:   i64 = 27;
+const TOK_RETURN:  i64 = 28;
+const TOK_COLON:   i64 = 29;   // `:` — param/let type annotations
+const TOK_EOF:     i64 = 0;
+
+// --- AST node kinds (kind, a, b) packed 3-i64 records ----------------
+const NODE_NUM:     i64 = 1;
+const NODE_IDENT:   i64 = 2;
+const NODE_ADD:     i64 = 3;
+const NODE_SUB:     i64 = 4;
+const NODE_MUL:     i64 = 5;
+const NODE_FN:      i64 = 6;
+const NODE_BLOCK:   i64 = 7;
+const NODE_STMT:    i64 = 8;
+const NODE_LETSTMT: i64 = 9;
+const NODE_PARAM:   i64 = 10;
+const NODE_CALL:    i64 = 11;
+const NODE_ARG:     i64 = 12;
+const NODE_LT:      i64 = 13;
+const NODE_GT:      i64 = 14;
+const NODE_EQ:      i64 = 15;
+const NODE_NE:      i64 = 16;
+const NODE_LE:      i64 = 17;
+const NODE_GE:      i64 = 18;
+const NODE_IF:      i64 = 19;
+const NODE_IFARMS:  i64 = 20;
+const NODE_DIV:     i64 = 21;
+const NODE_MOD:     i64 = 22;
+const NODE_NEG:     i64 = 23;
+const NODE_NOT:     i64 = 24;
+const NODE_ASSIGN:  i64 = 25;
+const NODE_WHILE:   i64 = 26;
+const NODE_RETURN:  i64 = 27;
+
+const MAX_TOKENS: i64 = 512;
+const MAX_NODES:  i64 = 512;
+const FN_CAP:     i64 = 32;
+
+// --- Generic 3-i64 packed-record buffer (tokens AND ast nodes) -------
+fn write_rec(buf: i64, idx: i64, f0: i64, f1: i64, f2: i64) {
+    let base = idx * 24;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(buf, base + k,      (f0 >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 8  + k, (f1 >> (k * 8)) & 255);
+        aether_byte_set(buf, base + 16 + k, (f2 >> (k * 8)) & 255);
+        k += 1;
+    }
+}
+fn read_rec_field(buf: i64, idx: i64, field: i64) -> i64 {
+    let base = idx * 24 + field * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 {
+        acc = acc | (aether_byte_at(buf, base + k) << (k * 8));
+        k += 1;
+    }
+    return acc;
+}
+
+// --- Lexer -----------------------------------------------------------
+fn is_digit(b: i64) -> i64 {
+    if b >= 48 && b <= 57 { return 1; }
+    return 0;
+}
+fn is_alpha(b: i64) -> i64 {
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95 { return 1; }
+    return 0;
+}
+
+fn lex(src: i64, n: i64, toks: i64) -> i64 {
+    let mut i: i64 = 0;
+    let mut tn: i64 = 0;
+    while i < n {
+        let b = aether_byte_at(src, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 { i += 1; continue; }
+        if is_digit(b) == 1 {
+            let start = i;
+            i += 1;
+            while i < n && is_digit(aether_byte_at(src, i)) == 1 { i += 1; }
+            write_rec(toks, tn, TOK_NUM, start, i - start);
+            tn += 1;
+            continue;
+        }
+        if is_alpha(b) == 1 {
+            let start = i;
+            i += 1;
+            while i < n && (is_alpha(aether_byte_at(src, i)) == 1 || is_digit(aether_byte_at(src, i)) == 1) {
+                i += 1;
+            }
+            if (i - start) == 3 && aether_bytes_eq(src + start, "let", 3) == 1 {
+                write_rec(toks, tn, TOK_LET, start, 3);
+            } else if (i - start) == 2 && aether_bytes_eq(src + start, "fn", 2) == 1 {
+                write_rec(toks, tn, TOK_FN, start, 2);
+            } else if (i - start) == 2 && aether_bytes_eq(src + start, "if", 2) == 1 {
+                write_rec(toks, tn, TOK_IF, start, 2);
+            } else if (i - start) == 4 && aether_bytes_eq(src + start, "else", 4) == 1 {
+                write_rec(toks, tn, TOK_ELSE, start, 4);
+            } else if (i - start) == 5 && aether_bytes_eq(src + start, "while", 5) == 1 {
+                write_rec(toks, tn, TOK_WHILE, start, 5);
+            } else if (i - start) == 6 && aether_bytes_eq(src + start, "return", 6) == 1 {
+                write_rec(toks, tn, TOK_RETURN, start, 6);
+            } else {
+                write_rec(toks, tn, TOK_IDENT, start, i - start);
+            }
+            tn += 1;
+            continue;
+        }
+        if b == 45 && (i + 1) < n && aether_byte_at(src, i + 1) == 62 {
+            write_rec(toks, tn, TOK_ARROW, i, 2);
+            tn += 1; i += 2; continue;
+        }
+        if b == 61 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_EQEQ, i, 2);
+            tn += 1; i += 2; continue;
+        }
+        if b == 33 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_NE, i, 2);
+            tn += 1; i += 2; continue;
+        }
+        if b == 60 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_LE, i, 2);
+            tn += 1; i += 2; continue;
+        }
+        if b == 62 && (i + 1) < n && aether_byte_at(src, i + 1) == 61 {
+            write_rec(toks, tn, TOK_GE, i, 2);
+            tn += 1; i += 2; continue;
+        }
+        let kind = if b == 61 { TOK_EQ }
+                   else if b == 59 { TOK_SEMI }
+                   else if b == 43 { TOK_PLUS }
+                   else if b == 45 { TOK_MINUS }
+                   else if b == 42 { TOK_STAR }
+                   else if b == 47 { TOK_SLASH }
+                   else if b == 37 { TOK_PERCENT }
+                   else if b == 33 { TOK_BANG }
+                   else if b == 40 { TOK_LPAREN }
+                   else if b == 41 { TOK_RPAREN }
+                   else if b == 123 { TOK_LBRACE }
+                   else if b == 125 { TOK_RBRACE }
+                   else if b == 44 { TOK_COMMA }
+                   else if b == 58 { TOK_COLON }
+                   else if b == 60 { TOK_LT }
+                   else if b == 62 { TOK_GT }
+                   else { 0 };
+        if kind == 0 {
+            aether_print_kv_i64("LEX skip byte", b);
+            i += 1;
+            continue;
+        }
+        write_rec(toks, tn, kind, i, 1);
+        tn += 1;
+        i += 1;
+    }
+    write_rec(toks, tn, TOK_EOF, 0, 0);
+    return tn;
+}
+
+// --- Fn table (name span -> NODE_FN index) ---------------------------
+fn fn_register(fn_names: i64, fn_nodes: i64, fc_p: i64,
+               name_start: i64, name_len: i64, fn_node_idx: i64) {
+    let count = read_rec_field(fc_p, 0, 0);
+    let nbase = count * 16;
+    let mut k = 0;
+    while k < 8 {
+        aether_byte_set(fn_names, nbase + k,     (name_start >> (k * 8)) & 255);
+        aether_byte_set(fn_names, nbase + 8 + k, (name_len   >> (k * 8)) & 255);
+        k += 1;
+    }
+    let vbase = count * 8;
+    let mut k2 = 0;
+    while k2 < 8 {
+        aether_byte_set(fn_nodes, vbase + k2, (fn_node_idx >> (k2 * 8)) & 255);
+        k2 += 1;
+    }
+    write_rec(fc_p, 0, count + 1, 0, 0);
+}
+fn fn_count(fc_p: i64) -> i64 { return read_rec_field(fc_p, 0, 0); }
+fn fn_name_start_i(fn_names: i64, i: i64) -> i64 {
+    let nbase = i * 16;
+    let mut s: i64 = 0;
+    let mut k = 0;
+    while k < 8 { s = s | (aether_byte_at(fn_names, nbase + k) << (k * 8)); k += 1; }
+    return s;
+}
+fn fn_name_len_i(fn_names: i64, i: i64) -> i64 {
+    let nbase = i * 16;
+    let mut l: i64 = 0;
+    let mut k = 0;
+    while k < 8 { l = l | (aether_byte_at(fn_names, nbase + 8 + k) << (k * 8)); k += 1; }
+    return l;
+}
+fn fn_node_i(fn_nodes: i64, i: i64) -> i64 {
+    let vbase = i * 8;
+    let mut acc: i64 = 0;
+    let mut k = 0;
+    while k < 8 { acc = acc | (aether_byte_at(fn_nodes, vbase + k) << (k * 8)); k += 1; }
+    return acc;
+}
+
+// --- AST node allocator ----------------------------------------------
+fn node_alloc(nodes: i64, nc_p: i64, kind: i64, a: i64, b: i64) -> i64 {
+    let idx = read_rec_field(nc_p, 0, 0);
+    write_rec(nodes, idx, kind, a, b);
+    write_rec(nc_p, 0, idx + 1, 0, 0);
+    return idx;
+}
+
+// --- Parser (RETURNS node indices) -----------------------------------
+fn pos_get(p: i64) -> i64 { return read_rec_field(p, 0, 0); }
+fn pos_set(p: i64, v: i64) { write_rec(p, 0, v, 0, 0); }
+fn peek_kind(toks: i64, pos_p: i64) -> i64 {
+    return read_rec_field(toks, pos_get(pos_p), 0);
+}
+fn peek_kind2(toks: i64, pos_p: i64) -> i64 {
+    return read_rec_field(toks, pos_get(pos_p) + 1, 0);
+}
+fn cmp_node_kind(tok_kind: i64) -> i64 {
+    if tok_kind == TOK_LT   { return NODE_LT; }
+    if tok_kind == TOK_GT   { return NODE_GT; }
+    if tok_kind == TOK_EQEQ { return NODE_EQ; }
+    if tok_kind == TOK_NE   { return NODE_NE; }
+    if tok_kind == TOK_LE   { return NODE_LE; }
+    if tok_kind == TOK_GE   { return NODE_GE; }
+    return -1;
+}
+
+fn parse_factor(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let p = pos_get(pos_p);
+    let k = read_rec_field(toks, p, 0);
+    let s = read_rec_field(toks, p, 1);
+    let l = read_rec_field(toks, p, 2);
+    if k == TOK_LPAREN {
+        pos_set(pos_p, p + 1);
+        let inner = parse_expr(toks, pos_p, src, nodes, nc_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        return inner;
+    }
+    if k == TOK_IF {
+        pos_set(pos_p, p + 1);
+        let cond = parse_expr(toks, pos_p, src, nodes, nc_p);
+        let then_block = parse_block(toks, pos_p, src, nodes, nc_p);
+        let mut else_block: i64 = -1;
+        if peek_kind(toks, pos_p) == TOK_ELSE {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            else_block = parse_block(toks, pos_p, src, nodes, nc_p);
+        }
+        let arms = node_alloc(nodes, nc_p, NODE_IFARMS, then_block, else_block);
+        return node_alloc(nodes, nc_p, NODE_IF, cond, arms);
+    }
+    if k == TOK_NUM {
+        pos_set(pos_p, p + 1);
+        let mut acc: i64 = 0;
+        let mut i = 0;
+        while i < l {
+            acc = acc * 10 + (aether_byte_at(src, s + i) - 48);
+            i += 1;
+        }
+        return node_alloc(nodes, nc_p, NODE_NUM, acc, 0);
+    }
+    if k == TOK_IDENT {
+        pos_set(pos_p, p + 1);
+        if peek_kind(toks, pos_p) == TOK_LPAREN {
+            let callee = node_alloc(nodes, nc_p, NODE_IDENT, s, l);
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            let mut head: i64 = -1;
+            let mut prev: i64 = -1;
+            while peek_kind(toks, pos_p) != TOK_RPAREN && peek_kind(toks, pos_p) != TOK_EOF {
+                let arg_expr = parse_expr(toks, pos_p, src, nodes, nc_p);
+                let cell = node_alloc(nodes, nc_p, NODE_ARG, arg_expr, -1);
+                if head == -1 {
+                    head = cell;
+                } else {
+                    let pk = read_rec_field(nodes, prev, 0);
+                    let pa = read_rec_field(nodes, prev, 1);
+                    write_rec(nodes, prev, pk, pa, cell);
+                }
+                prev = cell;
+                if peek_kind(toks, pos_p) == TOK_COMMA {
+                    pos_set(pos_p, pos_get(pos_p) + 1);
+                }
+            }
+            if peek_kind(toks, pos_p) == TOK_RPAREN {
+                pos_set(pos_p, pos_get(pos_p) + 1);
+            }
+            return node_alloc(nodes, nc_p, NODE_CALL, callee, head);
+        }
+        return node_alloc(nodes, nc_p, NODE_IDENT, s, l);
+    }
+    pos_set(pos_p, p + 1);
+    aether_print_kv_i64("PARSE bad factor kind", k);
+    return node_alloc(nodes, nc_p, NODE_NUM, 0, 0);
+}
+
+fn parse_unary(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let k = peek_kind(toks, pos_p);
+    if k == TOK_MINUS {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let operand = parse_unary(toks, pos_p, src, nodes, nc_p);
+        return node_alloc(nodes, nc_p, NODE_NEG, operand, 0);
+    }
+    if k == TOK_BANG {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let operand = parse_unary(toks, pos_p, src, nodes, nc_p);
+        return node_alloc(nodes, nc_p, NODE_NOT, operand, 0);
+    }
+    return parse_factor(toks, pos_p, src, nodes, nc_p);
+}
+
+fn parse_term(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let mut lhs = parse_unary(toks, pos_p, src, nodes, nc_p);
+    while peek_kind(toks, pos_p) == TOK_STAR
+       || peek_kind(toks, pos_p) == TOK_SLASH
+       || peek_kind(toks, pos_p) == TOK_PERCENT {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let rhs = parse_unary(toks, pos_p, src, nodes, nc_p);
+        if op == TOK_STAR {
+            lhs = node_alloc(nodes, nc_p, NODE_MUL, lhs, rhs);
+        } else if op == TOK_SLASH {
+            lhs = node_alloc(nodes, nc_p, NODE_DIV, lhs, rhs);
+        } else {
+            lhs = node_alloc(nodes, nc_p, NODE_MOD, lhs, rhs);
+        }
+    }
+    return lhs;
+}
+
+fn parse_addsub(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let mut lhs = parse_term(toks, pos_p, src, nodes, nc_p);
+    while peek_kind(toks, pos_p) == TOK_PLUS || peek_kind(toks, pos_p) == TOK_MINUS {
+        let op = peek_kind(toks, pos_p);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let rhs = parse_term(toks, pos_p, src, nodes, nc_p);
+        if op == TOK_PLUS {
+            lhs = node_alloc(nodes, nc_p, NODE_ADD, lhs, rhs);
+        } else {
+            lhs = node_alloc(nodes, nc_p, NODE_SUB, lhs, rhs);
+        }
+    }
+    return lhs;
+}
+
+fn parse_cmp(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    let lhs = parse_addsub(toks, pos_p, src, nodes, nc_p);
+    let nk = cmp_node_kind(peek_kind(toks, pos_p));
+    if nk == -1 {
+        return lhs;
+    }
+    pos_set(pos_p, pos_get(pos_p) + 1);
+    let rhs = parse_addsub(toks, pos_p, src, nodes, nc_p);
+    return node_alloc(nodes, nc_p, nk, lhs, rhs);
+}
+
+fn parse_expr(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    return parse_cmp(toks, pos_p, src, nodes, nc_p);
+}
+
+fn parse_stmt(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    if peek_kind(toks, pos_p) == TOK_LET {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let lp = pos_get(pos_p);
+        let name_s = read_rec_field(toks, lp, 1);
+        let name_l = read_rec_field(toks, lp, 2);
+        let name_idx = node_alloc(nodes, nc_p, NODE_IDENT, name_s, name_l);
+        pos_set(pos_p, lp + 1);
+        // Optional `: TYPE` on the let binding (elided in the dump).
+        if peek_kind(toks, pos_p) == TOK_COLON {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+            if peek_kind(toks, pos_p) == TOK_IDENT {
+                pos_set(pos_p, pos_get(pos_p) + 1);
+            }
+        }
+        pos_set(pos_p, pos_get(pos_p) + 1);              // consume '='
+        let val_idx = parse_expr(toks, pos_p, src, nodes, nc_p);
+        if peek_kind(toks, pos_p) == TOK_SEMI {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+        }
+        return node_alloc(nodes, nc_p, NODE_LETSTMT, name_idx, val_idx);
+    }
+    if peek_kind(toks, pos_p) == TOK_RETURN {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let val_idx = parse_expr(toks, pos_p, src, nodes, nc_p);
+        if peek_kind(toks, pos_p) == TOK_SEMI {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+        }
+        return node_alloc(nodes, nc_p, NODE_RETURN, val_idx, 0);
+    }
+    if peek_kind(toks, pos_p) == TOK_WHILE {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let cond = parse_expr(toks, pos_p, src, nodes, nc_p);
+        let body = parse_block(toks, pos_p, src, nodes, nc_p);
+        return node_alloc(nodes, nc_p, NODE_WHILE, cond, body);
+    }
+    if peek_kind(toks, pos_p) == TOK_IDENT && peek_kind2(toks, pos_p) == TOK_EQ {
+        let ap = pos_get(pos_p);
+        let name_s = read_rec_field(toks, ap, 1);
+        let name_l = read_rec_field(toks, ap, 2);
+        let name_idx = node_alloc(nodes, nc_p, NODE_IDENT, name_s, name_l);
+        pos_set(pos_p, ap + 1);
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        let val_idx = parse_expr(toks, pos_p, src, nodes, nc_p);
+        if peek_kind(toks, pos_p) == TOK_SEMI {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+        }
+        return node_alloc(nodes, nc_p, NODE_ASSIGN, name_idx, val_idx);
+    }
+    let e = parse_expr(toks, pos_p, src, nodes, nc_p);
+    if peek_kind(toks, pos_p) == TOK_SEMI {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+    }
+    return e;
+}
+
+fn parse_block(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    pos_set(pos_p, pos_get(pos_p) + 1);
+    let mut head: i64 = -1;
+    let mut prev: i64 = -1;
+    while peek_kind(toks, pos_p) != TOK_RBRACE && peek_kind(toks, pos_p) != TOK_EOF {
+        let stmt_node = parse_stmt(toks, pos_p, src, nodes, nc_p);
+        let cell = node_alloc(nodes, nc_p, NODE_STMT, stmt_node, -1);
+        if head == -1 {
+            head = cell;
+        } else {
+            let pk = read_rec_field(nodes, prev, 0);
+            let pa = read_rec_field(nodes, prev, 1);
+            write_rec(nodes, prev, pk, pa, cell);
+        }
+        prev = cell;
+    }
+    if peek_kind(toks, pos_p) == TOK_RBRACE {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+    }
+    return node_alloc(nodes, nc_p, NODE_BLOCK, head, 0);
+}
+
+fn parse_params(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64) -> i64 {
+    if peek_kind(toks, pos_p) == TOK_LPAREN {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+    }
+    let mut head: i64 = -1;
+    let mut prev: i64 = -1;
+    while peek_kind(toks, pos_p) != TOK_RPAREN && peek_kind(toks, pos_p) != TOK_EOF {
+        let pp = pos_get(pos_p);
+        let name_s = read_rec_field(toks, pp, 1);
+        let name_l = read_rec_field(toks, pp, 2);
+        let name_idx = node_alloc(nodes, nc_p, NODE_IDENT, name_s, name_l);
+        pos_set(pos_p, pp + 1);
+        // Optional `: TYPE` annotation — Rust-aetherc requires it on params;
+        // the canonical AST dump ELIDES types, so we just consume `:` + the
+        // type-name IDENT and emit only `(params NAME)`. Matches ast_dump.rs.
+        if peek_kind(toks, pos_p) == TOK_COLON {
+            pos_set(pos_p, pos_get(pos_p) + 1);          // consume ':'
+            if peek_kind(toks, pos_p) == TOK_IDENT {
+                pos_set(pos_p, pos_get(pos_p) + 1);      // consume type name
+            }
+        }
+        let cell = node_alloc(nodes, nc_p, NODE_PARAM, name_idx, -1);
+        if head == -1 {
+            head = cell;
+        } else {
+            let pk = read_rec_field(nodes, prev, 0);
+            let pa = read_rec_field(nodes, prev, 1);
+            write_rec(nodes, prev, pk, pa, cell);
+        }
+        prev = cell;
+        if peek_kind(toks, pos_p) == TOK_COMMA {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+        }
+    }
+    if peek_kind(toks, pos_p) == TOK_RPAREN {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+    }
+    return head;
+}
+
+fn parse_fn(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64,
+            fn_names: i64, fn_nodes: i64, fc_p: i64) -> i64 {
+    pos_set(pos_p, pos_get(pos_p) + 1);
+    let np = pos_get(pos_p);
+    let name_s = read_rec_field(toks, np, 1);
+    let name_l = read_rec_field(toks, np, 2);
+    pos_set(pos_p, np + 1);
+    let params = parse_params(toks, pos_p, src, nodes, nc_p);
+    if peek_kind(toks, pos_p) == TOK_ARROW {
+        pos_set(pos_p, pos_get(pos_p) + 1);
+        if peek_kind(toks, pos_p) == TOK_IDENT {
+            pos_set(pos_p, pos_get(pos_p) + 1);
+        }
+    }
+    let body = parse_block(toks, pos_p, src, nodes, nc_p);
+    let fn_node = node_alloc(nodes, nc_p, NODE_FN, params, body);
+    fn_register(fn_names, fn_nodes, fc_p, name_s, name_l, fn_node);
+    return fn_node;
+}
+
+fn parse_program(toks: i64, pos_p: i64, src: i64, nodes: i64, nc_p: i64,
+                 fn_names: i64, fn_nodes: i64, fc_p: i64) -> i64 {
+    let mut count = 0;
+    while peek_kind(toks, pos_p) == TOK_FN {
+        parse_fn(toks, pos_p, src, nodes, nc_p, fn_names, fn_nodes, fc_p);
+        count += 1;
+    }
+    return count;
+}
+
+// --- Buffer append helpers (cursor lives in slot 0 of cur_p) ---------
+fn buf_append_cstr(buf: i64, cur_p: i64, s: i64) {
+    let mut cur = read_rec_field(cur_p, 0, 0);
+    let len = aether_str_len(s);
+    let mut i = 0;
+    while i < len {
+        aether_byte_set(buf, cur, aether_byte_at(s, i));
+        cur += 1;
+        i += 1;
+    }
+    write_rec(cur_p, 0, cur, 0, 0);
+}
+fn buf_append_span(buf: i64, cur_p: i64, src: i64, s: i64, l: i64) {
+    let mut cur = read_rec_field(cur_p, 0, 0);
+    let mut i = 0;
+    while i < l {
+        aether_byte_set(buf, cur, aether_byte_at(src, s + i));
+        cur += 1;
+        i += 1;
+    }
+    write_rec(cur_p, 0, cur, 0, 0);
+}
+fn buf_append_int(buf: i64, cur_p: i64, v: i64) {
+    if v == 0 {
+        let cur0 = read_rec_field(cur_p, 0, 0);
+        aether_byte_set(buf, cur0, 48);
+        write_rec(cur_p, 0, cur0 + 1, 0, 0);
+        return;
+    }
+    let tmp = aether_alloc_bytes(32);
+    let mut x = v;
+    let mut nd = 0;
+    while x > 0 {
+        aether_byte_set(tmp, nd, 48 + (x % 10));
+        x = x / 10;
+        nd += 1;
+    }
+    let mut cur = read_rec_field(cur_p, 0, 0);
+    let mut j = nd - 1;
+    while j >= 0 {
+        aether_byte_set(buf, cur, aether_byte_at(tmp, j));
+        cur += 1;
+        j -= 1;
+    }
+    write_rec(cur_p, 0, cur, 0, 0);
+    aether_free_bytes(tmp, 32);
+}
+
+// --- AST re-emit into a BUFFER (mirrors compiler/src/codegen/ast_dump.rs) ---
+fn emit_buf(nodes: i64, src: i64, buf: i64, cur_p: i64, idx: i64) {
+    let k = read_rec_field(nodes, idx, 0);
+    let a = read_rec_field(nodes, idx, 1);
+    let b = read_rec_field(nodes, idx, 2);
+    if k == NODE_NUM {
+        buf_append_int(buf, cur_p, a);
+        return;
+    }
+    if k == NODE_IDENT {
+        buf_append_span(buf, cur_p, src, a, b);
+        return;
+    }
+    if k == NODE_BLOCK {
+        buf_append_cstr(buf, cur_p, "(block");
+        let mut cell = a;
+        while cell != -1 {
+            buf_append_cstr(buf, cur_p, " ");
+            let stmt_node = read_rec_field(nodes, cell, 1);
+            emit_buf(nodes, src, buf, cur_p, stmt_node);
+            cell = read_rec_field(nodes, cell, 2);
+        }
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_LETSTMT {
+        buf_append_cstr(buf, cur_p, "(let ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, " ");
+        emit_buf(nodes, src, buf, cur_p, b);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_ASSIGN {
+        buf_append_cstr(buf, cur_p, "(assign ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, " ");
+        emit_buf(nodes, src, buf, cur_p, b);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_WHILE {
+        buf_append_cstr(buf, cur_p, "(while ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, " ");
+        emit_buf(nodes, src, buf, cur_p, b);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_RETURN {
+        buf_append_cstr(buf, cur_p, "(return ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_CALL {
+        buf_append_cstr(buf, cur_p, "(call ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        let mut acell = b;
+        while acell != -1 {
+            buf_append_cstr(buf, cur_p, " ");
+            let arg_node = read_rec_field(nodes, acell, 1);
+            emit_buf(nodes, src, buf, cur_p, arg_node);
+            acell = read_rec_field(nodes, acell, 2);
+        }
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_IF {
+        buf_append_cstr(buf, cur_p, "(if ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        let then_block = read_rec_field(nodes, b, 1);
+        let else_block = read_rec_field(nodes, b, 2);
+        buf_append_cstr(buf, cur_p, " ");
+        emit_buf(nodes, src, buf, cur_p, then_block);
+        if else_block != -1 {
+            buf_append_cstr(buf, cur_p, " ");
+            emit_buf(nodes, src, buf, cur_p, else_block);
+        }
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_NEG {
+        buf_append_cstr(buf, cur_p, "(neg ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_NOT {
+        buf_append_cstr(buf, cur_p, "(not ");
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    if k == NODE_LT || k == NODE_GT || k == NODE_EQ
+       || k == NODE_NE || k == NODE_LE || k == NODE_GE {
+        buf_append_cstr(buf, cur_p, "(");
+        if k == NODE_LT { buf_append_cstr(buf, cur_p, "< "); }
+        else if k == NODE_GT { buf_append_cstr(buf, cur_p, "> "); }
+        else if k == NODE_EQ { buf_append_cstr(buf, cur_p, "== "); }
+        else if k == NODE_NE { buf_append_cstr(buf, cur_p, "!= "); }
+        else if k == NODE_LE { buf_append_cstr(buf, cur_p, "<= "); }
+        else { buf_append_cstr(buf, cur_p, ">= "); }
+        emit_buf(nodes, src, buf, cur_p, a);
+        buf_append_cstr(buf, cur_p, " ");
+        emit_buf(nodes, src, buf, cur_p, b);
+        buf_append_cstr(buf, cur_p, ")");
+        return;
+    }
+    // Binary arithmetic: + - / % *
+    buf_append_cstr(buf, cur_p, "(");
+    if k == NODE_ADD { buf_append_cstr(buf, cur_p, "+ "); }
+    else if k == NODE_SUB { buf_append_cstr(buf, cur_p, "- "); }
+    else if k == NODE_DIV { buf_append_cstr(buf, cur_p, "/ "); }
+    else if k == NODE_MOD { buf_append_cstr(buf, cur_p, "% "); }
+    else { buf_append_cstr(buf, cur_p, "* "); }
+    emit_buf(nodes, src, buf, cur_p, a);
+    buf_append_cstr(buf, cur_p, " ");
+    emit_buf(nodes, src, buf, cur_p, b);
+    buf_append_cstr(buf, cur_p, ")");
+}
+
+// (fn NAME (params NAME*) BODY) — NAME comes from the fn table.
+fn emit_fn_buf(nodes: i64, src: i64, buf: i64, cur_p: i64,
+               fnode: i64, name_s: i64, name_l: i64) {
+    let params_head = read_rec_field(nodes, fnode, 1);
+    let body = read_rec_field(nodes, fnode, 2);
+    buf_append_cstr(buf, cur_p, "(fn ");
+    buf_append_span(buf, cur_p, src, name_s, name_l);
+    buf_append_cstr(buf, cur_p, " (params");
+    let mut pcell = params_head;
+    while pcell != -1 {
+        buf_append_cstr(buf, cur_p, " ");
+        let name_node = read_rec_field(nodes, pcell, 1);
+        emit_buf(nodes, src, buf, cur_p, name_node);
+        pcell = read_rec_field(nodes, pcell, 2);
+    }
+    buf_append_cstr(buf, cur_p, ") ");
+    emit_buf(nodes, src, buf, cur_p, body);
+    buf_append_cstr(buf, cur_p, ")");
+}
+
+fn print_cstr(s: i64) {
+    aether_print_bytes(s, aether_str_len(s));
+}
+
+// --- main ------------------------------------------------------------
+fn main() -> i32 {
+    // 1. Read the SHARED input file (the same one aetherc --emit=ast parses).
+    let in_path = "tests/golden/inputs/p20_2.aether";
+    let src = aether_read_file(in_path);
+    if src == 0 {
+        print_cstr("could not read input\n");
+        return 1;
+    }
+    let n = aether_file_size_last();
+
+    // 2. Lex + parse into an AST node buffer + fn table.
+    let toks = aether_alloc_bytes(MAX_TOKENS * 24);
+    lex(src, n, toks);
+
+    let nodes = aether_alloc_bytes(MAX_NODES * 24);
+    let nc_p  = aether_alloc_bytes(24);
+    write_rec(nc_p, 0, 0, 0, 0);
+
+    let fn_names = aether_alloc_bytes(FN_CAP * 16);
+    let fn_nodes = aether_alloc_bytes(FN_CAP * 8);
+    let fc_p     = aether_alloc_bytes(24);
+    write_rec(fc_p, 0, 0, 0, 0);
+
+    let pos_p = aether_alloc_bytes(24);
+    pos_set(pos_p, 0);
+
+    parse_program(toks, pos_p, src, nodes, nc_p, fn_names, fn_nodes, fc_p);
+
+    // 3. Build the canonical AST dump into a heap buffer — one (fn ...) per
+    //    line, LF-terminated — iterating the fn table by index (no byte
+    //    offsets assumed).
+    let dump = aether_alloc_bytes(8192);
+    let dcur = aether_alloc_bytes(24);
+    write_rec(dcur, 0, 0, 0, 0);
+    let nfn = fn_count(fc_p);
+    let mut fi = 0;
+    while fi < nfn {
+        let fnode = fn_node_i(fn_nodes, fi);
+        let ns = fn_name_start_i(fn_names, fi);
+        let nl = fn_name_len_i(fn_names, fi);
+        emit_fn_buf(nodes, src, dump, dcur, fnode, ns, nl);
+        buf_append_cstr(dump, dcur, "\n");
+        fi += 1;
+    }
+    let dlen = read_rec_field(dcur, 0, 0);
+
+    // Print the self-hosted dump for human visibility.
+    print_cstr("SELF-HOSTED AST DUMP:\n");
+    aether_print_bytes(dump, dlen);
+
+    // 4. Read the committed Rust-aetherc dump and compare byte-for-byte.
+    let exp_path = "tests/golden/expected/p20_2.ast.expected";
+    let exp = aether_read_file(exp_path);
+    if exp == 0 {
+        print_cstr("could not read expected dump\n");
+        return 1;
+    }
+    let elen = aether_file_size_last();
+
+    if dlen != elen {
+        aether_print_kv_i64("LEN mismatch: self", dlen);
+        aether_print_kv_i64("LEN mismatch: rust", elen);
+        return 1;
+    }
+    if aether_bytes_eq(dump, exp, dlen) == 0 {
+        print_cstr("BYTE mismatch between self-hosted and aetherc dumps\n");
+        return 1;
+    }
+
+    print_cstr("MATCH: self-hosted AST == aetherc --emit=ast\n");
+    return 42;
+}

@@ -53,7 +53,7 @@ struct Args {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum Emit { Bin, Mir, LlvmIr, C, Asm, AsmBin, AetherBin, PeBin }
+enum Emit { Bin, Mir, LlvmIr, C, Asm, AsmBin, AetherBin, PeBin, Ast }
 
 fn parse_args() -> Result<Args, String> {
     let mut input: Option<PathBuf> = None;
@@ -73,6 +73,7 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "-o" => output = Some(PathBuf::from(it.next().ok_or("-o needs a path")?)),
             "--emit=mir" => emit = Emit::Mir,
+            "--emit=ast" => emit = Emit::Ast,
             "--emit=llvm-ir" => emit = Emit::LlvmIr,
             "--emit=c" => emit = Emit::C,
             "--emit=asm" => emit = Emit::Asm,
@@ -117,6 +118,7 @@ fn parse_args() -> Result<Args, String> {
         match emit {
             Emit::Bin | Emit::AsmBin | Emit::AetherBin | Emit::PeBin => { p.set_extension(if cfg!(windows) { "exe" } else { "" }); }
             Emit::Mir => { p.set_extension("mir"); }
+            Emit::Ast => { p.set_extension("ast"); }
             Emit::LlvmIr => { p.set_extension("ll"); }
             Emit::C => { p.set_extension("c"); }
             Emit::Asm => { p.set_extension("s"); }
@@ -130,7 +132,7 @@ fn parse_args() -> Result<Args, String> {
 fn print_help() {
     println!("aetherc - Aether compiler (Phase 0/0.5)\n");
     println!("USAGE:");
-    println!("  aetherc <input.aether> [-o <out>] [--emit=bin|asm-bin|mir|llvm-ir|c|asm]");
+    println!("  aetherc <input.aether> [-o <out>] [--emit=bin|asm-bin|mir|ast|llvm-ir|c|asm]");
     println!("  aetherc <input.aether> --check        # parse + MIR only, no emit");
     println!("  aetherc <input.aether> --json-errors  # JSON Lines diagnostics on stderr\n");
     println!("--emit=asm      x86-64 AT&T assembly (no C compiler in the loop)");
@@ -286,6 +288,12 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // P20.2 — snapshot the PRISTINE parse tree for `--emit=ast` before the
+    // use-resolution / closure-lifting / fusion / autodiff passes rewrite it.
+    // This is exactly the tree the self-hosted parser sees when it parses the
+    // same source, so the two AST dumps can be diffed byte-for-byte.
+    let ast_snapshot = if matches!(args.emit, Emit::Ast) { Some(prog.clone()) } else { None };
 
     // Resolve `use <name>;` against the bundled stdlib at `<aetherc>/../../stdlib/<name>.aether`.
     // Inlines the imported file's items in place. Cycles are broken by a
@@ -446,6 +454,15 @@ fn main() {
     match args.emit {
         Emit::Mir => {
             std::fs::write(&args.output, mir::dump_mir(&mir_prog)).unwrap();
+            eprintln!("[aetherc] wrote {:?}", args.output);
+        }
+        // P20.2 — dump the canonical S-expression AST from the PRISTINE
+        // parse-tree snapshot taken before the rewrite passes, so the output
+        // is exactly what the self-hosted parser re-emits byte-for-byte
+        // (tests/runtime/selfhost_parser_formal.aether).
+        Emit::Ast => {
+            let snap = ast_snapshot.as_ref().unwrap_or(&prog);
+            std::fs::write(&args.output, codegen::ast_dump::emit(snap)).unwrap();
             eprintln!("[aetherc] wrote {:?}", args.output);
         }
         Emit::LlvmIr => {

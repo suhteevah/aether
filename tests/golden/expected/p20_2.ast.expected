@@ -1,0 +1,2 @@
+(fn sum_to (params n) (block (let s 0) (let i 1) (while (<= i n) (block (assign s (+ s i)) (assign i (+ i 1)))) (return s)))
+(fn main (params) (block (+ (call sum_to 8) 6)))

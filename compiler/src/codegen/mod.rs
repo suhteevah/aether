@@ -9,3 +9,4 @@
 pub mod llvm;
 pub mod c;
 pub mod asm;
+pub mod ast_dump;
