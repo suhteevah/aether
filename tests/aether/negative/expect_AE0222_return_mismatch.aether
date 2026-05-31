@@ -1,0 +1,12 @@
+// A function body whose final expression conflicts with the declared return
+// type must be rejected.
+//
+// P6.1 — mir::infer infers the tail `3.5` as a float and unifies it against
+// the declared `-> i64`; the concrete Int-vs-Float clash surfaces as AE0222.
+fn ratio() -> i64 {
+    3.5
+}
+
+fn main() -> i32 {
+    ratio() as i32
+}

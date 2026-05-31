@@ -171,7 +171,22 @@ pub fn run(prog: &Program) -> Vec<Diag> {
                 let t = ann_to_type(&mut ctx, &p.ty);
                 env.insert(p.name.clone(), t);
             }
-            infer_block(&mut ctx, &sigs, &mut env, body, &mut diags);
+            let body_t = infer_block(&mut ctx, &sigs, &mut env, body, &mut diags);
+            // P6.1 — the implicit-return (tail) expression must match the
+            // declared return type. Explicit `return e;` checking is a
+            // follow-up (needs the expected type threaded into the walk).
+            if let Some(ret_ann) = &f.ret {
+                let rt = ann_to_type(&mut ctx, ret_ann);
+                if let Err((a, b)) = ctx.unify(&body_t, &rt) {
+                    if a.is_scalar() && b.is_scalar() {
+                        diags.push(Diag::error("AE0222", "type",
+                            format!("`{}` returns {}, but its body yields {}",
+                                f.name, bucket_name(&b), bucket_name(&a)))
+                            .with_hint("make the final expression match the declared return type, \
+                                or insert an explicit `as` cast"));
+                    }
+                }
+            }
         }
     }
     diags
