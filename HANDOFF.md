@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 20 features / ~35 commits: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 8867e32.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 24 features / ~40 commits incl. the GENERICS KEYSTONE (type-generic fn monomorphization) + char/int-cast/assembler-extension: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 8867e32.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -13,7 +13,20 @@ vtables**, **full NLL borrow**, **async**, **macros**, **threads**, and
 **match guards / OR-patterns / let-else** (the last three need an AST match-arm
 change touching every arm-tuple, or the core let-parse path — wider churn).
 
-### LATEST: control-flow cluster (if let / while let / loop / bool literals)
+### LATEST: GENERICS KEYSTONE — type-generic monomorphization (`640ba38`)
+**`fn id<T>(x: T) -> T` now monomorphizes by argument type** — a distinct
+specialization per concrete type, each with the correct storage class
+(`id__T_i64` in rax, `id__T_f32` in xmm0). Extended the existing const-generic
+(shape) worklist to TYPE params: `GenericState.pending` carries type bindings;
+call-site infers `T` from the arg's type; the spec worklist substitutes
+`T` → concrete throughout the signature + body (`subst_type_param_fn`). SAFE —
+type inference only fires for bare `Named(T)` params, so shape templates
+(generic_matmul etc.) are untouched. Witness `generic_fn.aether` (id<T> for both
+i64 + f32 → 42). **This is the foundation for generic structs / Box / Vec<T> /
+generic traits** — the next step is generic STRUCTS (`struct Pair<T>`), which
+extends the same substitution to struct decls + the flat-slot field machinery.
+
+### control-flow cluster (if let / while let / loop / bool literals)
 - **6.4 `if let`** (`42336f5`) + **`while let`** (`88989d5`) — parser desugars to
   the existing match machinery. `if let PAT = e { } else { }` → 2-arm match;
   `while let PAT = e { }` → `while 1 { let tmp = e; match tmp { PAT => …, _ =>
@@ -137,9 +150,10 @@ need a large/risky subsystem, NOT a quick deposit:
   any float field need an **sret hidden-pointer ABI** (caller passes a result
   pointer in rcx; callee writes fields through it; args shift right). Mirror the
   struct-return detection but route to sret when `!small`.
-- **Generics (type params + monomorphization)** — keystone, unblocks
-  Box/Vec<T>/HashMap (6.7) + generic traits + Iterator trait. Extends the
-  const-generic worklist but hits the same storage-class/asm-backend wall.
+- **Generics** — type-generic FUNCTIONS DONE (`640ba38`); the hard part
+  (monomorphization + per-type storage class) is solved. Remaining: generic
+  STRUCTS (`struct Pair<T>` — extend subst_type_param to struct decls + flat-slot
+  fields), then generic traits + Iterator trait, then Box/Vec<T>/HashMap (6.7).
 - **async (6.10) / macros (6.11)** — still model-only islands (wire like traits
   was, but each is a real L/XL transform).
 - **threads (6.9)** — `aether_thread_spawn` exists; closure-objects could now
