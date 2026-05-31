@@ -270,6 +270,19 @@ impl Parser {
     fn parse_impl_item(&mut self) -> PResult<Item> {
         self.expect(Tok::Impl)?;
         let first = self.expect_ident()?;
+        // Optional generic args on the trait/type ref: `impl From<i64> for T`.
+        // The source type in `From<S>` isn't needed for dispatch (the method
+        // flattens to `T__from`), so the args are parsed + discarded. v1
+        // supports a single non-nested arg list (`From<i64>`, not `From<Vec<i64>>`).
+        if matches!(self.peek(0), Tok::Lt) {
+            self.bump();
+            loop {
+                let _ = self.parse_ty()?;
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); continue; }
+                break;
+            }
+            self.expect(Tok::Gt)?;
+        }
         // `impl Foo for Bar { ... }` → ImplTrait. `impl Bar { ... }` → Impl.
         let (trait_name, type_name) = if matches!(self.peek(0), Tok::For) {
             self.bump();

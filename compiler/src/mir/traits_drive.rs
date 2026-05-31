@@ -88,9 +88,11 @@ pub fn run(prog: &mut Program) -> TraitReport {
             // (`unsafe impl Send for Foo {}`) has no interface to verify —
             // allow it silently. A *non-empty* impl of an undeclared trait is
             // a real unknown-trait error (typically a typo), so it still goes
-            // to the resolver and surfaces as AE0211.
+            // to the resolver and surfaces as AE0211. Builtin traits (From /
+            // Into) aren't user-declared but are legal — exempt them too.
             let declared = trait_methods.contains_key(trait_name);
-            if !declared && methods.is_empty() {
+            let builtin = matches!(trait_name.as_str(), "From" | "Into");
+            if !declared && (methods.is_empty() || builtin) {
                 continue;
             }
             r.add_impl(ImplBlock {

@@ -349,6 +349,17 @@ fn main() {
         }
     }
 
+    // P6.5 — `.into()` desugaring. Rewrites `let x: T = e.into()` to
+    // `T::from(e)` for every T with an `impl From<…> for T` (the conversion fn
+    // returns T by value via the struct-return ABI). Runs after `use`/trait
+    // resolution so the From impls are visible.
+    {
+        let n = mir::into_desugar::run(&mut prog);
+        if n > 0 && !args.json_errors {
+            eprintln!("[aetherc] desugared {} `.into()` call(s) via From", n);
+        }
+    }
+
     // P6.6 — closure-object lowering. Runs BEFORE the closure-lifting pass so
     // it can fully lower the cases that pass deliberately punts on: a CAPTURING
     // closure bound to a local and passed as a value (`apply(inc, 5)`). These

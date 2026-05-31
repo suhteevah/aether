@@ -1,0 +1,17 @@
+// roadmap: P6.5
+// expect: exit=42
+//
+// From + .into(): `impl From<i64> for Celsius` defines the conversion; the
+// `.into()` call in `let c: Celsius = 40.into()` is desugared to
+// `Celsius::from(40)`, and the conversion fn returns the struct by value via
+// the P6.5 struct-return ABI.
+struct Celsius { deg: i64 }
+
+impl From<i64> for Celsius {
+    fn from(x: i64) -> Celsius { Celsius { deg: x + 2 } }
+}
+
+fn main() -> i32 {
+    let c: Celsius = 40.into();     // Celsius::from(40) -> deg = 42
+    c.deg as i32
+}
