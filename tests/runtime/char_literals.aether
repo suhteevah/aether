@@ -1,0 +1,13 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// Char literals `'A'` / `'\n'` lex to their byte value (i64). Disambiguated
+// from lifetimes (`'a`) by the closing quote: `'a'` is a char, `'a` a lifetime.
+fn main() -> i32 {
+    let star: i64 = '*';     // 42
+    let a: i64 = 'A';        // 65
+    let nl: i64 = '\n';      // 10 (escape)
+    if a == 65 {
+        if nl == 10 { star as i32 } else { 0 }
+    } else { 0 }
+}

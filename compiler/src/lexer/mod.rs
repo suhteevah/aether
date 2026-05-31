@@ -284,6 +284,33 @@ impl<'a> Lexer<'a> {
             });
         }
 
+        // Char literal: `'A'` / `'\n'` → IntLit(byte value). Chars are byte
+        // values in Aether's i64 model, so a char literal is just an integer.
+        // Disambiguated from a lifetime by the CLOSING quote: `'a'` (quote at
+        // +2) is a char, `'a` (no closing quote) is a lifetime; an escape
+        // (`'\n'`) is always a char.
+        if b == b'\'' && (self.peek(1) == Some(b'\\') || self.peek(2) == Some(b'\'')) {
+            self.bump(); // opening quote
+            let val: u8 = match self.bump() {
+                Some(b'\\') => match self.bump() {
+                    Some(b'n') => b'\n',
+                    Some(b't') => b'\t',
+                    Some(b'r') => b'\r',
+                    Some(b'\\') => b'\\',
+                    Some(b'\'') => b'\'',
+                    Some(b'0') => 0,
+                    Some(c) => return Err(format!("bad char escape \\{}", c as char)),
+                    None => return Err("unterminated char literal".into()),
+                },
+                Some(c) => c,
+                None => return Err("unterminated char literal".into()),
+            };
+            match self.bump() {
+                Some(b'\'') => return Ok(Tok::IntLit(val as i64)),
+                _ => return Err("char literal must be a single byte".into()),
+            }
+        }
+
         // Lifetime / label: `'a`, `'_lt`. Lexer-side we just emit a Lifetime
         // token; the parser silently consumes them after `&` or `&mut` in
         // type positions (P12.2).
