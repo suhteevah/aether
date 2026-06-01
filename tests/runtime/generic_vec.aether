@@ -1,0 +1,50 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// A real GROWABLE generic Vec<T>, built in Aether on the generics + heap
+// foundation. The vector's state ([data_ptr, len, cap]) lives on the heap and
+// is mutated through the handle, so no &mut self is needed. push() doubles
+// capacity when full (4 -> 8 -> … -> 128 over 100 pushes). vec_get<T> infers T
+// from the return-position context. This is the 6.7 Vec<T>-with-growth witness.
+use runtime;
+
+fn vec_new() -> i64 {
+    let p: i64 = aether_alloc_bytes(24);   // [data_ptr, len, cap]
+    aether_store_i64(p, 0, 0);
+    aether_store_i64(p, 1, 0);
+    aether_store_i64(p, 2, 0);
+    p
+}
+
+fn vec_push<T>(v: i64, x: T) {
+    let len: i64 = aether_load_i64(v, 1);
+    let cap: i64 = aether_load_i64(v, 2);
+    if len >= cap {                              // grow: capacity doubling
+        let newcap: i64 = if cap == 0 { 4 } else { cap * 2 };
+        let old: i64 = aether_load_i64(v, 0);
+        let nd: i64 = aether_alloc_bytes(newcap * 8);
+        let mut j: i64 = 0;
+        while j < len { aether_store_i64(nd, j, aether_load_i64(old, j)); j = j + 1; }
+        aether_store_i64(v, 0, nd);
+        aether_store_i64(v, 2, newcap);
+    }
+    let data: i64 = aether_load_i64(v, 0);
+    aether_store_i64(data, len, x);
+    aether_store_i64(v, 1, len + 1);
+}
+
+fn vec_get<T>(v: i64, i: i64) -> T {
+    let data: i64 = aether_load_i64(v, 0);
+    aether_load_i64(data, i)
+}
+
+fn vec_len(v: i64) -> i64 { aether_load_i64(v, 1) }
+
+fn main() -> i32 {
+    let v: i64 = vec_new();
+    let mut i: i64 = 0;
+    while i < 100 { vec_push(v, i); i = i + 1; }   // pushes 0..100, growing
+    let n: i64 = vec_len(v);                       // 100
+    let e: i64 = vec_get(v, 42);                    // 42
+    if n == 100 { e as i32 } else { 0 }
+}
