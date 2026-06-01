@@ -1,0 +1,22 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// A payload-enum passed as a fn parameter by value — the 2-slot (tag, val)
+// enum-param ABI (mirrors struct-by-value). `unwrap(o)` receives the tag + val
+// in two arg regs and `match o { … }` decodes them. Also exercises the frame-
+// counting fix: aggregate params (struct + enum) are now counted slot-for-slot
+// with the prologue spill (was undercounted, masked by the unused ret-save slot).
+enum Opt { N, S(i64) }
+
+fn unwrap(o: Opt, default: i64) -> i64 {
+    match o {
+        Opt::S(x) => x,
+        Opt::N => default,
+    }
+}
+
+fn main() -> i32 {
+    let some: Opt = Opt::S(40);
+    let none: Opt = Opt::N;
+    (unwrap(some, 0) + unwrap(none, 2)) as i32   // 40 + 2 = 42
+}

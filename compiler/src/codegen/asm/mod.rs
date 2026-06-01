@@ -1286,8 +1286,27 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
         }
     }
     let body = f.body.as_ref().unwrap();
-    // Reserve slots for incoming params so the frame includes them.
-    for p in &f.params { locals.alloc(&p.name); }
+    // Reserve slots for incoming params so the frame includes them. This MUST
+    // mirror the prologue's param spill (below) slot-for-slot: a struct param
+    // expands to one slot per field, a payload-enum param to two (tag + val).
+    // (Previously this allocated a single `p.name` slot for every param, which
+    // undercounted aggregate params and could overflow the frame — masked only
+    // because the overflow slot, `_ret_save_`, is usually unused.)
+    for p in &f.params {
+        let p_ty = match &p.ty { Ty::Ref { inner, .. } => inner.as_ref(), other => other };
+        if let Some(sname) = struct_name_of(p_ty) {
+            if let Some(sd) = locals.struct_decls.get(&sname).cloned() {
+                for field in &sd.fields { locals.alloc(&format!("{}.{}", p.name, field.name)); }
+                continue;
+            }
+            if locals.enum_decls.contains_key(&sname) {
+                locals.alloc(&format!("{}.tag", p.name));
+                locals.alloc(&format!("{}.val", p.name));
+                continue;
+            }
+        }
+        locals.alloc(&p.name);
+    }
     count_locals(body, &mut locals);
     // One extra slot to spill `%rax` across the auto-free callq sequence
     // in the epilogue. Wastes 8 bytes if the fn has no Tensor locals but
@@ -1369,6 +1388,23 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
                         TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
                             out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[arg_idx], slot * 8)),
                     }
+                    arg_idx += 1;
+                }
+                continue;
+            }
+        }
+        // Payload-enum by value: a 2-slot (tag, val) param. Mirrors the
+        // struct-by-value path; `unwrap(o: Option<i64>)` receives (tag, val) in
+        // two int arg regs and `match o { … }` decodes the slots. P6.4.
+        if let Some(ename) = struct_name_of(p_ty) {
+            if locals.enum_decls.contains_key(&ename) {
+                locals.enum_locals.insert(p.name.clone(), ename.clone());
+                for suffix in ["tag", "val"] {
+                    if arg_idx >= 4 { return Err(AsmError::TooManyArgs); }
+                    let key = format!("{}.{}", p.name, suffix);
+                    let slot = locals.alloc(&key);
+                    locals.types.insert(key, TyKind::Int);
+                    out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[arg_idx], slot * 8));
                     arg_idx += 1;
                 }
                 continue;
@@ -3213,6 +3249,20 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                             }
                             continue;
                         }
+                    }
+                    // Payload-enum by value: a 2-slot (tag, val) local expands
+                    // to two ABI args, mirroring the enum-param spill side.
+                    if locals.enum_locals.contains_key(arg_name) {
+                        for suffix in ["tag", "val"] {
+                            let key = format!("{}.{}", arg_name, suffix);
+                            let slot = locals.get(&key)
+                                .ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
+                            out.push_str(&format!("    movq -{}(%rbp), %rax\n", slot * 8));
+                            out.push_str("    subq $16, %rsp\n");
+                            out.push_str("    movq %rax, (%rsp)\n");
+                            arg_kinds.push(TyKind::Int);
+                        }
+                        continue;
                     }
                 }
                 let kind = emit_expr_value(arg, out, data, locals)?;
