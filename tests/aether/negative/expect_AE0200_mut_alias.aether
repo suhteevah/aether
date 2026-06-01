@@ -1,12 +1,15 @@
-// Two simultaneous &mut borrows of the same local must be rejected.
+// Two &mut borrows of the same local whose live ranges OVERLAP must be rejected.
 //
-// P6.3 — the borrow checker (compiler/src/mir/lifetimes.rs) holds a
-// `let`-bound `&mut` live to end-of-fn. The second `&mut x` overlaps the
-// first, so the checker emits AE0200 "cannot borrow `x` as mutable:
-// already borrowed" and `--check` exits nonzero.
+// P6.3 — the borrow checker is now non-lexical: each `let`-bound borrow ends at
+// its LAST use. Here `a` is used (`*a = 1`) AFTER `b` is created, so `a`'s borrow
+// is still live when `b = &mut x` is taken — a genuine simultaneous mutable
+// alias. The checker emits AE0200 "cannot borrow `x` as mutable: already
+// borrowed" and `--check` (and compilation) exits nonzero.
 fn main() -> i64 {
     let mut x: i64 = 5;
     let a = &mut x;
     let b = &mut x;
+    *a = 1;
+    *b = 2;
     0
 }

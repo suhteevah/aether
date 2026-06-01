@@ -1,11 +1,14 @@
-// Taking a shared borrow while a mutable borrow is live must be rejected.
+// A shared borrow taken while a mutable borrow is still LIVE must be rejected.
 //
-// P6.3 — the `let`-bound `&mut x` stays live to end-of-fn; the later `&x`
-// overlaps it, so the borrow checker emits AE0201 "cannot borrow `x` as
-// shared: already mutably borrowed".
+// P6.3 — the borrow checker is now non-lexical: `a`'s `&mut x` lives until its
+// last use (`*a = 1`), which is AFTER `b = &x` is taken. So the shared borrow
+// `b` overlaps the live mutable borrow `a` — the checker emits AE0201 "cannot
+// borrow `x` as shared: already mutably borrowed".
 fn main() -> i64 {
     let mut x: i64 = 5;
     let a = &mut x;
     let b = &x;
-    0
+    let c: i64 = *b;
+    *a = 1;
+    c
 }
