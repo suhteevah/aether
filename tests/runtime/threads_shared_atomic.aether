@@ -1,0 +1,51 @@
+// roadmap: P6.9
+// expect: exit=42
+//
+// Race-free SHARED-STATE concurrency: six OS threads concurrently increment a
+// single shared counter via atomic fetch-add. Each worker receives the counter's
+// address as its argument and performs 7 atomic increments; with 6 threads that
+// is 6 * 7 = 42, and because every increment is atomic the final load is exact
+// regardless of interleaving (a non-atomic `+= 1` would lose updates to races).
+// Combines the real-thread spawn/join with the atomic primitives.
+extern fn aether_thread_spawn(fn_ptr: i64, arg: i64) -> i64;
+extern fn aether_thread_join(handle: i64) -> i64;
+extern fn aether_alloc_bytes(n: i64) -> i64;
+extern fn aether_free_bytes(p: i64, n: i64);
+extern fn aether_atomic_store_i64(p: i64, v: i64);
+extern fn aether_atomic_fetch_add_i64(p: i64, d: i64) -> i64;
+extern fn aether_atomic_load_i64(p: i64) -> i64;
+
+fn worker(counter: i64) -> i64 {
+    let mut k: i64 = 0;
+    while k < 7 {
+        let _ = aether_atomic_fetch_add_i64(counter, 1);   // atomic +1
+        k = k + 1;
+    }
+    0
+}
+
+fn main() -> i32 {
+    let counter: i64 = aether_alloc_bytes(8);
+    if counter == 0 { return 1; }
+    aether_atomic_store_i64(counter, 0);
+
+    // spawn six workers, all sharing `counter`
+    let t1: i64 = aether_thread_spawn(worker, counter);
+    let t2: i64 = aether_thread_spawn(worker, counter);
+    let t3: i64 = aether_thread_spawn(worker, counter);
+    let t4: i64 = aether_thread_spawn(worker, counter);
+    let t5: i64 = aether_thread_spawn(worker, counter);
+    let t6: i64 = aether_thread_spawn(worker, counter);
+
+    // join all (each blocks until its thread finishes)
+    let _ = aether_thread_join(t1);
+    let _ = aether_thread_join(t2);
+    let _ = aether_thread_join(t3);
+    let _ = aether_thread_join(t4);
+    let _ = aether_thread_join(t5);
+    let _ = aether_thread_join(t6);
+
+    let total: i64 = aether_atomic_load_i64(counter);   // exactly 42
+    aether_free_bytes(counter, 8);
+    total as i32
+}
