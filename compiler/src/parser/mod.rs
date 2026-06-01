@@ -288,6 +288,23 @@ impl Parser {
         if is_extern && body.is_some() {
             return Err(format!("extern fn {} must not have a body", name));
         }
+
+        // `impl Trait` in argument position is sugar for an anonymous bounded
+        // generic param: `fn f(x: impl Val)` ≡ `fn f<__implN: Val>(x: __implN)`.
+        // Re-point each `__impl_<Trait>` param type to a fresh type-param name
+        // registered in const_params, so the existing monomorphisation +
+        // struct-arg inference dispatches `x.method()` to the concrete impl.
+        let mut impl_param_n = 0usize;
+        for p in params.iter_mut() {
+            let is_impl_trait = matches!(&p.ty, Ty::Named(n) if n.starts_with("__impl_"));
+            if is_impl_trait {
+                let tp = format!("__implT{}", impl_param_n);
+                impl_param_n += 1;
+                const_params.push(tp.clone());
+                p.ty = Ty::Named(tp);
+            }
+        }
+
         Ok(FnDecl { attrs, is_pub, is_extern, name, const_params, params, ret, body })
     }
 

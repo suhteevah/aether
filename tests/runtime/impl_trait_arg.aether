@@ -1,0 +1,28 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// `impl Trait` in ARGUMENT position — `fn show(x: impl Val)` — is sugar for an
+// anonymous bounded generic param (`fn show<__implT: Val>(x: __implT)`). The
+// parser re-points each `impl Trait` param to a fresh type-param name in
+// const_params, so the existing monomorphisation + struct-arg inference
+// dispatch `x.method()` to the concrete impl. The same `show` is instantiated
+// over two distinct structs, each resolving its own impl, and the called method
+// is itself a default body built on a required method.
+trait Val {
+    fn raw(self) -> i64;
+    fn doubled(self) -> i64 { self.raw() * 2 }   // default built on required
+}
+
+struct P { v: i64 }
+struct Q { v: i64 }
+
+impl Val for P { fn raw(self) -> i64 { self.v } }
+impl Val for Q { fn raw(self) -> i64 { self.v + 1 } }
+
+fn show(x: impl Val) -> i64 { x.doubled() }
+
+fn main() -> i32 {
+    let p: P = P { v: 13 };   // raw 13 -> doubled 26
+    let q: Q = Q { v: 7 };    // raw 8  -> doubled 16
+    (show(p) + show(q)) as i32   // 26 + 16 = 42
+}
