@@ -61,11 +61,19 @@ fn arg_concrete_type_name(arg: &Expr, locals: &Locals) -> Option<String> {
         Expr::IntLit(_) | Expr::BoolLit(_) => Some("i64".into()),
         Expr::FloatLit(_) => Some(match locals.default_float {
             Some(TyKind::F64) => "f64", _ => "f32" }.into()),
-        Expr::Ident(n) => locals.types.get(n).map(|k| match k {
-            TyKind::F32 => "f32".to_string(),
-            TyKind::F64 => "f64".to_string(),
-            _ => "i64".to_string(),
-        }),
+        Expr::Ident(n) => {
+            // A struct-typed local infers the generic param as its struct name
+            // (`fn twice<T: Doubler>(x: T)` called with `n: N` -> T = N), so the
+            // monomorphised body can dispatch `x.dbl()` to `N`'s impl.
+            if let Some(sname) = locals.struct_locals.get(n) {
+                return Some(sname.clone());
+            }
+            locals.types.get(n).map(|k| match k {
+                TyKind::F32 => "f32".to_string(),
+                TyKind::F64 => "f64".to_string(),
+                _ => "i64".to_string(),
+            })
+        }
         Expr::Cast { ty, .. } => Some(ty.clone()),
         // A call argument: use the callee's return type. For a non-generic fn
         // that's its declared TyKind; for a generic fn returning a type param

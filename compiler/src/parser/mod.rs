@@ -225,6 +225,10 @@ impl Parser {
                 else {
                     let p = self.expect_ident()?;
                     const_params.push(p);
+                    // Optional trait bounds: `<T: Doubler + Clone>`. Bounds are
+                    // not recorded (generics monomorphize structurally), just
+                    // consumed so the bound syntax parses.
+                    self.skip_trait_bounds()?;
                 }
                 if matches!(self.peek(0), Tok::Comma) { self.bump(); }
             }
@@ -295,7 +299,8 @@ impl Parser {
         if matches!(self.peek(0), Tok::Lt) {
             self.bump();
             loop {
-                let _ = self.expect_ident()?;
+                if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
+                else { let _ = self.expect_ident()?; self.skip_trait_bounds()?; }
                 if matches!(self.peek(0), Tok::Comma) { self.bump(); continue; }
                 break;
             }
@@ -335,6 +340,22 @@ impl Parser {
         } else {
             Ok(Item::Impl { type_name, methods })
         }
+    }
+
+    /// Consume an optional trait-bound clause after a generic param name:
+    /// `: A`, `: A + B`, `: std::fmt::Display`, `: 'a`. Bounds are not recorded
+    /// in the AST — generics monomorphize structurally by the concrete argument
+    /// type — so this just keeps `<T: Trait>` syntax parsing cleanly.
+    fn skip_trait_bounds(&mut self) -> PResult<()> {
+        if !matches!(self.peek(0), Tok::Colon) { return Ok(()); }
+        self.bump(); // ':'
+        loop {
+            if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
+            else { let _ = self.parse_ty()?; }
+            if matches!(self.peek(0), Tok::Plus) { self.bump(); continue; }
+            break;
+        }
+        Ok(())
     }
 
     /// `trait Foo { fn bar(&self) -> i32; fn baz() -> i64 { 0 } }`.
@@ -403,7 +424,8 @@ impl Parser {
         if matches!(self.peek(0), Tok::Lt) {
             self.bump();
             loop {
-                let _ = self.expect_ident()?;
+                if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
+                else { let _ = self.expect_ident()?; self.skip_trait_bounds()?; }
                 if matches!(self.peek(0), Tok::Comma) { self.bump(); continue; }
                 break;
             }
@@ -436,7 +458,8 @@ impl Parser {
         if matches!(self.peek(0), Tok::Lt) {
             self.bump();
             while !matches!(self.peek(0), Tok::Gt) {
-                generics.push(self.expect_ident()?);
+                if matches!(self.peek(0), Tok::Lifetime(_)) { self.bump(); }
+                else { generics.push(self.expect_ident()?); self.skip_trait_bounds()?; }
                 if matches!(self.peek(0), Tok::Comma) { self.bump(); }
             }
             self.expect(Tok::Gt)?;

@@ -1,0 +1,31 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Bounded generics: `fn f<T: Trait>(x: T)` calling a trait method on the type
+// param. The bound `<T: Score>` now parses (fn/impl/struct/enum generic param
+// lists accept `: A + B`), and the asm backend infers T from a struct-typed
+// argument (T = the local's struct name) so the monomorphised body dispatches
+// `x.score()` to that type's impl. The SAME generic fn `total` is monomorphised
+// over two distinct structs (Hi, Lo) — each instantiation resolves to its own
+// trait impl, proving per-type dispatch, not a single shared body.
+trait Score { fn score(self) -> i64; }
+
+struct Hi { v: i64 }
+struct Lo { v: i64 }
+
+impl Score for Hi { fn score(self) -> i64 { self.v * 2 } }
+impl Score for Lo { fn score(self) -> i64 { self.v + 1 } }
+
+fn total<T: Score>(x: T) -> i64 { x.score() }
+
+// A multi-bound generic also parses (consumed, monomorphised structurally).
+trait Tag { fn tag(self) -> i64; }
+impl Tag for Hi { fn tag(self) -> i64 { 0 } }
+fn scored<T: Score + Tag>(x: T) -> i64 { x.score() }
+
+fn main() -> i32 {
+    let a: Hi = Hi { v: 15 };   // score = 30
+    let b: Lo = Lo { v: 11 };   // score = 12
+    let c: Hi = Hi { v: 0 };    // score = 0  (multi-bound path)
+    (total(a) + total(b) + scored(c)) as i32   // 30 + 12 + 0 = 42
+}
