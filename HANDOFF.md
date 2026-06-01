@@ -65,7 +65,8 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   `aether_thread_join(h) -> i64` run an Aether fn (passed by address) on a real
   std::thread and return its COMPUTED value (was discarded). Witness
   `threads_parallel` (3 workers, real loops, joined+combined -> 42). Atomics
-  (`concurrency`) already existed.
+  (`concurrency`) already existed. **Shared-state** witness `threads_shared_atomic`
+  (`413d4ae`) — 6 threads race-free-increment a shared atomic counter -> 42.
 - STILL-MISSING (top follow-ups, best fresh): direct `a.add(x).add(y)` struct-method
   chaining (needs an intermediate temp-local + count_locals reservation);
   >3-field enum return (sret); array `[v;n]` const-ident count; tuple-struct ctor
