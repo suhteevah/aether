@@ -67,12 +67,13 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   `threads_parallel` (3 workers, real loops, joined+combined -> 42). Atomics
   (`concurrency`) already existed. **Shared-state** witness `threads_shared_atomic`
   (`413d4ae`) — 6 threads race-free-increment a shared atomic counter -> 42.
-- **real declarative macros** (`3edd5a9`) — `macro_rules! name { ($x:expr) => { body } }`
-  now ACTUALLY EXPANDS at `name!(...)` use sites (was parsed-and-discarded). `$`
-  lexes; the body is a token template; args (paren-wrapped for precedence) splice
-  in + re-parse via a sub-parser that shares the macro table (macros nest).
-  Hardened `peek` to clamp past-end lookahead to Eof. Witness `macro_rules_expand`.
-  Scope: single rule, `$x:expr`, expression body (repetitions/hygiene = follow-ups).
+- **real declarative macros** (`3edd5a9` + `a35635c`) — `macro_rules!` now ACTUALLY
+  EXPANDS at `name!(...)` use sites (was parsed-and-discarded). `$` lexes; the body
+  is a token template; args (paren-wrapped for precedence) splice in + re-parse via
+  a sub-parser sharing the macro table (macros nest). **Multiple rules** selected by
+  arity (`pick!` with 1/2/3-arg rules). Hardened `peek` to clamp past-end lookahead
+  to Eof. Witnesses `macro_rules_expand`, `macro_multi_rule`. Scope: arity-disjoint
+  `$x:expr` rules, expression body (repetitions `$(…)*`/hygiene = follow-ups).
 - **probe sweep** (20-feature compositions): macro-in-array-literal, macro-arg-to-fn,
   macro-in-match-guard, multi-field-enum + guard, tuple-struct field,
   generic-over-enum-arg all OK. Found 2 issues; **1 FIXED** (`2983584`): struct
