@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +12 features / ~77 total commits — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +13 features / ~80 total commits — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -26,6 +26,13 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   positional fields "0".."N-1" reuse tuple `.0` field access; ctor recognised in
   the let path (Call→tuple-struct, reuses expand_struct_field_keys + populate).
   Witness `tuple_struct`. (Ctor in arg/return position = follow-up.)
+- **struct with array field** (`5f3f562`) — `struct Buf { data: [i64;N], len: i64 }`;
+  array field expands to element slots, registers in locals.arrays under its
+  dotted key, `b.data[i]` indexing resolves a Field receiver via field_path
+  (static + dynamic). Composes the struct + array features. Witness `struct_array_field`.
+- PROBED-WORKING this round (no fix needed): for-loop over array, compound assign
+  (+=/-=), bitwise (|&^<<>>), shadowing, recursion (fib), char literals `'A'`,
+  enum payload round-trip through fn args.
 - STILL-MISSING (top follow-ups): **multi-field enum payload** `Two(a,b)` — THE
   remaining big one (real ADTs): ~20 enum-codegen sites built on a single `.val`
   slot + AST `payloads:Vec<Option<Ty>>`→Vec<Vec<Ty>> + EnumVariantBind multi-name
