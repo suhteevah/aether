@@ -1,0 +1,24 @@
+// roadmap: P6.3
+// expect: exit=42
+//
+// Non-lexical lifetimes: a `let`-bound borrow ends at its LAST USE, not at the
+// end of the function. So sequential, non-overlapping `&mut` borrows of the same
+// local are accepted — `a`'s borrow ends at `*a = …` before `b = &mut v` is
+// taken. The old lexical over-approximation (borrow live to end-of-fn) rejected
+// this valid program with a spurious AE0200; now it compiles + runs. (Genuinely
+// overlapping borrows — both still live — are still rejected; see the
+// expect_AE0200/AE0201 negative conformance tests.)
+fn main() -> i32 {
+    let mut v: i64 = 0;
+
+    let a: &mut i64 = &mut v;
+    *a = 40;                    // last use of `a` -> its borrow ends here (v = 40)
+
+    let b: &mut i64 = &mut v;   // fine under NLL: `a` is already dead
+    *b = *b + 2;                // last use of `b` (v = 42)
+
+    let r: &i64 = &v;           // a fresh shared borrow, also fine
+    let read: i64 = *r;
+
+    read as i32                 // 42
+}
