@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 34 features + 7 probing bugfixes / ~55 commits incl. nested struct fields incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 36 features + 7 probing bugfixes / ~57 commits incl. nested struct fields + method chains (both structural gaps closed) incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -36,9 +36,16 @@ A ~40-construct robustness sweep confirms the common surface is solid.
 invariant held — zero regressions), `emit_struct_lit_populate` recurses into
 nested literals, `field_path` builds the dotted key for nested read + assign.
 Witness `nested_struct`.
-One structural probe gap remains: **method-on-method-result `c.id().n`** — the
-Field handler + method dispatcher require a bare-ident receiver; a chained call
-returning a struct needs the rax:rdx struct-return result read as a field.
+**Both structural probe gaps now CLOSED.** Method-on-method-result
+`c.method().field` / `mk().x` (`5561d21`) — `call_result_struct` resolves the
+return struct, the Field handler evaluates the call (field0→rax, field1→rdx via
+struct-return ABI) and selects the register by field index. (Callee must return
+a struct LITERAL — the struct-return-v1 limitation; `fn id(self)->C{self}` is
+separate.) Witness `method_chain`. So the COMMON language surface — generics,
+type system, traits, struct construction + composition + method chains, control
+flow — is now genuinely real and probe-hardened. What's left is the big
+SUBSYSTEMS (Iterator+adapters, Vec<T>-growth, sret, dyn vtables, full NLL, async,
+macros, threads) — each a focused multi-session effort.
 
 ### parser stmt-boundary fix (detail)
 - **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
