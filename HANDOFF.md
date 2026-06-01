@@ -1,9 +1,17 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +6 CLOSURE/GENERICS commits / ~69 total — CLOSURES NOW BROAD (capturing + non-capturing + let-bound + inline `apply(|x|..,5)` + escaping `->Closure` + through match-arms + vec-of-closures + closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` (parse `:A+B` + infer T from struct arg + per-type dispatch) + TRAIT DEFAULT BODIES calling `self.required()` (Iterator::nth shape) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 79dc16a.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +8 CLOSURE/GENERICS/TUPLE commits / ~71 total — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
-### LATEST: closures completed + bounded generics + trait default bodies (6 commits)
-Probed ~12 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
+### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
+Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
+- **impl Trait in ARG position** (`3050e84`) — `fn show(x: impl Val)` is sugar for
+  `fn show<__implT: Val>(x: __implT)`; parser re-points the param to a fresh
+  const_params type-param, reusing the bounded-generics machinery. Witness `impl_trait_arg`.
+- **multi-value tuple return** (`9e5d274`) — `fn f()->(i64,i64)` + `let (a,b)=f()`
+  via the 2-register ABI (rax:rdx). emit_tuple_tail descends if/else+block so a
+  tuple can be returned from a conditional. Arity-2 i64 only (larger=sret, errors
+  clearly). Witness `tuple_return`. PROBED-WORKING: generic struct method
+  impl<T> Cell<T>, nested match, block-expr value, `?` on Result.
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
