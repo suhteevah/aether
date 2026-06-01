@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +18 features / ~91 total commits — ADT STORY 100% COMPLETE (construct/match/param/arg/return) — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +19 features / ~94 total commits — ADT STORY 100% COMPLETE + REAL OS THREADS — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -61,11 +61,17 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   ADT+guard+factory-return, trait-default-via-bounded-generic, capturing closure,
   array dynamic-index, tuple destructure in ONE program -> 42. Proves the
   session's features interoperate.
+- **real OS threads** (`434e3dd`) — `aether_thread_spawn(fn, arg)` /
+  `aether_thread_join(h) -> i64` run an Aether fn (passed by address) on a real
+  std::thread and return its COMPUTED value (was discarded). Witness
+  `threads_parallel` (3 workers, real loops, joined+combined -> 42). Atomics
+  (`concurrency`) already existed.
 - STILL-MISSING (top follow-ups, best fresh): direct `a.add(x).add(y)` struct-method
   chaining (needs an intermediate temp-local + count_locals reservation);
   >3-field enum return (sret); array `[v;n]` const-ident count; tuple-struct ctor
-  in arg/return position; async/macros/threads (large multi-session subsystems);
-  full NLL borrow on the compile path (currently `--check`-only).
+  in arg/return position; **async** + **macros** (large multi-session subsystems);
+  full NLL borrow on the compile path (currently `--check`-only); thread shared-state
+  ergonomics (Arc/Mutex equivalents — atomics + raw ptrs work today).
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
