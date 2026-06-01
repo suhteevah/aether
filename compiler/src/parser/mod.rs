@@ -40,6 +40,26 @@ impl Parser {
     fn bump(&mut self) -> Tok { let t = self.toks[self.pos].tok.clone(); self.pos += 1; t }
     fn loc(&self) -> (u32, u32) { let t = &self.toks[self.pos]; (t.line, t.col) }
 
+    /// True if the current token closes a generic arg list — a bare `>`, or the
+    /// `>` part of a `>=` that the lexer fused (`Vec<i64>=` → `Vec < i64 >= …`).
+    fn at_generic_close(&self) -> bool {
+        matches!(self.peek(0), Tok::Gt | Tok::GtEq)
+    }
+    /// Consume the closing `>` of a generic arg list. A fused `>=` is split:
+    /// the `>` is consumed and the token is rewritten to `=` so the following
+    /// assignment (`let v: Vec<i64>= …`) still parses. (`>>` is already two
+    /// `Gt` tokens, so nested generics close fine without this.)
+    fn close_generic(&mut self) -> PResult<()> {
+        match self.peek(0) {
+            Tok::Gt => { self.bump(); Ok(()) }
+            Tok::GtEq => { self.toks[self.pos].tok = Tok::Eq; Ok(()) }
+            other => {
+                let (l, c) = self.loc();
+                Err(format!("{}:{}: expected `>` to close generic, got {:?}", l, c, other))
+            }
+        }
+    }
+
     fn expect(&mut self, want: Tok) -> PResult<()> {
         if std::mem::discriminant(self.peek(0)) == std::mem::discriminant(&want) {
             self.bump();
@@ -347,6 +367,9 @@ impl Parser {
     fn parse_match_pat(&mut self) -> PResult<MatchPat> {
         match self.peek(0).clone() {
             Tok::IntLit(n) => { self.bump(); Ok(MatchPat::Int(n)) }
+            // `true` / `false` patterns — bool is i64 1/0, so they match as ints.
+            Tok::True  => { self.bump(); Ok(MatchPat::Int(1)) }
+            Tok::False => { self.bump(); Ok(MatchPat::Int(0)) }
             Tok::Ident(s) if s == "_" => { self.bump(); Ok(MatchPat::Wildcard) }
             Tok::Ident(_) => {
                 let mut path = vec![self.expect_ident()?];
@@ -586,7 +609,7 @@ impl Parser {
         if matches!(self.peek(0), Tok::Lt) {
             self.bump();
             let mut args = Vec::new();
-            while !matches!(self.peek(0), Tok::Gt) {
+            while !self.at_generic_close() {
                 // Generic args can be types OR integer/symbolic shape values.
                 // `Linear<D_MODEL, 960>` → both elements collapse to Ty::Named/Shape.
                 if let Tok::IntLit(n) = self.peek(0).clone() {
@@ -597,7 +620,7 @@ impl Parser {
                 }
                 if matches!(self.peek(0), Tok::Comma) { self.bump(); }
             }
-            self.expect(Tok::Gt)?;
+            self.close_generic()?;
             return Ok(Ty::Generic { name, args });
         }
         Ok(Ty::Named(name))

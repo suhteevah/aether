@@ -683,16 +683,28 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
     // out so they still hit the clear "struct literal must appear…" error.
     for item in &p.items {
         if let Item::Fn(f) = item {
-            if let Some(Ty::Named(rname)) = f.ret.as_ref() {
-                if let Some(sd) = struct_decls.get(rname) {
-                    let small = (1..=2).contains(&sd.fields.len())
-                        && sd.fields.iter().all(|fld|
-                            matches!(TyKind::from_ty(&fld.ty), Some(TyKind::Int)));
-                    if small {
-                        fn_returns_struct.insert(f.name.clone(), rname.clone());
-                        fn_returns_struct.insert(format!("aether_{}", f.name), rname.clone());
-                    }
-                }
+            // Resolve the return type to a struct name — `Ty::Named` or a
+            // generic `Ty::Generic` annotation (`W<i64>`).
+            let Some(rname) = f.ret.as_ref().and_then(struct_name_of) else { continue; };
+            let Some(sd) = struct_decls.get(&rname) else { continue; };
+            // For a generic return, map field type params to the concrete args
+            // so `W<i64>`'s `T` field counts as i64.
+            let subst: HashMap<String, Ty> = match f.ret.as_ref() {
+                Some(Ty::Generic { args, .. }) =>
+                    sd.generics.iter().cloned().zip(args.iter().cloned()).collect(),
+                _ => HashMap::new(),
+            };
+            let small = (1..=2).contains(&sd.fields.len())
+                && sd.fields.iter().all(|fld| {
+                    let resolved = match &fld.ty {
+                        Ty::Named(n) => subst.get(n).cloned().unwrap_or_else(|| fld.ty.clone()),
+                        other => other.clone(),
+                    };
+                    matches!(TyKind::from_ty(&resolved), Some(TyKind::Int))
+                });
+            if small {
+                fn_returns_struct.insert(f.name.clone(), rname.clone());
+                fn_returns_struct.insert(format!("aether_{}", f.name), rname.clone());
             }
         }
     }

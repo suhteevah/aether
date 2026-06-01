@@ -1,0 +1,15 @@
+// roadmap: P6.5
+// expect: exit=42
+//
+// A generic struct returned by value (`fn mk() -> W<i64>`), plus the
+// no-space generic-close-before-assign form `W<i64>=` (the lexer fuses `>=`;
+// the parser splits it). The struct-return ABI detection resolves the
+// `Ty::Generic` return + its field type params to concrete (i64) types.
+struct W<T> { v: T }
+
+fn mk() -> W<i64> { W { v: 42 } }
+
+fn main() -> i32 {
+    let w: W<i64>=mk();      // no space before `=` exercises the `>=` split
+    w.v as i32
+}

@@ -1,0 +1,17 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// `match` on a bool with `true` / `false` patterns (bool is i64 1/0, so the
+// patterns match as ints). Previously "expected match pattern, got True".
+fn classify(b: bool) -> i64 {
+    match b {
+        true => 42,
+        false => 0,
+    }
+}
+
+fn main() -> i32 {
+    let t: bool = true;
+    let f: bool = false;
+    (classify(t) - classify(f)) as i32   // 42 - 0 = 42
+}
