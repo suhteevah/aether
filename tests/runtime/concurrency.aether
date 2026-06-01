@@ -8,9 +8,9 @@
 // followed by 958 decrements of -1, leaving 42), then verifies the
 // load. CAS path is exercised once to swap 42 → 100, then 100 → 42.
 //
-// Thread-spawn path (`aether_thread_spawn` / `aether_thread_join`) is
-// available via the same runtime ABI; the multi-threaded variant is
-// blocked on fn-pointer call expressions in the asm backend.
+// Thread-spawn path (`aether_thread_spawn` / `aether_thread_join`) now runs
+// real OS threads that return their worker's computed value — see
+// `threads_parallel.aether`. This witness covers the atomic primitives.
 use runtime;
 
 fn main() -> i32 {

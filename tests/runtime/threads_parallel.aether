@@ -1,0 +1,34 @@
+// roadmap: P6.9
+// expect: exit=42
+//
+// Real OS-level multithreading. `aether_thread_spawn(fn, arg)` launches a
+// std::thread that runs an Aether function (passed by ADDRESS — `sum_to` used as
+// a value emits its code pointer) with the MS x64 single-arg ABI; the handle is
+// joined by `aether_thread_join`, which now returns the value the worker
+// COMPUTED. Three workers each run a real loop in parallel and their partial
+// results are combined on the main thread. No executor, no global state — just
+// std::thread + JoinHandle<i64>.
+extern fn aether_thread_spawn(fn_ptr: i64, arg: i64) -> i64;
+extern fn aether_thread_join(handle: i64) -> i64;
+
+// Triangular sum 1+2+…+n — a non-trivial loop so the worker does real work.
+fn sum_to(n: i64) -> i64 {
+    let mut s: i64 = 0;
+    let mut i: i64 = 1;
+    while i <= n { s = s + i; i = i + 1; }
+    s
+}
+
+fn main() -> i32 {
+    // Launch three workers concurrently (each gets its own OS thread)...
+    let t1: i64 = aether_thread_spawn(sum_to, 3);    // -> 6
+    let t2: i64 = aether_thread_spawn(sum_to, 5);    // -> 15
+    let t3: i64 = aether_thread_spawn(sum_to, 6);    // -> 21
+
+    // ...then join and combine their computed results on the main thread.
+    let r1: i64 = aether_thread_join(t1);
+    let r2: i64 = aether_thread_join(t2);
+    let r3: i64 = aether_thread_join(t3);
+
+    (r1 + r2 + r3) as i32                             // 6 + 15 + 21 = 42
+}

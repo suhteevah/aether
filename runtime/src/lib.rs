@@ -1099,29 +1099,30 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     }
 }
 
-/// Spawn a thread that runs `fn_ptr(arg)`. Returns the OS thread handle
-/// (or 0 on failure). Caller joins via `aether_thread_join`.
+/// Spawn an OS thread that runs the Aether function at address `fn_ptr` (an
+/// `fn(i64) -> i64`, ABI-compatible with the MS x64 single-arg convention
+/// aetherc emits) with `arg`. Returns an opaque handle (a boxed
+/// `JoinHandle<i64>` pointer, or 0 on failure) for `aether_thread_join`, which
+/// returns the value the worker COMPUTED — real OS-level parallelism, no
+/// executor, no global state. The fn address is moved into the thread as a
+/// plain integer (Send) and reconstructed there.
 #[no_mangle] pub unsafe extern "C" fn aether_thread_spawn(fn_ptr: i64, arg: i64) -> i64 {
     if fn_ptr == 0 { return 0; }
-    let payload: Box<(i64, i64)> = Box::new((fn_ptr, arg));
-    let raw = Box::into_raw(payload) as i64;
     let handle = std::thread::spawn(move || {
-        let p = raw as *mut (i64, i64);
-        let (fp, ar) = *Box::from_raw(p);
-        let f: extern "C" fn(i64) -> i64 = std::mem::transmute(fp);
-        f(ar);
+        let f: extern "C" fn(i64) -> i64 = std::mem::transmute(fn_ptr);
+        f(arg)
     });
     Box::into_raw(Box::new(handle)) as i64
 }
 
-#[no_mangle] pub unsafe extern "C" fn aether_thread_join(handle: i64) -> i32 {
-    if handle == 0 { return -1; }
-    let h: Box<std::thread::JoinHandle<()>> =
-        Box::from_raw(handle as *mut std::thread::JoinHandle<()>);
-    match h.join() {
-        Ok(()) => 0,
-        Err(_) => -2,
-    }
+/// Join the thread `handle` from `aether_thread_spawn` and return the value its
+/// worker function produced (0 if the handle is null or the thread panicked).
+/// Consumes the handle.
+#[no_mangle] pub unsafe extern "C" fn aether_thread_join(handle: i64) -> i64 {
+    if handle == 0 { return 0; }
+    let h: Box<std::thread::JoinHandle<i64>> =
+        Box::from_raw(handle as *mut std::thread::JoinHandle<i64>);
+    h.join().unwrap_or(0)
 }
 
 /// Integer absolute value. Free fn — Aether doesn't have method-on-scalar
