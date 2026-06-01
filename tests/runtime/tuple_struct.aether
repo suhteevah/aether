@@ -1,0 +1,23 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// Tuple structs / newtypes: `struct Meters(i64);` and `struct Pair(i64, i64);`.
+// Positional fields are named "0", "1", … — the same keys tuple `.0`/`.1` field
+// access already uses — so field access and the flat-slot struct machinery apply
+// unchanged. The constructor `Meters(42)` parses as a call and is recognised at
+// codegen as a tuple-struct construction, mapping positional args to the fields.
+// (Construction in arg/return position is a follow-up; the let-bound form here is
+// the idiomatic one.)
+struct Meters(i64);
+struct Pair(i64, i64);
+
+fn main() -> i32 {
+    let m: Meters = Meters(42);
+    let p: Pair = Pair(15, 27);
+
+    // newtype field, then both fields of the 2-field tuple struct
+    let a: i64 = m.0;          // 42
+    let b: i64 = p.0 + p.1;    // 42
+
+    (a + b - 42) as i32        // 42 + 42 - 42 = 42
+}

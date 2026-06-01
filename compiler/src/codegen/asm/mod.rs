@@ -2530,6 +2530,33 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                 }
                 return Ok(());
             }
+            // Tuple-struct construction `let m: Meters = Meters(a, b)`. The
+            // constructor parses as a call; its positional args map to the
+            // tuple struct's fields "0","1",… Reuses the struct-lit slot +
+            // populate machinery. count_locals reserves the field slots via the
+            // `: Meters` annotation, so the dual-pass frame invariant holds.
+            if let Expr::Call { callee, args } = value {
+                if let Expr::Ident(sname) = callee.as_ref() {
+                    if let Some(sd) = locals.struct_decls.get(sname).cloned() {
+                        let is_tuple_struct = !sd.fields.is_empty()
+                            && sd.fields.iter().enumerate().all(|(i, f)| f.name == i.to_string());
+                        if is_tuple_struct && args.len() == sd.fields.len() {
+                            locals.struct_locals.insert(name.clone(), sname.clone());
+                            let decls = locals.struct_decls.clone();
+                            let mut keys = Vec::new();
+                            expand_struct_field_keys(name, &sd, &HashMap::new(), &decls, &mut keys);
+                            for (k, kind) in &keys {
+                                locals.alloc(k);
+                                locals.types.insert(k.clone(), *kind);
+                            }
+                            let synth: Vec<(String, Expr)> = args.iter().enumerate()
+                                .map(|(i, a)| (i.to_string(), a.clone())).collect();
+                            emit_struct_lit_populate(name, &synth, out, data, locals)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             if let Expr::StructLit { name: lit_name, fields } = value {
                 let sd = locals.struct_decls.get(lit_name).cloned()
                     .ok_or(AsmError::UnsupportedExpr("struct literal: unknown type"))?;

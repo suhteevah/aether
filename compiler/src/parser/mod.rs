@@ -481,6 +481,24 @@ impl Parser {
             }
             self.expect(Tok::Gt)?;
         }
+        // Tuple struct `struct Meters(i64, i64);` — positional fields named
+        // "0", "1", … (the same keys tuple `.0`/`.1` access uses, so field
+        // access + the flat-slot struct machinery apply unchanged). Construction
+        // `Meters(a, b)` parses as a call and is recognised at codegen.
+        if matches!(self.peek(0), Tok::LParen) {
+            self.bump();
+            let mut fields = Vec::new();
+            let mut idx = 0usize;
+            while !matches!(self.peek(0), Tok::RParen) {
+                let ty = self.parse_ty()?;
+                fields.push(StructField { name: idx.to_string(), ty });
+                idx += 1;
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+            }
+            self.expect(Tok::RParen)?;
+            if matches!(self.peek(0), Tok::Semi) { self.bump(); }
+            return Ok(Item::Struct(StructDecl { is_pub, name, generics, fields }));
+        }
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         while !matches!(self.peek(0), Tok::RBrace) {
