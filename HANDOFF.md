@@ -96,12 +96,17 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   declaring `-> i64` (bool-predicate closures tripped AE0222). Witness `nll_borrow`.
   (Deeper NLL — loop-region precision, two-phase borrows — is a follow-up; core
   NLL + compile-path enforcement is real.)
-- STILL-MISSING — **async/await** is now the ONE remaining named large subsystem
-  (futures + executor + the async-fn body-splitting state-machine transform; the
-  `async_executor`/`async_two_tasks` witnesses HAND-WRITE the shape — `async fn`/
-  `.await` aren't transformed, like macros were before they became real). A fake
-  synchronous async would be dishonest (don't-overclaim); needs a dedicated session.
-  Lesser follow-ups: macro hygiene + nested repetitions; deeper NLL precision;
+- **async — runtime half (real cooperative executor)** (`936399a`) —
+  `aether_executor_run(tasks, n)` is a REAL single-threaded round-robin scheduler
+  driving N poll-based futures (`poll(state)->0 Pending/1 Ready`); genuine
+  suspension + interleaving (witness `async_executor_real` records the poll order
+  and asserts A,B,A,B,A,B). NOT a synchronous fake. **Remaining async half =
+  COMPILER**: transform an `async fn` body into one of these poll state machines
+  (body-split at each `.await`, save cross-await locals in the state struct) +
+  `.await`/`async fn` syntax. THAT is the dedicated-session headline — the hard
+  part (a fake synchronous async would be dishonest; don't-overclaim).
+- Lesser follow-ups: macro hygiene + nested repetitions; deeper NLL precision
+  (loop regions, two-phase borrows);
   capturing an aggregate (array/struct) by value in a closure; direct
   `a.add(x).add(y)` struct-method chaining; >3-field enum return (sret); array
   `[v;n]` const-ident count; tuple-struct ctor in arg/return position.
