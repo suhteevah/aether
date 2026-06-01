@@ -1,0 +1,20 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// `match` directly on a call result (`match foo() { … }`) — the match codegen
+// needs a local scrutinee, so a non-ident scrutinee is temp-bound by the parser
+// (`{ let __m = foo(); match __m { … } }`). Common pattern: matching on a
+// function that returns an Option/Result-shaped enum.
+enum O { N, S(i64) }
+
+fn at(i: i64) -> O {
+    if i < 6 { O::S(i) } else { O::N }
+}
+
+fn main() -> i32 {
+    let v: i64 = match at(3) {   // call scrutinee, not a local
+        O::S(x) => x,            // 3
+        O::N => 0,
+    };
+    (v + 39) as i32              // 3 + 39 = 42
+}

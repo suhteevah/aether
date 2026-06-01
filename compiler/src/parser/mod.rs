@@ -1207,6 +1207,7 @@ impl Parser {
                 Ok(Expr::While { cond: Box::new(cond), body })
             }
             Tok::Match => {
+                let uid = self.pos;
                 self.bump();
                 let scrut = self.with_struct_lit_disabled(|p| p.parse_expr())?;
                 self.expect(Tok::LBrace)?;
@@ -1219,7 +1220,22 @@ impl Parser {
                     if matches!(self.peek(0), Tok::Comma) { self.bump(); }
                 }
                 self.expect(Tok::RBrace)?;
-                Ok(Expr::Match { scrutinee: Box::new(scrut), arms })
+                // The match codegen needs a local scrutinee. If it's already a
+                // bare ident use it directly; otherwise bind it to a fresh temp
+                // (`match foo() { … }` → `{ let __m = foo(); match __m { … } }`).
+                let (scrut_ident, prelude): (Expr, Option<Stmt>) = match scrut {
+                    s @ Expr::Ident(_) => (s, None),
+                    other => {
+                        let tmp = format!("__match_scrut_{}", uid);
+                        (Expr::Ident(tmp.clone()),
+                         Some(Stmt::Let { name: tmp, mutable: false, ty: None, value: Some(other) }))
+                    }
+                };
+                let m = Expr::Match { scrutinee: Box::new(scrut_ident), arms };
+                Ok(match prelude {
+                    None => m,
+                    Some(stmt) => Expr::Block(Block { stmts: vec![stmt], tail: Some(Box::new(m)) }),
+                })
             }
             Tok::Break => { self.bump(); Ok(Expr::Break) }
             Tok::Continue => { self.bump(); Ok(Expr::Continue) }
