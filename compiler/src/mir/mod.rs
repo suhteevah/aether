@@ -34,6 +34,7 @@ pub mod path_call;
 pub mod infer;
 pub mod lifetimes;
 pub mod async_exec;
+pub mod async_lower;
 pub mod ast_opt;
 pub mod inline;
 pub mod regalloc_drive;

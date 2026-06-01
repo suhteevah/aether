@@ -1162,6 +1162,22 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     polls
 }
 
+/// Drive a single future to completion and return its result — what `.await`
+/// lowers to. A future is the heap layout the async-lowering pass emits:
+/// `[poll_fn(0) | pc(1) | result(2) | …]`. Reads the poll fn from slot 0, polls
+/// until it returns nonzero (Ready), then returns slot 2 (the result). A null
+/// future or null poll fn yields slot 2 (or 0) directly.
+#[no_mangle] pub unsafe extern "C" fn aether_block_on(fut: i64) -> i64 {
+    if fut == 0 { return 0; }
+    let base = fut as *const i64;
+    let poll_fn = *base.add(0);
+    let result_slot = base.add(2);
+    if poll_fn == 0 { return *result_slot; }
+    let f: extern "C" fn(i64) -> i64 = std::mem::transmute(poll_fn);
+    while f(fut) == 0 {}
+    *result_slot
+}
+
 /// Integer absolute value. Free fn — Aether doesn't have method-on-scalar
 /// dispatch yet, so primitives live as `aether_*` extern fns.
 // =====================================================================

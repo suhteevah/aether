@@ -381,6 +381,14 @@ fn main() {
         }
     }
 
+    // Async lowering — transform `async fn`s into poll-based state machines
+    // (constructor + `__f_poll`) driven by the runtime executor, and rewrite
+    // `.await` to `aether_block_on`. Runs before closure lowering/codegen.
+    let nasync = mir::async_lower::run(&mut prog);
+    if nasync > 0 && !args.json_errors {
+        eprintln!("[aetherc] lowered {} async fn(s) to poll state machines", nasync);
+    }
+
     // P6.6 — closure-object lowering. Runs BEFORE the closure-lifting pass so
     // it can fully lower the cases that pass deliberately punts on: a CAPTURING
     // closure bound to a local and passed as a value (`apply(inc, 5)`). These

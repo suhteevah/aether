@@ -1,0 +1,32 @@
+// roadmap: P6.10, P12.3
+// expect: exit=42
+//
+// REAL async/await — the compiler now transforms `async fn` bodies into poll
+// state machines (no longer a synchronous pass-through). An `async fn` becomes a
+// heap future `[poll_fn | pc | result | params… | locals…]` plus a `pc`-dispatched
+// poll fn: each `yield_now().await` SUSPENDS (advances pc, returns Pending), and
+// values — params AND locals that cross a suspension — live in the future struct
+// so they survive across `.await`. `.await` lowers to `aether_block_on`, which
+// drives the future to completion. (Multi-task interleaving is driven by the real
+// cooperative executor `aether_executor_run` — see async_executor_real.aether.)
+//
+// `accumulate` suspends TWICE with two locals (`a`, `b`) live across the awaits,
+// proving real state preservation, not synchronous inlining.
+async fn accumulate(start: i64) -> i64 {
+    let a: i64 = start + 5;     // start=15 -> a=20
+    yield_now().await;          // suspend; `a` saved in the future
+    let b: i64 = a + 2;         // a=20 -> b=22  (read back after resume)
+    yield_now().await;          // suspend; `a` and `b` saved
+    a + b - 0                   // 20 + 22 = 42  (both locals survive)
+}
+
+// A second async fn with NO internal await — an immediately-ready future.
+async fn identity(x: i64) -> i64 {
+    x
+}
+
+fn main() -> i32 {
+    let r: i64 = accumulate(15).await;   // drives the suspending future -> 42
+    let z: i64 = identity(0).await;      // one-shot future -> 0
+    (r + z) as i32                        // 42
+}

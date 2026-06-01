@@ -1,9 +1,11 @@
 // expect: exit=42
-// roadmap: P12.3
-// `async fn` parses; `.await` parses. Today both are pass-throughs — the
-// lowering runs synchronously. Real executor + state-machine transform is
-// future work. The witness proves the parser surface is wired and the asm
-// backend produces a runnable .exe.
+// roadmap: P12.3, P6.10
+// `async fn` + `.await` are REAL now: each async fn is lowered to a poll state
+// machine (constructor + `__f_poll`), and `.await` drives the resulting future
+// to completion via `aether_block_on`. These two async fns have no internal
+// `.await`, so each is a one-shot (immediately-ready) future: add_two(20,1) -> 21,
+// double(21) -> 42. See async_await.aether for the suspending case with locals
+// that survive across `.await`.
 async fn add_two(a: i64, b: i64) -> i64 {
     a + b
 }

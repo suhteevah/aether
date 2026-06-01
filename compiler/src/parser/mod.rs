@@ -125,7 +125,7 @@ impl Parser {
 
     fn parse_item(&mut self) -> PResult<Item> {
         // Eat attributes — they belong to the next fn.
-        let attrs = self.parse_attrs()?;
+        let mut attrs = self.parse_attrs()?;
 
         // `extern` is a soft keyword (lexed as Ident). Consume it eagerly so
         // the rest of this function can pretend it doesn't exist.
@@ -134,10 +134,14 @@ impl Parser {
             true
         } else { false };
 
-        // P12.3 — `async fn …` parses; today the body runs synchronously
-        // (state-machine lowering is a deeper rewrite). The marker is
-        // consumed so the rest of the parser sees a normal fn decl.
-        if matches!(self.peek(0), Tok::Async) { self.bump(); }
+        // `async fn …` — mark the fn with a synthetic `#[__async]` attr so the
+        // async-lowering pass transforms its body into a poll state machine. The
+        // `async` token itself is consumed so the rest of the parser sees a
+        // normal fn decl. (Attr-based marker => no FnDecl struct change.)
+        if matches!(self.peek(0), Tok::Async) {
+            self.bump();
+            attrs.push(Attr { name: "__async".into(), args: Vec::new() });
+        }
 
         // P16.16 — `unsafe impl Trait for Type {}` is the canonical way to
         // declare a marker trait (Send, Sync) for a user type. We accept
@@ -1132,11 +1136,13 @@ impl Parser {
                 }
                 Tok::Dot => {
                     self.bump();
-                    // P12.3 — `.await` postfix. Today's lowering is a
-                    // pass-through (the value is the future itself); a real
-                    // executor + state-machine transform is the deeper rewrite.
+                    // `.await` postfix → a marker `MethodCall{name:"__await"}`
+                    // (no new Expr variant, so no exhaustive-match churn). The
+                    // async-lowering pass rewrites it to `aether_block_on(recv)`
+                    // (drive the future to completion + yield its result).
                     if matches!(self.peek(0), Tok::Await) {
                         self.bump();
+                        e = Expr::MethodCall { recv: Box::new(e), name: "__await".into(), args: Vec::new() };
                         continue;
                     }
                     // Tuple field syntax: `.0`, `.1`, etc. Numeric index is
