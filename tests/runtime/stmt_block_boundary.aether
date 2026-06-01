@@ -1,13 +1,15 @@
 // roadmap: P6.4
 // expect: exit=42
 //
-// Statement-vs-expression boundary: a block-like statement (if/while/for/loop/
-// match) in statement position is a COMPLETE statement — a following
-// parenthesized expression is a NEW statement (or the tail), NOT a postfix call
-// on the block. Regression: `for {...} (s*7) as i32` used to parse as
-// `Call { callee: <for-expr>, args: [s*7] }` -> "non-ident callee".
+// Statement-vs-expression boundary for block-like expressions:
+//   * a bare block-expr (if/while/for/loop/match) is NEVER the callee of a
+//     postfix `(…)` call — `for {…} (…)` is a block statement followed by a new
+//     expression, not `Call { callee: <for>, args }` (the original "non-ident
+//     callee" bug);
+//   * a CAST / binary operator still continues the expression (they're handled
+//     above the postfix call), so `if c {a} else {b} as i32` casts the if-value.
 fn main() -> i32 {
     let mut s: i64 = 0;
-    for k in 0..6 { s = s + 1; }      // s = 6
-    (s * 7) as i32                    // a NEW expression (the tail) -> 42
+    for k in 0..6 { s = s + 1; }            // s = 6 — the for is a statement
+    if s == 6 { s * 7 } else { 0 } as i32   // bare if + trailing cast -> 42
 }
