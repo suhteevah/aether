@@ -45,7 +45,12 @@ separate.) Witness `method_chain`. So the COMMON language surface — generics,
 type system, traits, struct construction + composition + method chains, control
 flow — is now genuinely real and probe-hardened. What's left is the big
 SUBSYSTEMS (Iterator+adapters, Vec<T>-growth, sret, dyn vtables, full NLL, async,
-macros, threads) — each a focused multi-session effort.
+macros, threads) — each a focused multi-session effort. One more probe gap noted
+(moderate, not done): a payload-enum passed as a fn PARAM (`fn f(o: Option<i64>)`
+then `match o`) needs the 2-slot enum-param ABI (tag+val on both sides),
+analogous to multi-field struct-param passing. The round-5 sweep is otherwise
+clean (3-level nested fields, nested generic struct fields, method-chain+arith,
+for-over-nested-field-bound, generic+struct combos).
 
 ### parser stmt-boundary fix (detail)
 - **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
