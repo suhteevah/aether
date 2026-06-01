@@ -1,0 +1,53 @@
+// roadmap: P6.8
+// expect: exit=42
+//
+// Iterator + ADAPTERS, in Aether. A stateful range iterator (`iter_next`
+// returns an `Option`-shaped enum that the consumer drives with `while let`),
+// consumed through a generic `fold` adapter that takes TWO closures by value:
+//   - `keep`    : a filter predicate   |n| n is even
+//   - `combine` : a fold accumulator   |acc, x| acc + x
+// Both closures capture by value (`half`, and `combine` is pure), are passed as
+// `Closure`-typed values, and are invoked *inside the while-let's match arm* —
+// the path that exercises closure-object call rewriting through `Match` arms.
+// Summing the even values of 0..13 -> 0+2+4+6+8+10+12 = 42.
+use runtime;
+
+enum Opt { N, S(i64) }
+
+// iterator state lives on the heap: [cursor, end]
+fn iter_new(n: i64) -> i64 {
+    let p: i64 = aether_alloc_bytes(16);
+    aether_store_i64(p, 0, 0);
+    aether_store_i64(p, 1, n);
+    p
+}
+
+fn iter_next(it: i64) -> Opt {
+    let cur: i64 = aether_load_i64(it, 0);
+    let end: i64 = aether_load_i64(it, 1);
+    if cur < end {
+        aether_store_i64(it, 0, cur + 1);
+        Opt::S(cur)
+    } else {
+        Opt::N
+    }
+}
+
+// fold adapter: a filter predicate and a binary combiner, both Closure values.
+fn fold_filtered(it: i64, init: i64, keep: Closure, combine: Closure) -> i64 {
+    let mut acc: i64 = init;
+    while let Opt::S(x) = iter_next(it) {
+        if keep(x) {
+            acc = combine(acc, x);
+        }
+    }
+    acc
+}
+
+fn main() -> i32 {
+    let it: i64 = iter_new(13);
+    let half: i64 = 2;
+    let is_even = |n: i64| (n - (n / half) * half) == 0;   // captures `half`
+    let add = |a: i64, x: i64| a + x;                      // binary combiner
+    fold_filtered(it, 0, is_even, add) as i32
+}

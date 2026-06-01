@@ -38,21 +38,29 @@
 //! and inline `apply(|x| .., 5)` closures are follow-ups.
 
 use crate::ast::{Block, Expr, FnDecl, Item, Param, Program, Stmt, Ty};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub fn run(prog: &mut Program) -> usize {
     let mut globals: HashSet<String> = HashSet::new();
+    // name -> which param positions are declared `Closure` (object ABI). A
+    // closure value must become a heap object ONLY when it flows into one of
+    // these positions; a closure passed to an `i64` param stays a bare fn
+    // pointer (the direct `op(x, y)` convention, no env arg).
+    let mut sigs: HashMap<String, Vec<bool>> = HashMap::new();
+    let mut note_sig = |f: &FnDecl| {
+        sigs.insert(f.name.clone(), f.params.iter().map(|p| is_closure_ty(&p.ty)).collect());
+    };
     for item in &prog.items {
         match item {
-            Item::Fn(f) => { globals.insert(f.name.clone()); }
+            Item::Fn(f) => { globals.insert(f.name.clone()); note_sig(f); }
             Item::Impl { methods, .. } | Item::ImplTrait { methods, .. } => {
-                for m in methods { globals.insert(m.name.clone()); }
+                for m in methods { globals.insert(m.name.clone()); note_sig(m); }
             }
             _ => {}
         }
     }
 
-    let mut ctx = Ctx { lifted: Vec::new(), counter: 0, globals };
+    let mut ctx = Ctx { lifted: Vec::new(), counter: 0, globals, sigs };
     // Process top-level fns + impl methods. `ctx` is disjoint from `prog`, so
     // a plain `iter_mut` is sound; the lifted fns are appended after the loop.
     for item in prog.items.iter_mut() {
@@ -74,6 +82,7 @@ struct Ctx {
     lifted: Vec<FnDecl>,
     counter: usize,
     globals: HashSet<String>,
+    sigs: HashMap<String, Vec<bool>>,
 }
 
 const ENV_PARAM: &str = "__cloenv";
@@ -97,7 +106,7 @@ fn process_fn(f: &mut FnDecl, ctx: &mut Ctx) {
     // direct-called. Done before construction lowering, which would otherwise
     // add synthetic `aether_store_i64(NAME, ...)` arg uses.
     let mut arg_used: HashSet<String> = HashSet::new();
-    collect_arg_idents_block(body, &mut arg_used);
+    collect_arg_idents_block(body, &ctx.sigs, &mut arg_used);
 
     // Phase A — lower capturing closures bound to a value-used name into
     // heap-object construction; record each as a call target.
@@ -125,13 +134,14 @@ fn lower_block(b: &mut Block, ctx: &mut Ctx, arg_used: &HashSet<String>, targets
                 let mut bound = param_names.clone();
                 collect_free_vars(&body, &mut bound, &ctx.globals, &mut caps, &mut seen);
 
-                if caps.is_empty() {
-                    // Non-capturing closure used as a value: leave it for
-                    // mir::closures (lifts to a bare fn pointer, which the
-                    // i64 indirect-call path already handles).
-                    out.push(Stmt::Let { name, mutable, ty, value: Some(Expr::Closure { params, body }) });
-                    continue;
-                }
+                // NOTE: even a NON-capturing closure (caps empty) is lowered to a
+                // 1-word `[fn_ptr]` object here, because it is passed as a value
+                // (`arg_used`) and will therefore be invoked through the closure-
+                // object ABI (`fp(obj, args)` with an env-first lifted fn). A bare
+                // fn pointer from mir::closures would mismatch that ABI — the
+                // consumer's `aether_load_i64(obj, 0)` would deref a raw code
+                // pointer (misaligned). Wrapping unconditionally keeps the ABI
+                // uniform; the empty-caps object's lifted fn just ignores `env`.
 
                 // Build the lifted fn: env param first, captures read from env.
                 let lifted_name = format!("__cloobj_{}", ctx.counter);
@@ -216,6 +226,16 @@ fn descend_expr(e: &mut Expr, ctx: &mut Ctx, arg_used: &HashSet<String>, targets
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => descend_expr(expr, ctx, arg_used, targets),
         Expr::Field { recv, .. } => descend_expr(recv, ctx, arg_used, targets),
         Expr::Index { recv, idx } => { descend_expr(recv, ctx, arg_used, targets); descend_expr(idx, ctx, arg_used, targets); }
+        Expr::Match { scrutinee, arms } => {
+            descend_expr(scrutinee, ctx, arg_used, targets);
+            for (_, arm) in arms { descend_expr(arm, ctx, arg_used, targets); }
+        }
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { descend_expr(fv, ctx, arg_used, targets); },
+        Expr::Tuple(elems) => for el in elems { descend_expr(el, ctx, arg_used, targets); },
+        Expr::Range { lo, hi, step } => {
+            descend_expr(lo, ctx, arg_used, targets); descend_expr(hi, ctx, arg_used, targets);
+            if let Some(s) = step { descend_expr(s, ctx, arg_used, targets); }
+        }
         _ => {}
     }
 }
@@ -281,6 +301,16 @@ fn rewrite_calls(e: &mut Expr, targets: &HashSet<String>, ctr: &mut usize) {
         Expr::For { iter, body, .. } => { rewrite_calls(iter, targets, ctr); rewrite_calls_block(body, targets, ctr); }
         Expr::While { cond, body } => { rewrite_calls(cond, targets, ctr); rewrite_calls_block(body, targets, ctr); }
         Expr::Region { body, .. } => rewrite_calls_block(body, targets, ctr),
+        Expr::Match { scrutinee, arms } => {
+            rewrite_calls(scrutinee, targets, ctr);
+            for (_, arm) in arms { rewrite_calls(arm, targets, ctr); }
+        }
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { rewrite_calls(fv, targets, ctr); },
+        Expr::Tuple(elems) => for e in elems { rewrite_calls(e, targets, ctr); },
+        Expr::Range { lo, hi, step } => {
+            rewrite_calls(lo, targets, ctr); rewrite_calls(hi, targets, ctr);
+            if let Some(s) = step { rewrite_calls(s, targets, ctr); }
+        }
         _ => {}
     }
 }
@@ -291,48 +321,67 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Call { callee: Box::new(Expr::Ident(name.into())), args }
 }
 
-/// Collect idents that appear in call-argument position anywhere in the block.
-fn collect_arg_idents_block(b: &Block, out: &mut HashSet<String>) {
-    for s in &b.stmts { collect_arg_idents_stmt(s, out); }
-    if let Some(t) = &b.tail { collect_arg_idents_expr(t, out); }
+/// Collect idents passed into a `Closure`-typed parameter position anywhere in
+/// the block. ONLY such idents need the heap-object representation — a closure
+/// passed to an `i64` param keeps the bare-fn-pointer convention. `sigs` maps a
+/// fn name to which of its param positions are declared `Closure`.
+fn collect_arg_idents_block(b: &Block, sigs: &HashMap<String, Vec<bool>>, out: &mut HashSet<String>) {
+    for s in &b.stmts { collect_arg_idents_stmt(s, sigs, out); }
+    if let Some(t) = &b.tail { collect_arg_idents_expr(t, sigs, out); }
 }
-fn collect_arg_idents_stmt(s: &Stmt, out: &mut HashSet<String>) {
+fn collect_arg_idents_stmt(s: &Stmt, sigs: &HashMap<String, Vec<bool>>, out: &mut HashSet<String>) {
     match s {
-        Stmt::Let { value: Some(e), .. } => collect_arg_idents_expr(e, out),
-        Stmt::LetTuple { value, .. } => collect_arg_idents_expr(value, out),
-        Stmt::Expr(e) | Stmt::Return(Some(e)) => collect_arg_idents_expr(e, out),
+        Stmt::Let { value: Some(e), .. } => collect_arg_idents_expr(e, sigs, out),
+        Stmt::LetTuple { value, .. } => collect_arg_idents_expr(value, sigs, out),
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => collect_arg_idents_expr(e, sigs, out),
         _ => {}
     }
 }
-fn collect_arg_idents_expr(e: &Expr, out: &mut HashSet<String>) {
+fn collect_arg_idents_expr(e: &Expr, sigs: &HashMap<String, Vec<bool>>, out: &mut HashSet<String>) {
     match e {
         Expr::Call { callee, args } => {
-            collect_arg_idents_expr(callee, out);
-            for a in args {
-                if let Expr::Ident(n) = a { out.insert(n.clone()); }
-                collect_arg_idents_expr(a, out);
+            collect_arg_idents_expr(callee, sigs, out);
+            // Resolve the callee's Closure-typed positions (if known).
+            let clo_pos: Option<&Vec<bool>> = match callee.as_ref() {
+                Expr::Ident(fname) => sigs.get(fname),
+                _ => None,
+            };
+            for (i, a) in args.iter().enumerate() {
+                if let Expr::Ident(n) = a {
+                    let is_clo = clo_pos.map_or(false, |v| v.get(i).copied().unwrap_or(false));
+                    if is_clo { out.insert(n.clone()); }
+                }
+                collect_arg_idents_expr(a, sigs, out);
             }
         }
         Expr::MethodCall { recv, args, .. } => {
-            collect_arg_idents_expr(recv, out);
-            for a in args {
-                if let Expr::Ident(n) = a { out.insert(n.clone()); }
-                collect_arg_idents_expr(a, out);
-            }
+            collect_arg_idents_expr(recv, sigs, out);
+            // Method signatures aren't position-resolved here; recurse only.
+            for a in args { collect_arg_idents_expr(a, sigs, out); }
         }
-        Expr::Bin { lhs, rhs, .. } => { collect_arg_idents_expr(lhs, out); collect_arg_idents_expr(rhs, out); }
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => collect_arg_idents_expr(expr, out),
-        Expr::Field { recv, .. } => collect_arg_idents_expr(recv, out),
-        Expr::Index { recv, idx } => { collect_arg_idents_expr(recv, out); collect_arg_idents_expr(idx, out); }
-        Expr::Block(b) => collect_arg_idents_block(b, out),
+        Expr::Bin { lhs, rhs, .. } => { collect_arg_idents_expr(lhs, sigs, out); collect_arg_idents_expr(rhs, sigs, out); }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => collect_arg_idents_expr(expr, sigs, out),
+        Expr::Field { recv, .. } => collect_arg_idents_expr(recv, sigs, out),
+        Expr::Index { recv, idx } => { collect_arg_idents_expr(recv, sigs, out); collect_arg_idents_expr(idx, sigs, out); }
+        Expr::Block(b) => collect_arg_idents_block(b, sigs, out),
         Expr::If { cond, then, else_ } => {
-            collect_arg_idents_expr(cond, out);
-            collect_arg_idents_block(then, out);
-            if let Some(b) = else_ { collect_arg_idents_block(b, out); }
+            collect_arg_idents_expr(cond, sigs, out);
+            collect_arg_idents_block(then, sigs, out);
+            if let Some(b) = else_ { collect_arg_idents_block(b, sigs, out); }
         }
-        Expr::For { iter, body, .. } => { collect_arg_idents_expr(iter, out); collect_arg_idents_block(body, out); }
-        Expr::While { cond, body } => { collect_arg_idents_expr(cond, out); collect_arg_idents_block(body, out); }
-        Expr::Region { body, .. } => collect_arg_idents_block(body, out),
+        Expr::For { iter, body, .. } => { collect_arg_idents_expr(iter, sigs, out); collect_arg_idents_block(body, sigs, out); }
+        Expr::While { cond, body } => { collect_arg_idents_expr(cond, sigs, out); collect_arg_idents_block(body, sigs, out); }
+        Expr::Region { body, .. } => collect_arg_idents_block(body, sigs, out),
+        Expr::Match { scrutinee, arms } => {
+            collect_arg_idents_expr(scrutinee, sigs, out);
+            for (_, arm) in arms { collect_arg_idents_expr(arm, sigs, out); }
+        }
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { collect_arg_idents_expr(fv, sigs, out); },
+        Expr::Tuple(elems) => for el in elems { collect_arg_idents_expr(el, sigs, out); },
+        Expr::Range { lo, hi, step } => {
+            collect_arg_idents_expr(lo, sigs, out); collect_arg_idents_expr(hi, sigs, out);
+            if let Some(s) = step { collect_arg_idents_expr(s, sigs, out); }
+        }
         _ => {}
     }
 }
@@ -375,10 +424,23 @@ fn collect_free_vars(e: &Expr, bound: &mut HashSet<String>, globals: &HashSet<St
             collect_free_vars_block(body, &mut inner, globals, caps, seen);
         }
         Expr::While { cond, body } => { collect_free_vars(cond, bound, globals, caps, seen); collect_free_vars_block(body, bound, globals, caps, seen); }
+        Expr::Region { body, .. } => collect_free_vars_block(body, bound, globals, caps, seen),
         Expr::Range { lo, hi, step } => {
             collect_free_vars(lo, bound, globals, caps, seen); collect_free_vars(hi, bound, globals, caps, seen);
             if let Some(s) = step { collect_free_vars(s, bound, globals, caps, seen); }
         }
+        Expr::Match { scrutinee, arms } => {
+            collect_free_vars(scrutinee, bound, globals, caps, seen);
+            for (pat, arm) in arms {
+                // A payload-binding arm introduces a fresh local that shadows
+                // any outer name, so it is NOT a free var inside that arm.
+                let mut inner = bound.clone();
+                if let crate::ast::MatchPat::EnumVariantBind(_, bind) = pat { inner.insert(bind.clone()); }
+                collect_free_vars(arm, &mut inner, globals, caps, seen);
+            }
+        }
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { collect_free_vars(fv, bound, globals, caps, seen); },
+        Expr::Tuple(elems) => for el in elems { collect_free_vars(el, bound, globals, caps, seen); },
         _ => {}
     }
 }
