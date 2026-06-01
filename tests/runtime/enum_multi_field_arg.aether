@@ -1,0 +1,33 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Multi-field enum payloads crossing a FUNCTION BOUNDARY — passing a multi-field
+// variant as a parameter (and matching it inside the callee). Completes the ADT
+// story: the enum-param/arg ABI now carries tag + val + val1 + … (one int arg
+// register each), generalised from the old tag+val. Both an enum LOCAL
+// (`area(r)`) and an inline CONSTRUCTOR (`area(Shape::Rect(6,5))`) are passed.
+// Single-payload enums are unchanged (this is the same code path, nslots=1).
+// (A multi-field enum RETURN still needs >2 registers / an sret enum ABI.)
+enum Shape {
+    Empty,
+    Circle(i64),            // 1 field
+    Rect(i64, i64),         // 2 fields
+}
+
+fn area(s: Shape) -> i64 {
+    match s {
+        Shape::Rect(w, h) => w * h,   // both payload fields survive the call
+        Shape::Circle(r) => r * 3,
+        Shape::Empty => 0,
+    }
+}
+
+fn main() -> i32 {
+    let r: Shape = Shape::Rect(6, 5);        // enum local arg -> area 30
+    let a: i64 = area(r);                    // 30
+    let b: i64 = area(Shape::Circle(4));     // inline ctor arg -> 12
+    let c: i64 = area(Shape::Rect(2, 0));    // 0
+    let d: i64 = area(Shape::Empty);         // 0
+
+    (a + b + c + d) as i32                    // 30 + 12 + 0 + 0 = 42
+}

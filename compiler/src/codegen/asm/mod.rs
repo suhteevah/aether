@@ -903,6 +903,23 @@ fn resolve_enum_ctor(
     Some((path[0].clone(), idx, args))
 }
 
+/// Number of payload VALUE slots an enum carries: the max field count across its
+/// variants, floored at 1 (a payload enum always has ≥1 field in some variant).
+/// Slot keys are `<name>.val` (field 0) then `<name>.val1`, `.val2`, … (fields 1+).
+/// Used to keep the enum slot layout consistent across construct / match / param
+/// / arg so a multi-field enum crosses a fn boundary intact.
+fn enum_payload_slots(enum_decls: &HashMap<String, EnumDecl>, ename: &str) -> usize {
+    enum_decls.get(ename)
+        .map(|d| d.payloads.iter().map(|p| p.len()).max().unwrap_or(0))
+        .unwrap_or(0)
+        .max(1)
+}
+
+/// The payload-value slot suffix for field index k: 0 -> "val", k>=1 -> "valK".
+fn enum_val_suffix(k: usize) -> String {
+    if k == 0 { "val".to_string() } else { format!("val{}", k) }
+}
+
 /// If `e` is a `Call { callee: Ident(fn_name), .. }` where `fn_name` is a
 /// fn that returns a payload-enum (registered in `fn_returns_enum`), return
 /// the enum's name. Drives the 2-register return ABI on the caller side.
@@ -1441,7 +1458,8 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
             }
             if locals.enum_decls.contains_key(&sname) {
                 locals.alloc(&format!("{}.tag", p.name));
-                locals.alloc(&format!("{}.val", p.name));
+                let nslots = enum_payload_slots(&locals.enum_decls, &sname);
+                for k in 0..nslots { locals.alloc(&format!("{}.{}", p.name, enum_val_suffix(k))); }
                 continue;
             }
         }
@@ -1539,9 +1557,13 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
         if let Some(ename) = struct_name_of(p_ty) {
             if locals.enum_decls.contains_key(&ename) {
                 locals.enum_locals.insert(p.name.clone(), ename.clone());
-                for suffix in ["tag", "val"] {
+                // tag + val + val1.. — one int arg reg each. Must match the
+                // caller's enum-arg push order (tag first, then fields).
+                let nslots = enum_payload_slots(&locals.enum_decls, &ename);
+                let mut keys = vec![format!("{}.tag", p.name)];
+                for k in 0..nslots { keys.push(format!("{}.{}", p.name, enum_val_suffix(k))); }
+                for key in keys {
                     if arg_idx >= 4 { return Err(AsmError::TooManyArgs); }
-                    let key = format!("{}.{}", p.name, suffix);
                     let slot = locals.alloc(&key);
                     locals.types.insert(key, TyKind::Int);
                     out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[arg_idx], slot * 8));
@@ -3561,29 +3583,32 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             //     invariant required at the CALL.
             let mut arg_kinds: Vec<TyKind> = Vec::with_capacity(args.len());
             for arg in args {
-                // Inline enum constructor `f(Opt::S(42))`: materialise (tag, val)
-                // into two ABI arg slots, mirroring the enum-local-by-value path
-                // below. The tag is pushed first, then field 0. (Single-payload
-                // across the boundary; a multi-field enum needs the sret enum ABI.)
-                if let Some((_en, variant_idx, payload_exprs)) =
+                // Inline enum constructor `f(Opt::S(42))` / `f(Rect(w, h))`:
+                // materialise tag + val + val1.. into ABI arg slots, mirroring
+                // the enum-local-by-value path. Tag first, then each field 0..N
+                // (unused fields for this variant push 0).
+                if let Some((en, variant_idx, payload_exprs)) =
                     resolve_enum_ctor(arg, &locals.enum_decls)
                 {
+                    let nslots = enum_payload_slots(&locals.enum_decls, &en);
                     out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
                     out.push_str("    subq $16, %rsp\n");
                     out.push_str("    movq %rax, (%rsp)\n");
                     arg_kinds.push(TyKind::Int);
-                    if let Some(pe) = payload_exprs.first() {
-                        let pk = emit_expr_value(pe, out, data, locals)?;
-                        if !matches!(pk, TyKind::Int) {
-                            return Err(AsmError::UnsupportedExpr(
-                                "enum payload arg currently restricted to i64-shaped types"));
+                    for k in 0..nslots {
+                        if let Some(pe) = payload_exprs.get(k) {
+                            let pk = emit_expr_value(pe, out, data, locals)?;
+                            if !matches!(pk, TyKind::Int) {
+                                return Err(AsmError::UnsupportedExpr(
+                                    "enum payload arg currently restricted to i64-shaped types"));
+                            }
+                        } else {
+                            out.push_str("    xorl %eax, %eax\n");
                         }
-                    } else {
-                        out.push_str("    xorl %eax, %eax\n");
+                        out.push_str("    subq $16, %rsp\n");
+                        out.push_str("    movq %rax, (%rsp)\n");
+                        arg_kinds.push(TyKind::Int);
                     }
-                    out.push_str("    subq $16, %rsp\n");
-                    out.push_str("    movq %rax, (%rsp)\n");
-                    arg_kinds.push(TyKind::Int);
                     continue;
                 }
                 // Struct-by-value: a struct ident expands to one push per
@@ -3620,10 +3645,13 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                             continue;
                         }
                     }
-                    // Payload-enum by value: a 2-slot (tag, val) local expands
-                    // to two ABI args, mirroring the enum-param spill side.
-                    if locals.enum_locals.contains_key(arg_name) {
-                        for suffix in ["tag", "val"] {
+                    // Payload-enum by value: tag + val + val1.. expand to one ABI
+                    // arg each, mirroring the enum-param spill side.
+                    if let Some(ename) = locals.enum_locals.get(arg_name).cloned() {
+                        let nslots = enum_payload_slots(&locals.enum_decls, &ename);
+                        let mut suffixes = vec!["tag".to_string()];
+                        for k in 0..nslots { suffixes.push(enum_val_suffix(k)); }
+                        for suffix in suffixes {
                             let key = format!("{}.{}", arg_name, suffix);
                             let slot = locals.get(&key)
                                 .ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
