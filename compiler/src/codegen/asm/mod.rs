@@ -717,6 +717,23 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
         }
     }
 
+    // Tuple-return: a fn returning a 2-element i64 tuple `(i64, i64)` reuses the
+    // same 2-register ABI (elem0 -> rax, elem1 -> rdx). Larger / float tuples
+    // would need sret and are left to error clearly.
+    let mut fn_returns_tuple: HashMap<String, usize> = HashMap::new();
+    for item in &p.items {
+        if let Item::Fn(f) = item {
+            if let Some(Ty::Tuple(elems)) = f.ret.as_ref() {
+                if elems.len() == 2
+                    && elems.iter().all(|t| matches!(TyKind::from_ty(t), Some(TyKind::Int)))
+                {
+                    fn_returns_tuple.insert(f.name.clone(), elems.len());
+                    fn_returns_tuple.insert(format!("aether_{}", f.name), elems.len());
+                }
+            }
+        }
+    }
+
     // Pre-register every template's return TyKind under both its bare name and
     // every future mangled name's bare prefix — call sites read sigs by name
     // before the spec exists, so without this the call would default to Int.
@@ -733,7 +750,7 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
                 let (floats, f64s) = emit_fn(
                     f, &mut text, &mut data, &sigs, &local_fns,
                     &struct_decls, &enum_decls, &fn_returns_enum, &fn_returns_struct,
-                    &const_env, Some(generics.clone()), fn_plan)?;
+                    &fn_returns_tuple, &const_env, Some(generics.clone()), fn_plan)?;
                 all_floats.extend(floats);
                 all_f64s.extend(f64s);
             }
@@ -781,7 +798,7 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
         let (floats, f64s) = emit_fn(
             &spec, &mut text, &mut data, &sigs, &local_fns,
             &struct_decls, &enum_decls, &fn_returns_enum, &fn_returns_struct,
-            &spec_env, Some(generics.clone()), None)?;
+            &fn_returns_tuple, &spec_env, Some(generics.clone()), None)?;
         all_floats.extend(floats);
         all_f64s.extend(f64s);
     }
@@ -900,6 +917,17 @@ fn call_returns_struct(e: &Expr, fn_returns_struct: &HashMap<String, String>) ->
     None
 }
 
+/// If `e` is a call to a fn that returns a 2-element i64 tuple, return its
+/// arity. The call leaves (elem0, elem1) in (%rax, %rdx) — the tuple-return ABI.
+fn call_returns_tuple(e: &Expr, fn_returns_tuple: &HashMap<String, usize>) -> Option<usize> {
+    if let Expr::Call { callee, .. } = e {
+        if let Expr::Ident(n) = callee.as_ref() {
+            return fn_returns_tuple.get(n).copied();
+        }
+    }
+    None
+}
+
 /// Emit a small struct's fields into (%rax = field0, %rdx = field1) for the
 /// struct-return ABI. `fields` are the literal's (name, expr) pairs; `sd`
 /// gives the declared field order. field1 is evaluated and parked in rdx
@@ -935,6 +963,90 @@ fn emit_struct_return_value(
     }
     out.push_str("    popq %rax\n");
     Ok(())
+}
+
+/// Marshal a 2-element i64 tuple literal `(e0, e1)` into (%rax = e0, %rdx = e1)
+/// for the tuple-return ABI. Positional twin of emit_struct_return_value: e0 is
+/// parked on the stack while e1 is computed so e1's eval can't clobber it.
+fn emit_tuple_return_value(
+    elems: &[Expr],
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    if elems.len() != 2 {
+        return Err(AsmError::UnsupportedExpr(
+            "tuple-return supports exactly 2 i64 elements (larger needs sret)"));
+    }
+    let k0 = emit_expr_value(&elems[0], out, data, locals)?;
+    if !matches!(k0, TyKind::Int) {
+        return Err(AsmError::UnsupportedExpr("tuple-return element must be i64-shaped"));
+    }
+    out.push_str("    pushq %rax\n");
+    let k1 = emit_expr_value(&elems[1], out, data, locals)?;
+    if !matches!(k1, TyKind::Int) {
+        return Err(AsmError::UnsupportedExpr("tuple-return element must be i64-shaped"));
+    }
+    out.push_str("    movq %rax, %rdx\n");
+    out.push_str("    popq %rax\n");
+    Ok(())
+}
+
+/// Marshal a tuple-returning fn's tail expression into (%rax, %rdx), descending
+/// through `if`/block tails so `if c { (a,b) } else { (c,d) }` works — each
+/// branch's tuple is marshalled and control converges with both regs set. A
+/// tuple-returning call in tail position already leaves (%rax, %rdx).
+fn emit_tuple_tail(
+    e: &Expr,
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    match e {
+        Expr::Tuple(elems) => emit_tuple_return_value(elems, out, data, locals),
+        Expr::Block(b) => emit_tuple_tail_block(b, out, data, locals),
+        Expr::If { cond, then, else_ } => {
+            let else_label = locals.fresh_label("tupelse");
+            let end_label = locals.fresh_label("tupend");
+            let cond_ty = emit_expr_value(cond, out, data, locals)?;
+            if cond_ty != TyKind::Int {
+                return Err(AsmError::UnsupportedExpr("if condition must be int/bool"));
+            }
+            out.push_str("    testq %rax, %rax\n");
+            out.push_str(&format!("    je {}\n", else_label));
+            emit_tuple_tail_block(then, out, data, locals)?;
+            out.push_str(&format!("    jmp {}\n", end_label));
+            out.push_str(&format!("{}:\n", else_label));
+            match else_ {
+                Some(b) => emit_tuple_tail_block(b, out, data, locals)?,
+                None => return Err(AsmError::UnsupportedExpr(
+                    "tuple-returning `if` needs an `else` branch")),
+            }
+            out.push_str(&format!("{}:\n", end_label));
+            Ok(())
+        }
+        _ if call_returns_tuple(e, &locals.fn_returns_tuple).is_some() => {
+            emit_expr_value(e, out, data, locals)?;   // leaves (rax, rdx)
+            Ok(())
+        }
+        _ => Err(AsmError::UnsupportedExpr(
+            "tuple-returning fn tail must be a 2-tuple literal, an if/else of \
+             tuples, or a tuple-returning call")),
+    }
+}
+
+fn emit_tuple_tail_block(
+    b: &Block,
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    for s in &b.stmts { emit_stmt(s, out, data, locals)?; }
+    match b.tail.as_deref() {
+        Some(t) => emit_tuple_tail(t, out, data, locals),
+        None => Err(AsmError::UnsupportedExpr(
+            "tuple-returning block must end with a tuple tail")),
+    }
 }
 
 /// Emit code that produces a payload-enum value in (%rax = tag, %rdx = val).
@@ -1126,6 +1238,12 @@ struct Locals {
     /// struct. The block tail (a struct literal) is marshalled into
     /// (%rax = field0, %rdx = field1) instead of single-rax.
     current_fn_returns_struct: Option<String>,
+    /// Caller-side: fn name -> arity (always 2) iff it returns a 2-element
+    /// i64 tuple `(i64, i64)`. Reuses the 2-register ABI (elem0 -> %rax,
+    /// elem1 -> %rdx) so `let (a, b) = f()` can unmarshal both. P6.x tuple-return.
+    fn_returns_tuple: HashMap<String, usize>,
+    /// Callee-side: Some(arity) iff the *current* fn returns an i64 tuple.
+    current_fn_returns_tuple: Option<usize>,
     /// Cached fn-frame size in bytes — used by `Expr::Try` and `Stmt::Return`
     /// to emit `addq $frame, %rsp` epilogues without re-running the
     /// frame-sizing pass.
@@ -1258,6 +1376,7 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
            enum_decls: &HashMap<String, EnumDecl>,
            fn_returns_enum: &HashMap<String, String>,
            fn_returns_struct: &HashMap<String, String>,
+           fn_returns_tuple: &HashMap<String, usize>,
            const_env: &HashMap<String, i64>,
            generics: Option<Rc<RefCell<GenericState>>>,
            fn_plan: Option<&HashMap<String, u8>>)
@@ -1279,6 +1398,8 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
     locals.current_fn_returns_enum = fn_returns_enum.get(&f.name).cloned();
     locals.fn_returns_struct = fn_returns_struct.clone();
     locals.current_fn_returns_struct = fn_returns_struct.get(&f.name).cloned();
+    locals.fn_returns_tuple = fn_returns_tuple.clone();
+    locals.current_fn_returns_tuple = fn_returns_tuple.get(&f.name).copied();
     locals.const_env = const_env.clone();
     locals.generics = generics;
     // P15.2 — install per-fn reg plan (callee-saved r12..r15). Empty at --O0.
@@ -1507,6 +1628,17 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
                 "struct-returning fn must end with a struct-literal tail \
                  (explicit `return T{..}` is a follow-up)")),
         }
+    } else if locals.current_fn_returns_tuple.is_some() {
+        // Tuple-returning fn: marshal the tail into (rax, rdx), descending
+        // through if/block tails. Explicit `return (a,b)` is handled in emit_stmt.
+        for s in &body.stmts {
+            emit_stmt(s, out, data, &mut locals)?;
+        }
+        match body.tail.as_deref() {
+            Some(t) => emit_tuple_tail(t, out, data, &mut locals)?,
+            None => return Err(AsmError::UnsupportedExpr(
+                "tuple-returning fn must end with a tuple tail")),
+        }
     } else {
         emit_block(body, out, data, &mut locals)?;
     }
@@ -1520,6 +1652,7 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
         && !matches!(ret_kind, Some(TyKind::F32) | Some(TyKind::F64))
         && locals.current_fn_returns_enum.is_none()
         && locals.current_fn_returns_struct.is_none()
+        && locals.current_fn_returns_tuple.is_none()
     {
         out.push_str("    xorl %eax, %eax\n");
     }
@@ -2086,12 +2219,28 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
 {
     match s {
         Stmt::LetTuple { names, value } => {
+            // `let (a, b) = f();` where `f` returns a 2-i64 tuple — the call
+            // leaves (elem0, elem1) in (%rax, %rdx); spill each into its slot.
+            if call_returns_tuple(value, &locals.fn_returns_tuple).is_some() {
+                if names.len() != 2 {
+                    return Err(AsmError::UnsupportedExpr("let-tuple from a tuple-returning call binds exactly 2 names"));
+                }
+                emit_expr_value(value, out, data, locals)?;   // rax=elem0, rdx=elem1
+                out.push_str("    movq %rdx, %rcx\n");         // park elem1 (rax store may clobber rdx)
+                let slot0 = locals.alloc(&names[0]);
+                locals.types.insert(names[0].clone(), TyKind::Int);
+                out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot0 * 8));
+                let slot1 = locals.alloc(&names[1]);
+                locals.types.insert(names[1].clone(), TyKind::Int);
+                out.push_str(&format!("    movq %rcx, -{}(%rbp)\n", slot1 * 8));
+                return Ok(());
+            }
             // `let (a, b, ...) = (e1, e2, ...);` — must be a tuple literal of
             // matching arity. Each name binds to its own top-level slot.
             let elems = match value {
                 Expr::Tuple(es) => es,
                 _ => return Err(AsmError::UnsupportedExpr(
-                    "let-tuple rhs must be a tuple literal (fn-tuple-returns require sret)")),
+                    "let-tuple rhs must be a tuple literal or a tuple-returning call")),
             };
             if elems.len() != names.len() {
                 return Err(AsmError::UnsupportedExpr("let-tuple arity mismatch"));
@@ -2113,6 +2262,17 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
         Stmt::Return(Some(e)) => {
             if locals.current_fn_returns_enum.is_some() {
                 emit_enum_return_value(e, out, data, locals)?;
+            } else if locals.current_fn_returns_tuple.is_some() {
+                // `return (a, b)` from a tuple-returning fn -> (rax, rdx).
+                match e {
+                    Expr::Tuple(elems) => emit_tuple_return_value(elems, out, data, locals)?,
+                    // A call that itself returns the tuple already leaves rax:rdx.
+                    _ if call_returns_tuple(e, &locals.fn_returns_tuple).is_some() => {
+                        emit_expr_value(e, out, data, locals)?;
+                    }
+                    _ => return Err(AsmError::UnsupportedExpr(
+                        "tuple-returning fn `return` must be a 2-tuple literal or a tuple-returning call")),
+                }
             } else {
                 emit_expr_value(e, out, data, locals)?;
             }

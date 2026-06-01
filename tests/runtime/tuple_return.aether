@@ -1,0 +1,24 @@
+// roadmap: P6.5
+// expect: exit=42
+//
+// Multi-value return via a 2-element tuple `(i64, i64)`, reusing the 2-register
+// struct-return ABI (elem0 -> %rax, elem1 -> %rdx). `let (a, b) = f()` unmarshals
+// both registers into their own slots. The tail marshaller descends through
+// if/else, so a tuple can be returned from a conditional (minmax). Direct tuple
+// tail (divmod), conditional tuple tail (minmax), and destructuring of a
+// tuple-returning CALL are all exercised. Larger / float tuples still need sret
+// and error clearly.
+fn divmod(a: i64, b: i64) -> (i64, i64) {
+    (a / b, a - (a / b) * b)            // direct tuple tail
+}
+
+fn minmax(a: i64, b: i64) -> (i64, i64) {
+    if a < b { (a, b) } else { (b, a) } // tuple from a conditional tail
+}
+
+fn main() -> i32 {
+    let (q, r) = divmod(128, 43);   // q = 2,  r = 42
+    let (lo, hi) = minmax(40, 9);   // lo = 9, hi = 40
+    // (42 + 2 + 9 + 40) - 51 = 42
+    (r + q + lo + hi - 51) as i32
+}
