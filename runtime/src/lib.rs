@@ -1125,6 +1125,43 @@ thread_local! { static LAST_FILE_SIZE: Cell<i64> = Cell::new(0); }
     h.join().unwrap_or(0)
 }
 
+/// Single-threaded COOPERATIVE executor — the runtime half of async/await. Each
+/// task is a poll-based future: `poll(state) -> i64` returns 0 (Pending, still
+/// running) or 1 (Ready, finished — its result lives in the task's own `state`
+/// struct). The executor round-robins, polling every not-yet-ready task once per
+/// round, until all are Ready. Real cooperative scheduling with genuine
+/// suspension: a task that returns Pending yields control and is resumed next
+/// round (no OS threads, single stack). `tasks` is a packed array of
+/// `(poll_fn_ptr, state_ptr)` i64 pairs; `n` is the task count. Returns the
+/// number of polls performed (a witness can assert the interleaving).
+///
+/// The compiler half — transforming an `async fn` body into the poll-based
+/// state machine — is the remaining piece; today the state machines are written
+/// explicitly and driven by this real executor.
+#[no_mangle] pub unsafe extern "C" fn aether_executor_run(tasks: i64, n: i64) -> i64 {
+    if tasks == 0 || n <= 0 { return 0; }
+    let base = tasks as *const i64;
+    let count = n as usize;
+    let mut done = vec![false; count];
+    let mut polls: i64 = 0;
+    let mut remaining = count;
+    while remaining > 0 {
+        for i in 0..count {
+            if done[i] { continue; }
+            let poll_fn = *base.add(i * 2);
+            let state = *base.add(i * 2 + 1);
+            if poll_fn == 0 { done[i] = true; remaining -= 1; continue; }
+            let f: extern "C" fn(i64) -> i64 = std::mem::transmute(poll_fn);
+            polls += 1;
+            if f(state) != 0 {
+                done[i] = true;
+                remaining -= 1;
+            }
+        }
+    }
+    polls
+}
+
 /// Integer absolute value. Free fn — Aether doesn't have method-on-scalar
 /// dispatch yet, so primitives live as `aether_*` extern fns.
 // =====================================================================

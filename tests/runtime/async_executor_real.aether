@@ -1,0 +1,82 @@
+// roadmap: P6.10
+// expect: exit=42
+//
+// A REAL cooperative executor — the runtime half of async/await. Two poll-based
+// futures (state machines that SUSPEND by returning Pending) are interleaved by
+// `aether_executor_run`, a real single-threaded round-robin scheduler, until
+// both finish. This is genuine cooperative concurrency with real suspension —
+// not a hand-written single-task block_on loop. Each poll appends its task id to
+// a shared log; the witness verifies the polls actually INTERLEAVED (A,B,A,B,…),
+// proving the tasks suspended and resumed rather than running to completion.
+//
+// The remaining (compiler) half of async is transforming an `async fn` body into
+// one of these poll state machines; here they are written explicitly and driven
+// by the real executor.
+use runtime;
+extern fn aether_executor_run(tasks: i64, n: i64) -> i64;
+
+// A global log buffer + cursor so each poll records the order it ran in.
+// state layout: [pc, result, log_ptr, log_cursor_ptr, my_id]
+
+fn record(state: i64) {
+    let log: i64 = aether_load_i64(state, 2);
+    let curp: i64 = aether_load_i64(state, 3);
+    let cur: i64 = aether_load_i64(curp, 0);
+    aether_store_i64(log, cur, aether_load_i64(state, 4));   // append my_id
+    aether_store_i64(curp, 0, cur + 1);
+}
+
+// Task A: suspends twice (pc 0,1 Pending), ready at pc 2 with result 20.
+fn poll_a(state: i64) -> i64 {
+    record(state);
+    let pc: i64 = aether_load_i64(state, 0);
+    if pc >= 2 { aether_store_i64(state, 1, 20); return 1; }
+    aether_store_i64(state, 0, pc + 1);
+    0
+}
+
+// Task B: suspends twice, ready at pc 2 with result 22.
+fn poll_b(state: i64) -> i64 {
+    record(state);
+    let pc: i64 = aether_load_i64(state, 0);
+    if pc >= 2 { aether_store_i64(state, 1, 22); return 1; }
+    aether_store_i64(state, 0, pc + 1);
+    0
+}
+
+fn main() -> i32 {
+    let log: i64 = aether_alloc_bytes(64);
+    let curp: i64 = aether_alloc_bytes(8); aether_store_i64(curp, 0, 0);
+
+    let sa: i64 = aether_alloc_bytes(40);
+    aether_store_i64(sa, 0, 0); aether_store_i64(sa, 1, 0);
+    aether_store_i64(sa, 2, log); aether_store_i64(sa, 3, curp); aether_store_i64(sa, 4, 1);
+
+    let sb: i64 = aether_alloc_bytes(40);
+    aether_store_i64(sb, 0, 0); aether_store_i64(sb, 1, 0);
+    aether_store_i64(sb, 2, log); aether_store_i64(sb, 3, curp); aether_store_i64(sb, 4, 2);
+
+    let tasks: i64 = aether_alloc_bytes(32);
+    aether_store_i64(tasks, 0, poll_a); aether_store_i64(tasks, 1, sa);
+    aether_store_i64(tasks, 2, poll_b); aether_store_i64(tasks, 3, sb);
+
+    let polls: i64 = aether_executor_run(tasks, 2);
+
+    // The log must interleave: A,B,A,B,A,B (ids 1,2,1,2,1,2) — proof the tasks
+    // suspended and the executor round-robined them, not ran each to completion.
+    let mut interleaved: i64 = 1;
+    let mut i: i64 = 0;
+    while i < 6 {
+        let want: i64 = if i - (i / 2) * 2 == 0 { 1 } else { 2 };   // 1,2,1,2,1,2
+        if aether_load_i64(log, i) != want { interleaved = 0; }
+        i = i + 1;
+    }
+
+    let ra: i64 = aether_load_i64(sa, 1);   // 20
+    let rb: i64 = aether_load_i64(sb, 1);   // 22
+    if interleaved == 1 && polls == 6 {
+        (ra + rb) as i32                      // 42
+    } else {
+        0
+    }
+}
