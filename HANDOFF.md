@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +17 features / ~89 total commits — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +18 features / ~91 total commits — ADT STORY 100% COMPLETE (construct/match/param/arg/return) — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -53,10 +53,14 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   callee. enum-param/arg ABI generalised to tag+val+val1.. (one int reg each) via
   enum_payload_slots; both enum-local and inline-ctor args. Single-payload byte-
   identical. Witness `enum_multi_field_arg`. **ADT story now complete bar return.**
-- STILL-MISSING (top follow-ups): multi-field enum RETURN (>2 regs / sret enum
-  ABI — last ADT piece); direct `a.add(x).add(y)` struct-method chaining; array
-  `[v;n]` const-ident count; tuple-struct ctor in arg/return position;
-  async/macros/threads (large subsystems); full NLL borrow on the compile path.
+- **multi-field enum RETURN** (`7811ca0`) — `fn make() -> Shape` returning
+  `Rect(w,h)`; ADT story COMPLETE. Return ABI generalised to tag(rax)+fields
+  (rdx/rcx/r8), ≤3 fields. Single-payload byte-identical (`?` unchanged). Witness
+  `enum_multi_field_return`.
+- STILL-MISSING (top follow-ups): direct `a.add(x).add(y)` struct-method chaining;
+  >3-field enum return (sret); array `[v;n]` const-ident count; tuple-struct ctor
+  in arg/return position; async/macros/threads (large subsystems); full NLL borrow
+  on the compile path.
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
