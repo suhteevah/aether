@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +19 features / ~94 total commits — ADT STORY 100% COMPLETE + REAL OS THREADS — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +20 features / ~98 total commits — ADTs COMPLETE + REAL OS THREADS + REAL MACRO EXPANSION — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -67,12 +67,17 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   `threads_parallel` (3 workers, real loops, joined+combined -> 42). Atomics
   (`concurrency`) already existed. **Shared-state** witness `threads_shared_atomic`
   (`413d4ae`) — 6 threads race-free-increment a shared atomic counter -> 42.
-- STILL-MISSING (top follow-ups, best fresh): direct `a.add(x).add(y)` struct-method
-  chaining (needs an intermediate temp-local + count_locals reservation);
-  >3-field enum return (sret); array `[v;n]` const-ident count; tuple-struct ctor
-  in arg/return position; **async** + **macros** (large multi-session subsystems);
-  full NLL borrow on the compile path (currently `--check`-only); thread shared-state
-  ergonomics (Arc/Mutex equivalents — atomics + raw ptrs work today).
+- **real declarative macros** (`3edd5a9`) — `macro_rules! name { ($x:expr) => { body } }`
+  now ACTUALLY EXPANDS at `name!(...)` use sites (was parsed-and-discarded). `$`
+  lexes; the body is a token template; args (paren-wrapped for precedence) splice
+  in + re-parse via a sub-parser that shares the macro table (macros nest).
+  Hardened `peek` to clamp past-end lookahead to Eof. Witness `macro_rules_expand`.
+  Scope: single rule, `$x:expr`, expression body (repetitions/hygiene = follow-ups).
+- STILL-MISSING (top follow-ups, best fresh): **async/await** (futures + executor +
+  state-machine transform — the one large subsystem left); full NLL borrow on the
+  compile path (currently `--check`-only); macro repetitions `$(…)*` + multiple
+  rules + hygiene; direct `a.add(x).add(y)` struct-method chaining; >3-field enum
+  return (sret); array `[v;n]` const-ident count; tuple-struct ctor in arg/return.
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
