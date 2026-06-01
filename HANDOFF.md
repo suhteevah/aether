@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +20 features / ~98 total commits — ADTs COMPLETE + REAL OS THREADS + REAL MACRO EXPANSION — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-06-01 (🟢 P6 RUST-PARITY PUSH — ADTs COMPLETE + REAL OS THREADS + REAL MACROS (3 capabilities) + NLL BORROW (enforced + non-lexical) — 3 of 4 named large gaps done; async is the one remaining — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -85,17 +85,23 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   LIMITATION (workaround exists, not a regression): capturing an ARRAY by value in
   a closure — aggregates can't be captured as a single i64; bind the element first
   (`let a0 = arr[0]; |x| x+a0`).
-- **borrow checking enforced on the compile path** (`475fe69`) — the NLL borrow
-  checker ran only at `--check`; now it also GATES codegen (aliasing -> AE0200
-  compile error, nonzero exit). Verified zero false positives: clean across all 305
-  runtime witnesses + examples + stdlib + positive conformance. Also fixed the
-  synthesized closure-object fn declaring `-> i64` (a bool-predicate closure tripped
-  AE0222 — `__cloobj_N` now declares no return type). (Lexical over-approx; full
-  non-lexical PRECISION is the remaining NLL follow-up — but it now gates compilation.)
-- STILL-MISSING (top follow-ups, best fresh): **async/await** (futures + executor +
-  state-machine transform — THE one large subsystem left; note `async_executor`/
-  `async_two_tasks` witnesses exist — check what they actually do); full NLL
-  PRECISION (the compile-path check is now on but lexical); macro hygiene + nested repetitions;
+- **NLL borrow checking — enforced + non-lexical** (`475fe69` + `e549951`) — the
+  checker ran only at `--check` (aliasing still COMPILED) AND was lexical (borrow
+  live to end-of-fn). Now: (1) it GATES codegen (aliasing -> AE0200 compile error);
+  (2) it's NON-LEXICAL — each `let`-bound borrow ends at its LAST USE, so
+  `let a=&mut v; *a=1; let b=&mut v; *b=2;` (valid Rust) compiles, while genuinely
+  overlapping borrows are still rejected. Verified 0 false positives across all 305
+  witnesses + examples + stdlib + conformance. Updated AE0200/AE0201 negative tests
+  (their old unused-borrow pattern is valid under NLL). Also fixed `__cloobj_N`
+  declaring `-> i64` (bool-predicate closures tripped AE0222). Witness `nll_borrow`.
+  (Deeper NLL — loop-region precision, two-phase borrows — is a follow-up; core
+  NLL + compile-path enforcement is real.)
+- STILL-MISSING — **async/await** is now the ONE remaining named large subsystem
+  (futures + executor + the async-fn body-splitting state-machine transform; the
+  `async_executor`/`async_two_tasks` witnesses HAND-WRITE the shape — `async fn`/
+  `.await` aren't transformed, like macros were before they became real). A fake
+  synchronous async would be dishonest (don't-overclaim); needs a dedicated session.
+  Lesser follow-ups: macro hygiene + nested repetitions; deeper NLL precision;
   capturing an aggregate (array/struct) by value in a closure; direct
   `a.add(x).add(y)` struct-method chaining; >3-field enum return (sret); array
   `[v;n]` const-ident count; tuple-struct ctor in arg/return position.
