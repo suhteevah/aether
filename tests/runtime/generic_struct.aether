@@ -7,9 +7,14 @@
 // storage class (i64 slots vs f32 xmm slots).
 struct Pair<T> { a: T, b: T }
 
+// A generic struct also works as a fn PARAMETER (its field slots resolve via
+// the Box2<i64> annotation, not just at let sites).
+fn sum_pair(p: Pair<i64>) -> i64 { p.a + p.b }
+
 fn main() -> i32 {
     let pi: Pair<i64> = Pair { a: 40, b: 2 };       // i64 fields
     let pf: Pair<f32> = Pair { a: 30.0, b: 10.0 };  // f32 fields
     let s: f32 = pf.a + pf.b;                        // 40.0
-    (pi.a + pi.b + (s as i64) - 40) as i32          // 42 + 40 - 40 = 42
+    let viafn: i64 = sum_pair(pi);                   // 42 — generic struct param
+    (viafn + (s as i64) - 40) as i32                 // 42 + 40 - 40 = 42
 }

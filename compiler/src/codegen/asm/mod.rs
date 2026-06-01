@@ -1575,7 +1575,14 @@ fn count_locals(b: &Block, locals: &mut Locals) {
 
 /// If `t` is a Named type pointing to a registered struct, return its name.
 fn struct_name_of(t: &Ty) -> Option<String> {
-    if let Ty::Named(n) = t { Some(n.clone()) } else { None }
+    match t {
+        Ty::Named(n) => Some(n.clone()),
+        // A generic struct annotation (`Box2<i64>`) resolves to the base
+        // struct name, so generic structs work as fn params / uninit lets
+        // (field type params default to the Int storage class — the i64 case).
+        Ty::Generic { name, .. } => Some(name.clone()),
+        _ => None,
+    }
 }
 
 /// For a `Ty::Slice`, return `(loaded-value TyKind, element size in bytes)`.
