@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +8 CLOSURE/GENERICS/TUPLE commits / ~71 total — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +9 CLOSURE/GENERICS/TUPLE/BUILDER commits / ~72 total — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -12,6 +12,13 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   tuple can be returned from a conditional. Arity-2 i64 only (larger=sret, errors
   clearly). Witness `tuple_return`. PROBED-WORKING: generic struct method
   impl<T> Cell<T>, nested match, block-expr value, `?` on Result.
+- **builder pattern** (`c1a5bb6`) — `let b: Acc = a.add(x)` where a METHOD returns
+  a struct now binds + registers `b` as a struct local (was Call-only via
+  call_returns_struct → switched to call_result_struct which handles `a.add(x)`).
+  Witness `builder_pattern`. (Direct `a.add(x).add(y)` chaining still a follow-up.)
+- STILL-MISSING gaps found probing (each larger): fixed-size arrays `[i64;N]` +
+  array literals, multi-field enum payload `Two(a,b)` (AST+enum-codegen), match
+  guards `n if c =>` (AST arm change), tuple structs `struct M(i64)`.
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
