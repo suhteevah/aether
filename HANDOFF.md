@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 33 features + 6 probing bugfixes / ~67 commits incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 34 features + 7 probing bugfixes / ~55 commits incl. nested struct fields incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -29,12 +29,16 @@ clean):
   detection resolves Ty::Generic + field type params.
 - **match on bool** (`78b54e1`) — `match b { true => …, false => … }` patterns.
 
-A ~40-construct robustness sweep confirms the common surface is solid. Two
-remaining probe gaps are STRUCTURAL flat-slot limitations (not quick fixes):
-**nested struct fields `a.b.c`** (needs recursive slot-key expansion in
-count_locals + struct-lit + field-access) and **method-on-method-result
-`c.id().n`** (the method/field dispatcher requires a bare-ident receiver; chained
-calls need an intermediate struct temp).
+A ~40-construct robustness sweep confirms the common surface is solid.
+**Nested struct fields `a.b.c` are now DONE** (`514e5ee`) — struct composition:
+`expand_struct_field_keys` recursively flattens a struct's fields to leaf slots
+(used by count_locals + struct-lit emit in lockstep, so the dual-pass slot
+invariant held — zero regressions), `emit_struct_lit_populate` recurses into
+nested literals, `field_path` builds the dotted key for nested read + assign.
+Witness `nested_struct`.
+One structural probe gap remains: **method-on-method-result `c.id().n`** — the
+Field handler + method dispatcher require a bare-ident receiver; a chained call
+returning a struct needs the rax:rdx struct-return result read as a field.
 
 ### parser stmt-boundary fix (detail)
 - **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
