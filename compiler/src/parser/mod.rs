@@ -1115,6 +1115,22 @@ impl Parser {
                 self.expect(Tok::RParen)?;
                 Ok(first)
             }
+            Tok::LBracket => {
+                // Array literal `[e0, e1, ...]` in expression position.
+                // Reuses `Expr::Tuple` as the positional-element carrier — a
+                // `let a: [T; N] = [..]` annotation drives the array storage +
+                // index registration in codegen. (Repeat form `[v; n]` is a
+                // follow-up.) Distinct from the type-position `[T; N]` parsed in
+                // parse_ty, since this is only reached from expression context.
+                self.bump();
+                let mut elems = Vec::new();
+                while !matches!(self.peek(0), Tok::RBracket) {
+                    elems.push(self.parse_expr()?);
+                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                }
+                self.expect(Tok::RBracket)?;
+                Ok(Expr::Tuple(elems))
+            }
             Tok::LBrace => Ok(Expr::Block(self.parse_block()?)),
             // P16.20 — `unsafe { ... }` is parsed and elided. The block runs
             // exactly as a normal block today; real raw-pointer semantics

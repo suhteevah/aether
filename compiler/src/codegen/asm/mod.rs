@@ -2476,6 +2476,35 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             // lit but elements are positional `<name>.0`, `<name>.1`, etc. Type
             // is inferred elementwise from the rhs values; an explicit annotation
             // (`let pair: (i32, f32) = ...`) is allowed but informational.
+            // Array literal init `let a: [T; N] = [e0, .., e_{N-1}]`. The literal
+            // reuses Expr::Tuple as its element carrier; the `[T; N]` annotation
+            // routes it here so each element lands in a contiguous slot AND `a`
+            // registers as an array local (driving `a[i]` index codegen).
+            if let (Some(Ty::Array { elem, n }), Expr::Tuple(elems)) = (ty.as_ref(), value) {
+                let elem_kind = TyKind::from_ty(elem).unwrap_or(TyKind::Int);
+                if !matches!(elem_kind, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr("stack arrays currently support int/handle elements only"));
+                }
+                if elems.len() != *n {
+                    return Err(AsmError::UnsupportedExpr("array-literal length does not match the declared `[T; N]`"));
+                }
+                let mut base_slot: Option<usize> = None;
+                for (k, elem_expr) in elems.iter().enumerate() {
+                    let val_ty = emit_expr_value(elem_expr, out, data, locals)?;
+                    if !matches!(val_ty, TyKind::Int) {
+                        return Err(AsmError::UnsupportedExpr("array element must be i64-shaped"));
+                    }
+                    let key = format!("{}.{}", name, k);
+                    let slot = locals.alloc(&key);
+                    if k == 0 { base_slot = Some(slot); }
+                    locals.types.insert(key, elem_kind);
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8));
+                }
+                if let Some(bs) = base_slot {
+                    locals.arrays.insert(name.clone(), (bs, *n, elem_kind));
+                }
+                return Ok(());
+            }
             if let Expr::Tuple(elems) = value {
                 for (i, elem) in elems.iter().enumerate() {
                     let key = format!("{}.{}", name, i);

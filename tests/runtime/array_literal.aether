@@ -1,0 +1,27 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// Fixed-size stack arrays `[i64; N]` with a literal initialiser `[e0, .., eN-1]`.
+// The array literal parses (reusing Expr::Tuple as the element carrier) and the
+// `[T; N]` annotation routes it to contiguous stack slots + registers the local
+// as an array, driving `a[i]` index codegen (static AND dynamic) and `a[i] = v`
+// writes. No heap, no hidden allocation — N consecutive rbp-relative slots.
+// (Repeat form `[v; n]` and non-i64 elements are follow-ups.)
+fn main() -> i32 {
+    // literal init + static index
+    let a: [i64; 4] = [3, 5, 7, 9];
+    let s_static: i64 = a[0] + a[1] + a[2] + a[3];   // 24
+
+    // dynamic index in a loop
+    let b: [i64; 5] = [1, 2, 3, 4, 5];
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 5 { acc = acc + b[i]; i = i + 1; }      // 15
+
+    // index WRITE then read back
+    let c: [i64; 3] = [0, 0, 0];
+    c[0] = 1; c[1] = 1; c[2] = 1;
+    let s_write: i64 = c[0] + c[1] + c[2];            // 3
+
+    (s_static + acc + s_write) as i32                 // 24 + 15 + 3 = 42
+}
