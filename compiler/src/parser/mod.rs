@@ -1123,7 +1123,28 @@ impl Parser {
                 // follow-up.) Distinct from the type-position `[T; N]` parsed in
                 // parse_ty, since this is only reached from expression context.
                 self.bump();
-                let mut elems = Vec::new();
+                if matches!(self.peek(0), Tok::RBracket) {
+                    self.bump();
+                    return Ok(Expr::Tuple(Vec::new()));
+                }
+                let first = self.parse_expr()?;
+                // Repeat form `[v; N]` — N must be an integer literal so the
+                // initialiser expands at parse time into N copies of `v`. (A
+                // const-ident count is a follow-up.)
+                if matches!(self.peek(0), Tok::Semi) {
+                    self.bump();
+                    let n = match self.peek(0).clone() {
+                        Tok::IntLit(k) if k >= 0 => { self.bump(); k as usize }
+                        other => return Err(format!(
+                            "array repeat count must be an integer literal, got {:?}", other)),
+                    };
+                    self.expect(Tok::RBracket)?;
+                    let elems = (0..n).map(|_| first.clone()).collect();
+                    return Ok(Expr::Tuple(elems));
+                }
+                // Element-list form `[e0, e1, ...]`.
+                let mut elems = vec![first];
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); }
                 while !matches!(self.peek(0), Tok::RBracket) {
                     elems.push(self.parse_expr()?);
                     if matches!(self.peek(0), Tok::Comma) { self.bump(); }

@@ -1,0 +1,17 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// Array repeat initialiser `[v; N]` — N copies of `v`. Expanded at parse time
+// (N is an integer literal) into the same Expr::Tuple element carrier the
+// element-list form uses, so it flows through the `[T; N]` stack-array path.
+fn main() -> i32 {
+    let a: [i64; 6] = [7; 6];          // [7,7,7,7,7,7] -> sum 42
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 6 { sum = sum + a[i]; i = i + 1; }
+
+    // a zero-filled scratch buffer, then write a couple cells
+    let b: [i64; 4] = [0; 4];
+    b[2] = 0; b[3] = 0;                // still all zero -> contributes 0
+    sum as i32                          // 42
+}
