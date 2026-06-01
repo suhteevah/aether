@@ -1,0 +1,43 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Multi-field enum payloads — real algebraic data types. A variant may now carry
+// 0, 1, or N payload fields: `enum E { A, One(i64), Rect(i64, i64) }`.
+// Construction stores each field; a binding match pattern `Rect(w, h)` binds each.
+// Slot layout keeps field 0 in the historical `.val` key (so every existing
+// single-payload path — the 2-register return ABI, `?`, single-field match — is
+// untouched) and adds `.val1`, `.val2`, … for fields 1+.
+//
+// SCOPE (honest): multi-field variants are construct + match LOCALLY. Passing a
+// multi-field enum across a fn boundary (param/return) goes through the
+// 2-register tag+val ABI, which carries one field — so that, and a multi-field
+// sret ABI, are follow-ups. Single-field enums cross fn boundaries as before.
+enum Shape {
+    Empty,
+    Circle(i64),            // single payload (unchanged path)
+    Rect(i64, i64),         // two payload fields
+}
+
+enum Triple { T(i64, i64, i64) }   // three payload fields
+
+fn main() -> i32 {
+    let r: Shape = Shape::Rect(6, 5);
+    let area_r: i64 = match r {
+        Shape::Rect(w, h) => w * h,      // 6 * 5 = 30  (binds BOTH fields)
+        Shape::Circle(rad) => rad * 3,
+        Shape::Empty => 0,
+    };
+
+    let c: Shape = Shape::Circle(3);
+    let area_c: i64 = match c {
+        Shape::Rect(w, h) => w * h,
+        Shape::Circle(rad) => rad * 3,   // 9
+        Shape::Empty => 0,
+    };
+
+    let t: Triple = Triple::T(1, 1, 1);
+    let ts: i64 = match t { Triple::T(a, b, cc) => a + b + cc };   // 3
+
+    // 30 + 9 + 3 = 42
+    (area_r + area_c + ts) as i32
+}

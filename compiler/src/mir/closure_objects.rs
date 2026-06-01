@@ -626,7 +626,9 @@ fn collect_free_vars(e: &Expr, bound: &mut HashSet<String>, globals: &HashSet<St
                 // A payload-binding arm introduces a fresh local that shadows
                 // any outer name, so it is NOT a free var inside that arm.
                 let mut inner = bound.clone();
-                if let crate::ast::MatchPat::EnumVariantBind(_, bind) = pat { inner.insert(bind.clone()); }
+                if let crate::ast::MatchPat::EnumVariantBind(_, binds) = pat {
+                    for b in binds { inner.insert(b.clone()); }
+                }
                 collect_free_vars(arm, &mut inner, globals, caps, seen);
             }
         }

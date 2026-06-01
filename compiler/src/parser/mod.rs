@@ -415,12 +415,17 @@ impl Parser {
                     self.bump();
                     path.push(self.expect_ident()?);
                 }
-                // `Box::Full(x)` → bind payload into local `x`.
+                // `Box::Full(x)` / `Rect(w, h)` → bind each payload field into a
+                // local. One or more comma-separated bind names.
                 if matches!(self.peek(0), Tok::LParen) {
                     self.bump();
-                    let bind = self.expect_ident()?;
+                    let mut binds = Vec::new();
+                    while !matches!(self.peek(0), Tok::RParen) {
+                        binds.push(self.expect_ident()?);
+                        if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    }
                     self.expect(Tok::RParen)?;
-                    Ok(MatchPat::EnumVariantBind(path, bind))
+                    Ok(MatchPat::EnumVariantBind(path, binds))
                 } else {
                     Ok(MatchPat::EnumVariant(path))
                 }
@@ -453,13 +458,17 @@ impl Parser {
         let mut payloads = Vec::new();
         while !matches!(self.peek(0), Tok::RBrace) {
             let v = self.expect_ident()?;
-            // Optional `( ty )` payload. Single-element only for now.
+            // Optional `( ty, ty, … )` payload — zero or more field types.
             let payload = if matches!(self.peek(0), Tok::LParen) {
                 self.bump();
-                let ty = self.parse_ty()?;
+                let mut tys = Vec::new();
+                while !matches!(self.peek(0), Tok::RParen) {
+                    tys.push(self.parse_ty()?);
+                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                }
                 self.expect(Tok::RParen)?;
-                Some(ty)
-            } else { None };
+                tys
+            } else { Vec::new() };
             variants.push(v);
             payloads.push(payload);
             if matches!(self.peek(0), Tok::Comma) { self.bump(); }

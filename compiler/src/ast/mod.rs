@@ -29,11 +29,12 @@ pub enum Item {
     /// recorded so the trait resolver can verify completeness.
     ImplTrait { trait_name: String, type_name: String, methods: Vec<FnDecl> },
     /// `enum Color { Red, Green, Blue }` — discriminant tags. Each variant
-    /// gets a sequential i32 tag (Red=0, Green=1, ...). For variants with
-    /// a payload (`Box::Full(i64)`), `payloads[i]` is `Some(Ty)`. Enums
-    /// where any variant has a payload use a 2-slot layout (tag + val);
-    /// payload-less enums stay as bare i64 tag values.
-    Enum { name: String, variants: Vec<String>, payloads: Vec<Option<Ty>> },
+    /// gets a sequential i32 tag (Red=0, Green=1, ...). `payloads[i]` is the
+    /// (possibly empty) list of payload field types for variant i: `[]` =
+    /// no payload (`Red`), `[T]` = single (`Box::Full(i64)`), `[T, U]` = two
+    /// (`Rect(i64, i64)`). Payload-carrying enums use a slot layout of
+    /// `tag` + `val` (field 0) + `val1`, `val2`, … (fields 1+).
+    Enum { name: String, variants: Vec<String>, payloads: Vec<Vec<Ty>> },
 }
 
 #[derive(Debug, Clone)]
@@ -240,10 +241,11 @@ pub enum MatchPat {
     /// `Color::Red` — a path of length 2; the asm backend resolves it
     /// to the variant's i32 tag at codegen time.
     EnumVariant(Vec<String>),
-    /// `Box::Full(x)` — payload-carrying variant pattern. After tag-cmp
-    /// matches, the payload slot is copied into a freshly-introduced
-    /// local named `bind` for use in the arm's body.
-    EnumVariantBind(Vec<String>, String),
+    /// `Box::Full(x)` / `Rect(w, h)` — payload-carrying variant pattern. After
+    /// tag-cmp matches, each payload slot is copied into a freshly-introduced
+    /// local named by `binds[k]` for use in the arm's body. `binds` has 1+ names
+    /// (field 0 ← `val`, fields 1+ ← `val1`, `val2`, …).
+    EnumVariantBind(Vec<String>, Vec<String>),
     Wildcard,
 }
 

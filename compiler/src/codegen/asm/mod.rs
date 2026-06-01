@@ -638,7 +638,7 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
                 const_env.insert(format!("{}::{}", name, v), i as i64);
             }
             // Register payload-aware variants for the codegen rewrites below.
-            let has_any_payload = payloads.iter().any(|p| p.is_some());
+            let has_any_payload = payloads.iter().any(|p| !p.is_empty());
             if has_any_payload {
                 enum_decls.insert(name.clone(), EnumDecl {
                     variants: variants.clone(),
@@ -677,9 +677,16 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
             // These use the 2-register return ABI (tag in %rax, value in
             // %rdx) and drive the `?`-operator early-return propagation.
             if let Some(Ty::Named(rname)) = f.ret.as_ref() {
-                if enum_decls.contains_key(rname) {
-                    fn_returns_enum.insert(f.name.clone(), rname.clone());
-                    fn_returns_enum.insert(format!("aether_{}", f.name), rname.clone());
+                if let Some(ed) = enum_decls.get(rname) {
+                    // The 2-register return ABI carries tag + ONE payload field.
+                    // A multi-field-payload enum can't return through it (fields
+                    // 1+ would be dropped); such enums are local construct/match
+                    // only until an sret enum-return lands.
+                    let max_fields = ed.payloads.iter().map(|p| p.len()).max().unwrap_or(0);
+                    if max_fields <= 1 {
+                        fn_returns_enum.insert(f.name.clone(), rname.clone());
+                        fn_returns_enum.insert(format!("aether_{}", f.name), rname.clone());
+                    }
                 }
             }
         }
@@ -868,29 +875,32 @@ impl StringTable {
 #[derive(Clone)]
 struct EnumDecl {
     variants: Vec<String>,
-    payloads: Vec<Option<Ty>>,
+    /// Per-variant payload field types: `[]` none, `[T]` single, `[T, U]` two.
+    payloads: Vec<Vec<Ty>>,
 }
 
-/// If `e` is `EnumName::Variant(arg)` (`Call(Path([..2]), [arg])`) or the
-/// no-arg form `EnumName::Variant` (`Path([..2])`), and the path resolves
-/// to a known payload-enum, return (enum_name, variant_idx, payload_expr).
+/// If `e` is `EnumName::Variant(args…)` (`Call(Path([..2]), [..])`) or the
+/// no-arg form `EnumName::Variant` (`Path([..2])`), and the path resolves to a
+/// known payload-enum, return (enum_name, variant_idx, payload_exprs). The
+/// payload list is empty for a no-arg variant, one expr for a single-field
+/// variant, N for a multi-field one (`Rect(w, h)`).
 fn resolve_enum_ctor(
     e: &Expr,
     enum_decls: &HashMap<String, EnumDecl>,
-) -> Option<(String, usize, Option<Expr>)> {
-    let (path, arg) = match e {
+) -> Option<(String, usize, Vec<Expr>)> {
+    let (path, args) = match e {
         Expr::Call { callee, args } => {
             if let Expr::Path(p) = callee.as_ref() {
-                if p.len() != 2 || args.len() != 1 { return None; }
-                (p.clone(), Some(args[0].clone()))
+                if p.len() != 2 { return None; }
+                (p.clone(), args.clone())
             } else { return None; }
         }
-        Expr::Path(p) if p.len() == 2 => (p.clone(), None),
+        Expr::Path(p) if p.len() == 2 => (p.clone(), Vec::new()),
         _ => return None,
     };
     let decl = enum_decls.get(&path[0])?;
     let idx = decl.variants.iter().position(|v| *v == path[1])?;
-    Some((path[0].clone(), idx, arg))
+    Some((path[0].clone(), idx, args))
 }
 
 /// If `e` is a `Call { callee: Ident(fn_name), .. }` where `fn_name` is a
@@ -1066,15 +1076,16 @@ fn emit_enum_return_value(
     data: &mut StringTable,
     locals: &mut Locals,
 ) -> Result<(), AsmError> {
-    // Case 1: enum constructor literal.
-    if let Some((_enum_name, variant_idx, payload_expr)) =
+    // Case 1: enum constructor literal. The 2-register return ABI carries
+    // field 0 only (enums registered for return are guaranteed ≤1 payload field).
+    if let Some((_enum_name, variant_idx, payload_exprs)) =
         resolve_enum_ctor(e, &locals.enum_decls)
     {
         // Evaluate the payload first (clobbers rax) then set both regs.
         // Keep the tag immediate small and dependency-free so it doesn't
         // get reordered with the payload eval.
-        if let Some(pe) = payload_expr {
-            let pty = emit_expr_value(&pe, out, data, locals)?;
+        if let Some(pe) = payload_exprs.first() {
+            let pty = emit_expr_value(pe, out, data, locals)?;
             if !matches!(pty, TyKind::Int) {
                 return Err(AsmError::UnsupportedExpr(
                     "enum payload return currently restricted to i64-shaped types"));
@@ -1700,12 +1711,19 @@ fn count_locals(b: &Block, locals: &mut Locals) {
         match s {
             Stmt::Let { name, value, ty, .. } => {
                 if let Some(v) = value { count_locals_in_expr(v, locals); }
-                // Payload-enum constructor rhs: reserve `<name>.tag` and
-                // `<name>.val` slots (mirrors emit_stmt's dual-slot layout).
+                // Payload-enum constructor rhs: reserve `<name>.tag`, `<name>.val`
+                // (field 0) + `<name>.val1..` for the enum's max extra fields —
+                // must match emit_stmt's layout exactly (frame invariant).
                 if let Some(v) = value {
-                    if resolve_enum_ctor(v, &locals.enum_decls).is_some() {
+                    if let Some((enum_name, _, _)) = resolve_enum_ctor(v, &locals.enum_decls) {
                         locals.alloc(&format!("{}.tag", name));
                         locals.alloc(&format!("{}.val", name));
+                        let max_fields = locals.enum_decls.get(&enum_name)
+                            .map(|d| d.payloads.iter().map(|p| p.len()).max().unwrap_or(0))
+                            .unwrap_or(1);
+                        for k in 1..max_fields {
+                            locals.alloc(&format!("{}.val{}", name, k));
+                        }
                         continue;
                     }
                 }
@@ -2239,8 +2257,8 @@ fn count_locals_in_expr(e: &Expr, locals: &mut Locals) {
             // slot but that's fine).
             locals.alloc("_match_scrut_");
             for (pat, body) in arms {
-                if let MatchPat::EnumVariantBind(_, bind) = pat {
-                    locals.alloc(bind);
+                if let MatchPat::EnumVariantBind(_, binds) = pat {
+                    for b in binds { locals.alloc(b); }
                 }
                 count_locals_in_expr(body, locals);
             }
@@ -2452,20 +2470,34 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             // Payload-enum constructor: `let b = Box::Full(42);` →
             // allocate `name.tag` (i64) + `name.val` (i64), write tag from
             // the variant index, write the payload arg into `.val`.
-            if let Some((enum_name, variant_idx, payload_expr)) =
+            if let Some((enum_name, variant_idx, payload_exprs)) =
                 resolve_enum_ctor(value, &locals.enum_decls)
             {
-                let tag_key = format!("{}.tag", name);
-                let val_key = format!("{}.val", name);
-                let tag_slot = locals.alloc(&tag_key);
-                locals.types.insert(tag_key, TyKind::Int);
-                let val_slot = locals.alloc(&val_key);
-                locals.types.insert(val_key, TyKind::Int);
+                // Slot layout: `.tag` + `.val` (field 0) + `.val1`, `.val2`, …
+                // (fields 1+). Field 0 keeps the historical `.val` key so all the
+                // single-payload paths (return ABI, match) are unchanged.
+                let tag_slot = locals.alloc(&format!("{}.tag", name));
+                locals.types.insert(format!("{}.tag", name), TyKind::Int);
+                let val_slot = locals.alloc(&format!("{}.val", name));
+                locals.types.insert(format!("{}.val", name), TyKind::Int);
+                // Reserve the max extra-field slots this enum could carry so the
+                // layout is fixed regardless of which variant this is.
+                let max_fields = locals.enum_decls.get(&enum_name)
+                    .map(|d| d.payloads.iter().map(|p| p.len()).max().unwrap_or(0))
+                    .unwrap_or(payload_exprs.len());
+                let mut extra_slots = Vec::new();
+                for k in 1..max_fields {
+                    let key = format!("{}.val{}", name, k);
+                    let s = locals.alloc(&key);
+                    locals.types.insert(key, TyKind::Int);
+                    extra_slots.push(s);
+                }
                 locals.enum_locals.insert(name.clone(), enum_name);
                 out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
                 out.push_str(&format!("    movq %rax, -{}(%rbp)\n", tag_slot * 8));
-                if let Some(pe) = payload_expr {
-                    let pty = emit_expr_value(&pe, out, data, locals)?;
+                // Field 0 -> .val (0 if the variant carries no payload).
+                if let Some(pe) = payload_exprs.first() {
+                    let pty = emit_expr_value(pe, out, data, locals)?;
                     if !matches!(pty, TyKind::Int) {
                         return Err(AsmError::UnsupportedExpr(
                             "enum payload currently restricted to i64-shaped types"));
@@ -2474,6 +2506,19 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                 } else {
                     out.push_str("    xorl %eax, %eax\n");
                     out.push_str(&format!("    movq %rax, -{}(%rbp)\n", val_slot * 8));
+                }
+                // Fields 1+ -> .val1, .val2, … (unused slots stay zeroed).
+                for (k, s) in extra_slots.iter().enumerate() {
+                    if let Some(pe) = payload_exprs.get(k + 1) {
+                        let pty = emit_expr_value(pe, out, data, locals)?;
+                        if !matches!(pty, TyKind::Int) {
+                            return Err(AsmError::UnsupportedExpr(
+                                "enum payload currently restricted to i64-shaped types"));
+                        }
+                    } else {
+                        out.push_str("    xorl %eax, %eax\n");
+                    }
+                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", s * 8));
                 }
                 let _ = ty;
                 return Ok(());
@@ -3773,7 +3818,7 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                             out.push_str(&format!("    jne {}\n", end_label));
                         }
                     }
-                    MatchPat::EnumVariantBind(parts, _bind) => {
+                    MatchPat::EnumVariantBind(parts, _binds) => {
                         let key = parts.join("::");
                         let v = locals.const_env.get(&key).copied()
                             .ok_or_else(|| AsmError::UnsupportedExpr(string_to_static(format!("match: unknown enum variant {}", key))))?;
@@ -3787,16 +3832,27 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                         }
                     }
                 }
-                // For binding patterns, copy the payload into the bound local
-                // BEFORE emitting the arm body so the body sees `bind` as a local.
-                if let MatchPat::EnumVariantBind(_, bind) = pat {
+                // For binding patterns, copy each payload field into its bound
+                // local BEFORE the arm body. binds[0] <- `.val` (field 0);
+                // binds[k] <- `.val{k}` (fields 1+).
+                if let MatchPat::EnumVariantBind(_, binds) = pat {
                     let val_slot = payload_val_slot
                         .ok_or(AsmError::UnsupportedExpr(
                             "binding pattern requires a payload-enum scrutinee"))?;
-                    let bind_slot = locals.alloc(bind);
-                    locals.types.insert(bind.clone(), TyKind::Int);
-                    out.push_str(&format!("    movq -{}(%rbp), %rax\n", val_slot * 8));
-                    out.push_str(&format!("    movq %rax, -{}(%rbp)\n", bind_slot * 8));
+                    for (k, bind) in binds.iter().enumerate() {
+                        let src_slot = if k == 0 {
+                            val_slot
+                        } else {
+                            let enum_local = payload_enum_scrut.as_ref().ok_or(
+                                AsmError::UnsupportedExpr("multi-field bind requires a payload-enum scrutinee local"))?;
+                            locals.get(&format!("{}.val{}", enum_local, k)).ok_or(
+                                AsmError::UnsupportedExpr("payload-enum match: missing .valN slot for multi-field bind"))?
+                        };
+                        let bind_slot = locals.alloc(bind);
+                        locals.types.insert(bind.clone(), TyKind::Int);
+                        out.push_str(&format!("    movq -{}(%rbp), %rax\n", src_slot * 8));
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", bind_slot * 8));
+                    }
                 }
                 let body_kind = emit_expr_value(body, out, data, locals)?;
                 arm_kind.get_or_insert(body_kind);
