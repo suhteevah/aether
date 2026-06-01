@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-06-01 (🟢 P6 RUST-PARITY PUSH — ADTs COMPLETE + REAL OS THREADS + REAL MACROS (3 capabilities) + NLL BORROW (enforced + non-lexical) — 3 of 4 named large gaps done; async is the one remaining — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-06-01 (🟢 P6 RUST-PARITY PUSH — ADTs COMPLETE + REAL OS THREADS + REAL MACROS (3 capabilities) + NLL BORROW (enforced + non-lexical) + REAL ASYNC/AWAIT (async fn → poll state machine) — ALL 4 named large gaps now genuinely addressed — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -96,17 +96,21 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   declaring `-> i64` (bool-predicate closures tripped AE0222). Witness `nll_borrow`.
   (Deeper NLL — loop-region precision, two-phase borrows — is a follow-up; core
   NLL + compile-path enforcement is real.)
-- **async — runtime half (real cooperative executor)** (`936399a`) —
-  `aether_executor_run(tasks, n)` is a REAL single-threaded round-robin scheduler
-  driving N poll-based futures (`poll(state)->0 Pending/1 Ready`); genuine
-  suspension + interleaving (witness `async_executor_real` records the poll order
-  and asserts A,B,A,B,A,B). NOT a synchronous fake. **Remaining async half =
-  COMPILER**: transform an `async fn` body into one of these poll state machines
-  (body-split at each `.await`, save cross-await locals in the state struct) +
-  `.await`/`async fn` syntax. THAT is the dedicated-session headline — the hard
-  part (a fake synchronous async would be dishonest; don't-overclaim).
-- Lesser follow-ups: macro hygiene + nested repetitions; deeper NLL precision
-  (loop regions, two-phase borrows);
+- **REAL ASYNC/AWAIT** (`936399a` runtime + `3bb14c0` compiler) — async fn/.await
+  were a synchronous pass-through; now GENUINELY transformed. `mir::async_lower`:
+  an `async fn` becomes a heap future `[poll_fn|pc|result|params…|locals…]` +
+  constructor + `__f_poll` pc-dispatched state machine; each `yield_now().await`
+  is a SUSPENSION (advance pc, return Pending); cross-await LOCALS persist in the
+  future struct (witness `async_await`: `accumulate(15)` suspends twice with a,b
+  live across the awaits -> 42). `.await` -> `aether_block_on` (drive to
+  completion). Multi-task interleaving via the real `aether_executor_run`
+  (witness `async_executor_real`, asserts A,B,A,B). ZERO AST churn (`.await` =
+  MethodCall{__await}, async = `#[__async]` attr); purely additive (only fires on
+  async fns). **ALL 4 NAMED LARGE GAPS NOW GENUINELY ADDRESSED.**
+  Scope: straight-line async-fn bodies + `yield_now().await` suspension; awaits
+  inside loops/branches + awaiting a value-producing future mid-expression = follow-ups.
+- Lesser follow-ups: async awaits in loops/branches + value-awaits; macro hygiene
+  + nested repetitions; deeper NLL precision (loop regions, two-phase borrows);
   capturing an aggregate (array/struct) by value in a closure; direct
   `a.add(x).add(y)` struct-method chaining; >3-field enum return (sret); array
   `[v;n]` const-ident count; tuple-struct ctor in arg/return position.
