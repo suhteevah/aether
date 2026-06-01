@@ -269,6 +269,18 @@ impl Parser {
 
     fn parse_impl_item(&mut self) -> PResult<Item> {
         self.expect(Tok::Impl)?;
+        // Optional impl generic params: `impl<T> Wrap<T> { … }`. Parsed +
+        // discarded — methods flatten to `Wrap__method` and monomorphize by the
+        // receiver's concrete type (Int default covers the i64 case).
+        if matches!(self.peek(0), Tok::Lt) {
+            self.bump();
+            loop {
+                let _ = self.expect_ident()?;
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); continue; }
+                break;
+            }
+            self.expect(Tok::Gt)?;
+        }
         let first = self.expect_ident()?;
         // Optional generic args on the trait/type ref: `impl From<i64> for T`.
         // The source type in `From<S>` isn't needed for dispatch (the method

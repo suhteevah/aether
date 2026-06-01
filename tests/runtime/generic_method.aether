@@ -1,0 +1,18 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Generic methods: `impl<T> Wrap<T> { fn get(self) -> T }`. The impl generic
+// params parse + the methods flatten to `Wrap__get` / `Wrap__double`, dispatched
+// on the receiver's concrete type. (i64 here; per-T monomorphization of methods
+// for f32 is a follow-up — today the Int default covers i64.)
+struct Wrap<T> { v: T }
+
+impl<T> Wrap<T> {
+    fn get(self) -> T { self.v }
+    fn double(self) -> i64 { self.v + self.v }
+}
+
+fn main() -> i32 {
+    let w: Wrap<i64> = Wrap { v: 21 };
+    (w.get() + w.double() - 21) as i32   // 21 + 42 - 21 = 42
+}
