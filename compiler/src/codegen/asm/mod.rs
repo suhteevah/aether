@@ -678,12 +678,11 @@ pub fn try_emit(p: &Program, plan: &crate::mir::regalloc_plan::PlanMap) -> Resul
             // %rdx) and drive the `?`-operator early-return propagation.
             if let Some(Ty::Named(rname)) = f.ret.as_ref() {
                 if let Some(ed) = enum_decls.get(rname) {
-                    // The 2-register return ABI carries tag + ONE payload field.
-                    // A multi-field-payload enum can't return through it (fields
-                    // 1+ would be dropped); such enums are local construct/match
-                    // only until an sret enum-return lands.
+                    // Return ABI: tag in %rax + up to 3 payload fields in
+                    // %rdx/%rcx/%r8. An enum with a >3-field variant can't return
+                    // through it (would need sret) and stays local-only.
                     let max_fields = ed.payloads.iter().map(|p| p.len()).max().unwrap_or(0);
-                    if max_fields <= 1 {
+                    if max_fields <= 3 {
                         fn_returns_enum.insert(f.name.clone(), rname.clone());
                         fn_returns_enum.insert(format!("aether_{}", f.name), rname.clone());
                     }
@@ -1093,38 +1092,65 @@ fn emit_enum_return_value(
     data: &mut StringTable,
     locals: &mut Locals,
 ) -> Result<(), AsmError> {
-    // Case 1: enum constructor literal. The 2-register return ABI carries
-    // field 0 only (enums registered for return are guaranteed ≤1 payload field).
-    if let Some((_enum_name, variant_idx, payload_exprs)) =
+    // Case 1: enum constructor literal. Return ABI: tag in %rax, payload fields
+    // in %rdx (field 0), %rcx (field 1), %r8 (field 2) — up to 3 fields fit the
+    // 4-register convention.
+    if let Some((enum_name, variant_idx, payload_exprs)) =
         resolve_enum_ctor(e, &locals.enum_decls)
     {
-        // Evaluate the payload first (clobbers rax) then set both regs.
-        // Keep the tag immediate small and dependency-free so it doesn't
-        // get reordered with the payload eval.
-        if let Some(pe) = payload_exprs.first() {
-            let pty = emit_expr_value(pe, out, data, locals)?;
-            if !matches!(pty, TyKind::Int) {
-                return Err(AsmError::UnsupportedExpr(
-                    "enum payload return currently restricted to i64-shaped types"));
+        let nslots = enum_payload_slots(&locals.enum_decls, &enum_name);
+        if nslots <= 1 {
+            // Single-payload — byte-identical to the original 2-register path.
+            if let Some(pe) = payload_exprs.first() {
+                let pty = emit_expr_value(pe, out, data, locals)?;
+                if !matches!(pty, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr(
+                        "enum payload return currently restricted to i64-shaped types"));
+                }
+                out.push_str("    movq %rax, %rdx\n");
+            } else {
+                out.push_str("    xorl %edx, %edx\n");
             }
-            out.push_str("    movq %rax, %rdx\n");
-        } else {
-            out.push_str("    xorl %edx, %edx\n");
+            out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
+            return Ok(());
+        }
+        // Multi-field — evaluate each field forward (pushing), then pop into the
+        // payload registers in reverse, finally set the tag. Stack-spill keeps a
+        // later field's eval from clobbering an earlier field's register.
+        let regs = ["%rdx", "%rcx", "%r8"];
+        for k in 0..nslots {
+            if let Some(pe) = payload_exprs.get(k) {
+                let pty = emit_expr_value(pe, out, data, locals)?;
+                if !matches!(pty, TyKind::Int) {
+                    return Err(AsmError::UnsupportedExpr(
+                        "enum payload return currently restricted to i64-shaped types"));
+                }
+            } else {
+                out.push_str("    xorl %eax, %eax\n");
+            }
+            out.push_str("    pushq %rax\n");
+        }
+        for k in (0..nslots).rev() {
+            out.push_str(&format!("    popq {}\n", regs[k]));
         }
         out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
         return Ok(());
     }
-    // Case 2: bare ident → existing payload-enum local.
+    // Case 2: bare ident → existing payload-enum local. tag -> rax, fields ->
+    // rdx/rcx/r8 (no eval, so a straight load per slot — no clobber risk).
     if let Expr::Ident(n) = e {
-        if locals.enum_locals.contains_key(n) {
-            let tag_key = format!("{}.tag", n);
-            let val_key = format!("{}.val", n);
-            let tag_slot = locals.get(&tag_key).ok_or(AsmError::UnsupportedExpr(
+        if let Some(ename) = locals.enum_locals.get(n).cloned() {
+            let tag_slot = locals.get(&format!("{}.tag", n)).ok_or(AsmError::UnsupportedExpr(
                 "enum return: ident missing .tag slot"))?;
-            let val_slot = locals.get(&val_key).ok_or(AsmError::UnsupportedExpr(
-                "enum return: ident missing .val slot"))?;
             out.push_str(&format!("    movq -{}(%rbp), %rax\n", tag_slot * 8));
-            out.push_str(&format!("    movq -{}(%rbp), %rdx\n", val_slot * 8));
+            let nslots = enum_payload_slots(&locals.enum_decls, &ename);
+            let regs = ["%rdx", "%rcx", "%r8"];
+            for k in 0..nslots {
+                let key = format!("{}.{}", n, enum_val_suffix(k));
+                let slot = locals.get(&key).ok_or(AsmError::UnsupportedExpr(
+                    "enum return: ident missing payload slot"))?;
+                out.push_str(&format!("    movq -{}(%rbp), {}\n", slot * 8, regs[k]));
+            }
             return Ok(());
         }
     }
@@ -1749,12 +1775,13 @@ fn count_locals(b: &Block, locals: &mut Locals) {
                         continue;
                     }
                 }
-                // Call to a fn returning a payload-enum: same 2-slot layout,
-                // populated from (rax, rdx) instead of from the literal.
+                // Call to a fn returning a payload-enum: tag + val + val1.. slots,
+                // populated from the return registers instead of from a literal.
                 if let Some(v) = value {
-                    if call_returns_enum(v, &locals.fn_returns_enum).is_some() {
+                    if let Some(en) = call_returns_enum(v, &locals.fn_returns_enum) {
                         locals.alloc(&format!("{}.tag", name));
-                        locals.alloc(&format!("{}.val", name));
+                        let nslots = enum_payload_slots(&locals.enum_decls, &en);
+                        for k in 0..nslots { locals.alloc(&format!("{}.{}", name, enum_val_suffix(k))); }
                         continue;
                     }
                 }
@@ -2564,20 +2591,26 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             // `let r = parse_one(x);` materialises `r.tag` + `r.val` from
             // the call result so subsequent `match r { ... }` can decode it.
             if let Some(enum_name) = call_returns_enum(value, &locals.fn_returns_enum) {
-                let tag_key = format!("{}.tag", name);
-                let val_key = format!("{}.val", name);
-                let tag_slot = locals.alloc(&tag_key);
-                locals.types.insert(tag_key, TyKind::Int);
-                let val_slot = locals.alloc(&val_key);
-                locals.types.insert(val_key, TyKind::Int);
+                let tag_slot = locals.alloc(&format!("{}.tag", name));
+                locals.types.insert(format!("{}.tag", name), TyKind::Int);
+                let nslots = enum_payload_slots(&locals.enum_decls, &enum_name);
+                let mut val_slots = Vec::new();
+                for k in 0..nslots {
+                    let key = format!("{}.{}", name, enum_val_suffix(k));
+                    let s = locals.alloc(&key);
+                    locals.types.insert(key, TyKind::Int);
+                    val_slots.push(s);
+                }
                 locals.enum_locals.insert(name.clone(), enum_name);
-                // Evaluate the call. The 2-register return convention leaves
-                // tag in rax and val in rdx — emit_expr_value reports Int
-                // (rax) and we capture rdx ourselves before any subsequent
-                // instruction can clobber it.
+                // Evaluate the call. The return convention leaves tag in rax and
+                // payload fields in rdx/rcx/r8 — capture each before any later
+                // instruction can clobber them (memory stores don't).
                 let _ = emit_expr_value(value, out, data, locals)?;
                 out.push_str(&format!("    movq %rax, -{}(%rbp)\n", tag_slot * 8));
-                out.push_str(&format!("    movq %rdx, -{}(%rbp)\n", val_slot * 8));
+                let regs = ["%rdx", "%rcx", "%r8"];
+                for (k, s) in val_slots.iter().enumerate() {
+                    out.push_str(&format!("    movq {}, -{}(%rbp)\n", regs[k], s * 8));
+                }
                 let _ = ty;
                 return Ok(());
             }

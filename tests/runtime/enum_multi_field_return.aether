@@ -1,0 +1,30 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Returning a multi-field enum from a function — the last piece of the ADT story.
+// The enum return ABI now carries tag in %rax + payload fields in %rdx/%rcx/%r8
+// (up to 3 fields, fitting the 4-register convention), generalised from the old
+// tag+val. A factory builds a multi-field variant; the caller unmarshals all
+// fields and matches them. The single-payload path is byte-identical (the `?`
+// operator and Option/Result-shaped returns are unchanged).
+enum Shape { Empty, Rect(i64, i64) }
+enum Triple { Z, Tri(i64, i64, i64) }
+
+fn make_rect(w: i64, h: i64) -> Shape { Shape::Rect(w, h) }
+fn make_tri(a: i64, b: i64, c: i64) -> Triple { Triple::Tri(a, b, c) }
+
+fn main() -> i32 {
+    let r: Shape = make_rect(6, 5);            // returned 2-field enum
+    let ar: i64 = match r {
+        Shape::Rect(w, h) => w * h,            // 30  (both fields survived return)
+        Shape::Empty => 0,
+    };
+
+    let t: Triple = make_tri(3, 4, 5);         // returned 3-field enum
+    let st: i64 = match t {
+        Triple::Tri(a, b, c) => a + b + c,     // 12
+        Triple::Z => 0,
+    };
+
+    (ar + st) as i32                            // 30 + 12 = 42
+}
