@@ -1,0 +1,42 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// Match guards `<pat> if <cond> =>` + irrefutable binding patterns `n =>`.
+// A guarded arm matches its inner pattern (and binds) first, then evaluates the
+// guard; if the guard is false, control falls through to the next arm. A bare
+// single-segment ident that isn't a known variant/const is an irrefutable
+// binding of the scrutinee value (the head of `n if n > 10`). Guards also see
+// the bound payload of an enum pattern (`S(x) if x > 40`).
+enum Opt { N, S(i64) }
+
+// int scrutinee: first matching guard wins; non-matching guards fall through
+fn bucket(x: i64) -> i64 {
+    match x {
+        n if n > 100 => 0,     // skipped (50 !> 100)
+        n if n < 5   => 0,     // skipped (50 !< 5)
+        n if n > 10  => n - 8, // taken: 50 - 8 = 42
+        _ => 0,
+    }
+}
+
+fn main() -> i32 {
+    let a: i64 = bucket(50);                 // 42
+
+    // guard reading an enum payload binding, matched locally
+    let hi: Opt = Opt::S(7);
+    let b: i64 = match hi {
+        Opt::S(x) if x >= 5 => x,            // 7  (guard true)
+        Opt::S(x) => 0,
+        Opt::N => 0,
+    };
+
+    let lo: Opt = Opt::S(3);
+    let c: i64 = match lo {
+        Opt::S(x) if x >= 5 => x,
+        Opt::S(x) => 0,                      // 0  (guard false -> fallthrough)
+        Opt::N => 0,
+    };
+
+    // 42 + 7 - 0 - 7 = 42
+    (a + b - c - 7) as i32
+}

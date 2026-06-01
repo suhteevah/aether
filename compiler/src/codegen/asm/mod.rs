@@ -2257,9 +2257,23 @@ fn count_locals_in_expr(e: &Expr, locals: &mut Locals) {
             // slot but that's fine).
             locals.alloc("_match_scrut_");
             for (pat, body) in arms {
-                if let MatchPat::EnumVariantBind(_, binds) = pat {
-                    for b in binds { locals.alloc(b); }
+                // Unwrap a guard so its inner-pattern binds + guard-expr locals
+                // are reserved (frame invariant), then count the body.
+                let (core_pat, guard_expr): (&MatchPat, Option<&Expr>) = match pat {
+                    MatchPat::Guard(inner, g) => (inner.as_ref(), Some(g.as_ref())),
+                    other => (other, None),
+                };
+                match core_pat {
+                    MatchPat::EnumVariantBind(_, binds) => { for b in binds { locals.alloc(b); } }
+                    // Irrefutable binding pattern `n =>` — reserve the bound name.
+                    MatchPat::EnumVariant(parts)
+                        if parts.len() == 1 && !locals.const_env.contains_key(&parts[0]) =>
+                    {
+                        locals.alloc(&parts[0]);
+                    }
+                    _ => {}
                 }
+                if let Some(g) = guard_expr { count_locals_in_expr(g, locals); }
                 count_locals_in_expr(body, locals);
             }
         }
@@ -3792,18 +3806,34 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 } else {
                     None
                 };
-                match pat {
+                // A guarded arm `<pat> if <cond>` wraps an inner pattern; match
+                // the inner pattern (+bind) first, then evaluate the guard below.
+                let (core_pat, guard_expr): (&MatchPat, Option<&Expr>) = match pat {
+                    MatchPat::Guard(inner, g) => (inner.as_ref(), Some(g.as_ref())),
+                    other => (other, None),
+                };
+                // Target to fall to when an arm fails to match (or its guard is
+                // false): the next arm, or match-end for the final arm.
+                let fail_label = next_label.clone().unwrap_or_else(|| end_label.clone());
+                match core_pat {
                     MatchPat::Wildcard => { /* fall through to body */ }
                     MatchPat::Int(n) => {
                         out.push_str(&format!("    movq -{}(%rbp), %rax\n", save_slot * 8));
                         out.push_str(&format!("    movq ${}, %r10\n", n));
                         out.push_str("    cmpq %r10, %rax\n");
-                        if let Some(nl) = &next_label {
-                            out.push_str(&format!("    jne {}\n", nl));
-                        } else {
-                            // Last arm without wildcard — fall through if no match
-                            out.push_str(&format!("    jne {}\n", end_label));
-                        }
+                        out.push_str(&format!("    jne {}\n", fail_label));
+                    }
+                    // A single-segment path that ISN'T a known variant/const is an
+                    // irrefutable BINDING pattern (`match x { n => … }` / the head
+                    // of a guard `n if n > 10`): bind the scrutinee value, always
+                    // match. A single-segment name that IS a const compares by value.
+                    MatchPat::EnumVariant(parts)
+                        if parts.len() == 1 && !locals.const_env.contains_key(&parts[0]) =>
+                    {
+                        let bind_slot = locals.alloc(&parts[0]);
+                        locals.types.insert(parts[0].clone(), TyKind::Int);
+                        out.push_str(&format!("    movq -{}(%rbp), %rax\n", save_slot * 8));
+                        out.push_str(&format!("    movq %rax, -{}(%rbp)\n", bind_slot * 8));
                     }
                     MatchPat::EnumVariant(parts) => {
                         let key = parts.join("::");
@@ -3812,11 +3842,10 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                         out.push_str(&format!("    movq -{}(%rbp), %rax\n", save_slot * 8));
                         out.push_str(&format!("    movq ${}, %r10\n", v));
                         out.push_str("    cmpq %r10, %rax\n");
-                        if let Some(nl) = &next_label {
-                            out.push_str(&format!("    jne {}\n", nl));
-                        } else {
-                            out.push_str(&format!("    jne {}\n", end_label));
-                        }
+                        out.push_str(&format!("    jne {}\n", fail_label));
+                    }
+                    MatchPat::Guard(_, _) => {
+                        return Err(AsmError::UnsupportedExpr("nested match guards are not supported"));
                     }
                     MatchPat::EnumVariantBind(parts, _binds) => {
                         let key = parts.join("::");
@@ -3835,7 +3864,7 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 // For binding patterns, copy each payload field into its bound
                 // local BEFORE the arm body. binds[0] <- `.val` (field 0);
                 // binds[k] <- `.val{k}` (fields 1+).
-                if let MatchPat::EnumVariantBind(_, binds) = pat {
+                if let MatchPat::EnumVariantBind(_, binds) = core_pat {
                     let val_slot = payload_val_slot
                         .ok_or(AsmError::UnsupportedExpr(
                             "binding pattern requires a payload-enum scrutinee"))?;
@@ -3853,6 +3882,16 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                         out.push_str(&format!("    movq -{}(%rbp), %rax\n", src_slot * 8));
                         out.push_str(&format!("    movq %rax, -{}(%rbp)\n", bind_slot * 8));
                     }
+                }
+                // Guard: with the bindings in scope, evaluate the guard; if it is
+                // false (0), fall through to the next arm.
+                if let Some(g) = guard_expr {
+                    let gk = emit_expr_value(g, out, data, locals)?;
+                    if !matches!(gk, TyKind::Int) {
+                        return Err(AsmError::UnsupportedExpr("match guard must be a bool/int expression"));
+                    }
+                    out.push_str("    testq %rax, %rax\n");
+                    out.push_str(&format!("    je {}\n", fail_label));   // je == jz (guard false)
                 }
                 let body_kind = emit_expr_value(body, out, data, locals)?;
                 arm_kind.get_or_insert(body_kind);

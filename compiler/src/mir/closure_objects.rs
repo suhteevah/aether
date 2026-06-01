@@ -623,12 +623,24 @@ fn collect_free_vars(e: &Expr, bound: &mut HashSet<String>, globals: &HashSet<St
         Expr::Match { scrutinee, arms } => {
             collect_free_vars(scrutinee, bound, globals, caps, seen);
             for (pat, arm) in arms {
-                // A payload-binding arm introduces a fresh local that shadows
-                // any outer name, so it is NOT a free var inside that arm.
+                // A payload-binding (or irrefutable bind / guard-head) arm
+                // introduces fresh locals that shadow outer names. A guard
+                // expression is also evaluated in that scope.
                 let mut inner = bound.clone();
-                if let crate::ast::MatchPat::EnumVariantBind(_, binds) = pat {
-                    for b in binds { inner.insert(b.clone()); }
+                let (core_pat, guard) = match pat {
+                    crate::ast::MatchPat::Guard(p, g) => (p.as_ref(), Some(g.as_ref())),
+                    other => (other, None),
+                };
+                match core_pat {
+                    crate::ast::MatchPat::EnumVariantBind(_, binds) => {
+                        for b in binds { inner.insert(b.clone()); }
+                    }
+                    crate::ast::MatchPat::EnumVariant(parts) if parts.len() == 1 => {
+                        inner.insert(parts[0].clone());
+                    }
+                    _ => {}
                 }
+                if let Some(g) = guard { collect_free_vars(g, &mut inner, globals, caps, seen); }
                 collect_free_vars(arm, &mut inner, globals, caps, seen);
             }
         }

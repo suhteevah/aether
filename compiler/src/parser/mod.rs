@@ -403,6 +403,17 @@ impl Parser {
     }
 
     fn parse_match_pat(&mut self) -> PResult<MatchPat> {
+        let pat = self.parse_match_pat_core()?;
+        // Optional guard: `<pat> if <cond> => …`.
+        if matches!(self.peek(0), Tok::If) {
+            self.bump();
+            let guard = self.parse_expr()?;
+            return Ok(MatchPat::Guard(Box::new(pat), Box::new(guard)));
+        }
+        Ok(pat)
+    }
+
+    fn parse_match_pat_core(&mut self) -> PResult<MatchPat> {
         match self.peek(0).clone() {
             Tok::IntLit(n) => { self.bump(); Ok(MatchPat::Int(n)) }
             // `true` / `false` patterns — bool is i64 1/0, so they match as ints.

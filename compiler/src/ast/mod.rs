@@ -246,6 +246,10 @@ pub enum MatchPat {
     /// local named by `binds[k]` for use in the arm's body. `binds` has 1+ names
     /// (field 0 ← `val`, fields 1+ ← `val1`, `val2`, …).
     EnumVariantBind(Vec<String>, Vec<String>),
+    /// A guarded pattern `<pat> if <expr> => …`. The inner pattern is matched
+    /// (and binds) first; the guard is then evaluated and, if false, control
+    /// falls through to the next arm. Lets a single arm refine its match.
+    Guard(Box<MatchPat>, Box<Expr>),
     Wildcard,
 }
 
