@@ -1,0 +1,26 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// A struct with an ARRAY field — `struct Buf { data: [i64; N], len: i64 }` —
+// composing the struct-field and stack-array features. The array field expands
+// to element slots `b.data.0 .. b.data.{N-1}` (via expand_struct_field_keys),
+// the struct-literal init stores each element, the field registers in
+// locals.arrays under its dotted key `b.data`, and `b.data[i]` indexing resolves
+// a Field receiver through field_path — both static and dynamic indices, beside
+// an ordinary scalar field (`len`).
+struct Buf { data: [i64; 4], len: i64 }
+
+fn main() -> i32 {
+    let b: Buf = Buf { data: [5, 10, 12, 13], len: 4 };
+
+    // static field-array index
+    let head: i64 = b.data[0];          // 5
+
+    // dynamic field-array index bounded by the scalar `len` field
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < b.len { sum = sum + b.data[i]; i = i + 1; }   // 5+10+12+13 = 40
+
+    // 40 + 5 - 3 = 42
+    (sum + head - 3) as i32
+}

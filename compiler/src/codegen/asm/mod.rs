@@ -1866,7 +1866,44 @@ fn expand_struct_field_keys(
                 continue;
             }
         }
+        // An array FIELD (`data: [i64; N]`) expands to N element slots
+        // `prefix.field.0 .. prefix.field.{N-1}`, matching how a top-level
+        // array local is laid out. Indexing `b.data[i]` is then a lookup of the
+        // `prefix.field` array base (registered alongside in the let path).
+        if let Ty::Array { elem, n } = &resolved {
+            let ek = TyKind::from_ty(elem).unwrap_or(TyKind::Int);
+            for k in 0..*n {
+                out.push((format!("{}.{}", key, k), ek));
+            }
+            continue;
+        }
         out.push((key, TyKind::from_ty(&resolved).unwrap_or(TyKind::Int)));
+    }
+}
+
+/// Register every array-typed field of a struct local in `locals.arrays` under
+/// its dotted key (`b.data` -> base slot of `b.data.0`, n, elem kind), so
+/// `b.data[i]` indexing resolves. Recurses into nested struct fields.
+fn register_struct_array_fields(
+    prefix: &str,
+    sd: &StructDecl,
+    struct_decls: &HashMap<String, StructDecl>,
+    locals: &mut Locals,
+) {
+    for f in &sd.fields {
+        let key = format!("{}.{}", prefix, f.name);
+        if let Ty::Array { elem, n } = &f.ty {
+            let ek = TyKind::from_ty(elem).unwrap_or(TyKind::Int);
+            if let Some(base) = locals.get(&format!("{}.0", key)) {
+                locals.arrays.insert(key.clone(), (base, *n, ek));
+            }
+            continue;
+        }
+        if let Some(inner) = struct_name_of(&f.ty) {
+            if let Some(inner_sd) = struct_decls.get(&inner).cloned() {
+                register_struct_array_fields(&key, &inner_sd, struct_decls, locals);
+            }
+        }
     }
 }
 
@@ -1886,6 +1923,24 @@ fn emit_struct_lit_populate(
         if let Expr::StructLit { fields: inner_fields, .. } = fvalue {
             emit_struct_lit_populate(&key, inner_fields, out, data, locals)?;
             continue;
+        }
+        // An array-literal FIELD value (`data: [10, 15, 17]`, carried as a
+        // Tuple) stores each element into the field's expanded element slots
+        // `key.0 .. key.{n-1}`.
+        if let Expr::Tuple(elems) = fvalue {
+            if locals.get(&format!("{}.0", key)).is_some() {
+                for (k, elem) in elems.iter().enumerate() {
+                    let ekey = format!("{}.{}", key, k);
+                    let eslot = locals.get(&ekey).ok_or_else(|| AsmError::UnknownIdent(ekey.clone()))?;
+                    let vt = emit_expr_value(elem, out, data, locals)?;
+                    match vt {
+                        TyKind::F32 => out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", eslot * 8)),
+                        TyKind::F64 => out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", eslot * 8)),
+                        _ => out.push_str(&format!("    movq %rax, -{}(%rbp)\n", eslot * 8)),
+                    }
+                }
+                continue;
+            }
         }
         let slot = locals.get(&key).ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
         let kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
@@ -2580,6 +2635,8 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                     locals.types.insert(k.clone(), *kind);
                     let _ = slot;
                 }
+                // Register any array-typed fields so `name.field[i]` resolves.
+                register_struct_array_fields(name, &sd, &decls, locals);
                 // Populate, recursing into nested struct-literal field values.
                 emit_struct_lit_populate(name, fields, out, data, locals)?;
                 return Ok(());
@@ -3574,10 +3631,14 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             Ok(TyKind::Int)
         }
         Expr::Index { recv, idx } => {
-            // Stack-array read: load `*(&buf[0] - 8*idx)` into rax.
+            // Stack-array read: load `*(&buf[0] - 8*idx)` into rax. The receiver
+            // is a bare local (`a[i]`) or a struct array-field path (`b.data[i]`,
+            // registered in locals.arrays under its dotted key).
             let arr_name = match recv.as_ref() {
                 Expr::Ident(n) => n.clone(),
-                _ => return Err(AsmError::UnsupportedExpr("array index read: receiver must be an ident")),
+                Expr::Field { .. } => field_path(recv)
+                    .ok_or(AsmError::UnsupportedExpr("array index read: unresolved field path"))?,
+                _ => return Err(AsmError::UnsupportedExpr("array index read: receiver must be an ident or field path")),
             };
             // P16.19 — slice index `s[i]`: load `*(s.ptr + i*elem_size)`.
             // Slices store their base as a heap pointer in `<name>.ptr` and
