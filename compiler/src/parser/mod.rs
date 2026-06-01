@@ -362,6 +362,18 @@ impl Parser {
     fn parse_enum_item(&mut self) -> PResult<Item> {
         self.expect(Tok::Enum)?;
         let name = self.expect_ident()?;
+        // Optional generic params: `enum Option<T> { … }`. The payload is
+        // int-shaped today, so the params are parsed + discarded; an
+        // `Option<i64>` annotation resolves to the base enum at codegen.
+        if matches!(self.peek(0), Tok::Lt) {
+            self.bump();
+            loop {
+                let _ = self.expect_ident()?;
+                if matches!(self.peek(0), Tok::Comma) { self.bump(); continue; }
+                break;
+            }
+            self.expect(Tok::Gt)?;
+        }
         self.expect(Tok::LBrace)?;
         let mut variants = Vec::new();
         let mut payloads = Vec::new();

@@ -1,0 +1,23 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// Generic enums `Option<T>` / `Result<T, E>` (the marquee Rust enums). The
+// payload is int-shaped today, so the type params are parsed + discarded and
+// the `Option<i64>` / `Result<i64,i64>` annotations resolve to the base enum;
+// construction + payload-binding match work via the existing enum machinery.
+enum Option<T> { None, Some(T) }
+enum Result<T, E> { Ok(T), Err(E) }
+
+fn main() -> i32 {
+    let o: Option<i64> = Option::Some(40);
+    let a: i64 = match o {
+        Option::Some(x) => x,        // 40
+        Option::None => 0,
+    };
+    let r: Result<i64, i64> = Result::Ok(2);
+    let b: i64 = match r {
+        Result::Ok(v) => v,          // 2
+        Result::Err(e) => e,
+    };
+    (a + b) as i32                   // 42
+}
