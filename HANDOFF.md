@@ -57,10 +57,15 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   `Rect(w,h)`; ADT story COMPLETE. Return ABI generalised to tag(rax)+fields
   (rdx/rcx/r8), ≤3 fields. Single-payload byte-identical (`?` unchanged). Witness
   `enum_multi_field_return`.
-- STILL-MISSING (top follow-ups): direct `a.add(x).add(y)` struct-method chaining;
+- **integration witness** (`1715ce6`) — `parity_integration.aether` composes
+  ADT+guard+factory-return, trait-default-via-bounded-generic, capturing closure,
+  array dynamic-index, tuple destructure in ONE program -> 42. Proves the
+  session's features interoperate.
+- STILL-MISSING (top follow-ups, best fresh): direct `a.add(x).add(y)` struct-method
+  chaining (needs an intermediate temp-local + count_locals reservation);
   >3-field enum return (sret); array `[v;n]` const-ident count; tuple-struct ctor
-  in arg/return position; async/macros/threads (large subsystems); full NLL borrow
-  on the compile path.
+  in arg/return position; async/macros/threads (large multi-session subsystems);
+  full NLL borrow on the compile path (currently `--check`-only).
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
