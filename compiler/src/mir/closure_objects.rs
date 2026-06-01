@@ -264,7 +264,11 @@ fn construct_object(name: &str, params: &[(String, Option<Ty>)], body: &Expr, ct
         name: lifted_name.clone(),
         const_params: Vec::new(),
         params: fn_params,
-        ret: Some(Ty::Named("i64".into())),
+        // No declared return type: the closure body decides it (i64 / bool /
+        // f32). Forcing `i64` made a predicate closure (`|n| n % 2 == 0`, bool
+        // body) trip the AE0222 return-type check; the asm backend infers the
+        // return from the body regardless (bool is i64-shaped in a register).
+        ret: None,
         body: Some(Block { stmts: Vec::new(), tail: Some(Box::new(lifted_body)) }),
     });
 

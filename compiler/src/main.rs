@@ -531,6 +531,27 @@ fn main() {
         return;
     }
 
+    // P6.3 — enforce borrow checking on the COMPILE path too, not just `--check`.
+    // The checker is clean across the whole codebase (runtime witnesses, examples,
+    // stdlib, positive conformance), so this is a real safety net with zero false
+    // positives: an aliasing program now fails to COMPILE (nonzero exit), the same
+    // AE0200-family diagnostic `--check` reports — borrow safety is no longer
+    // advisory-only. (Lexical over-approximation; full non-lexical precision is a
+    // follow-up — but it now actually gates codegen.)
+    {
+        let lt_violations = mir::lifetimes_drive::drive(&prog);
+        if !lt_violations.is_empty() {
+            for v in &lt_violations {
+                sink.push(Diag::error(v.code, "borrow", v.message.clone())
+                    .with_hint("a `let`-bound `&mut` borrow stays live to the end of the \
+                        function; release the prior borrow (drop the binding or pass the value \
+                        instead of `&mut`) before taking another"));
+            }
+            report(&sink, &file_str, args.json_errors);
+            std::process::exit(1);
+        }
+    }
+
     match args.emit {
         Emit::Mir => {
             std::fs::write(&args.output, mir::dump_mir(&mir_prog)).unwrap();
