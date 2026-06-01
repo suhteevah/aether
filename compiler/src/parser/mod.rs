@@ -16,16 +16,17 @@ pub struct Parser {
     /// Mirrors Rust's `no_struct_literal` flag. Restored by callers via
     /// `with_struct_lit_disabled`.
     struct_lit_allowed: bool,
-    /// Declarative-macro table: name -> (metavar names, body token template).
-    /// A `name!(args)` invocation substitutes each `$param` in the body with the
-    /// matching argument's tokens and re-parses the result as an expression.
-    /// Single-rule, `$x:expr` metavars, expression body. (Definition is captured
-    /// in parse_item; expansion happens in parse_postfix, gated on the name.)
-    macros: std::collections::HashMap<String, MacroDef>,
+    /// Declarative-macro table: name -> ordered list of rules. A `name!(args)`
+    /// invocation picks the first rule whose metavar count matches the argument
+    /// count, substitutes each `$param` in that rule's body with the matching
+    /// argument's tokens, and re-parses the result as an expression. `$x:expr`
+    /// metavars, expression body, arity-overloaded rules. (Captured in
+    /// parse_item; expanded in parse_postfix, gated on the name.)
+    macros: std::collections::HashMap<String, Vec<MacroRule>>,
 }
 
 #[derive(Clone)]
-struct MacroDef {
+struct MacroRule {
     params: Vec<String>,
     body: Vec<Token>,
 }
@@ -155,47 +156,47 @@ impl Parser {
             self.bump(); // !
             let name = self.expect_ident()?;
             self.expect(Tok::LBrace)?;
-            // Rule pattern: `( $a:expr , $b:expr )`. Collect the metavar names.
-            let mut params: Vec<String> = Vec::new();
-            self.expect(Tok::LParen)?;
-            while !matches!(self.peek(0), Tok::RParen) {
-                if matches!(self.peek(0), Tok::Dollar) {
-                    self.bump(); // $
-                    params.push(self.expect_ident()?);
-                    // optional `: expr` fragment specifier — consumed, single kind.
-                    if matches!(self.peek(0), Tok::Colon) { self.bump(); let _ = self.expect_ident()?; }
-                } else {
-                    self.bump(); // tolerate literal tokens in the matcher
-                }
-                if matches!(self.peek(0), Tok::Comma) { self.bump(); }
-            }
-            self.expect(Tok::RParen)?;
-            self.expect(Tok::FatArrow)?;
-            self.expect(Tok::LBrace)?;
-            // Capture the body token template (between the transcriber braces).
-            let mut body: Vec<Token> = Vec::new();
-            let mut depth = 1u32;
-            loop {
-                match self.peek(0).clone() {
-                    Tok::LBrace => { depth += 1; body.push(self.toks[self.pos].clone()); self.bump(); }
-                    Tok::RBrace => {
-                        depth -= 1;
-                        if depth == 0 { self.bump(); break; }
-                        body.push(self.toks[self.pos].clone()); self.bump();
-                    }
-                    Tok::Eof => return Err("unterminated macro_rules! body".into()),
-                    _ => { body.push(self.toks[self.pos].clone()); self.bump(); }
-                }
-            }
-            // Optional `;` separator after a rule, then the outer
-            // `macro_rules! name { … }` brace. Any further rules are tolerated
-            // (consumed) but only the first is modelled.
-            if matches!(self.peek(0), Tok::Semi) { self.bump(); }
+            // One or more rules `( $a:expr , … ) => { <expr-body> }`, separated by
+            // optional `;`. Each rule's metavar count is its arity; an invocation
+            // selects the first rule whose arity matches the argument count.
+            let mut rules: Vec<MacroRule> = Vec::new();
             while !matches!(self.peek(0), Tok::RBrace) && !matches!(self.peek(0), Tok::Eof) {
-                self.bump();
+                let mut params: Vec<String> = Vec::new();
+                self.expect(Tok::LParen)?;
+                while !matches!(self.peek(0), Tok::RParen) {
+                    if matches!(self.peek(0), Tok::Dollar) {
+                        self.bump(); // $
+                        params.push(self.expect_ident()?);
+                        // optional `: expr` fragment specifier — consumed, single kind.
+                        if matches!(self.peek(0), Tok::Colon) { self.bump(); let _ = self.expect_ident()?; }
+                    } else {
+                        self.bump(); // tolerate literal tokens in the matcher
+                    }
+                    if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                }
+                self.expect(Tok::RParen)?;
+                self.expect(Tok::FatArrow)?;
+                self.expect(Tok::LBrace)?;
+                // Capture the body token template (between the transcriber braces).
+                let mut body: Vec<Token> = Vec::new();
+                let mut depth = 1u32;
+                loop {
+                    match self.peek(0).clone() {
+                        Tok::LBrace => { depth += 1; body.push(self.toks[self.pos].clone()); self.bump(); }
+                        Tok::RBrace => {
+                            depth -= 1;
+                            if depth == 0 { self.bump(); break; }
+                            body.push(self.toks[self.pos].clone()); self.bump();
+                        }
+                        Tok::Eof => return Err("unterminated macro_rules! body".into()),
+                        _ => { body.push(self.toks[self.pos].clone()); self.bump(); }
+                    }
+                }
+                rules.push(MacroRule { params, body });
+                if matches!(self.peek(0), Tok::Semi) { self.bump(); }
             }
             self.expect(Tok::RBrace)?;
-            self.macros.insert(name, MacroDef { params, body });
+            self.macros.insert(name, rules);
             // Synthesize a no-op item the rest of the pipeline ignores.
             return Ok(Item::Use(vec!["__macro_rules_skipped".to_string()]));
         }
@@ -1067,14 +1068,17 @@ impl Parser {
                         e = expand_print_macro(&nm, args)?;
                         continue;
                     }
-                    // User-defined declarative macro: expand the captured body
-                    // template with the call's argument tokens, then re-parse the
-                    // result as an expression.
-                    if let Some(def) = self.macros.get(&nm).cloned() {
+                    // User-defined declarative macro: capture the argument tokens,
+                    // pick the rule whose arity matches, expand its body template,
+                    // and re-parse the result as an expression.
+                    if let Some(rules) = self.macros.get(&nm).cloned() {
                         self.bump(); // !
                         self.bump(); // (
                         let arg_toks = self.capture_macro_args()?;
-                        e = self.expand_macro(&def, &arg_toks)?;
+                        let rule = rules.iter().find(|r| r.params.len() == arg_toks.len())
+                            .ok_or_else(|| format!(
+                                "macro `{}!` has no rule for {} argument(s)", nm, arg_toks.len()))?;
+                        e = self.expand_macro(rule, &arg_toks)?;
                         continue;
                     }
                     self.bump(); // !
@@ -1197,19 +1201,19 @@ impl Parser {
     /// Expand a declarative macro: substitute each `$param` in the body template
     /// with the matching argument's tokens, then re-parse the result as an
     /// expression via a sub-parser (sharing the macro table for nested macros).
-    fn expand_macro(&self, def: &MacroDef, args: &[Vec<Token>]) -> PResult<Expr> {
-        if args.len() != def.params.len() {
-            return Err(format!("macro expected {} argument(s), got {}", def.params.len(), args.len()));
+    fn expand_macro(&self, rule: &MacroRule, args: &[Vec<Token>]) -> PResult<Expr> {
+        if args.len() != rule.params.len() {
+            return Err(format!("macro expected {} argument(s), got {}", rule.params.len(), args.len()));
         }
-        let mut out: Vec<Token> = Vec::with_capacity(def.body.len());
+        let mut out: Vec<Token> = Vec::with_capacity(rule.body.len());
         let mut i = 0;
-        while i < def.body.len() {
+        while i < rule.body.len() {
             // `$ident` → the matching arg's token run, parenthesised so the
             // substituted expression binds as a unit at the splice site.
-            if matches!(def.body[i].tok, Tok::Dollar) && i + 1 < def.body.len() {
-                if let Tok::Ident(mv) = &def.body[i + 1].tok {
-                    if let Some(idx) = def.params.iter().position(|p| p == mv) {
-                        let here = (def.body[i].line, def.body[i].col);
+            if matches!(rule.body[i].tok, Tok::Dollar) && i + 1 < rule.body.len() {
+                if let Tok::Ident(mv) = &rule.body[i + 1].tok {
+                    if let Some(idx) = rule.params.iter().position(|p| p == mv) {
+                        let here = (rule.body[i].line, rule.body[i].col);
                         out.push(Token { tok: Tok::LParen, line: here.0, col: here.1 });
                         out.extend(args[idx].iter().cloned());
                         out.push(Token { tok: Tok::RParen, line: here.0, col: here.1 });
@@ -1218,7 +1222,7 @@ impl Parser {
                     }
                 }
             }
-            out.push(def.body[i].clone());
+            out.push(rule.body[i].clone());
             i += 1;
         }
         out.push(Token { tok: Tok::Eof, line: 0, col: 0 });

@@ -1,0 +1,21 @@
+// roadmap: P6.11
+// expect: exit=42
+//
+// Arity-overloaded declarative macros — a `macro_rules!` with MULTIPLE rules;
+// an invocation selects the first rule whose metavar count matches the argument
+// count. Builds on single-rule expansion (the rule list replaces the single
+// def). Each rule keeps the precedence-safe paren-wrapping of substituted args.
+macro_rules! pick {
+    ($a:expr) => { $a };
+    ($a:expr, $b:expr) => { $a + $b };
+    ($a:expr, $b:expr, $c:expr) => { $a + $b + $c };
+}
+
+fn main() -> i32 {
+    let one: i64   = pick!(42);           // 1-arg rule  -> 42
+    let two: i64   = pick!(3, 4);         // 2-arg rule  -> 7
+    let three: i64 = pick!(10, 20, 5);    // 3-arg rule  -> 35
+
+    // one stands alone; two and three cancel against literals
+    (one + (two - 7) + (three - 35)) as i32   // 42
+}
