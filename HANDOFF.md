@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 36 features + 7 probing bugfixes / ~57 commits incl. nested struct fields + method chains (both structural gaps closed) incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 38 features + 8 probing bugfixes / ~61 commits incl. nested struct fields + method chains + enum-as-param (all probe gaps closed) incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -45,12 +45,15 @@ separate.) Witness `method_chain`. So the COMMON language surface — generics,
 type system, traits, struct construction + composition + method chains, control
 flow — is now genuinely real and probe-hardened. What's left is the big
 SUBSYSTEMS (Iterator+adapters, Vec<T>-growth, sret, dyn vtables, full NLL, async,
-macros, threads) — each a focused multi-session effort. One more probe gap noted
-(moderate, not done): a payload-enum passed as a fn PARAM (`fn f(o: Option<i64>)`
-then `match o`) needs the 2-slot enum-param ABI (tag+val on both sides),
-analogous to multi-field struct-param passing. The round-5 sweep is otherwise
-clean (3-level nested fields, nested generic struct fields, method-chain+arith,
-for-over-nested-field-bound, generic+struct combos).
+macros, threads) — each a focused multi-session effort. **Enum-as-param now DONE
+too** (`c6e2bee`): the 2-slot (tag,val) enum-param ABI — and en route fixed a
+LATENT frame-size bug (the count pass allocated 1 slot per param but the prologue
+expands aggregate params; the undercount overflowed the frame, masked only by the
+unused ret-save slot). The count pass now mirrors the prologue slot-for-slot
+(struct fields + enum tag/val) — the highest-risk change of the arc (frame
+invariant), held clean across the whole suite. Witness `enum_param`. (Caller side
+covers enum LOCAL args; enum CONSTRUCTOR args want emit_expr_value to leave
+tag:rax/val:rdx — a follow-up.) The round-5 sweep was otherwise clean.
 
 ### parser stmt-boundary fix (detail)
 - **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
