@@ -657,6 +657,25 @@ impl Parser {
                 stmts.push(Stmt::Return(val));
                 continue;
             }
+            // Block-like expressions (if / while / for / loop / match / { /
+            // unsafe) in STATEMENT position are complete statements: they do NOT
+            // take a postfix `(…)` call or continue into a binary expression
+            // (Rust's statement-vs-expression rule). Parsed via `parse_atom`
+            // (which skips `parse_postfix`), so a following `(expr)` is a NEW
+            // statement, not `Call { callee: <if-expr>, args: [expr] }`. If the
+            // block-expr is the last thing before `}` it's the tail.
+            if matches!(self.peek(0),
+                Tok::If | Tok::While | Tok::For | Tok::Loop | Tok::Match | Tok::LBrace | Tok::Unsafe)
+            {
+                let expr = self.parse_atom()?;
+                if matches!(self.peek(0), Tok::Semi) { self.bump(); }
+                if matches!(self.peek(0), Tok::RBrace) {
+                    tail = Some(Box::new(expr));
+                } else {
+                    stmts.push(Stmt::Expr(expr));
+                }
+                continue;
+            }
             // Expr statement or trailing expression
             let expr = self.parse_expr()?;
             if matches!(self.peek(0), Tok::Semi) {
