@@ -3561,6 +3561,31 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             //     invariant required at the CALL.
             let mut arg_kinds: Vec<TyKind> = Vec::with_capacity(args.len());
             for arg in args {
+                // Inline enum constructor `f(Opt::S(42))`: materialise (tag, val)
+                // into two ABI arg slots, mirroring the enum-local-by-value path
+                // below. The tag is pushed first, then field 0. (Single-payload
+                // across the boundary; a multi-field enum needs the sret enum ABI.)
+                if let Some((_en, variant_idx, payload_exprs)) =
+                    resolve_enum_ctor(arg, &locals.enum_decls)
+                {
+                    out.push_str(&format!("    movq ${}, %rax\n", variant_idx as i64));
+                    out.push_str("    subq $16, %rsp\n");
+                    out.push_str("    movq %rax, (%rsp)\n");
+                    arg_kinds.push(TyKind::Int);
+                    if let Some(pe) = payload_exprs.first() {
+                        let pk = emit_expr_value(pe, out, data, locals)?;
+                        if !matches!(pk, TyKind::Int) {
+                            return Err(AsmError::UnsupportedExpr(
+                                "enum payload arg currently restricted to i64-shaped types"));
+                        }
+                    } else {
+                        out.push_str("    xorl %eax, %eax\n");
+                    }
+                    out.push_str("    subq $16, %rsp\n");
+                    out.push_str("    movq %rax, (%rsp)\n");
+                    arg_kinds.push(TyKind::Int);
+                    continue;
+                }
                 // Struct-by-value: a struct ident expands to one push per
                 // declared field (in declaration order), each treated as
                 // an independent ABI arg slot. Mirrors the param-spill

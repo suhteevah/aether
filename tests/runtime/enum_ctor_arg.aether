@@ -1,0 +1,25 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Passing an enum CONSTRUCTOR directly as a function argument — `get(Opt::S(42))`
+// — without first binding it to a local. Previously this hit "non-ident callee"
+// (the constructor is a `Call` on a `Path`, not an Ident, so it missed the
+// enum-local-by-value arg path). The call-arg loop now recognises an enum
+// constructor arg and materialises (tag, val) into the two ABI slots the
+// enum-param side expects, mirroring the enum-local path. Single-payload enums
+// across the boundary; the no-payload variant works too (val = 0).
+enum Opt { N, S(i64) }
+
+fn unwrap_or(o: Opt, d: i64) -> i64 {
+    match o {
+        Opt::S(x) => x,
+        Opt::N => d,
+    }
+}
+
+fn main() -> i32 {
+    let a: i64 = unwrap_or(Opt::S(30), 0);   // 30  (payload constructor arg)
+    let b: i64 = unwrap_or(Opt::S(12), 0);   // 12
+    let c: i64 = unwrap_or(Opt::N, 0);       // 0   (no-payload constructor arg)
+    (a + b + c) as i32                        // 42
+}
