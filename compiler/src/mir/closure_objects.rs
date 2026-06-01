@@ -100,6 +100,14 @@ fn process_fn(f: &mut FnDecl, ctx: &mut Ctx) {
     // value-used named closure, so Phases A/B lower it like any other.
     hoist_inline_block(body, &ctx.sigs, &mut ctx.counter);
 
+    // Phase 0.5 — a closure that ESCAPES upward as the fn's return value
+    // (`fn make_adder(n) -> Closure { |x| x + n }`) is lowered in place to a
+    // heap-object pointer, so the caller (which holds a `Closure`) can invoke it
+    // through the object ABI with the captures intact.
+    if f.ret.as_ref().map_or(false, is_closure_ty) {
+        lower_escaping_in_fn(body, ctx);
+    }
+
     // Targets whose calls use the closure-object ABI: params typed `Closure`,
     // plus any closure-object local we create below.
     let mut targets: HashSet<String> = f.params.iter()
@@ -225,74 +233,150 @@ fn hoist_inline_expr(e: &mut Expr, sigs: &HashMap<String, Vec<bool>>, hoisted: &
     }
 }
 
+// ─── shared closure-object construction ─────────────────────────────────────
+
+/// Build the lifted `__cloobj_K(__cloenv, <params>)` fn (captures read back from
+/// the env) and return the statements that allocate the heap object bound to
+/// `name` and store `[fn_ptr | cap0 | cap1 | ...]`. NON-capturing closures get a
+/// 1-word `[fn_ptr]` object so the object call ABI stays uniform.
+fn construct_object(name: &str, params: &[(String, Option<Ty>)], body: &Expr, ctx: &mut Ctx) -> Vec<Stmt> {
+    let param_names: HashSet<String> = params.iter().map(|(n, _)| n.clone()).collect();
+    let mut caps: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut bound = param_names.clone();
+    collect_free_vars(body, &mut bound, &ctx.globals, &mut caps, &mut seen);
+
+    let lifted_name = format!("__cloobj_{}", ctx.counter);
+    ctx.counter += 1;
+    let mut lifted_body = body.clone();
+    let cap_idx: HashMap<String, usize> =
+        caps.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
+    rewrite_captures(&mut lifted_body, &cap_idx);
+    let mut fn_params: Vec<Param> = Vec::with_capacity(1 + params.len());
+    fn_params.push(Param { name: ENV_PARAM.into(), ty: Ty::Named("i64".into()) });
+    for (n, t) in params {
+        fn_params.push(Param { name: n.clone(), ty: t.clone().unwrap_or(Ty::Named("i64".into())) });
+    }
+    ctx.lifted.push(FnDecl {
+        attrs: Vec::new(),
+        is_pub: false,
+        is_extern: false,
+        name: lifted_name.clone(),
+        const_params: Vec::new(),
+        params: fn_params,
+        ret: Some(Ty::Named("i64".into())),
+        body: Some(Block { stmts: Vec::new(), tail: Some(Box::new(lifted_body)) }),
+    });
+
+    let words = 1 + caps.len();
+    let mut out: Vec<Stmt> = Vec::with_capacity(2 + caps.len());
+    out.push(Stmt::Let {
+        name: name.to_string(),
+        mutable: false,
+        ty: None,
+        value: Some(call("aether_alloc_bytes", vec![Expr::IntLit((words * 8) as i64)])),
+    });
+    out.push(Stmt::Expr(call("aether_store_i64", vec![
+        Expr::Ident(name.to_string()),
+        Expr::IntLit(0),
+        Expr::Ident(lifted_name),
+    ])));
+    for (i, cap) in caps.iter().enumerate() {
+        out.push(Stmt::Expr(call("aether_store_i64", vec![
+            Expr::Ident(name.to_string()),
+            Expr::IntLit((1 + i) as i64),
+            Expr::Ident(cap.clone()),
+        ])));
+    }
+    out
+}
+
+/// Lower an ESCAPING closure expression (return / tail / Closure-typed binding)
+/// in place: replace it with `{ <construction>; __escclo_K }`, yielding the
+/// heap-object pointer. Used where the closure is not bound to a user name.
+fn lower_escaping_closure(e: &mut Expr, ctx: &mut Ctx) {
+    let Expr::Closure { params, body } = e else { return; };
+    let params = std::mem::take(params);
+    let body = std::mem::replace(body.as_mut(), Expr::IntLit(0));
+    let objname = format!("__escclo_{}", ctx.counter);
+    ctx.counter += 1;
+    let stmts = construct_object(&objname, &params, &body, ctx);
+    *e = Expr::Block(Block { stmts, tail: Some(Box::new(Expr::Ident(objname))) });
+}
+
+/// Lower closures that escape upward out of `fn` (return type `Closure`): the
+/// body tail and every `return <closure>`. Tail recursion descends through
+/// `if`/`match`/`block` so each branch tail that is a closure is lowered.
+fn lower_escaping_in_fn(body: &mut Block, ctx: &mut Ctx) {
+    lower_escaping_in_block_tail(body, ctx);
+    lower_escaping_returns_block(body, ctx);
+}
+
+fn lower_escaping_in_block_tail(b: &mut Block, ctx: &mut Ctx) {
+    if let Some(t) = b.tail.as_mut() {
+        lower_escaping_tail_expr(t, ctx);
+    }
+}
+
+fn lower_escaping_tail_expr(e: &mut Expr, ctx: &mut Ctx) {
+    match e {
+        Expr::Closure { .. } => lower_escaping_closure(e, ctx),
+        Expr::Block(b) => lower_escaping_in_block_tail(b, ctx),
+        Expr::If { then, else_, .. } => {
+            lower_escaping_in_block_tail(then, ctx);
+            if let Some(b) = else_ { lower_escaping_in_block_tail(b, ctx); }
+        }
+        Expr::Match { arms, .. } => {
+            for (_, arm) in arms { lower_escaping_tail_expr(arm, ctx); }
+        }
+        _ => {}
+    }
+}
+
+fn lower_escaping_returns_block(b: &mut Block, ctx: &mut Ctx) {
+    for s in b.stmts.iter_mut() {
+        match s {
+            Stmt::Return(Some(e)) => lower_escaping_tail_expr(e, ctx),
+            Stmt::Let { value: Some(e), .. } => lower_escaping_returns_in_expr(e, ctx),
+            Stmt::LetTuple { value, .. } => lower_escaping_returns_in_expr(value, ctx),
+            Stmt::Expr(e) => lower_escaping_returns_in_expr(e, ctx),
+            _ => {}
+        }
+    }
+    if let Some(t) = b.tail.as_mut() { lower_escaping_returns_in_expr(t, ctx); }
+}
+
+// Walk into nested blocks (if/for/while/region/match/block bodies) to lower any
+// `return <closure>` they contain (a return exits the whole fn).
+fn lower_escaping_returns_in_expr(e: &mut Expr, ctx: &mut Ctx) {
+    match e {
+        Expr::Block(b) => lower_escaping_returns_block(b, ctx),
+        Expr::If { cond, then, else_ } => {
+            lower_escaping_returns_in_expr(cond, ctx);
+            lower_escaping_returns_block(then, ctx);
+            if let Some(b) = else_ { lower_escaping_returns_block(b, ctx); }
+        }
+        Expr::For { body, .. } => lower_escaping_returns_block(body, ctx),
+        Expr::While { body, .. } => lower_escaping_returns_block(body, ctx),
+        Expr::Region { body, .. } => lower_escaping_returns_block(body, ctx),
+        Expr::Match { arms, .. } => for (_, arm) in arms { lower_escaping_returns_in_expr(arm, ctx); },
+        _ => {}
+    }
+}
+
 // ─── Phase A: construction lowering ─────────────────────────────────────────
 
 fn lower_block(b: &mut Block, ctx: &mut Ctx, arg_used: &HashSet<String>, targets: &mut HashSet<String>) {
     let mut out: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
     for stmt in std::mem::take(&mut b.stmts) {
         match stmt {
-            Stmt::Let { name, mutable, ty, value: Some(Expr::Closure { params, body }) }
-                if arg_used.contains(&name) =>
+            Stmt::Let { name, ty, value: Some(Expr::Closure { params, body }), .. }
+                // A closure value: either passed as an arg (`arg_used`) or bound
+                // to an explicitly `Closure`-typed local. Both need the object
+                // representation + object call ABI through `name`.
+                if arg_used.contains(&name) || ty.as_ref().map_or(false, is_closure_ty) =>
             {
-                let param_names: HashSet<String> =
-                    params.iter().map(|(n, _)| n.clone()).collect();
-                let mut caps: Vec<String> = Vec::new();
-                let mut seen: HashSet<String> = HashSet::new();
-                let mut bound = param_names.clone();
-                collect_free_vars(&body, &mut bound, &ctx.globals, &mut caps, &mut seen);
-
-                // NOTE: even a NON-capturing closure (caps empty) is lowered to a
-                // 1-word `[fn_ptr]` object here, because it is passed as a value
-                // (`arg_used`) and will therefore be invoked through the closure-
-                // object ABI (`fp(obj, args)` with an env-first lifted fn). A bare
-                // fn pointer from mir::closures would mismatch that ABI — the
-                // consumer's `aether_load_i64(obj, 0)` would deref a raw code
-                // pointer (misaligned). Wrapping unconditionally keeps the ABI
-                // uniform; the empty-caps object's lifted fn just ignores `env`.
-
-                // Build the lifted fn: env param first, captures read from env.
-                let lifted_name = format!("__cloobj_{}", ctx.counter);
-                ctx.counter += 1;
-                let mut lifted_body = (*body).clone();
-                let cap_idx: std::collections::HashMap<String, usize> =
-                    caps.iter().cloned().enumerate().map(|(i, n)| (n, i)).collect();
-                rewrite_captures(&mut lifted_body, &cap_idx);
-                let mut fn_params: Vec<Param> = Vec::with_capacity(1 + params.len());
-                fn_params.push(Param { name: ENV_PARAM.into(), ty: Ty::Named("i64".into()) });
-                for (n, t) in &params {
-                    fn_params.push(Param { name: n.clone(), ty: t.clone().unwrap_or(Ty::Named("i64".into())) });
-                }
-                ctx.lifted.push(FnDecl {
-                    attrs: Vec::new(),
-                    is_pub: false,
-                    is_extern: false,
-                    name: lifted_name.clone(),
-                    const_params: Vec::new(),
-                    params: fn_params,
-                    ret: Some(Ty::Named("i64".into())),
-                    body: Some(Block { stmts: Vec::new(), tail: Some(Box::new(lifted_body)) }),
-                });
-
-                // Emit object construction: alloc, store fn ptr, store captures.
-                let words = 1 + caps.len();
-                out.push(Stmt::Let {
-                    name: name.clone(),
-                    mutable: false,
-                    ty: None,
-                    value: Some(call("aether_alloc_bytes", vec![Expr::IntLit((words * 8) as i64)])),
-                });
-                out.push(Stmt::Expr(call("aether_store_i64", vec![
-                    Expr::Ident(name.clone()),
-                    Expr::IntLit(0),
-                    Expr::Ident(lifted_name.clone()),
-                ])));
-                for (i, cap) in caps.iter().enumerate() {
-                    out.push(Stmt::Expr(call("aether_store_i64", vec![
-                        Expr::Ident(name.clone()),
-                        Expr::IntLit((1 + i) as i64),
-                        Expr::Ident(cap.clone()),
-                    ])));
-                }
+                out.extend(construct_object(&name, &params, &body, ctx));
                 targets.insert(name);
             }
             mut other => {

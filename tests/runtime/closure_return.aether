@@ -1,0 +1,33 @@
+// roadmap: P6.6
+// expect: exit=42
+//
+// Closures that ESCAPE upward as a function's return value — Rust's
+// `fn make_adder(n) -> impl Fn(i64) -> i64`. A closure in return/tail position
+// of a `-> Closure` fn is lowered in place to a heap `[fn_ptr | caps]` object
+// (captures snapshotted by value at the point of return), so the caller — which
+// holds a `Closure` — invokes it through the object ABI with captures intact.
+// `make_adder` is a closure factory; the returned closures retain distinct `n`.
+use runtime;
+
+fn make_adder(n: i64) -> Closure {
+    |x: i64| x + n          // captures n; returned as the tail value
+}
+
+fn make_scaler(k: i64, off: i64) -> Closure {
+    |x: i64| x * k + off    // captures k and off
+}
+
+fn apply(f: Closure, x: i64) -> i64 { f(x) }
+
+fn main() -> i32 {
+    let add5: Closure = make_adder(5);
+    let add100: Closure = make_adder(100);   // distinct capture from add5
+    let scale: Closure = make_scaler(3, 1);  // |x| x*3 + 1
+
+    let a: i64 = apply(add5, 4);     // 9
+    let b: i64 = apply(add100, 2);   // 102  (proves captures don't alias)
+    let c: i64 = apply(scale, 7);    // 22
+
+    // 9 + 102 + 22 = 133; subtract 91 -> 42
+    (a + b + c - 91) as i32
+}
