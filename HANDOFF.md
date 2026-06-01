@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 26 features / ~47 commits incl. the GENERICS KEYSTONE (type-generic FUNCTIONS + STRUCTS + ENUMS) + char/int-cast/assembler-extension: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 8867e32.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 27 features + a real parser bugfix / ~50 commits incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 0fd383f.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -13,7 +13,18 @@ vtables**, **full NLL borrow**, **async**, **macros**, **threads**, and
 **match guards / OR-patterns / let-else** (the last three need an AST match-arm
 change touching every arm-tuple, or the core let-parse path — wider churn).
 
-### LATEST: GENERICS KEYSTONE — type-generic monomorphization (`640ba38`)
+### LATEST: parser stmt-boundary fix + robustness verified
+- **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
+  statement position no longer swallow a following expression. `for {…} (s*7) as
+  i32` used to mis-parse as `Call { callee: <for>, args: [s*7] }` ("non-ident
+  callee"). Found by systematic probing; common pattern (loop then result).
+- **robustness probe** — swept ~30 common Rust constructs (recursion,
+  generic-fn-calling-generic-fn, struct-by-value args, early return, `&&`/`||`,
+  method chains, nested if/else, for-over-range-expr, negative unary, tuple
+  destructure, nested match) — ALL work. The common surface is solid; remaining
+  gaps are the multi-part subsystems below.
+
+### GENERICS KEYSTONE — type-generic monomorphization (`640ba38`)
 **`fn id<T>(x: T) -> T` now monomorphizes by argument type** — a distinct
 specialization per concrete type, each with the correct storage class
 (`id__T_i64` in rax, `id__T_f32` in xmm0). Extended the existing const-generic
