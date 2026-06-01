@@ -85,9 +85,17 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   LIMITATION (workaround exists, not a regression): capturing an ARRAY by value in
   a closure — aggregates can't be captured as a single i64; bind the element first
   (`let a0 = arr[0]; |x| x+a0`).
+- **borrow checking enforced on the compile path** (`475fe69`) — the NLL borrow
+  checker ran only at `--check`; now it also GATES codegen (aliasing -> AE0200
+  compile error, nonzero exit). Verified zero false positives: clean across all 305
+  runtime witnesses + examples + stdlib + positive conformance. Also fixed the
+  synthesized closure-object fn declaring `-> i64` (a bool-predicate closure tripped
+  AE0222 — `__cloobj_N` now declares no return type). (Lexical over-approx; full
+  non-lexical PRECISION is the remaining NLL follow-up — but it now gates compilation.)
 - STILL-MISSING (top follow-ups, best fresh): **async/await** (futures + executor +
-  state-machine transform — THE one large subsystem left); full NLL borrow on the
-  compile path (currently `--check`-only); macro hygiene + nested repetitions;
+  state-machine transform — THE one large subsystem left; note `async_executor`/
+  `async_two_tasks` witnesses exist — check what they actually do); full NLL
+  PRECISION (the compile-path check is now on but lexical); macro hygiene + nested repetitions;
   capturing an aggregate (array/struct) by value in a closure; direct
   `a.add(x).add(y)` struct-method chaining; >3-field enum return (sret); array
   `[v;n]` const-ident count; tuple-struct ctor in arg/return position.
