@@ -1640,6 +1640,28 @@ fn field_path(e: &Expr) -> Option<String> {
     }
 }
 
+/// If `e` is a call (`mk()`) or method call (`c.id()`) that returns a small
+/// struct (registered in `fn_returns_struct`), return that struct's name. Used
+/// to read a field off a struct-returning call result (`c.id().n`).
+fn call_result_struct(e: &Expr, locals: &Locals) -> Option<String> {
+    match e {
+        Expr::Call { callee, .. } => {
+            if let Expr::Ident(n) = callee.as_ref() {
+                return locals.fn_returns_struct.get(n).cloned();
+            }
+            None
+        }
+        Expr::MethodCall { recv, name, .. } => {
+            if let Expr::Ident(rn) = recv.as_ref() {
+                let st = locals.struct_locals.get(rn)?;
+                return locals.fn_returns_struct.get(&format!("{}__{}", st, name)).cloned();
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Recursively expand a struct's fields into flat `(slot-key, TyKind)` leaves
 /// under `prefix`. A field whose own type is a struct nests further (so
 /// `Out { i: In { x } }` yields `o.i.x`), giving nested-field access `o.i.x`.
@@ -2457,19 +2479,36 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             // Build the dotted slot key for a (possibly nested) field path:
             // `o.i.x` → key "o.i.x" (the leaf slot allocated by the recursive
             // struct expansion).
-            let base = field_path(recv)
-                .ok_or(AsmError::UnsupportedExpr("field access: receiver must be a struct field path"))?;
-            let key = format!("{}.{}", base, field);
-            let slot = locals.get(&key).ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
-            let kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
-            match kind {
-                TyKind::Int => out.push_str(&format!("    movq -{}(%rbp), %rax\n", slot * 8)),
-                TyKind::F32 => out.push_str(&format!("    movss -{}(%rbp), %xmm0\n", slot * 8)),
-                TyKind::F64 => out.push_str(&format!("    movsd -{}(%rbp), %xmm0\n", slot * 8)),
-                TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
-                    out.push_str(&format!("    movq -{}(%rbp), %rax\n", slot * 8)),
+            // Flat-slot field path (`o.i.x`).
+            if let Some(base) = field_path(recv) {
+                let key = format!("{}.{}", base, field);
+                if let Some(slot) = locals.get(&key) {
+                    let kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
+                    match kind {
+                        TyKind::F32 => out.push_str(&format!("    movss -{}(%rbp), %xmm0\n", slot * 8)),
+                        TyKind::F64 => out.push_str(&format!("    movsd -{}(%rbp), %xmm0\n", slot * 8)),
+                        _ => out.push_str(&format!("    movq -{}(%rbp), %rax\n", slot * 8)),
+                    }
+                    return Ok(kind);
+                }
             }
-            Ok(kind)
+            // Field on a struct-returning CALL result (`c.id().n`, `mk().x`):
+            // evaluate the call (field0 → %rax, field1 → %rdx via the P6.5
+            // struct-return ABI), then select the field's register by its index.
+            if let Some(sname) = call_result_struct(recv, locals) {
+                if let Some(sd) = locals.struct_decls.get(&sname).cloned() {
+                    let idx = sd.fields.iter().position(|f| &f.name == field)
+                        .ok_or(AsmError::UnsupportedExpr("field access: unknown field on call result"))?;
+                    let _ = emit_expr_value(recv, out, data, locals)?;
+                    if idx == 1 {
+                        out.push_str("    movq %rdx, %rax\n");
+                    }
+                    // (idx 0 is already in %rax; struct-return is i64-only today.)
+                    return Ok(TyKind::Int);
+                }
+            }
+            Err(AsmError::UnsupportedExpr(
+                "field access: receiver must be a struct path or a struct-returning call"))
         }
         Expr::Bin { op: BinOp::Assign, lhs, rhs } => {
             // `*ptr = rhs` — store-through-pointer. Used by the closure-with-

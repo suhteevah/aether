@@ -1,0 +1,20 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// Field access on a struct-returning call result (`c.method().field`,
+// `mk().field`). The call leaves field0 in %rax / field1 in %rdx via the
+// struct-return ABI; the Field handler picks the register by the field's index.
+// (The callee must return a struct LITERAL — the struct-return-v1 limitation.)
+struct P { x: i64, y: i64 }
+
+impl P {
+    fn swap(self) -> P { P { x: self.y, y: self.x } }
+}
+
+fn mk() -> P { P { x: 30, y: 12 } }
+
+fn main() -> i32 {
+    let p: P = P { x: 2, y: 8 };
+    // p.swap() -> P{x:8,y:2}; .x = 8.  mk() -> P{30,12}; .x + .y = 42.
+    (p.swap().x + mk().x + mk().y - 8) as i32   // 8 + 30 + 12 - 8 = 42
+}
