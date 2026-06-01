@@ -73,6 +73,14 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   in + re-parse via a sub-parser that shares the macro table (macros nest).
   Hardened `peek` to clamp past-end lookahead to Eof. Witness `macro_rules_expand`.
   Scope: single rule, `$x:expr`, expression body (repetitions/hygiene = follow-ups).
+- **probe sweep** (20-feature compositions): 6/8 clean — macro-in-array-literal,
+  macro-arg-to-fn, macro-in-match-guard, multi-field-enum + guard, tuple-struct
+  field, generic-over-enum-arg all OK. 2 documented LIMITATIONS (not regressions —
+  each feature's own witness passes; clean workarounds exist): (a) a struct with an
+  array field passed BY VALUE to a method (`b.sum()` reading `self.d[i]`) — the
+  struct-by-value ABI doesn't expand array fields (collapses to 1 slot); works
+  LOCALLY (`b.d[i]`). (b) capturing an ARRAY by value in a closure — aggregates
+  can't be captured as a single i64; bind the element first (`let a0 = arr[0]; |x| x+a0`).
 - STILL-MISSING (top follow-ups, best fresh): **async/await** (futures + executor +
   state-machine transform — the one large subsystem left); full NLL borrow on the
   compile path (currently `--check`-only); macro repetitions `$(…)*` + multiple
