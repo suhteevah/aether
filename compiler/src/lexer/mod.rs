@@ -33,6 +33,7 @@ pub enum Tok {
     Async,
     Await,
     MacroRules,
+    Dollar,       // $ — macro metavariable sigil
     Unsafe,
     Enum,
     Match,
@@ -386,6 +387,7 @@ impl<'a> Lexer<'a> {
             b'.' => if two(b'.', b'.', self) { Tok::DotDot } else { Tok::Dot },
             b'#' => Tok::Hash,
             b'?' => Tok::Question,
+            b'$' => Tok::Dollar,   // macro metavariable sigil (`$x`)
             other => return Err(format!("unexpected byte {:?}", other as char)),
         };
         Ok(tok)

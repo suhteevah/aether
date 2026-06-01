@@ -1,0 +1,23 @@
+// roadmap: P6.11
+// expect: exit=42
+//
+// REAL declarative-macro expansion — `macro_rules!` invocations `name!(args)`
+// are now expanded at use sites (not hand-written post-expansion shapes). A
+// single-rule macro with `$x:expr` metavars captures its body as a token
+// template; each invocation substitutes the argument tokens (each wrapped in
+// parentheses so a compound argument binds as a unit — `madd!(2+1, 5+2)` is
+// (2+1)*(5+2), not 2+1*5+2) and re-parses the result as an expression. Macros
+// expand recursively (the sub-parser shares the macro table).
+macro_rules! double { ($x:expr) => { $x + $x } }
+macro_rules! madd   { ($a:expr, $b:expr) => { $a * $b } }
+macro_rules! inc    { ($x:expr) => { $x + 1 } }
+macro_rules! sq     { ($x:expr) => { $x * $x } }
+
+fn main() -> i32 {
+    let a: i64 = double!(8);              // 8 + 8 = 16
+    let b: i64 = madd!(2 + 1, 5 + 2);     // (2+1) * (5+2) = 3 * 7 = 21  (precedence-safe)
+    let c: i64 = sq!(inc!(1));            // sq(2) = 4   (nested expansion)
+    let d: i64 = double!(madd!(0, 0)) + 1;  // double(0) + 1 = 1
+
+    (a + b + c + d) as i32                // 16 + 21 + 4 + 1 = 42
+}
