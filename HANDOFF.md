@@ -67,13 +67,15 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   `threads_parallel` (3 workers, real loops, joined+combined -> 42). Atomics
   (`concurrency`) already existed. **Shared-state** witness `threads_shared_atomic`
   (`413d4ae`) — 6 threads race-free-increment a shared atomic counter -> 42.
-- **real declarative macros** (`3edd5a9` + `a35635c`) — `macro_rules!` now ACTUALLY
-  EXPANDS at `name!(...)` use sites (was parsed-and-discarded). `$` lexes; the body
-  is a token template; args (paren-wrapped for precedence) splice in + re-parse via
-  a sub-parser sharing the macro table (macros nest). **Multiple rules** selected by
-  arity (`pick!` with 1/2/3-arg rules). Hardened `peek` to clamp past-end lookahead
-  to Eof. Witnesses `macro_rules_expand`, `macro_multi_rule`. Scope: arity-disjoint
-  `$x:expr` rules, expression body (repetitions `$(…)*`/hygiene = follow-ups).
+- **declarative macros — all 3 core capabilities** (`3edd5a9`+`a35635c`+`b6b21af`) —
+  `macro_rules!` now ACTUALLY EXPANDS at `name!(...)` (was parsed-and-discarded). `$`
+  lexes; bodies are token templates; args (paren-wrapped for precedence) splice in +
+  re-parse via a sub-parser sharing the macro table (macros nest). (1) single rule,
+  (2) **multiple rules** by arity (`pick!` 1/2/3-arg), (3) **repetitions/variadic**
+  `$($x:expr),*` + body group `$(+ $x)*` (`sum!` any arity). Hardened `peek` to clamp
+  past-end lookahead to Eof. Witnesses `macro_rules_expand`/`macro_multi_rule`/`macro_variadic`.
+  Scope: `$x:expr` metavars, expr body, one repetition metavar/rule (hygiene +
+  nested/multiple repetition groups + non-expr fragments = follow-ups).
 - **probe sweep** (20-feature compositions): macro-in-array-literal, macro-arg-to-fn,
   macro-in-match-guard, multi-field-enum + guard, tuple-struct field,
   generic-over-enum-arg all OK. Found 2 issues; **1 FIXED** (`2983584`): struct
@@ -84,10 +86,11 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   a closure — aggregates can't be captured as a single i64; bind the element first
   (`let a0 = arr[0]; |x| x+a0`).
 - STILL-MISSING (top follow-ups, best fresh): **async/await** (futures + executor +
-  state-machine transform — the one large subsystem left); full NLL borrow on the
-  compile path (currently `--check`-only); macro repetitions `$(…)*` + multiple
-  rules + hygiene; direct `a.add(x).add(y)` struct-method chaining; >3-field enum
-  return (sret); array `[v;n]` const-ident count; tuple-struct ctor in arg/return.
+  state-machine transform — THE one large subsystem left); full NLL borrow on the
+  compile path (currently `--check`-only); macro hygiene + nested repetitions;
+  capturing an aggregate (array/struct) by value in a closure; direct
+  `a.add(x).add(y)` struct-method chaining; >3-field enum return (sret); array
+  `[v;n]` const-ident count; tuple-struct ctor in arg/return position.
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
