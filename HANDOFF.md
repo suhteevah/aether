@@ -1,6 +1,29 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 40 features + 9 probing bugfixes / ~63 commits — nested struct fields + method chains + enum-as-param + match-on-call (round-7 probe sweep CLEAN) incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +6 CLOSURE/GENERICS commits / ~69 total — CLOSURES NOW BROAD (capturing + non-capturing + let-bound + inline `apply(|x|..,5)` + escaping `->Closure` + through match-arms + vec-of-closures + closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` (parse `:A+B` + infer T from struct arg + per-type dispatch) + TRAIT DEFAULT BODIES calling `self.required()` (Iterator::nth shape) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 79dc16a.)
+
+### LATEST: closures completed + bounded generics + trait default bodies (6 commits)
+Probed ~12 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
+- **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
+  Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
+  call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
+  a Closure value**: lowering is now TYPE-DIRECTED (object IFF it flows into a
+  `Closure` param; closure→`i64` param stays a bare fn-ptr). Witness `iterator_filter`.
+- **inline closures** `apply(|x| .., 5)` (`a47e4d4`) — Phase-0 hoist to a
+  synthetic `let __inlineclo_K`. Witness `closure_inline_arg`.
+- **escaping closures** `fn make_adder(n)->Closure{|x| x+n}` (`bb1d33d`) — Phase-0.5
+  lowers return/tail closures to heap-object pointers (captures snapshotted).
+  Shared `construct_object` helper. Witness `closure_return`.
+- **bounded generics** `fn f<T: Trait>(x:T)` (`1ca2235`) — parser `skip_trait_bounds`
+  (`:A+B`/path/`'a`) in fn/impl/struct/enum generics; asm infers T from a STRUCT
+  arg (struct_locals); same fn monomorphises over 2 structs w/ per-type dispatch.
+  Witness `generic_trait_bound`.
+- **trait default bodies calling self.required()** (`79dc16a`) — `retype_self`
+  re-points a synthesized default's self/Self to the concrete impl type (was the
+  trait name → receiver unresolved; constant `{6}` defaults dodged it). The
+  Iterator::nth-calls-next shape. Witness `trait_default_calls_required`.
+- PROBED WORKING (no fix): vec-of-closures dispatch table, closure-capturing-closure,
+  recursive enum via heap, `?` on Result, generic over 2 struct types.
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
