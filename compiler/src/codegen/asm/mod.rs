@@ -1553,9 +1553,10 @@ fn count_locals(b: &Block, locals: &mut Locals) {
                 }
                 if let Some(Expr::StructLit { name: lit_name, .. }) = value {
                     if let Some(sd) = locals.struct_decls.get(lit_name).cloned() {
-                        for f in &sd.fields {
-                            locals.alloc(&format!("{}.{}", name, f.name));
-                        }
+                        let decls = locals.struct_decls.clone();
+                        let mut keys = Vec::new();
+                        expand_struct_field_keys(name, &sd, &HashMap::new(), &decls, &mut keys);
+                        for (k, _) in keys { locals.alloc(&k); }
                         continue;
                     }
                 }
@@ -1568,12 +1569,14 @@ fn count_locals(b: &Block, locals: &mut Locals) {
                         continue;
                     }
                 }
-                // Struct-typed lets allocate one slot per declared field.
+                // Struct-typed lets allocate one slot per declared LEAF field
+                // (nested struct fields expand recursively to `name.f.g`).
                 if let Some(struct_name) = ty.as_ref().and_then(struct_name_of) {
                     if let Some(sd) = locals.struct_decls.get(&struct_name).cloned() {
-                        for f in &sd.fields {
-                            locals.alloc(&format!("{}.{}", name, f.name));
-                        }
+                        let decls = locals.struct_decls.clone();
+                        let mut keys = Vec::new();
+                        expand_struct_field_keys(name, &sd, &HashMap::new(), &decls, &mut keys);
+                        for (k, _) in keys { locals.alloc(&k); }
                         continue;
                     }
                 }
@@ -1625,6 +1628,82 @@ fn struct_name_of(t: &Ty) -> Option<String> {
         Ty::Generic { name, .. } => Some(name.clone()),
         _ => None,
     }
+}
+
+/// Build the dotted slot-key path for a (possibly nested) field access:
+/// `Field{Field{Ident(o),i},x}` → "o.i.x". Returns None for a non-path receiver.
+fn field_path(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n) => Some(n.clone()),
+        Expr::Field { recv, name } => Some(format!("{}.{}", field_path(recv)?, name)),
+        _ => None,
+    }
+}
+
+/// Recursively expand a struct's fields into flat `(slot-key, TyKind)` leaves
+/// under `prefix`. A field whose own type is a struct nests further (so
+/// `Out { i: In { x } }` yields `o.i.x`), giving nested-field access `o.i.x`.
+/// Used in lockstep by count_locals (alloc) and the struct-literal emit
+/// (alloc + populate) so the dual-pass slot invariant holds.
+fn expand_struct_field_keys(
+    prefix: &str,
+    sd: &StructDecl,
+    type_subst: &HashMap<String, Ty>,
+    struct_decls: &HashMap<String, StructDecl>,
+    out: &mut Vec<(String, TyKind)>,
+) {
+    for f in &sd.fields {
+        let key = format!("{}.{}", prefix, f.name);
+        // Resolve a generic type-param field (`Pair<f32>`'s `T` → f32). This
+        // only affects the leaf TyKind, not the key set, so count_locals (which
+        // ignores TyKind) and emit stay in slot-lockstep.
+        let resolved = match &f.ty {
+            Ty::Named(n) => type_subst.get(n).cloned().unwrap_or_else(|| f.ty.clone()),
+            other => other.clone(),
+        };
+        if let Some(inner) = struct_name_of(&resolved) {
+            if let Some(inner_sd) = struct_decls.get(&inner) {
+                expand_struct_field_keys(&key, inner_sd, &HashMap::new(), struct_decls, out);
+                continue;
+            }
+        }
+        out.push((key, TyKind::from_ty(&resolved).unwrap_or(TyKind::Int)));
+    }
+}
+
+/// Populate a struct local's leaf slots from a struct literal, recursing into
+/// nested struct-literal field values (`Out { i: In { x: 42 } }` writes
+/// `out.i.x`). The leaf slots + their TyKinds must already be allocated.
+fn emit_struct_lit_populate(
+    prefix: &str,
+    lit_fields: &[(String, Expr)],
+    out: &mut String,
+    data: &mut StringTable,
+    locals: &mut Locals,
+) -> Result<(), AsmError> {
+    for (fname, fvalue) in lit_fields {
+        let key = format!("{}.{}", prefix, fname);
+        // Nested struct field → recurse into its literal.
+        if let Expr::StructLit { fields: inner_fields, .. } = fvalue {
+            emit_struct_lit_populate(&key, inner_fields, out, data, locals)?;
+            continue;
+        }
+        let slot = locals.get(&key).ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
+        let kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
+        let saved = locals.default_float;
+        if matches!(kind, TyKind::F32 | TyKind::F64) { locals.default_float = Some(kind); }
+        let val_ty = emit_expr_value(fvalue, out, data, locals)?;
+        locals.default_float = saved;
+        if val_ty != kind {
+            return Err(AsmError::UnsupportedExpr("struct literal field type mismatch"));
+        }
+        match kind {
+            TyKind::F32 => out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", slot * 8)),
+            TyKind::F64 => out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", slot * 8)),
+            _ => out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
+        }
+    }
+    Ok(())
 }
 
 /// For a `Ty::Slice`, return `(loaded-value TyKind, element size in bytes)`.
@@ -2209,42 +2288,18 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
                     }
                     _ => HashMap::new(),
                 };
-                // Allocate one slot per declared field under `name.field` keys.
-                for field in &sd.fields {
-                    let key = format!("{}.{}", name, field.name);
-                    let slot = locals.alloc(&key);
-                    let resolved_ty = match &field.ty {
-                        Ty::Named(n) => type_subst.get(n).cloned().unwrap_or_else(|| field.ty.clone()),
-                        other => other.clone(),
-                    };
-                    let kind = TyKind::from_ty(&resolved_ty).unwrap_or(TyKind::Int);
-                    locals.types.insert(key, kind);
+                // Allocate every LEAF slot (nested struct fields expand to
+                // `name.f.g`) + record its TyKind — matching count_locals.
+                let decls = locals.struct_decls.clone();
+                let mut keys = Vec::new();
+                expand_struct_field_keys(name, &sd, &type_subst, &decls, &mut keys);
+                for (k, kind) in &keys {
+                    let slot = locals.alloc(k);
+                    locals.types.insert(k.clone(), *kind);
                     let _ = slot;
                 }
-                // Now emit each provided field's initialiser into the slot.
-                for (fname, fvalue) in fields {
-                    let key = format!("{}.{}", name, fname);
-                    let slot = locals.get(&key)
-                        .ok_or_else(|| AsmError::UnknownIdent(fname.clone()))?;
-                    let kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
-                    let saved = locals.default_float;
-                    if matches!(kind, TyKind::F32 | TyKind::F64) {
-                        locals.default_float = Some(kind);
-                    }
-                    let val_ty = emit_expr_value(fvalue, out, data, locals)?;
-                    locals.default_float = saved;
-                    if val_ty != kind {
-                        return Err(AsmError::UnsupportedExpr(
-                            "struct literal field type mismatch"));
-                    }
-                    match kind {
-                        TyKind::Int => out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
-                        TyKind::F32 => out.push_str(&format!("    movss %xmm0, -{}(%rbp)\n", slot * 8)),
-                        TyKind::F64 => out.push_str(&format!("    movsd %xmm0, -{}(%rbp)\n", slot * 8)),
-                        TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
-                            out.push_str(&format!("    movq %rax, -{}(%rbp)\n", slot * 8)),
-                    }
-                }
+                // Populate, recursing into nested struct-literal field values.
+                emit_struct_lit_populate(name, fields, out, data, locals)?;
                 return Ok(());
             }
             // P6.5 — `let p: T = small_struct_call();`. count_locals already
@@ -2399,12 +2454,11 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             Ok(kind)
         }
         Expr::Field { recv, name: field } => {
-            // Only `ident.field` for a struct-typed local — nested paths await a
-            // future bump.
-            let base = match recv.as_ref() {
-                Expr::Ident(n) => n.clone(),
-                _ => return Err(AsmError::UnsupportedExpr("nested field access not yet supported")),
-            };
+            // Build the dotted slot key for a (possibly nested) field path:
+            // `o.i.x` → key "o.i.x" (the leaf slot allocated by the recursive
+            // struct expansion).
+            let base = field_path(recv)
+                .ok_or(AsmError::UnsupportedExpr("field access: receiver must be a struct field path"))?;
             let key = format!("{}.{}", base, field);
             let slot = locals.get(&key).ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
             let kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
@@ -2470,9 +2524,10 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
             // (`x.field = ...`). Build a synthetic key in either case.
             let name = match lhs.as_ref() {
                 Expr::Ident(n) => n.clone(),
-                Expr::Field { recv, name: field } => match recv.as_ref() {
-                    Expr::Ident(base) => format!("{}.{}", base, field),
-                    _ => return Err(AsmError::UnsupportedExpr("LHS of assignment: nested field access not yet supported")),
+                Expr::Field { recv, name: field } => match field_path(recv) {
+                    // Nested field path `o.i.x` → leaf key "o.i.x".
+                    Some(base) => format!("{}.{}", base, field),
+                    None => return Err(AsmError::UnsupportedExpr("LHS of assignment: field receiver must be a struct path")),
                 },
                 _ => return Err(AsmError::UnsupportedExpr("LHS of assignment must be an ident, field, or array index")),
             };

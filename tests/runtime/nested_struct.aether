@@ -1,0 +1,16 @@
+// roadmap: P6.4
+// expect: exit=42
+//
+// Nested struct fields (struct composition) — `a.b.c`. A struct field whose own
+// type is a struct expands recursively into flat leaf slots (`o.inner.x`), so
+// the literal `Out { inner: In { … } }` populates them and `o.inner.x` reads /
+// assigns them. count_locals + struct-lit emit share the recursive expansion,
+// so the dual-pass slot invariant holds.
+struct In { x: i64, y: i64 }
+struct Out { a: i64, inner: In }
+
+fn main() -> i32 {
+    let mut o: Out = Out { a: 30, inner: In { x: 10, y: 1 } };
+    o.inner.y = 2;                       // nested field assignment
+    (o.a + o.inner.x + o.inner.y) as i32 // 30 + 10 + 2 = 42
+}
