@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 30 features + a real parser bugfix / ~55 commits incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 0fd383f.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 33 features + 6 probing bugfixes / ~67 commits incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -13,7 +13,30 @@ vtables**, **full NLL borrow**, **async**, **macros**, **threads**, and
 **match guards / OR-patterns / let-else** (the last three need an AST match-arm
 change touching every arm-tuple, or the core let-parse path — wider churn).
 
-### LATEST: parser stmt-boundary fix + robustness verified
+### LATEST: 4 probing rounds → 6 genuine bug fixes (generics/parser/match hardened)
+Systematic edge-case probing found + fixed 6 real bugs (all witnessed, audit
+clean):
+- **parser stmt-boundary** (`0fd383f`→`265ff3a`) — `for {…} (expr)` mis-parsed as
+  a call on the block. Fixed via parse_postfix guard (block-exprs aren't call
+  callees); casts/binary still continue (`if c {a} else {b} as i32` works).
+- **generic struct as fn param** (`1fb8c56`) — struct_name_of now resolves
+  Ty::Generic, so `fn f(b: Box2<i64>)` gets field slots.
+- **nested/recursive generic calls** (`b1df3c7`) — `id(id(x))` infers the outer
+  T by recursing into the inner call's arg.
+- **generic `>=` token split** (`78b54e1`) — `let v: W<i64>= …` (no space) lexed
+  `>=` as one token; close_generic() splits it.
+- **generic struct returns** (`78b54e1`) — `fn mk() -> W<i64>` struct-return ABI
+  detection resolves Ty::Generic + field type params.
+- **match on bool** (`78b54e1`) — `match b { true => …, false => … }` patterns.
+
+A ~40-construct robustness sweep confirms the common surface is solid. Two
+remaining probe gaps are STRUCTURAL flat-slot limitations (not quick fixes):
+**nested struct fields `a.b.c`** (needs recursive slot-key expansion in
+count_locals + struct-lit + field-access) and **method-on-method-result
+`c.id().n`** (the method/field dispatcher requires a bare-ident receiver; chained
+calls need an intermediate struct temp).
+
+### parser stmt-boundary fix (detail)
 - **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
   statement position no longer swallow a following expression. `for {…} (s*7) as
   i32` used to mis-parse as `Call { callee: <for>, args: [s*7] }` ("non-ident
