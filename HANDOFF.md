@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +10 CLOSURE/GENERICS/TUPLE/BUILDER/ARRAY commits / ~74 total — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — now +12 features / ~77 total commits — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)
 Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit clean:
@@ -20,11 +20,18 @@ Probed ~16 core-Rust constructs; fixed every gap found, each witnessed + audit c
   dynamic `a[i]` + `a[i]=v`. Stack arrays + indexing pre-existed for uninit lets;
   added the literal (parse_atom reuses Expr::Tuple) + literal-init path. i64 only.
   Witness `array_literal`. No hidden alloc (N contiguous rbp slots).
-- STILL-MISSING gaps found probing (each larger): multi-field enum payload
-  `Two(a,b)` (AST `payloads`→Vec<Vec<Ty>> + EnumVariantBind multi-name + enum
-  codegen, wide+risky), match guards `n if c =>` (AST arm change), tuple structs
-  `struct M(i64)` (parser + ctor-as-call), array `[v;n]` repeat form,
-  direct `a.add(x).add(y)` chaining of struct-returning methods.
+- **array repeat** (`14e2ac9`) — `[v; N]` (N int literal, expands at parse time).
+  Witness `array_repeat`.
+- **tuple structs / newtypes** (`6aa3765`) — `struct Meters(i64); Meters(42)`;
+  positional fields "0".."N-1" reuse tuple `.0` field access; ctor recognised in
+  the let path (Call→tuple-struct, reuses expand_struct_field_keys + populate).
+  Witness `tuple_struct`. (Ctor in arg/return position = follow-up.)
+- STILL-MISSING (top follow-ups): **multi-field enum payload** `Two(a,b)` — THE
+  remaining big one (real ADTs): ~20 enum-codegen sites built on a single `.val`
+  slot + AST `payloads:Vec<Option<Ty>>`→Vec<Vec<Ty>> + EnumVariantBind multi-name
+  (wide+risky, deferred to keep the zero-regression streak); match guards
+  `n if c =>` (AST arm change); direct `a.add(x).add(y)` struct-method chaining;
+  array `[v;n]` const-ident count; tuple-struct ctor in arg/return position.
 - **closure-object ABI through match arms** (`febbd98`) — rewrite_calls + the 3
   Phase-A walkers didn't recurse into Match/StructLit/Tuple/Range, so a closure
   call inside a `while let` match arm SIGSEGV'd. Plus **non-capturing closure as
