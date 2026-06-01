@@ -1,0 +1,44 @@
+// roadmap: P6.2
+// expect: exit=42
+//
+// A trait DEFAULT method whose body calls another (required) method through
+// `self` — the realistic shape of default methods (e.g. Iterator::nth calling
+// next), not a constant default. A trait method's `self` parses as the trait
+// type; when the default is synthesized into `impl Trait for Type`, the self /
+// Self type is now re-pointed to the concrete impl type, so `self.required()`
+// in the default body dispatches to that type's impl. Previously the mere
+// PRESENCE of such a default broke compilation ("method receiver must be a
+// struct local with matching impl method"). Exercised both via direct
+// `obj.default()` and through a bounded generic `fn<T: Trait>`.
+trait Calc {
+    fn base(self) -> i64;                          // required
+    fn scaled(self) -> i64 { self.base() * 3 }     // default, calls required
+    fn shifted(self) -> i64 { self.scaled() + 1 }  // default, calls another default
+}
+
+struct A { v: i64 }
+struct B { v: i64 }
+
+impl Calc for A { fn base(self) -> i64 { self.v } }          // inherits both defaults
+impl Calc for B {
+    fn base(self) -> i64 { self.v }
+    fn scaled(self) -> i64 { self.base() + 100 }             // overrides scaled
+}
+
+fn via_generic<T: Calc>(x: T) -> i64 { x.shifted() }
+
+fn main() -> i32 {
+    let a: A = A { v: 4 };
+    // a.base()=4, a.scaled()=12, a.shifted()=13  (both defaults inherited)
+    let s1: i64 = a.shifted();             // 13
+
+    let b: B = B { v: 1 };
+    // b.base()=1, b.scaled()=101 (override), b.shifted()=102 (default over override)
+    let s2: i64 = via_generic(b);          // 102, through a bounded generic
+
+    let c: A = A { v: 8 };
+    let s3: i64 = c.scaled();              // 24
+
+    // 13 + 102 + 24 = 139; subtract 97 -> 42
+    (s1 + s2 + s3 - 97) as i32
+}

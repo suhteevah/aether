@@ -21,10 +21,28 @@
 //! `Resolver::check_completeness`, so the resolver is now genuinely on the
 //! compile path rather than an untested island.
 
-use crate::ast::{FnDecl, Item, Program};
+use crate::ast::{FnDecl, Item, Program, Ty};
 use crate::diag::Diag;
 use super::traits::{ImplBlock, Resolver, TraitDecl};
 use std::collections::{HashMap, HashSet};
+
+/// Rewrite a synthesized default method's param/return types so any reference
+/// to the trait name or `Self` becomes the concrete impl type. This makes the
+/// `self` receiver a struct local of the impl type after flattening, so method
+/// calls in the default body (`self.required()`) resolve to that type's impls.
+fn retype_self(m: &mut FnDecl, trait_name: &str, type_name: &str) {
+    let fix = |t: &mut Ty| {
+        if let Ty::Named(n) = t {
+            if n == trait_name || n == "Self" { *n = type_name.to_string(); }
+        } else if let Ty::Ref { inner, .. } = t {
+            if let Ty::Named(n) = inner.as_mut() {
+                if n == trait_name || n == "Self" { *n = type_name.to_string(); }
+            }
+        }
+    };
+    for p in m.params.iter_mut() { fix(&mut p.ty); }
+    if let Some(rt) = m.ret.as_mut() { fix(rt); }
+}
 
 pub struct TraitReport {
     /// Number of default-method `FnDecl`s spliced into impls.
@@ -56,13 +74,20 @@ pub fn run(prog: &mut Program) -> TraitReport {
     //    omits a method the trait supplies a default body for.
     let mut synthesized_defaults = 0usize;
     for it in prog.items.iter_mut() {
-        if let Item::ImplTrait { trait_name, methods, .. } = it {
+        if let Item::ImplTrait { trait_name, type_name, methods, .. } = it {
             if let Some(tms) = trait_methods.get(trait_name) {
                 let provided: HashSet<String> =
                     methods.iter().map(|m| m.name.clone()).collect();
                 for tm in tms {
                     if tm.body.is_some() && !provided.contains(&tm.name) {
-                        methods.push(tm.clone());
+                        // A trait method's `self` parses as `Ty::Named(trait)`
+                        // (the impl_type at trait-parse time). Re-point self /
+                        // Self to the concrete impl type so the flattened
+                        // `Type__m` registers `self` as a struct local of that
+                        // type and `self.other()` dispatches to the impl.
+                        let mut m = tm.clone();
+                        retype_self(&mut m, trait_name, type_name);
+                        methods.push(m);
                         synthesized_defaults += 1;
                     }
                 }
