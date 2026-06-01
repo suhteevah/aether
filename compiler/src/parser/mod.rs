@@ -29,6 +29,10 @@ pub struct Parser {
 struct MacroRule {
     params: Vec<String>,
     body: Vec<Token>,
+    /// `Some(metavar)` for a variadic rule `( $($x:expr),* )` — every argument
+    /// binds to `metavar`, and a body repetition group `$( … $x … )sep*` expands
+    /// once per argument joined by `sep`. `None` for a fixed-arity rule.
+    variadic: Option<String>,
 }
 
 type PResult<T> = Result<T, String>;
@@ -162,17 +166,34 @@ impl Parser {
             let mut rules: Vec<MacroRule> = Vec::new();
             while !matches!(self.peek(0), Tok::RBrace) && !matches!(self.peek(0), Tok::Eof) {
                 let mut params: Vec<String> = Vec::new();
+                let mut variadic: Option<String> = None;
                 self.expect(Tok::LParen)?;
-                while !matches!(self.peek(0), Tok::RParen) {
-                    if matches!(self.peek(0), Tok::Dollar) {
-                        self.bump(); // $
-                        params.push(self.expect_ident()?);
-                        // optional `: expr` fragment specifier — consumed, single kind.
-                        if matches!(self.peek(0), Tok::Colon) { self.bump(); let _ = self.expect_ident()?; }
-                    } else {
-                        self.bump(); // tolerate literal tokens in the matcher
-                    }
+                // Repetition matcher `$( $x:expr ),*` / `…)+` / `…)*` — capture the
+                // single metavar; every call argument binds to it.
+                if matches!(self.peek(0), Tok::Dollar) && matches!(self.peek(1), Tok::LParen) {
+                    self.bump(); // $
+                    self.bump(); // (
+                    self.expect(Tok::Dollar)?;
+                    let mv = self.expect_ident()?;
+                    if matches!(self.peek(0), Tok::Colon) { self.bump(); let _ = self.expect_ident()?; }
+                    self.expect(Tok::RParen)?;
+                    // optional separator token, then the repeat op `*` / `+`.
                     if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    if matches!(self.peek(0), Tok::Star) || matches!(self.peek(0), Tok::Plus) { self.bump(); }
+                    variadic = Some(mv.clone());
+                    params.push(mv);
+                } else {
+                    while !matches!(self.peek(0), Tok::RParen) {
+                        if matches!(self.peek(0), Tok::Dollar) {
+                            self.bump(); // $
+                            params.push(self.expect_ident()?);
+                            // optional `: expr` fragment specifier — consumed, single kind.
+                            if matches!(self.peek(0), Tok::Colon) { self.bump(); let _ = self.expect_ident()?; }
+                        } else {
+                            self.bump(); // tolerate literal tokens in the matcher
+                        }
+                        if matches!(self.peek(0), Tok::Comma) { self.bump(); }
+                    }
                 }
                 self.expect(Tok::RParen)?;
                 self.expect(Tok::FatArrow)?;
@@ -192,7 +213,7 @@ impl Parser {
                         _ => { body.push(self.toks[self.pos].clone()); self.bump(); }
                     }
                 }
-                rules.push(MacroRule { params, body });
+                rules.push(MacroRule { params, body, variadic });
                 if matches!(self.peek(0), Tok::Semi) { self.bump(); }
             }
             self.expect(Tok::RBrace)?;
@@ -1075,7 +1096,11 @@ impl Parser {
                         self.bump(); // !
                         self.bump(); // (
                         let arg_toks = self.capture_macro_args()?;
-                        let rule = rules.iter().find(|r| r.params.len() == arg_toks.len())
+                        // Prefer an exact fixed-arity rule; fall back to a variadic
+                        // rule (which accepts any argument count).
+                        let rule = rules.iter()
+                            .find(|r| r.variadic.is_none() && r.params.len() == arg_toks.len())
+                            .or_else(|| rules.iter().find(|r| r.variadic.is_some()))
                             .ok_or_else(|| format!(
                                 "macro `{}!` has no rule for {} argument(s)", nm, arg_toks.len()))?;
                         e = self.expand_macro(rule, &arg_toks)?;
@@ -1202,27 +1227,78 @@ impl Parser {
     /// with the matching argument's tokens, then re-parse the result as an
     /// expression via a sub-parser (sharing the macro table for nested macros).
     fn expand_macro(&self, rule: &MacroRule, args: &[Vec<Token>]) -> PResult<Expr> {
-        if args.len() != rule.params.len() {
+        if rule.variadic.is_none() && args.len() != rule.params.len() {
             return Err(format!("macro expected {} argument(s), got {}", rule.params.len(), args.len()));
         }
-        let mut out: Vec<Token> = Vec::with_capacity(rule.body.len());
+        let body = &rule.body;
+        let lp = |t: &Token| Token { tok: Tok::LParen, line: t.line, col: t.col };
+        let rp = |t: &Token| Token { tok: Tok::RParen, line: t.line, col: t.col };
+        // Substitute `$mv` in `tmpl` with `arg` (paren-wrapped). Used per
+        // repetition iteration with the variadic rule's single metavar.
+        fn subst_one(tmpl: &[Token], mv: &str, arg: &[Token], out: &mut Vec<Token>) {
+            let mut t = 0;
+            while t < tmpl.len() {
+                if matches!(tmpl[t].tok, Tok::Dollar) && t + 1 < tmpl.len() {
+                    if let Tok::Ident(name) = &tmpl[t + 1].tok {
+                        if name == mv {
+                            out.push(Token { tok: Tok::LParen, line: tmpl[t].line, col: tmpl[t].col });
+                            out.extend(arg.iter().cloned());
+                            out.push(Token { tok: Tok::RParen, line: tmpl[t].line, col: tmpl[t].col });
+                            t += 2;
+                            continue;
+                        }
+                    }
+                }
+                out.push(tmpl[t].clone());
+                t += 1;
+            }
+        }
+        let mut out: Vec<Token> = Vec::with_capacity(body.len());
         let mut i = 0;
-        while i < rule.body.len() {
-            // `$ident` → the matching arg's token run, parenthesised so the
-            // substituted expression binds as a unit at the splice site.
-            if matches!(rule.body[i].tok, Tok::Dollar) && i + 1 < rule.body.len() {
-                if let Tok::Ident(mv) = &rule.body[i + 1].tok {
+        while i < body.len() {
+            // Repetition group `$( … )sep*` — expand once per argument.
+            if matches!(body[i].tok, Tok::Dollar) && i + 1 < body.len()
+                && matches!(body[i + 1].tok, Tok::LParen)
+            {
+                let mv = rule.variadic.clone()
+                    .ok_or("repetition group `$(…)` in a non-variadic macro")?;
+                let tstart = i + 2;
+                let mut j = tstart;
+                let mut depth = 1i32;
+                while j < body.len() && depth > 0 {
+                    match body[j].tok { Tok::LParen => depth += 1, Tok::RParen => depth -= 1, _ => {} }
+                    if depth == 0 { break; }
+                    j += 1;
+                }
+                let template = &body[tstart..j];
+                let mut k = j + 1; // past the closing ')'
+                let sep = if k < body.len()
+                    && !matches!(body[k].tok, Tok::Star) && !matches!(body[k].tok, Tok::Plus) {
+                    let s = body[k].clone(); k += 1; Some(s)
+                } else { None };
+                if k < body.len() && (matches!(body[k].tok, Tok::Star) || matches!(body[k].tok, Tok::Plus)) {
+                    k += 1;
+                }
+                for (ai, arg) in args.iter().enumerate() {
+                    if ai > 0 { if let Some(s) = &sep { out.push(s.clone()); } }
+                    subst_one(template, &mv, arg, &mut out);
+                }
+                i = k;
+                continue;
+            }
+            // Fixed metavar `$x` (non-variadic rules).
+            if rule.variadic.is_none() && matches!(body[i].tok, Tok::Dollar) && i + 1 < body.len() {
+                if let Tok::Ident(mv) = &body[i + 1].tok {
                     if let Some(idx) = rule.params.iter().position(|p| p == mv) {
-                        let here = (rule.body[i].line, rule.body[i].col);
-                        out.push(Token { tok: Tok::LParen, line: here.0, col: here.1 });
+                        out.push(lp(&body[i]));
                         out.extend(args[idx].iter().cloned());
-                        out.push(Token { tok: Tok::RParen, line: here.0, col: here.1 });
+                        out.push(rp(&body[i]));
                         i += 2;
                         continue;
                     }
                 }
             }
-            out.push(rule.body[i].clone());
+            out.push(body[i].clone());
             i += 1;
         }
         out.push(Token { tok: Tok::Eof, line: 0, col: 0 });

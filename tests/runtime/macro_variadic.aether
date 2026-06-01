@@ -1,0 +1,16 @@
+// roadmap: P6.11
+// expect: exit=42
+//
+// Variadic declarative macros — repetition matcher `$($x:expr),*` binds every
+// argument to one metavar, and a body repetition group `$(+ $x)*` expands the
+// template once per argument. Completes the core macro_rules! triad (single
+// rule -> multiple rules -> repetitions). `sum!` accepts any arg count.
+macro_rules! sum { ($($x:expr),*) => { 0 $(+ $x)* } }
+
+fn main() -> i32 {
+    let a: i64 = sum!(1, 2, 3, 4, 5, 6);   // 0+1+2+3+4+5+6 = 21
+    let b: i64 = sum!(8, 9, 4);            // 0+8+9+4 = 21
+    let c: i64 = sum!(0);                  // 0+0 = 0
+    let d: i64 = sum!();                   // 0 (empty)
+    (a + b + c + d) as i32                  // 21 + 21 + 0 + 0 = 42
+}
