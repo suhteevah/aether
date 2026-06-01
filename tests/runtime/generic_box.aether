@@ -1,0 +1,26 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// A generic heap container (the Box<T> pattern), built from the generics
+// foundation: `box_new<T>(x)` heap-allocates + stores x, `box_get<T>(p)`
+// retrieves it. box_new's T is inferred from the argument; box_get's T appears
+// only in the return type and is inferred from the `let v: i64` context
+// (return-position inference). This is the path to Box<T> / Vec<T>.
+use runtime;
+
+fn box_new<T>(x: T) -> i64 {
+    let p: i64 = aether_alloc_bytes(8);
+    aether_store_i64(p, 0, x);
+    p
+}
+
+fn box_get<T>(p: i64) -> T {
+    aether_load_i64(p, 0)
+}
+
+fn main() -> i32 {
+    let p: i64 = box_new(42);     // T = i64 from the argument
+    let v: i64 = box_get(p);      // T = i64 from the let-annotation context
+    aether_free_bytes(p, 8);
+    v as i32
+}
