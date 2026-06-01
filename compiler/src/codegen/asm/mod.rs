@@ -67,6 +67,36 @@ fn arg_concrete_type_name(arg: &Expr, locals: &Locals) -> Option<String> {
             _ => "i64".to_string(),
         }),
         Expr::Cast { ty, .. } => Some(ty.clone()),
+        // A call argument: use the callee's return type. For a non-generic fn
+        // that's its declared TyKind; for a generic fn returning a type param
+        // `-> T`, recurse into the argument bound to T (so `id(id(x))` infers
+        // the outer T from the inner call's argument).
+        Expr::Call { callee, args } => {
+            if let Expr::Ident(n) = callee.as_ref() {
+                if let Some(k) = locals.sigs.get(n) {
+                    return Some(match k {
+                        TyKind::F32 => "f32".to_string(),
+                        TyKind::F64 => "f64".to_string(),
+                        _ => "i64".to_string(),
+                    });
+                }
+                if let Some(g) = locals.generics.clone() {
+                    let tdecl = g.borrow().templates.get(n).cloned();
+                    if let Some(tdecl) = tdecl {
+                        if let Some(Ty::Named(rt)) = tdecl.ret.as_ref() {
+                            for (i, p) in tdecl.params.iter().enumerate() {
+                                if matches!(&p.ty, Ty::Named(pn) if pn == rt) {
+                                    if let Some(a) = args.get(i) {
+                                        return arg_concrete_type_name(a, locals);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }

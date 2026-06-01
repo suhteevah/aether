@@ -1,0 +1,16 @@
+// roadmap: P6.1
+// expect: exit=42
+//
+// Nested / recursive generic calls: a generic call whose ARGUMENT is itself a
+// generic call. `id(id(x))` infers the outer T by recursing into the inner
+// call's argument; `twice<T>` (a generic fn calling another generic fn) works
+// the same way.
+fn id<T>(x: T) -> T { x }
+
+fn twice<T>(x: T) -> T { id(id(x)) }
+
+fn main() -> i32 {
+    let a: i64 = twice(40);          // id(id(40)) inside twice<i64>
+    let b: i64 = id(id(id(2)));      // triple-nested generic call
+    (a + b) as i32                   // 40 + 2 = 42
+}
