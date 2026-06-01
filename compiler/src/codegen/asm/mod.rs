@@ -1012,6 +1012,11 @@ struct Locals {
     /// disambiguates. F32 by default; `let x: f64 = ...` flips to F64 for the
     /// duration of the value expression.
     default_float: Option<TyKind>,
+    /// The concrete type NAME the current expression is expected to produce,
+    /// from the enclosing `let x: T = …` annotation. Lets type-generic call
+    /// monomorphization infer a type param that appears only in the RETURN
+    /// position (`fn make<T>() -> T`) from the let context, not just args. P6.1.
+    expected_type: Option<String>,
     /// Program-wide fn name → return TyKind. Lets call sites know whether the
     /// result lives in rax (Int) or xmm0 (F32/F64). Cloned in per-fn.
     sigs: HashMap<String, TyKind>,
@@ -2231,7 +2236,15 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             if matches!(annot, Some(TyKind::F32) | Some(TyKind::F64)) {
                 locals.default_float = annot;
             }
+            // P6.1 — expose the annotation's concrete type name so a generic
+            // call whose type param is only in the return position
+            // (`let v: i64 = make::<_>()`) can infer it from the let context.
+            let saved_expected = locals.expected_type.clone();
+            if let Some(Ty::Named(n)) = ty.as_ref() {
+                locals.expected_type = Some(n.clone());
+            }
             let val_ty = emit_expr_value(value, out, data, locals)?;
+            locals.expected_type = saved_expected;
             locals.default_float = saved;
             let kind = annot.unwrap_or(val_ty);
             let slot = locals.alloc(name);
@@ -2855,6 +2868,18 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                                 if tdecl.const_params.iter().any(|cp| cp == s) {
                                     bindings.insert(s.clone(), concrete as i64);
                                 }
+                            }
+                        }
+                    }
+                    // Return-position inference: a type param that appears in the
+                    // return type but in no param can be bound from the enclosing
+                    // `let x: T = …` annotation context (`fn make<T>() -> T`).
+                    if let Some(Ty::Named(rt)) = tdecl.ret.as_ref() {
+                        if tdecl.const_params.iter().any(|cp| cp == rt)
+                            && !bindings.contains_key(rt) && !type_bindings.contains_key(rt)
+                        {
+                            if let Some(exp) = locals.expected_type.clone() {
+                                type_bindings.insert(rt.clone(), exp);
                             }
                         }
                     }

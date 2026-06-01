@@ -1,0 +1,15 @@
+// roadmap: P6.1
+// expect: exit=42
+//
+// Return-position type inference: a type param that appears only in the RETURN
+// type (not in any argument) is inferred from the `let x: T = …` annotation
+// context. `make<T>() -> T` takes no T-typed args, so T comes from the let.
+fn make<T>() -> T { 0 as T }
+
+fn first<T>(a: T, b: i64) -> T { a }
+
+fn main() -> i32 {
+    let x: i64 = make();          // T = i64 inferred from `let x: i64`
+    let y: i64 = first(42, 9);    // T = i64 from the argument
+    (x + y) as i32                // 0 + 42 = 42
+}
