@@ -2533,8 +2533,13 @@ fn emit_stmt(s: &Stmt, out: &mut String, data: &mut StringTable, locals: &mut Lo
             // the `: T` annotation), so here we mirror that allocation, run the
             // call (which leaves field0 in %rax, field1 in %rdx via the
             // struct-return ABI), and store each register into its field slot.
-            if call_returns_struct(value, &locals.fn_returns_struct).is_some() {
-                if let Some(struct_name) = ty.as_ref().and_then(struct_name_of) {
+            // Accept a struct-returning free fn (`add(a, x)`) OR a struct-returning
+            // METHOD (`a.add(x)` → `Acc__add(a, x)`, the builder pattern). Both
+            // leave field0/field1 in rax/rdx; call_result_struct resolves either.
+            if call_result_struct(value, locals).is_some() {
+                let struct_name = ty.as_ref().and_then(struct_name_of)
+                    .or_else(|| call_result_struct(value, locals));
+                if let Some(struct_name) = struct_name {
                     if let Some(sd) = locals.struct_decls.get(&struct_name).cloned() {
                         locals.struct_locals.insert(name.clone(), struct_name.clone());
                         for field in &sd.fields {

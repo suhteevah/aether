@@ -1,0 +1,28 @@
+// roadmap: P6.5
+// expect: exit=42
+//
+// Builder pattern: a method that returns a struct (`fn add(self, x) -> Acc`),
+// its result bound to a new struct local and used as the receiver of the next
+// call. A struct-returning free fn already worked; a struct-returning METHOD
+// did not — the `let b: Acc = a.add(x)` binding checked only `Expr::Call`, so
+// `b` never registered as a struct local and `b.add(..)` failed. The binding
+// now resolves a struct-returning method via call_result_struct (which handles
+// `a.add(x)` -> `Acc__add(a, x)`), unmarshalling rax/rdx into b's field slots.
+// (Direct chaining `a.add(x).add(y)` — a method on a struct-returning method
+// RESULT used as a receiver — is a deeper follow-up; the let-bound form here is
+// the idiomatic one.)
+struct Acc { total: i64, count: i64 }
+
+impl Acc {
+    fn add(self, x: i64) -> Acc {
+        Acc { total: self.total + x, count: self.count + 1 }
+    }
+}
+
+fn main() -> i32 {
+    let a: Acc = Acc { total: 0, count: 0 };
+    let b: Acc = a.add(20);    // total 20, count 1
+    let c: Acc = b.add(19);    // total 39, count 2
+    let d: Acc = c.add(1);     // total 40, count 3
+    (d.total + d.count - 1) as i32   // 40 + 3 - 1 = 42
+}
