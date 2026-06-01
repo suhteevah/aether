@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 25 features / ~43 commits incl. the GENERICS KEYSTONE (type-generic FUNCTIONS + STRUCTS) + char/int-cast/assembler-extension: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 8867e32.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 26 features / ~47 commits incl. the GENERICS KEYSTONE (type-generic FUNCTIONS + STRUCTS + ENUMS) + char/int-cast/assembler-extension: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 201 tests, errors: 0, ZERO regressions. HEAD 8867e32.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -24,9 +24,11 @@ type inference only fires for bare `Named(T)` params, so shape templates
 (generic_matmul etc.) are untouched. Witness `generic_fn.aether` (id<T> for both
 i64 + f32 → 42). **Generic STRUCTS also done** (`f5c24c6`): `struct Pair<T>`
 resolves each field's type param from the use-site annotation (`Pair<f32>` → f32
-fields with xmm storage). So generics now covers **functions + structs**.
-Remaining: generic methods/traits + `Vec<T>`/`Box<T>` (needs heap + generics
-together) + the `Iterator` trait. Witnesses `generic_fn.aether` + `generic_struct.aether`.
+fields with xmm storage). **Generic ENUMS too** (`c9d0860`): `Option<T>` /
+`Result<T,E>` parse + work for int payloads — the marquee Rust enums. So generics
+now spans **functions + structs + enums**. Witnesses `generic_fn` /
+`generic_struct` / `generic_enum`. Remaining generics = methods (`impl<T>`),
+return-position inference, generic struct returns, then Vec<T>/Box.
 
 ### control-flow cluster (if let / while let / loop / bool literals)
 - **6.4 `if let`** (`42336f5`) + **`while let`** (`88989d5`) — parser desugars to
@@ -152,10 +154,13 @@ need a large/risky subsystem, NOT a quick deposit:
   any float field need an **sret hidden-pointer ABI** (caller passes a result
   pointer in rcx; callee writes fields through it; args shift right). Mirror the
   struct-return detection but route to sret when `!small`.
-- **Generics** — type-generic FUNCTIONS (`640ba38`) + generic STRUCTS (`f5c24c6`)
-  DONE. The hard part (monomorphization + per-instantiation storage class) is
-  solved for both. Remaining: generic methods/traits, then Box/Vec<T>/HashMap
-  (6.7, needs generics + heap together), then the Iterator trait.
+- **Generics** — FUNCTIONS (`640ba38`) + STRUCTS (`f5c24c6`) + ENUMS
+  Option<T>/Result<T,E> (`c9d0860`) DONE. Monomorphization + per-instantiation
+  storage class solved. Remaining: generic METHODS (needs `impl<T>` parsing +
+  per-T method monomorphization), return-type-position inference (T inferred from
+  the let annotation, not just args — needed for `Box::get`), generic struct
+  RETURNS (struct-return detection handles Ty::Named not Ty::Generic), then
+  Box/Vec<T>/HashMap (6.7) + the Iterator trait.
 - **async (6.10) / macros (6.11)** — still model-only islands (wire like traits
   was, but each is a real L/XL transform).
 - **threads (6.9)** — `aether_thread_spawn` exists; closure-objects could now
