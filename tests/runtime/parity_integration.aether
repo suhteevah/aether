@@ -1,0 +1,69 @@
+// roadmap: P6.14
+// expect: exit=42
+//
+// Integration witness — composes many of the P6 Rust-parity features shipped this
+// session into one program, proving they interoperate:
+//   * a multi-field enum (ADT) constructed, RETURNED from a fn, and matched with
+//     a GUARD that reads its payload bindings;
+//   * a trait with a DEFAULT method built on a required one, dispatched through a
+//     BOUNDED GENERIC `fn<T: Trait>`;
+//   * a CLOSURE capturing a local, passed as a value and applied;
+//   * a fixed-size ARRAY summed with a dynamic index;
+//   * a TUPLE return destructured with `let (a, b)`.
+// All independently computed pieces sum to 42.
+use runtime;
+
+// --- ADT + factory + guarded match ---
+enum Shape { Empty, Rect(i64, i64) }
+fn make_rect(w: i64, h: i64) -> Shape { Shape::Rect(w, h) }
+
+fn shape_score(s: Shape) -> i64 {
+    match s {
+        Shape::Rect(w, h) if w == h => w,        // square: side
+        Shape::Rect(w, h) => w * h,              // else: area
+        Shape::Empty => 0,
+    }
+}
+
+// --- trait + default method + bounded generic ---
+trait Weighted {
+    fn base(self) -> i64;
+    fn weighted(self) -> i64 { self.base() * 2 }   // default built on required
+}
+struct Item { v: i64 }
+impl Weighted for Item { fn base(self) -> i64 { self.v } }
+fn weigh<T: Weighted>(x: T) -> i64 { x.weighted() }
+
+// --- closure consumer ---
+fn apply(f: Closure, x: i64) -> i64 { f(x) }
+
+// --- tuple return ---
+fn split(n: i64) -> (i64, i64) { (n / 2, n - n / 2) }
+
+fn main() -> i32 {
+    // ADT: Rect(2,3) -> area 6  (guard w==h is false)
+    let r: Shape = make_rect(2, 3);
+    let a: i64 = shape_score(r);                 // 6
+
+    // trait default through a bounded generic: base 5 -> weighted 10
+    let it: Item = Item { v: 5 };
+    let b: i64 = weigh(it);                       // 10
+
+    // closure capturing a local
+    let bump: i64 = 4;
+    let add_bump = |x: i64| x + bump;
+    let c: i64 = apply(add_bump, 8);             // 12
+
+    // array with dynamic index
+    let arr: [i64; 4] = [1, 2, 3, 4];
+    let mut d: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 4 { d = d + arr[i]; i = i + 1; }    // 10
+
+    // tuple return
+    let (lo, hi) = split(8);                      // (4, 4)
+    let e: i64 = lo + hi - 4;                     // 4
+
+    // 6 + 10 + 12 + 10 + 4 = 42
+    (a + b + c + d + e) as i32
+}
