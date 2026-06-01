@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 27 features + a real parser bugfix / ~50 commits incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 0fd383f.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 30 features + a real parser bugfix / ~55 commits incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 0fd383f.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -37,9 +37,13 @@ i64 + f32 → 42). **Generic STRUCTS also done** (`f5c24c6`): `struct Pair<T>`
 resolves each field's type param from the use-site annotation (`Pair<f32>` → f32
 fields with xmm storage). **Generic ENUMS too** (`c9d0860`): `Option<T>` /
 `Result<T,E>` parse + work for int payloads — the marquee Rust enums. So generics
-now spans **functions + structs + enums**. Witnesses `generic_fn` /
-`generic_struct` / `generic_enum`. Remaining generics = methods (`impl<T>`),
-return-position inference, generic struct returns, then Vec<T>/Box.
+now spans **functions + structs + enums + METHODS (`impl<T>`, ccc39fb) +
+RETURN-POSITION inference (0b85c87) + the Box<T> HEAP-CONTAINER pattern
+(49dbfe1)**. Witnesses `generic_fn` / `generic_struct` / `generic_enum` /
+`generic_method` / `generic_return_infer` / `generic_box`. Generics is now
+comprehensive (the i64 path; per-T f32 method monomorphization + generic struct
+RETURNS are the remaining refinements). Next on this thread: a real `Vec<T>` /
+`Iterator` trait built on this foundation.
 
 ### control-flow cluster (if let / while let / loop / bool literals)
 - **6.4 `if let`** (`42336f5`) + **`while let`** (`88989d5`) — parser desugars to
