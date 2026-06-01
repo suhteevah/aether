@@ -1479,7 +1479,12 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
         let p_ty = match &p.ty { Ty::Ref { inner, .. } => inner.as_ref(), other => other };
         if let Some(sname) = struct_name_of(p_ty) {
             if let Some(sd) = locals.struct_decls.get(&sname).cloned() {
-                for field in &sd.fields { locals.alloc(&format!("{}.{}", p.name, field.name)); }
+                // Leaf-expand so nested-struct + array fields reserve the same
+                // slot set the prologue spill below allocates (frame invariant).
+                let decls = locals.struct_decls.clone();
+                let mut keys = Vec::new();
+                expand_struct_field_keys(&p.name, &sd, &HashMap::new(), &decls, &mut keys);
+                for (k, _) in &keys { locals.alloc(k); }
                 continue;
             }
             if locals.enum_decls.contains_key(&sname) {
@@ -1559,21 +1564,24 @@ fn emit_fn(f: &FnDecl, out: &mut String, data: &mut StringTable,
         if let Some(sname) = struct_name {
             if let Some(sd) = locals.struct_decls.get(&sname).cloned() {
                 locals.struct_locals.insert(p.name.clone(), sname.clone());
-                for field in &sd.fields {
+                // Leaf-expand (nested struct + array fields) so each scalar leaf
+                // takes one ABI arg slot, matching the caller's by-value push.
+                let decls = locals.struct_decls.clone();
+                let mut keys = Vec::new();
+                expand_struct_field_keys(&p.name, &sd, &HashMap::new(), &decls, &mut keys);
+                for (key, field_kind) in &keys {
                     if arg_idx >= 4 { return Err(AsmError::TooManyArgs); }
-                    let field_kind = TyKind::from_ty(&field.ty).unwrap_or(TyKind::Int);
-                    let key = format!("{}.{}", p.name, field.name);
-                    let slot = locals.alloc(&key);
-                    locals.types.insert(key, field_kind);
+                    let slot = locals.alloc(key);
+                    locals.types.insert(key.clone(), *field_kind);
                     match field_kind {
-                        TyKind::Int => out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[arg_idx], slot * 8)),
                         TyKind::F32 => out.push_str(&format!("    movss %xmm{}, -{}(%rbp)\n", arg_idx, slot * 8)),
                         TyKind::F64 => out.push_str(&format!("    movsd %xmm{}, -{}(%rbp)\n", arg_idx, slot * 8)),
-                        TyKind::TensorDev(_) | TyKind::TensorDevI32(_) =>
-                            out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[arg_idx], slot * 8)),
+                        _ => out.push_str(&format!("    movq {}, -{}(%rbp)\n", int_arg_regs[arg_idx], slot * 8)),
                     }
                     arg_idx += 1;
                 }
+                // Register array fields so `self.arr[i]` indexing resolves.
+                register_struct_array_fields(&p.name, &sd, &decls, &mut locals);
                 continue;
             }
         }
@@ -3651,11 +3659,15 @@ fn emit_expr_value(e: &Expr, out: &mut String, data: &mut StringTable, locals: &
                 if let Expr::Ident(arg_name) = arg {
                     if let Some(struct_ty) = locals.struct_locals.get(arg_name).cloned() {
                         if let Some(sd) = locals.struct_decls.get(&struct_ty).cloned() {
-                            for field in &sd.fields {
-                                let key = format!("{}.{}", arg_name, field.name);
-                                let slot = locals.get(&key)
+                            // Leaf-expand to match the callee's by-value spill
+                            // (nested struct + array fields push one slot each).
+                            let decls = locals.struct_decls.clone();
+                            let mut keys = Vec::new();
+                            expand_struct_field_keys(arg_name, &sd, &HashMap::new(), &decls, &mut keys);
+                            for (key, kind) in &keys {
+                                let slot = locals.get(key)
                                     .ok_or_else(|| AsmError::UnknownIdent(key.clone()))?;
-                                let field_kind = locals.types.get(&key).copied().unwrap_or(TyKind::Int);
+                                let field_kind = locals.types.get(key).copied().unwrap_or(*kind);
                                 match field_kind {
                                     TyKind::Int | TyKind::TensorDev(_) | TyKind::TensorDevI32(_) => {
                                         out.push_str(&format!("    movq -{}(%rbp), %rax\n", slot * 8));

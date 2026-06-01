@@ -1,0 +1,29 @@
+// roadmap: P6.7
+// expect: exit=42
+//
+// A struct with an ARRAY field passed BY VALUE — to a method (`b.sum()` reading
+// `self.d[i]`) and to a free fn. Previously the struct-by-value ABI iterated
+// `sd.fields` (one ABI slot per field), so an array field collapsed to a single
+// slot and the receiver read a truncated copy (a silent wrong answer). The
+// param-reservation, prologue spill, and caller push now leaf-EXPAND a struct
+// (nested struct + array fields -> one ABI slot per scalar leaf), and array
+// fields register so `self.d[i]` indexes. Plain structs are unchanged (their leaf
+// keys equal sd.fields). Bounded by the 4 int arg registers.
+struct Buf { d: [i64; 3] }
+
+impl Buf {
+    fn sum(self) -> i64 { self.d[0] + self.d[1] + self.d[2] }
+}
+
+fn pick(b: Buf, i: i64) -> i64 { b.d[i] }   // dynamic index on a by-value param
+
+fn main() -> i32 {
+    let b: Buf = Buf { d: [10, 15, 17] };
+    let viamethod: i64 = b.sum();            // 42  (by-value method receiver)
+
+    let c: Buf = Buf { d: [1, 2, 39] };
+    let viafree: i64 = pick(c, 2);           // 39  (by-value free-fn param)
+
+    // 42 + 39 - 39 = 42
+    (viamethod + viafree - 39) as i32
+}
