@@ -1,0 +1,30 @@
+// roadmap: P6.6
+// expect: exit=42
+//
+// INLINE closures passed directly into a `Closure`-typed parameter — the
+// idiomatic Rust form `apply(|x| .., 5)`, no intermediate `let`. The closure-
+// object pass hoists each inline closure in a Closure-arg slot to a synthetic
+// `let __inlineclo_K = |..|` before the enclosing statement, after which it is
+// lowered like any value-used named closure (heap `[fn_ptr | caps]`). Captures
+// (`bias`, `scale`) are taken by value at the hoist site.
+use runtime;
+
+fn apply2(f: Closure, a: i64, b: i64) -> i64 { f(a, b) }
+
+fn combine3(g: Closure, h: Closure, x: i64) -> i64 {
+    g(x) + h(x)
+}
+
+fn main() -> i32 {
+    let bias: i64 = 4;
+    let scale: i64 = 3;
+    // inline closure capturing `bias`, in a Closure slot: (20+12+4)=36 -> no,
+    // compute exactly: apply2 returns x+y+bias = 9+5+4 = 18
+    let p: i64 = apply2(|x: i64, y: i64| x + y + bias, 9, 5);   // 18
+    // two inline closures, one capturing `scale`, one capturing `bias`:
+    //   g(x)=x*scale=6, h(x)=x+bias=6  -> 12,  at x=2
+    let q: i64 = combine3(|x: i64| x * scale, |x: i64| x + bias, 2);   // 6 + 6 = 12
+    // and one nested inside an expression position
+    let r: i64 = apply2(|a: i64, b: i64| a - b, 20, 8);   // 12
+    (p + q + r) as i32   // 18 + 12 + 12 = 42
+}

@@ -94,6 +94,12 @@ fn is_closure_ty(ty: &Ty) -> bool {
 fn process_fn(f: &mut FnDecl, ctx: &mut Ctx) {
     let Some(body) = f.body.as_mut() else { return; };
 
+    // Phase 0 — hoist an INLINE closure that sits in a `Closure`-typed arg
+    // position (`apply(|x| .., 5)`) into a synthetic `let __inlineclo_K = |..|`
+    // immediately before the enclosing statement. From there it is an ordinary
+    // value-used named closure, so Phases A/B lower it like any other.
+    hoist_inline_block(body, &ctx.sigs, &mut ctx.counter);
+
     // Targets whose calls use the closure-object ABI: params typed `Closure`,
     // plus any closure-object local we create below.
     let mut targets: HashSet<String> = f.params.iter()
@@ -115,6 +121,107 @@ fn process_fn(f: &mut FnDecl, ctx: &mut Ctx) {
     // Phase B — rewrite calls through any target (closure params + objects).
     if !targets.is_empty() {
         rewrite_calls_block(body, &targets, &mut ctx.counter);
+    }
+}
+
+// ─── Phase 0: inline-closure hoisting ───────────────────────────────────────
+
+/// Replace `f(.., |p| body, ..)` (closure in a `Closure`-typed arg slot) with a
+/// hoisted `let __inlineclo_K = |p| body;` before the statement and the ident
+/// `__inlineclo_K` in the call. Nested blocks (if/for/while/region bodies) and
+/// match arms are handled in their own scope so a hoisted binding never escapes
+/// past a payload pattern bind.
+fn hoist_inline_block(b: &mut Block, sigs: &HashMap<String, Vec<bool>>, ctr: &mut usize) {
+    let mut out: Vec<Stmt> = Vec::with_capacity(b.stmts.len());
+    for mut s in std::mem::take(&mut b.stmts) {
+        let mut hoisted: Vec<Stmt> = Vec::new();
+        match &mut s {
+            Stmt::Let { value: Some(e), .. } => hoist_inline_expr(e, sigs, &mut hoisted, ctr),
+            Stmt::LetTuple { value, .. } => hoist_inline_expr(value, sigs, &mut hoisted, ctr),
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => hoist_inline_expr(e, sigs, &mut hoisted, ctr),
+            _ => {}
+        }
+        out.extend(hoisted);
+        out.push(s);
+    }
+    if let Some(t) = b.tail.as_mut() {
+        let mut hoisted: Vec<Stmt> = Vec::new();
+        hoist_inline_expr(t, sigs, &mut hoisted, ctr);
+        out.extend(hoisted);
+    }
+    b.stmts = out;
+}
+
+fn make_inline_let(clo: Expr, ctr: &mut usize) -> (String, Stmt) {
+    let name = format!("__inlineclo_{}", *ctr);
+    *ctr += 1;
+    let st = Stmt::Let {
+        name: name.clone(),
+        mutable: false,
+        ty: Some(Ty::Named("Closure".into())),
+        value: Some(clo),
+    };
+    (name, st)
+}
+
+fn hoist_inline_expr(e: &mut Expr, sigs: &HashMap<String, Vec<bool>>, hoisted: &mut Vec<Stmt>, ctr: &mut usize) {
+    match e {
+        Expr::Call { callee, args } => {
+            hoist_inline_expr(callee, sigs, hoisted, ctr);
+            let clo_pos: Option<Vec<bool>> = match callee.as_ref() {
+                Expr::Ident(f) => sigs.get(f).cloned(),
+                _ => None,
+            };
+            for (i, a) in args.iter_mut().enumerate() {
+                let is_clo_slot = clo_pos.as_ref().map_or(false, |v| v.get(i).copied().unwrap_or(false));
+                if is_clo_slot && matches!(a, Expr::Closure { .. }) {
+                    let clo = std::mem::replace(a, Expr::IntLit(0));
+                    let (name, st) = make_inline_let(clo, ctr);
+                    hoisted.push(st);
+                    *a = Expr::Ident(name);
+                } else {
+                    hoist_inline_expr(a, sigs, hoisted, ctr);
+                }
+            }
+        }
+        Expr::MethodCall { recv, args, .. } => {
+            hoist_inline_expr(recv, sigs, hoisted, ctr);
+            for a in args { hoist_inline_expr(a, sigs, hoisted, ctr); }
+        }
+        Expr::Bin { lhs, rhs, .. } => { hoist_inline_expr(lhs, sigs, hoisted, ctr); hoist_inline_expr(rhs, sigs, hoisted, ctr); }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Ref { expr, .. } | Expr::Deref(expr) | Expr::Try(expr) => hoist_inline_expr(expr, sigs, hoisted, ctr),
+        Expr::Field { recv, .. } => hoist_inline_expr(recv, sigs, hoisted, ctr),
+        Expr::Index { recv, idx } => { hoist_inline_expr(recv, sigs, hoisted, ctr); hoist_inline_expr(idx, sigs, hoisted, ctr); }
+        Expr::StructLit { fields, .. } => for (_, fv) in fields { hoist_inline_expr(fv, sigs, hoisted, ctr); },
+        Expr::Tuple(elems) => for el in elems { hoist_inline_expr(el, sigs, hoisted, ctr); },
+        Expr::Range { lo, hi, step } => {
+            hoist_inline_expr(lo, sigs, hoisted, ctr); hoist_inline_expr(hi, sigs, hoisted, ctr);
+            if let Some(s) = step { hoist_inline_expr(s, sigs, hoisted, ctr); }
+        }
+        // Block-introducing sub-exprs recurse in their OWN scope.
+        Expr::Block(b) => hoist_inline_block(b, sigs, ctr),
+        Expr::If { cond, then, else_ } => {
+            hoist_inline_expr(cond, sigs, hoisted, ctr);
+            hoist_inline_block(then, sigs, ctr);
+            if let Some(b) = else_ { hoist_inline_block(b, sigs, ctr); }
+        }
+        Expr::For { iter, body, .. } => { hoist_inline_expr(iter, sigs, hoisted, ctr); hoist_inline_block(body, sigs, ctr); }
+        Expr::While { cond, body } => { hoist_inline_expr(cond, sigs, hoisted, ctr); hoist_inline_block(body, sigs, ctr); }
+        Expr::Region { body, .. } => hoist_inline_block(body, sigs, ctr),
+        Expr::Match { scrutinee, arms } => {
+            hoist_inline_expr(scrutinee, sigs, hoisted, ctr);
+            for (_, arm) in arms {
+                // Each arm is its own scope (may bind a payload). Hoist within
+                // the arm, wrapping it in a block if anything was hoisted.
+                let mut arm_hoist: Vec<Stmt> = Vec::new();
+                hoist_inline_expr(arm, sigs, &mut arm_hoist, ctr);
+                if !arm_hoist.is_empty() {
+                    let inner = std::mem::replace(arm, Expr::IntLit(0));
+                    *arm = Expr::Block(Block { stmts: arm_hoist, tail: Some(Box::new(inner)) });
+                }
+            }
+        }
+        _ => {}
     }
 }
 
