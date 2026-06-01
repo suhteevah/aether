@@ -1,6 +1,6 @@
 # Aether — Session Handoff
 
-## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 38 features + 8 probing bugfixes / ~61 commits incl. nested struct fields + method chains + enum-as-param (all probe gaps closed) incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
+## Last Updated — 2026-05-31 PM (🟢 P6 RUST-PARITY PUSH — 40 features + 9 probing bugfixes / ~63 commits — nested struct fields + method chains + enum-as-param + match-on-call (round-7 probe sweep CLEAN) incl. the GENERICS KEYSTONE (FUNCTIONS + STRUCTS + ENUMS) + assembler-extension + stmt-boundary parser fix: type inference engine (5 scalar checks) + traits (default/completeness/supertraits/assoc-fns/Self) + borrow-reject + closures-as-value + iterators-with-closures + process spawn + std::env + struct-construction cluster (struct-return ABI / From-into / Type::method / Self) + **control-flow cluster (if let / while let / loop / true-false)** + audit reliability. Goal: "reach rust feature parity". Audit clean, 202 tests, errors: 0, ZERO regressions. HEAD 78b54e1.)
 
 ### Honest goal status
 "Reach rust feature parity" is a multi-month arc — NOT reached this session, but
@@ -53,7 +53,12 @@ unused ret-save slot). The count pass now mirrors the prologue slot-for-slot
 (struct fields + enum tag/val) — the highest-risk change of the arc (frame
 invariant), held clean across the whole suite. Witness `enum_param`. (Caller side
 covers enum LOCAL args; enum CONSTRUCTOR args want emit_expr_value to leave
-tag:rax/val:rdx — a follow-up.) The round-5 sweep was otherwise clean.
+tag:rax/val:rdx — a follow-up.) **Match-on-call** `match foo() { … }` also DONE
+(`606822d`, parser temp-binds a non-ident scrutinee). After 7 probing rounds /
+~60 constructs and **9 bug fixes**, the round-7 sweep is COMPLETELY CLEAN
+(match-in-arith, if-let-on-call, nested match, struct method chaining, generic
+struct methods, const+generic+struct, early-return-in-arm, float struct fields,
+bool comparisons). The common language surface is genuinely solid + hardened.
 
 ### parser stmt-boundary fix (detail)
 - **parser fix** (`0fd383f`) — block-like statements (if/while/for/loop/match) in
