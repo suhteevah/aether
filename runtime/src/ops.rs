@@ -162,6 +162,34 @@ pub unsafe fn gelu_f32(x: *mut f32, n: usize) {
     }
 }
 
+/// erf(x) via Abramowitz & Stegun 7.1.26 (max abs err ~1.5e-7), in f64.
+#[inline]
+fn erf_f64(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
+}
+
+/// Exact (erf) GELU, in place. `gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`.
+/// This is the variant PyTorch / HF `hidden_act="gelu"` use — distinct from the
+/// tanh approximation in `gelu_f32`. DINOv3 / ViT need this for bit-faithful
+/// reproduction (cosine >= 0.999 vs the reference). Computed in f64 internally
+/// for accuracy, narrowed to f32 on store.
+pub unsafe fn gelu_erf_f32(x: *mut f32, n: usize) {
+    let x = sm(x, n);
+    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+    for v in x.iter_mut() {
+        let xf = *v as f64;
+        *v = (0.5 * xf * (1.0 + erf_f64(xf * inv_sqrt2))) as f32;
+    }
+}
+
 /// d/dx GELU (tanh approx). dx[i] = dy[i] * gelu'(x[i]).
 pub unsafe fn gelu_backward_f32(x: *const f32, dy: *const f32, dx: *mut f32, n: usize) {
     let x = s(x, n); let dy = s(dy, n); let dx = sm(dx, n);
@@ -483,6 +511,58 @@ pub unsafe fn sdpa_causal_f32(
             for v in row.iter_mut() { *v *= inv; }
         }
         // out[i] = sum_j attn[i, j] * v[j]
+        for i in 0..s_len {
+            for dd in 0..d {
+                let mut acc = 0.0f32;
+                for j in 0..s_len {
+                    acc += ah[i * s_len + j] * vh[j * d + dd];
+                }
+                oh[i * d + dd] = acc;
+            }
+        }
+    }
+}
+
+/// Non-causal (bidirectional) scaled dot-product attention. Same layout +
+/// math as `sdpa_causal_f32` but every query attends to every key (no mask).
+/// Used by encoder / ViT models (BERT, DINOv3). q/k/v are `[bh, s_len, d]`
+/// head-major; `out` is `[bh, s_len, d]`; `attn_out` is `[bh, s_len, s_len]`
+/// (post-softmax weights, kept for debugging/backward). scale = 1/sqrt(d).
+pub unsafe fn sdpa_full_f32(
+    q: *const f32, k: *const f32, v: *const f32,
+    out: *mut f32, attn_out: *mut f32,
+    bh: usize, s_len: usize, d: usize,
+) {
+    let q = s(q, bh * s_len * d);
+    let k = s(k, bh * s_len * d);
+    let v = s(v, bh * s_len * d);
+    let out = sm(out, bh * s_len * d);
+    let attn_out = sm(attn_out, bh * s_len * s_len);
+    let scale = 1.0 / (d as f32).sqrt();
+
+    for h in 0..bh {
+        let qh = &q[h * s_len * d..(h + 1) * s_len * d];
+        let kh = &k[h * s_len * d..(h + 1) * s_len * d];
+        let vh = &v[h * s_len * d..(h + 1) * s_len * d];
+        let oh = &mut out[h * s_len * d..(h + 1) * s_len * d];
+        let ah = &mut attn_out[h * s_len * s_len..(h + 1) * s_len * s_len];
+
+        for i in 0..s_len {
+            for j in 0..s_len {
+                let mut acc = 0.0f32;
+                for dd in 0..d { acc += qh[i * d + dd] * kh[j * d + dd]; }
+                ah[i * s_len + j] = acc * scale;
+            }
+        }
+        for i in 0..s_len {
+            let row = &mut ah[i * s_len..(i + 1) * s_len];
+            let mut mx = row[0];
+            for &v in row.iter().skip(1) { if v > mx { mx = v; } }
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() { *v = (*v - mx).exp(); sum += *v; }
+            let inv = 1.0 / sum;
+            for v in row.iter_mut() { *v *= inv; }
+        }
         for i in 0..s_len {
             for dd in 0..d {
                 let mut acc = 0.0f32;

@@ -63,6 +63,9 @@ CREDS.md
 # Session scratch — never commit
 scratch/
 
+# Downloaded model weights (FR-V1 DINOv3 ONNX ~1.2GB, etc.) — never commit
+models/
+
 # Windows reserved device names (cause git add failures)
 nul
 con

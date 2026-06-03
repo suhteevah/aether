@@ -23,6 +23,11 @@ pub mod batched_serving;
 #[cfg(feature = "cuda")]
 pub mod bert;
 
+/// DINOv3 ViT vision-backbone inference (FR-V1). Pure-CPU f32 reference
+/// `Dinov3Session` for correctness (cosine >= 0.999 vs the ONNX reference);
+/// the GPU serving path mirrors it under `feature = "cuda"`.
+pub mod vit;
+
 #[cfg(feature = "nccl")]
 pub mod nccl_real;
 
@@ -379,6 +384,13 @@ pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
     0
 }
 
+/// Exact (erf) GELU, in place — the `hidden_act="gelu"` variant used by ViT /
+/// DINOv3, distinct from the tanh approximation in `aether_op_gelu_f32`.
+#[no_mangle] pub unsafe extern "C" fn aether_op_gelu_erf_f32(x: *mut c_void, n: c_int) -> c_int {
+    ops::gelu_erf_f32(x as _, n as _);
+    0
+}
+
 #[no_mangle] pub unsafe extern "C" fn aether_op_silu_f32(x: *mut c_void, n: c_int) -> c_int {
     ops::silu_f32(x as _, n as _);
     0
@@ -507,6 +519,18 @@ pub unsafe extern "C" fn aether_autodiff_reverse(_tape: *mut c_void) {
 ) -> c_int {
     ops::sdpa_causal_backward_f32(q as _, k as _, v as _, attn as _, dout as _,
         dq as _, dk as _, dv as _, bh as _, s_len as _, d as _);
+    0
+}
+
+/// Non-causal (bidirectional) SDPA — encoder / ViT attention. Same layout as
+/// `aether_op_sdpa_causal_f32`, no causal mask. See `ops::sdpa_full_f32`.
+#[no_mangle] pub unsafe extern "C" fn aether_op_sdpa_full_f32(
+    q: *const c_void, k: *const c_void, v: *const c_void,
+    out: *mut c_void, attn_out: *mut c_void,
+    bh: c_int, s_len: c_int, d: c_int,
+) -> c_int {
+    ops::sdpa_full_f32(q as _, k as _, v as _, out as _, attn_out as _,
+        bh as _, s_len as _, d as _);
     0
 }
 

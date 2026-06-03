@@ -1,5 +1,50 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-06-03 (🟢 FR-V1 DINOv3 ViT-L/16 vision backbone — COMPLETE: cosine 0.999999 on CPU + 3070 Ti + cnc P100; 56.9 ms/forward + ~1.45 GB resident on P100; `POST /v1/vision/embed` service live; visionsystem `AetherBackend::embed()` → HTTP client)
+
+FR-V1 (first vision backbone in Aether) is done end-to-end. DINOv3 ViT-L/16
+(300M params, 24 layers, d=1024, 16 heads, patch-16, 4 register tokens, 2D axial
+RoPE, GELU MLP) reproduces the onnx-community/ORT golden
+(`visionsystem/scratch/dinov3_vitl16_ref.json`) to **cosine 0.999999**.
+
+**What shipped:**
+- `runtime/src/vit.rs` — `Dinov3Session` (pure-CPU f32 reference, 1210 s/img,
+  correctness only) + `Dinov3GpuSession` (cuda, device-resident deploy path).
+  Tests `dinov3_cosine_vs_ort_reference` (CPU 0.999999) + `dinov3_gpu_cosine_vs_golden`
+  (GPU 0.999999 + latency). Paths env-overridable (`DINOV3_WEIGHTS`/`DINOV3_FIXTURES`).
+- New runtime ops: `aether_op_gelu_erf_f32` (exact erf GELU — existing one is
+  tanh-approx, breaks 0.999), `aether_op_sdpa_full_f32` (CPU non-causal). cuda
+  `VitCtx` nvrtc unit: `gelu_erf` + `dinov3_rope2d` kernels.
+- `trainer/src/bin/serve.rs` — `--vit-weights DIR`, `POST /v1/vision/embed`
+  (pixel_values → 1024-d L2 embedding), `parse_f32_array`, body cap 1→16 MiB.
+- `docs/DINOV3_VITL16_SPEC.md` — full architecture spec.
+- visionsystem `crates/vs-model/src/backend.rs::embed()` — thin std-net HTTP
+  client (Triangle resize + ImageNet norm → POST). `dinov3_ref.rs` dumps the
+  golden pixels. (Both uncommitted in the visionsystem repo — review.)
+
+**Verified:** CPU golden 0.999999 · 3070 Ti GPU 0.999999 @ 49.2 ms · loopback
+service round-trip cosine 1.0 · **cnc P100 (GPU 1) 0.999999 @ 56.9 ms, ~1.45 GB
+resident** (transient/co-tenant on free VRAM, coordinated with openclaw `main`).
+
+**KEY gotchas (cost 0.999 if wrong):** the exported ONNX (= the ORT reference)
+has **NO q/k/v bias** — match the graph, not the HF config. 2D axial RoPE:
+theta 100, 16 freqs, coords [-1,1] +0.5 center, [h16,w16,h16,w16] split-half,
+patch tokens only (CLS+4 reg unrotated). Weights gated → ungated onnx-community
+ONNX, opaque `val_*` MatMul weights recovered by tracing the 144 init-bearing
+MatMuls. Golden preprocessing = `image`-crate **Triangle** (PIL bilinear/bicubic
+only hit 0.997).
+
+**Build/run on cnc P100:** isolated tree at `cnc:/root/aether-vit`, weights at
+`cnc:/opt/aether/scratch/dinov3/wclean`; `CUDA_VISIBLE_DEVICES=1 LD_LIBRARY_PATH=
+/usr/local/cuda-12.8/lib64:/usr/local/lib DINOV3_WEIGHTS=... cargo test -p
+aether_rt --features cuda --lib vit::tests::dinov3_gpu -- --nocapture`. DO NOT
+overlay onto `/opt/aether` — it has uncommitted local cuda.rs/serving.rs perf work.
+
+**Follow-ons:** standing P100 vision daemon (re-coordinate with main first),
+DINOv3 fine-tune/LoRA (separate FR), visionsystem libaether_rt link-decoupling.
+
+---
+
 ## Last Updated — 2026-06-01 (🟢 P6 RUST-PARITY PUSH — ADTs COMPLETE + REAL OS THREADS + REAL MACROS (3 capabilities) + NLL BORROW (enforced + non-lexical) + REAL ASYNC/AWAIT (async fn → poll state machine) — ALL 4 named large gaps now genuinely addressed — closures(complete) + bounded generics + impl-Trait-arg + trait-default-bodies + tuple-return + builder + arrays(literal/repeat) + tuple-structs + struct-with-array-field + MULTI-FIELD ENUM PAYLOADS (real ADTs) + MATCH GUARDS + binding patterns — CLOSURES BROAD (capturing/non-capturing/let-bound/inline/escaping/through-match-arms/vec-of/closure-capturing-closure) + BOUNDED GENERICS `fn f<T: Trait>(x:T){x.m()}` + `impl Trait` ARG position + TRAIT DEFAULT BODIES calling `self.required()` + MULTI-VALUE TUPLE RETURN `(i64,i64)` w/ `let (a,b)=f()` (incl. tuple-from-if/else) — atop the earlier 40 features + GENERICS KEYSTONE + struct-construction/control-flow clusters. Goal: "reach rust feature parity". Audit clean, 202 cargo tests, errors: 0, ZERO regressions. HEAD 9e5d274.)
 
 ### LATEST: closures + bounded generics + impl-Trait-arg + tuple return (8 commits)

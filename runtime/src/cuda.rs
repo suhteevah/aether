@@ -336,6 +336,107 @@ fn train_ctx() -> &'static TrainCtx {
     })
 }
 
+// FR-V1 (DINOv3 ViT) kernels — separate nvrtc unit so they don't perturb the
+// register allocation of the Qwen-decode KERNEL_SRC kernels (nvrtc unit
+// pressure is real — see memory). Only two ViT-specific kernels; everything
+// else (matmul_nt, bias_add, layer_norm, bert_self_attention) reuses the main
+// ctx. LayerScale is folded into the o_proj/down_proj weights at upload.
+const VIT_KERNEL_SRC: &str = r#"
+// Exact (erf) GELU — DINOv3 `hidden_act="gelu"`. Distinct from the tanh
+// approximation in `gelu_fwd`; needed for cosine >= 0.999 reproduction.
+extern "C" __global__ void gelu_erf(const float* __restrict__ x,
+                                    float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        y[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+    }
+}
+
+// DINOv3 2D axial RoPE — split-half rotate of Q/K for PATCH tokens only.
+// `buf` is [seq, n_heads, head_dim]; cos/sin are [n_patches, head_dim]. The
+// first `n_prefix` tokens (CLS + registers) are left untouched. One thread per
+// (patch, head) pair; head_dim <= 64.
+extern "C" __global__ void dinov3_rope2d(
+    float* __restrict__ buf,
+    const float* __restrict__ cosb,
+    const float* __restrict__ sinb,
+    int seq, int n_prefix, int n_heads, int head_dim, int n_patches) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_patches * n_heads;
+    if (idx >= total) return;
+    int p = idx / n_heads;
+    int h = idx % n_heads;
+    int half = head_dim >> 1;
+    int base = (n_prefix + p) * n_heads * head_dim + h * head_dim;
+    const float* cs = cosb + p * head_dim;
+    const float* sn = sinb + p * head_dim;
+    float tmp[64];
+    for (int d = 0; d < head_dim; d++) tmp[d] = buf[base + d];
+    for (int d = 0; d < head_dim; d++) {
+        float rot = (d < half) ? -tmp[d + half] : tmp[d - half];
+        buf[base + d] = tmp[d] * cs[d] + rot * sn[d];
+    }
+}
+"#;
+
+struct VitCtx {
+    gelu_erf: CudaFunction,
+    rope2d:   CudaFunction,
+}
+
+static VIT_CTX: OnceLock<VitCtx> = OnceLock::new();
+
+fn vit_ctx() -> &'static VitCtx {
+    VIT_CTX.get_or_init(|| {
+        let device = &ctx().device;
+        let ptx = compile_ptx(VIT_KERNEL_SRC).expect("compile_ptx vit");
+        device.load_ptx(ptx, "aether_vit_kernels", &["gelu_erf", "dinov3_rope2d"])
+            .expect("load_ptx vit");
+        VitCtx {
+            gelu_erf: device.get_func("aether_vit_kernels", "gelu_erf").unwrap(),
+            rope2d:   device.get_func("aether_vit_kernels", "dinov3_rope2d").unwrap(),
+        }
+    })
+}
+
+/// Exact erf GELU (in place when x==y), device. ViT MLP activation.
+#[no_mangle] pub extern "C" fn aether_op_gelu_erf_f32_cuda(x: i64, y: i64, n: c_int) -> c_int {
+    let (Some(ix), Some(iy)) = (handle_to_idx(x), handle_to_idx(y)) else { return -1; };
+    let bs = unsafe { bufs() };
+    let x_p = bs[ix].as_ref().unwrap() as *const CudaSlice<f32>;
+    let y_p = bs[iy].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        let xv = &*x_p; let yv = &mut *y_p;
+        vit_ctx().gelu_erf.clone().launch(cfg, (xv, yv, n)).expect("launch gelu_erf");
+    }
+    0
+}
+
+/// DINOv3 2D axial RoPE on Q or K (in place), patch tokens only. `buf` is
+/// [seq, n_heads*head_dim]; `cos`/`sin` are [n_patches*head_dim] device handles.
+#[no_mangle] pub extern "C" fn aether_op_dinov3_rope2d_f32_cuda(
+    buf: i64, cosb: i64, sinb: i64,
+    seq: c_int, n_prefix: c_int, n_heads: c_int, head_dim: c_int, n_patches: c_int,
+) -> c_int {
+    let (Some(ib), Some(ic), Some(is)) = (handle_to_idx(buf), handle_to_idx(cosb), handle_to_idx(sinb))
+        else { return -1; };
+    let bs = unsafe { bufs() };
+    let b_p = bs[ib].as_mut().unwrap() as *mut CudaSlice<f32>;
+    let c_p = bs[ic].as_ref().unwrap() as *const CudaSlice<f32>;
+    let s_p = bs[is].as_ref().unwrap() as *const CudaSlice<f32>;
+    let total = (n_patches * n_heads) as u32;
+    let cfg = LaunchConfig::for_num_elems(total);
+    unsafe {
+        let bv = &mut *b_p; let cv = &*c_p; let sv = &*s_p;
+        vit_ctx().rope2d.clone()
+            .launch(cfg, (bv, cv, sv, seq, n_prefix, n_heads, head_dim, n_patches))
+            .expect("launch dinov3_rope2d");
+    }
+    0
+}
+
 /// FR-19.4-extra paged-KV kernels.  Separate nvrtc unit so its register
 /// allocation doesn't perturb the main KERNEL_SRC kernels.
 ///

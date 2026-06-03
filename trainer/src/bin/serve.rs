@@ -44,6 +44,8 @@ use aether_rt::serving::{QwenSession, SharedKvPool};
 #[cfg(feature = "cuda")]
 use aether_rt::bert::{BertSession, WordPieceTokenizer};
 #[cfg(feature = "cuda")]
+use aether_rt::vit::Dinov3GpuSession;
+#[cfg(feature = "cuda")]
 use aether_rt::{aether_gguf_open, aether_gguf_close};
 
 #[derive(Debug)]
@@ -115,6 +117,13 @@ struct Cli {
     /// single-session path (`max_concurrent == 1`) is NOT bounded by this —
     /// it uses the full `serving::MAX_SEQ` (2048) KV cache.
     blocks_per_slot: i32,
+    /// FR-V1: directory of raw-f32 DINOv3 ViT-L/16 weight `.bin` tensors
+    /// (one per canonical key, e.g. `layer.0.attention.q_proj.weight.bin`).
+    /// When set, the server loads a `Dinov3GpuSession` and serves
+    /// `POST /v1/vision/embed`.
+    vit_weights: Option<String>,
+    /// Model name reported in `/v1/vision/embed` responses.
+    vit_model: String,
 }
 
 fn parse_cli() -> Cli {
@@ -143,6 +152,8 @@ fn parse_cli() -> Cli {
         tp: 1,
         max_concurrent: 1,
         blocks_per_slot: 8,
+        vit_weights: None,
+        vit_model: "dinov3-vitl16".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -183,6 +194,8 @@ fn parse_cli() -> Cli {
                 it.next().expect("--max-concurrent N").parse().expect("max-concurrent int"),
             "--blocks-per-slot" => cli.blocks_per_slot =
                 it.next().expect("--blocks-per-slot N").parse().expect("blocks-per-slot int"),
+            "--vit-weights" => cli.vit_weights = Some(it.next().expect("--vit-weights DIR")),
+            "--vit-model" => cli.vit_model = it.next().expect("--vit-model NAME"),
             "-h" | "--help" => {
                 eprintln!("aether-serve [--port N] [--bind ADDR] [--model NAME] [--gguf PATH] [--max-tokens N] [--stop-token ID|none] [--warmup N] [--tls] [--tls-cn NAME] [--paged]");
                 eprintln!();
@@ -551,6 +564,18 @@ fn parse_int_array(s: &str) -> Result<Vec<usize>, &'static str> {
     Ok(out)
 }
 
+/// Parse a flat array of f32 (space/comma separated, no nesting).
+fn parse_f32_array(s: &str) -> Result<Vec<f32>, &'static str> {
+    let mut out = Vec::new();
+    for chunk in s.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = chunk.trim();
+        if t.is_empty() { continue; }
+        let v: f32 = t.parse().map_err(|_| "non-float in pixel_values")?;
+        out.push(v);
+    }
+    Ok(out)
+}
+
 fn find_key_int(s: &str, key: &str) -> Option<i64> {
     let pat = format!("\"{}\"", key);
     let i = s.find(&pat)?;
@@ -811,6 +836,11 @@ struct ServerState {
     /// + immutable after construction; shared by reference across requests.
     #[cfg(feature = "cuda")]
     bert_tokenizer: Option<WordPieceTokenizer>,
+    /// FR-V1: DINOv3 ViT-L/16 vision backbone for /v1/vision/embed, loaded
+    /// when --vit-weights is supplied. Under a Mutex so concurrent vision
+    /// requests serialise (the session reuses device scratch buffers).
+    #[cfg(feature = "cuda")]
+    vit: Option<std::sync::Mutex<Dinov3GpuSession>>,
 }
 
 impl ServerState {
@@ -934,12 +964,23 @@ impl ServerState {
                 }
                 None => (None, None),
             };
-            return Ok(ServerState { cli, session, pool, scheduler, bert, bert_tokenizer });
+            let vit = match &cli.vit_weights {
+                Some(dir) => {
+                    eprintln!("[aether-serve] loading DINOv3 ViT-L/16 weights: {}", dir);
+                    let t = std::time::Instant::now();
+                    let s = Dinov3GpuSession::load_dir(dir)?;
+                    eprintln!("[aether-serve] DINOv3 loaded + uploaded to GPU in {:.2}s",
+                        t.elapsed().as_secs_f32());
+                    Some(std::sync::Mutex::new(s))
+                }
+                None => None,
+            };
+            return Ok(ServerState { cli, session, pool, scheduler, bert, bert_tokenizer, vit });
         }
         #[cfg(not(feature = "cuda"))]
         {
-            if cli.gguf.is_some() || cli.bge_gguf.is_some() {
-                return Err("--gguf / --bge-gguf require building with --features cuda".into());
+            if cli.gguf.is_some() || cli.bge_gguf.is_some() || cli.vit_weights.is_some() {
+                return Err("--gguf / --bge-gguf / --vit-weights require building with --features cuda".into());
             }
             Ok(ServerState { cli })
         }
@@ -1394,7 +1435,9 @@ unsafe fn handle_request(state: &ServerState, t: &mut dyn Transport) {
     }
     // Otherwise treat as HTTP/1.1 — prepend the peeked bytes back into the
     // request buffer.
-    let req_bytes = match read_full_http_request_with_prefix(t, 1 << 20, &peek[..got]) {
+    // 16 MiB cap — chat/embeddings bodies are tiny, but /v1/vision/embed
+    // carries a 3x224x224 f32 pixel_values array (~1.6 MB as JSON text).
+    let req_bytes = match read_full_http_request_with_prefix(t, 16 << 20, &peek[..got]) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[serve] {}", e);
@@ -1432,6 +1475,7 @@ unsafe fn handle_request(state: &ServerState, t: &mut dyn Transport) {
             handle_completion_t(state, t, body, /*is_chat=*/false);
         }
         ("POST", "/v1/embeddings") => handle_embeddings_t(state, t, body),
+        ("POST", "/v1/vision/embed") => handle_vision_embed_t(state, t, body),
         _ => { let _ = send_text_t(t, 404, "not found"); }
     }
 }
@@ -1444,6 +1488,59 @@ unsafe fn handle_embeddings_t(state: &ServerState, t: &mut dyn Transport, body: 
     };
     let json = render_embeddings_json(state, &req);
     let _ = send_json_t(t, 200, &json);
+}
+
+/// FR-V1 — DINOv3 ViT vision-embedding endpoint. Body:
+/// `{"pixel_values":[... 3*224*224 f32, RGB-CHW, ImageNet-normalized ...]}`.
+/// Returns `{"embedding":[1024 f32 L2-normalized],"dim":1024,"model":"..."}`.
+/// The client (visionsystem) owns preprocessing — resize-224 (image-crate
+/// Triangle) + ImageNet normalize — to match the golden reference exactly.
+#[cfg(feature = "cuda")]
+unsafe fn handle_vision_embed_t(state: &ServerState, t: &mut dyn Transport, body: &[u8]) {
+    let vit_mu = match &state.vit {
+        Some(v) => v,
+        None => { let _ = send_text_t(t, 503,
+            "no vision model loaded — pass --vit-weights DIR on aether-serve startup"); return; }
+    };
+    let s = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => { let _ = send_text_t(t, 400, "body not utf-8"); return; }
+    };
+    let arr = match find_key_array(s, "pixel_values") {
+        Some(a) => a,
+        None => { let _ = send_text_t(t, 400,
+            "/v1/vision/embed requires \"pixel_values\":[3*224*224 f32]"); return; }
+    };
+    let px = match parse_f32_array(arr) {
+        Ok(v) => v,
+        Err(e) => { let _ = send_text_t(t, 400, e); return; }
+    };
+    let expect = 3 * 224 * 224;
+    if px.len() != expect {
+        let _ = send_text_t(t, 400, &format!(
+            "pixel_values length {} != {} (expect 3x224x224 RGB-CHW)", px.len(), expect));
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let emb = { let vit = vit_mu.lock().unwrap(); vit.embed(&px) };
+    eprintln!("[serve] /v1/vision/embed: {}-dim in {:.1} ms",
+        emb.len(), t0.elapsed().as_secs_f32() * 1000.0);
+    let mut emb_json = String::with_capacity(emb.len() * 12);
+    emb_json.push('[');
+    for (i, v) in emb.iter().enumerate() {
+        if i > 0 { emb_json.push(','); }
+        emb_json.push_str(&format!("{:.7}", v));
+    }
+    emb_json.push(']');
+    let json = format!(
+        "{{\"embedding\":{},\"dim\":{},\"model\":\"{}\"}}",
+        emb_json, emb.len(), state.cli.vit_model);
+    let _ = send_json_t(t, 200, &json);
+}
+
+#[cfg(not(feature = "cuda"))]
+unsafe fn handle_vision_embed_t(_state: &ServerState, t: &mut dyn Transport, _body: &[u8]) {
+    let _ = send_text_t(t, 503, "aether-serve built without --features cuda");
 }
 
 unsafe fn handle_list_models_t(state: &ServerState, t: &mut dyn Transport) {

@@ -57,6 +57,23 @@ fp32 ViT-L ONNX on ort/CPU; the graph loads + runs clean under onnxruntime 1.22)
 a fixed test image; report e2e latency + GPU residency on the dedicated P100. Runs
 within the cnc GPU coordination contract (visionsystem owns that with `main`).
 
+> **✅ DONE 2026-06-03 — all acceptance criteria met.** Aether-hosted DINOv3
+> ViT-L/16 reproduces the golden (`dinov3_vitl16_ref.json`) to **cosine
+> 0.999999** on CPU, kokonoe 3070 Ti, AND the **cnc P100 (GPU 1)**. P100
+> **forward 56.9 ms**, **~1.45 GB resident** (transient/co-tenant, coordinated
+> with `main`). Service `POST /v1/vision/embed` live in aether-serve
+> (`--vit-weights DIR`); loopback round-trip cosine 1.0. visionsystem
+> `AetherBackend::embed()` rewritten as a thin HTTP client.
+> Impl: `runtime/src/vit.rs` (`Dinov3Session` CPU + `Dinov3GpuSession`),
+> new ops `aether_op_gelu_erf_f32` + `aether_op_sdpa_full_f32` + cuda kernels
+> `gelu_erf`/`dinov3_rope2d`, route in `trainer/src/bin/serve.rs`. Spec:
+> `docs/DINOV3_VITL16_SPEC.md`. Witnesses: `vit::tests::dinov3_cosine_vs_ort_reference`
+> (CPU) + `dinov3_gpu_cosine_vs_golden` (GPU). **KEY:** match the ONNX graph
+> (no q/k/v bias), not the abstract HF config. Weights gated → used ungated
+> onnx-community, traced opaque MatMuls. Follow-ons: standing P100 vision
+> daemon (re-coordinate w/ main), DINOv3 fine-tune (the separate FR below),
+> visionsystem libaether_rt link-decoupling.
+
 **Follow-on (separate FR once inference lands):** DINOv3 fine-tune / LoRA on
 visionsystem's capture corpus. Aether already has AdamW + MIR autodiff + dual-P100
 DP, so backbone adaptation is the natural next step — visionsystem's stated end
