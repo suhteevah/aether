@@ -1,0 +1,32 @@
+[Unit]
+Description=Aether-vision — DINOv3 ViT-L/16 image embeddings (Aether runtime, GPU 1) [FR-V2]
+Documentation=file:///opt/aether/docs/DINOV3_VITL16_SPEC.md
+After=network-online.target nvidia-persistenced.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# GPU 1 (physical P100-16GB) — Qwen (aether-serve.service) owns GPU 0. Standing
+# ~1.45 GB tenant, granted by openclaw main 2026-06-03. Yield for both-card
+# windows via: systemctl stop aether-vision (SIGTERM -> exit -> VRAM released).
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=RUST_LOG=info
+# cuda-extra/lib resolves the curand/cufft/nvrtc libs main flagged (same trap
+# the onnxruntime path hit); cuda-12.8 + /usr/local/lib for cublas + the rest.
+Environment=LD_LIBRARY_PATH=/opt/visionsystem/runtime/cuda-extra/lib:/usr/local/cuda-12.8/lib64:/usr/local/lib
+ExecStart=/opt/aether-vision/bin/aether-serve \
+    --vit-weights /opt/aether-vision/wclean \
+    --vit-model dinov3-vitl16 \
+    --port 18951 \
+    --bind 0.0.0.0
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+TimeoutStopSec=30
+StandardOutput=append:/var/log/aether-vision.log
+StandardError=append:/var/log/aether-vision.log
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

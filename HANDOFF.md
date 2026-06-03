@@ -40,8 +40,20 @@ only hit 0.997).
 aether_rt --features cuda --lib vit::tests::dinov3_gpu -- --nocapture`. DO NOT
 overlay onto `/opt/aether` — it has uncommitted local cuda.rs/serving.rs perf work.
 
-**Follow-ons:** standing P100 vision daemon (re-coordinate with main first),
-DINOv3 fine-tune/LoRA (separate FR), visionsystem libaether_rt link-decoupling.
+**FR-V2 (standing P100 daemon) — ALSO DONE.** `aether-vision.service` (systemd,
+enabled/reboot-survive, `Restart=on-failure`) runs the FR-V1 binary on cnc GPU 1
+at **`192.168.168.100:18951`** (`/v1/vision/embed`), `--vit-weights
+/opt/aether-vision/wclean`, built `--release` in the clean tree `/root/aether-vit`
+(NOT `/opt/aether` — it has uncommitted perf work). Coexists with Qwen
+`aether-serve.service` (:18913, GPU 0 — untouched). GPU-1 residency ~1.45 GB.
+**Smoke: cosine 1.000000 from cnc-localhost AND kokonoe-LAN.** Standing ~1.45 GB
+GPU-1 tenancy granted + ledgered by openclaw `main`; **yield = `systemctl stop
+aether-vision`** for both-card windows. firewalld :18951 scoped to LAN /24 +
+tailscale CGNAT. Unit + recipe committed at `deploy/`. visionsystem: set
+`AETHER_VISION_URL=http://192.168.168.100:18951`.
+
+**Remaining follow-ons:** DINOv3 fine-tune/LoRA (separate FR), visionsystem
+libaether_rt link-decoupling, tailscale-zone firewalld rule (LAN path is live).
 
 ---
 

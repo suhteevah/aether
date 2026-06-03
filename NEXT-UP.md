@@ -129,6 +129,23 @@ with the Qwen unit (:18913 stays 200), and visionsystem's `dinov3_smoke` from
 cnc-localhost + kokonoe-LAN returns cosine ≥ 0.999 vs the golden
 (`visionsystem/scratch/dinov3_vitl16_ref.json`). Report the host:port.
 
+> **✅ DONE 2026-06-03 — standing on the cnc P100.** `aether-vision.service`
+> (systemd, **enabled** → reboot-survive, `Restart=on-failure`) runs
+> `/opt/aether-vision/bin/aether-serve --vit-weights /opt/aether-vision/wclean
+> --port 18951 --bind 0.0.0.0`, `CUDA_VISIBLE_DEVICES=1` (GPU 1), built
+> `--release` from FR-V1 source in the clean tree `/root/aether-vit` (NOT
+> `/opt/aether`). **host:port = `cnc-server` / `192.168.168.100:18951`**
+> (firewalld opened for :18951 scoped to `192.168.168.0/24` + `100.64.0.0/10`
+> only). Coexists with Qwen `aether-serve.service` (:18913 stayed 200; GPU 0,
+> untouched). GPU-1 residency ~1.45 GB (11965/16384 MiB). **Smoke: cosine
+> 1.000000 vs golden from BOTH cnc-localhost AND kokonoe-LAN.** Standing ~1.45 GB
+> GPU-1 tenancy granted + ledgered by openclaw `main`; **yield mechanism =
+> `systemctl stop aether-vision`** (SIGTERM → exit → VRAM released in seconds)
+> for both-card matt-voice/trw-voice windows, `systemctl start` after. Unit
+> committed at `deploy/aether-vision.service`. visionsystem: set
+> `AETHER_VISION_URL=http://192.168.168.100:18951`. (Tailscale path needs a
+> zone-specific firewalld rule if wanted — LAN path is live.)
+
 **visionsystem side (already done):** `AetherBackend::embed()` is the HTTP client;
 point `AETHER_VISION_URL` at the cnc service once it's standing. The kokonoe→cnc
 Windows firewall is visionsystem's concern (auto-block rules for `aether-serve`
