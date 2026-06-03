@@ -1,5 +1,62 @@
 # NEXT-UP — v4 critical path + parked items
 
+## FR-V1 — DINOv3 ViT vision-backbone hosting (incoming from visionsystem, 2026-06-03)
+
+**Requested by:** visionsystem (`J:\visionsystem`). **Target:** the dedicated cnc
+**P100-12GB** (sm_60, fp32 — no tensor cores). **Blocks:** visionsystem
+`AetherBackend::embed()`, today a 384-d fingerprint stub
+(`crates/vs-model/src/backend.rs`).
+
+**Why this lands in Aether, not visionsystem:** visionsystem's Backend policy
+mandates the in-house path (Aether) over candle/ort. candle has no DINOv3 impl;
+the ort path bypasses the Backend trait. Hosting it here is on-policy *and* on
+Aether's own roadmap — Phase 4 serving + SafeTensors, ROADMAP_V2 candle-parity
+(whose flagship is ViT/DINO). First vision-backbone target; extends the runtime
+past LLM-only, reusing the existing kernel surface.
+
+**Ask:** serve **DINOv3 ViT-L/16** inference on the dedicated P100 — 300M params,
+patch-16, **embed-dim 1024**, 4 register tokens, axial RoPE, GELU MLP. Return one
+**L2-normalized 1024-d** embedding per image. Weights:
+`onnx-community/dinov3-vitl16-pretrain-lvd1689m-ONNX` (fp32) or
+`facebook/dinov3-vitl16-pretrain-lvd1689m` safetensors. **Stretch ceiling:**
+ViT-H+/16 (840M, ~3.4 GB fp32) also fits 12 GB for inference — pick at bench time
+on fp32-Pascal throughput.
+
+**Interface (decided: service, via the running aether-serve):** a vision-embedding
+route, e.g. `POST /v1/vision/embed`, taking a preprocessed `3×H×W` f32 tensor (or
+raw RGB + server-side resize/normalize to the model input res) →
+`{ "embedding": [1024×f32], "dim": 1024, "model": "dinov3-vitl16" }`, plus a
+health route. visionsystem's `AetherBackend::embed()` becomes a thin HTTP client —
+no `libaether_rt` link, builds stay decoupled. (FFI fallback
+`aether_vit_embed_f32(handle, pixels, out, h, w, dim)` is acceptable if a service
+is undesirable, but the service is the chosen path.)
+
+**New runtime pieces this implies (scoping aid):**
+1. safetensors/ONNX ViT weight loader (Phase-4 SafeTensors aligned).
+2. patch-embedding — conv2d, or im2col + the existing `matmul_f32`.
+3. **2D axial RoPE** kernel — distinct from the existing 1D llama
+   `aether_op_rope_apply_f32`.
+4. register/CLS-token plumbing + a **non-causal** SDPA mode (`aether_op_sdpa_f32`
+   exists; needs the bidirectional path — no causal mask).
+5. `layer_norm_f32` + `gelu_f32` already present. **No KV-cache, no
+   autoregressive** — strictly simpler than the Qwen decode path.
+
+**Acceptance:** embedding cosine **≥ 0.999** vs the onnx-community/ort reference on
+a fixed test image; report e2e latency + GPU residency on the dedicated P100. Runs
+within the cnc GPU coordination contract (visionsystem owns that with `main`).
+
+**Follow-on (separate FR once inference lands):** DINOv3 fine-tune / LoRA on
+visionsystem's capture corpus. Aether already has AdamW + MIR autodiff + dual-P100
+DP, so backbone adaptation is the natural next step — visionsystem's stated end
+goal ("backbone fine-tune → ship inference").
+
+**Provenance:** visionsystem session 2026-06-03 (post cnc host-native GPU
+validation). Cross-ref: visionsystem `HANDOFF.md` Round 23 + `docs/migrations/
+2026-06-02-cnc-host-native-deploy.md`. The `FR-V1` tag is provisional — renumber
+into Aether's sequence as the owner sees fit.
+
+---
+
 ## *Need to smoke* — renlys CT fleet reference inference targets (2026-05-27)
 
 Discovered while smoke-testing lattice on jitk's renlys (proxmox-renlys, jitk's
