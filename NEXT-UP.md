@@ -86,6 +86,60 @@ into Aether's sequence as the owner sees fit.
 
 ---
 
+## FR-V2 — Standing DINOv3 vision daemon on the cnc P100 (incoming from visionsystem, 2026-06-03)
+
+**Requested by:** visionsystem. **Builds on:** FR-V1 (DINOv3 ViT-L/16
+`/v1/vision/embed`, validated cosine 1.000000). **This is the deploy follow-on
+Aether's own handoff already flagged: "standing P100 vision daemon (re-coordinate
+with main first)."**
+
+**Why this is an Aether task, not visionsystem:** it's Aether's `aether-serve`
+binary, build, and serving infrastructure (systemd conventions cf. the existing
+`aether-serve.service`), plus a *standing* GPU-1 allocation that's a fleet
+decision (Aether + `main`). visionsystem is the consumer — the `AetherBackend`
+HTTP client is already wired — and shouldn't build/deploy Aether's binary into
+Aether's trees on the shared box.
+
+**Current gap:** the FR-V1 vision binary isn't built on cnc. `/opt/aether` is a
+perf tree (no `runtime/src/vit.rs`); `/root/aether-vit` ran only the vit test
+with a stale trainer; both built `aether-serve` binaries predate FR-V1. The
+complete FR-V1 source is on kokonoe (`J:\aether` HEAD `846167e`). visionsystem
+proved the service works end-to-end by building it on kokonoe and smoking from
+kokonoe + cnc (both cosine 1.000000) — but nothing stands on cnc.
+
+**Ask — stand up a persistent vision service on the cnc P100:**
+- Build `aether-serve --features cuda` from current FR-V1 source on cnc, in a
+  clean tree (NOT `/opt/aether`'s uncommitted perf tree).
+- A **systemd unit** (e.g. `aether-vision.service`) on a port **≠ 18913** (suggest
+  **18951**), `CUDA_VISIBLE_DEVICES=1` (physical GPU 1),
+  `--vit-weights /opt/aether/scratch/dinov3/wclean --bind 0.0.0.0`. **Must NOT
+  stop/restart/`systemctl`-touch the existing `aether-serve.service`** (Qwen2.5-Math
+  LLM on :18913 — backs the math/school agents).
+- `LD_LIBRARY_PATH` must resolve the cuda runtime libs `main` flagged
+  (`libcurand.so.10`/`libcufft.so.11`/`libnvrtc.so.12`) — the same missing-libs
+  trap that bit the onnxruntime path; copies are staged at
+  `/opt/visionsystem/runtime/cuda-extra/lib`.
+- **Standing GPU-1 allocation coordinated with `main`** — a persistent ~1.45 GB
+  tenant. The unit must support a graceful `systemctl stop` as the yield
+  mechanism for both-card matt-voice/trw-voice eviction windows (main pings →
+  stop → restart after).
+
+**Acceptance:** unit starts + survives reboot (or documented start), coexists
+with the Qwen unit (:18913 stays 200), and visionsystem's `dinov3_smoke` from
+cnc-localhost + kokonoe-LAN returns cosine ≥ 0.999 vs the golden
+(`visionsystem/scratch/dinov3_vitl16_ref.json`). Report the host:port.
+
+**visionsystem side (already done):** `AetherBackend::embed()` is the HTTP client;
+point `AETHER_VISION_URL` at the cnc service once it's standing. The kokonoe→cnc
+Windows firewall is visionsystem's concern (auto-block rules for `aether-serve`
+must be cleared — done during the FR-V1 smoke).
+
+**Provenance:** visionsystem session 2026-06-03, after the FR-V1 end-to-end smoke
+(cosine 1.000000 from both machines, hosted on the kokonoe 3070 Ti). `FR-V2` tag
+provisional — renumber into Aether's sequence as the owner sees fit.
+
+---
+
 ## *Need to smoke* — renlys CT fleet reference inference targets (2026-05-27)
 
 Discovered while smoke-testing lattice on jitk's renlys (proxmox-renlys, jitk's
