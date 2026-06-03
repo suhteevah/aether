@@ -41,6 +41,18 @@ is undesirable, but the service is the chosen path.)
 5. `layer_norm_f32` + `gelu_f32` already present. **No KV-cache, no
    autoregressive** — strictly simpler than the Qwen decode path.
 
+**Pinned I/O contract (verified 2026-06-03 — visionsystem ran the onnx-community
+fp32 ViT-L ONNX on ort/CPU; the graph loads + runs clean under onnxruntime 1.22):**
+- **Input:** `pixel_values` `[1, 3, 224, 224]` f32, RGB-CHW, ImageNet-normalized
+  (mean `[0.485, 0.456, 0.406]`, std `[0.229, 0.224, 0.225]`), resize-to-224.
+- **Outputs:** `last_hidden_state` `[1, 201, 1024]` (201 = 1 CLS + 4 register +
+  196 patch tokens, 224/16=14²) and `pooler_output` `[1, 1024]`. **Serve the
+  `pooler_output`, L2-normalized.**
+- **Golden reference** for the cosine acceptance is on kokonoe at
+  `J:\visionsystem\scratch\dinov3_vitl16_ref.json` (vector + exact preprocessing),
+  produced by `crates/vs-perceive/examples/dinov3_ref.rs`. Match that
+  preprocessing for the cosine to be meaningful.
+
 **Acceptance:** embedding cosine **≥ 0.999** vs the onnx-community/ort reference on
 a fixed test image; report e2e latency + GPU residency on the dedicated P100. Runs
 within the cnc GPU coordination contract (visionsystem owns that with `main`).
