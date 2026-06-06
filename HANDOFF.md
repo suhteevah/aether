@@ -1,5 +1,14 @@
 # Aether — Session Handoff
 
+## Last Updated — 2026-06-05 (🟢 NO CODE CHANGES — `/handoff` on a fresh session; repo confirmed clean & current at the FR-V1/V2 DINOv3-vision milestone)
+
+This session opened directly with `/handoff` and did no code work — recording it so the timeline stays honest. Verified state:
+- **Working tree clean**; the substantive source is intact (`runtime/src/vit.rs`, `compiler/src/main.rs`, `aether_asm/src/pe.rs`, `deploy/` all present). Latest real work is unchanged from the 2026-06-03 entry below (FR-V1 backbone + FR-V2 standing `aether-vision.service` on the cnc P100).
+- **Heads-up on the git log:** several commits read `Initial commit - uploaded via github-uploader-buildout` (`aa570e8`, `c066613`, `474f418`, `176f32d`, `7bfac1b`). These are from an **external GitHub-uploader automation, not from any session** — each is a **README.md-only, 2-line cosmetic touch**, NOT real work and NOT history corruption. HEAD advanced `70ea4f2 → aa570e8` between session-start and now purely from that bot. Ignore them when reading history; the load-bearing commits are the `FR-*` / `feat(P6.*)` ones.
+- **What's next is unchanged from 2026-06-03:** DINOv3 fine-tune/LoRA (separate FR), visionsystem `libaether_rt` link-decoupling, tailscale-zone firewalld rule (LAN path already live); plus Roadmap-v2 P6+ continuation per `docs/ROADMAP_V2.md`.
+
+---
+
 ## Last Updated — 2026-06-03 (🟢 FR-V1 DINOv3 ViT-L/16 vision backbone — COMPLETE: cosine 0.999999 on CPU + 3070 Ti + cnc P100; 56.9 ms/forward + ~1.45 GB resident on P100; `POST /v1/vision/embed` service live; visionsystem `AetherBackend::embed()` → HTTP client)
 
 FR-V1 (first vision backbone in Aether) is done end-to-end. DINOv3 ViT-L/16
